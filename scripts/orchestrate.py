@@ -75,7 +75,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--frameworks", nargs="+", default=FRAMEWORKS, choices=FRAMEWORKS)
     parser.add_argument("--models", nargs="+", default=MODELS, choices=MODELS)
-    parser.add_argument("--registry", default="ghcr.io/jinwoo-cho/trainbench")
+    # GHCR namespace must match the GitHub account (jinwoo-cho-ilevit-com), which
+    # differs from the Hugging Face account (jinwoo-cho) used for data/results.
+    parser.add_argument("--registry", default="ghcr.io/jinwoo-cho-ilevit-com/trainbench")
     parser.add_argument("--tag", default="latest")
     parser.add_argument("--gpu-type-id", default="NVIDIA A100-SXM4-80GB")
     parser.add_argument("--result-repo", default="jinwoo-cho/trainbench-results")
