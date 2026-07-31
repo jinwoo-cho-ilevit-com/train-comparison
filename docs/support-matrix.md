@@ -188,3 +188,17 @@ pod 실행으로 판정한다.
 - Tevatron 패키지의 정체 (git HEAD가 0.0.1로 보고됨) 및 세 모델 지원
 - sentence-transformers가 생성형 VLM 2종에서 module layout 없이 기본 pooling으로
   떨어지는지
+
+## 데이터 준비 실측 (2026-07-31)
+
+- 행 수 조회는 datasets-server `size` 엔드포인트로 한다. `get_dataset_config_info`는
+  config마다 데이터에 접근해 55GB 저장소에서 응답이 오지 않았다(20개 config 무응답).
+  엔드포인트는 같은 정보를 **0.43초**에 돌려준다
+- `MrZilinXiao/MMEB_train_with_image` `original` 스플릿 총 **1,068,472행 / 20 config**
+- 2048행 비례 배분 예: VisDial 227, MSCOCO_i2t 218, ImageNet_1K 192, VOC2007 16
+- 스트리밍 샘플링 실경로 확인(VOC2007 3행 + WebQA 5행, 29.7초). 컬럼
+  `qry / qry_image / pos_text / mmeb_config`, 이미지가 PIL 객체로 실려온다
+
+**주의 — Task 3에 반영 필요**: 쿼리 텍스트에 MMEB 자체 placeholder `<|image_1|>`가
+들어 있다. 모델의 이미지 토큰이 아니므로 그대로 넣으면 image token 0개 대 feature N개
+불일치로 forward가 실패한다. 모델별 `apply_chat_template`으로 변환해야 한다.

@@ -59,14 +59,35 @@ SPLIT = "original"
 SHUFFLE_BUFFER = 2000
 
 
-def config_row_counts(source_repo: str) -> dict[str, int]:
-    """Row count per config, from the Hub rather than a hardcoded table."""
-    from datasets import get_dataset_config_info
+SIZE_ENDPOINT = "https://datasets-server.huggingface.co/size"
 
-    counts = {}
-    for name in MMEB_CONFIGS:
-        info = get_dataset_config_info(source_repo, config_name=name)
-        counts[name] = info.splits[SPLIT].num_examples
+
+def config_row_counts(source_repo: str) -> dict[str, int]:
+    """Row count per config, read from the Hub's precomputed size index.
+
+    Not `datasets.get_dataset_config_info`: that reaches into the data for each
+    config and does not return in reasonable time against a 55GB repo (measured:
+    no output at all across 20 configs). One HTTP call answers for all of them in
+    well under a second.
+    """
+    from huggingface_hub import get_session
+
+    response = get_session().get(SIZE_ENDPOINT, params={"dataset": source_repo}, timeout=60)
+    response.raise_for_status()
+    size = response.json()["size"]
+
+    wanted = set(MMEB_CONFIGS)
+    counts = {
+        entry["config"]: entry["num_rows"]
+        for entry in size.get("splits", [])
+        if entry.get("config") in wanted and entry.get("split") == SPLIT
+    }
+    missing = wanted - set(counts)
+    if missing:
+        raise RuntimeError(
+            f"{source_repo} is missing expected configs for split '{SPLIT}': {sorted(missing)}. "
+            "Upstream composition changed; the subset would no longer match MMEB."
+        )
     return counts
 
 
