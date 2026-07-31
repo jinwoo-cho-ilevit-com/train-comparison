@@ -6,7 +6,7 @@ import pytest
 from hydra import compose, initialize_config_dir
 from pydantic import ValidationError
 
-from trainbench.config import to_bench_config
+from trainbench.compose import resolve
 from trainbench.config_schema import BenchConfig
 
 from .conftest import CONFIG_DIR
@@ -15,7 +15,7 @@ from .conftest import CONFIG_DIR
 def compose_cfg(*overrides: str) -> BenchConfig:
     with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
         cfg = compose(config_name="config", overrides=list(overrides))
-        return to_bench_config(cfg)
+        return resolve(cfg)[0]
 
 
 def test_default_composition_is_valid():

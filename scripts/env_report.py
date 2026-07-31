@@ -12,7 +12,7 @@ from omegaconf import DictConfig
 from rich.console import Console
 from rich.table import Table
 
-from trainbench.config import CONFIG_DIR, CONFIG_NAME, output_dir, to_bench_config
+from trainbench.compose import CONFIG_DIR, CONFIG_NAME, output_dir, resolve
 from trainbench.device import get_device
 from trainbench.record import build_record, write_json
 from trainbench.seed import set_seed
@@ -22,7 +22,7 @@ console = Console()
 
 @hydra.main(version_base=None, config_path=CONFIG_DIR, config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
-    config = to_bench_config(cfg)
+    config, _ = resolve(cfg)
     device = get_device(config.device)
     set_seed(config.train.seed, deterministic=config.train.deterministic)
 

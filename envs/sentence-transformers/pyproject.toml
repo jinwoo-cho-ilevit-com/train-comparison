@@ -1,0 +1,25 @@
+# Independent project + independent lock for the sentence-transformers framework image.
+# A shared lock would force one version per shared package across all frameworks;
+# see docs/support-matrix.md for the measured failure that led here.
+[project]
+name = "trainbench-env-sentence-transformers"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "trainbench",
+    "sentence-transformers>=5.6",
+]
+
+[tool.uv]
+# These images only ever run on linux/CUDA pods. Resolving for the host platform
+# would drag in wheels that do not exist there.
+environments = ["sys_platform == 'linux'"]
+
+[tool.uv.sources]
+trainbench = { path = "../..", editable = true }
+torch = [{ index = "pytorch-cuda" }]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

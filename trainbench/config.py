@@ -1,39 +1,38 @@
-"""Bridge from Hydra's DictConfig to the validated schema."""
+"""Config loading that works everywhere, including inside framework images.
+
+Deliberately free of Hydra and OmegaConf. Hydra pins `antlr4==4.9.*` and axolotl
+pins `antlr4==4.13.2`, so a Hydra dependency here would make that image
+unbuildable. Composition happens where experiments are defined; a pod receives an
+already-resolved config and only validates it. See trainbench/compose.py.
+"""
 
 from __future__ import annotations
 
+import json
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig, OmegaConf
-
 from trainbench.config_schema import BenchConfig
 
-CONFIG_DIR = "../configs"
-CONFIG_NAME = "config"
+
+def to_bench_config(mapping: Mapping[str, Any]) -> BenchConfig:
+    """Validate a plain mapping. Raises before any work starts."""
+    return BenchConfig.model_validate(dict(mapping))
 
 
-def to_bench_config(cfg: DictConfig) -> BenchConfig:
-    """Resolve interpolations and validate. Raises before any work starts."""
-    resolved: Any = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
-    return BenchConfig.model_validate(resolved)
-
-
-def output_dir() -> Path:
-    """The run's output directory, owned by Hydra (`hydra.run.dir`).
-
-    Falls back to the working directory when called outside `@hydra.main`, which is
-    the case in unit tests.
-    """
-    if HydraConfig.initialized():
-        return Path(HydraConfig.get().runtime.output_dir)
-    return Path.cwd()
+def load_bench_config(path: str | Path) -> BenchConfig:
+    """Load a resolved config JSON, as written by scripts/compose_config.py."""
+    return to_bench_config(json.loads(Path(path).read_text()))
 
 
 def git_commit() -> str:
-    """Commit hash recorded with every run (convention 07). 'unknown' outside a repo."""
+    """Commit hash recorded with every run (convention 07).
+
+    Returns 'unknown' outside a repo — which is the normal case inside an image,
+    where the commit is instead passed in by the orchestrator.
+    """
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"],

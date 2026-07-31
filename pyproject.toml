@@ -6,24 +6,43 @@ readme = "README.md"
 # Upper bound pins resolution to 3.13: torch ships cp314 wheels but the training
 # frameworks under test do not all support 3.14 yet.
 requires-python = ">=3.13,<3.14"
-# Lower bounds are load-bearing, not cosmetic. Without them uv backtracks to satisfy
-# the most constrained framework group and silently downgrades the shared stack
-# (observed: transformers 5.3.0, ms-swift 1.4.0). gemma-4 needs transformers >=5.5,
-# and the models under test only exist in recent releases.
+# Every framework env installs this package by path, so anything pinned here is
+# imposed on all of them. Bounds are therefore the loosest that still work — only
+# what config/device/seed/record actually call. Tight core bounds were measured to
+# break three of five envs on their own:
+#   torch>=2.13            -> unsloth needs torch<2.12
+#   huggingface-hub>=1.26  -> axolotl pins huggingface-hub==1.17.0 exactly
+#   pillow>=12.0           -> ms-swift -> gradio needs pillow<12
+# The modelling stack lives in the `native` extra; framework envs let their own
+# framework choose it, and the resolved versions are recorded per run.
+#   hydra-core             -> pins antlr4==4.9.*, axolotl pins antlr4==4.13.2
+# Hydra is a composition tool, and composition happens where experiments are
+# defined, not on the pod. Pods receive an already-resolved config JSON, so Hydra
+# lives in the `compose` extra and never enters a framework image.
 dependencies = [
-    "torch>=2.13",
+    "torch>=2.4",
+    "huggingface-hub>=0.34",
+    "pydantic>=2.7",
+    "numpy>=1.26",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+# Local/orchestrator side: composes experiment variants and writes resolved JSON.
+compose = ["hydra-core>=1.3"]
+native = [
     "transformers>=5.14",
+    "datasets>=5.0",
     "accelerate>=1.14",
     "peft>=0.20",
-    "datasets>=5.0",
-    "huggingface-hub[hf-xet]>=1.26",
-    "hydra-core>=1.3",
-    "pydantic>=2.13",
-    "trackio>=0.34",
-    "pillow>=12.0",
-    "numpy>=2.5",
-    "rich>=15.0",
+    "pillow>=11.0",
 ]
+# Experiment tracking pulls gradio, which constrains pillow. Kept optional so an
+# env that cannot satisfy it still produces results (written as JSON regardless).
+tracking = ["trackio>=0.34"]
+# Accelerated Hub transfers. Optional because it is a hard version floor on
+# huggingface-hub that some frameworks cannot meet.
+xet = ["hf-xet>=1.1"]
 
 [build-system]
 requires = ["hatchling"]

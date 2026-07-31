@@ -39,9 +39,65 @@ we can conclude that your project and unsloth>=2026.7.1 are incompatible.
 lockfile을 공유하므로 대안이 아니다. `envs/<framework>/`에 각각의 `pyproject.toml`을
 두고 `trainbench`를 path 의존성으로 참조한다.
 
-**측정 유효성에 대한 함의**: 프레임워크별 이미지는 서로 다른 torch/transformers
-버전을 갖게 된다. 이는 제거 불가능한 교란 변수이므로, 모든 run이 해석된
-torch/transformers/프레임워크 버전을 함께 기록하고 리포트에 노출한다.
+### 코어가 강제하는 핀이 곧 이미지 빌드 실패였다 — 확정
+
+독립 프로젝트로 분리한 뒤에도 5종 중 3종이 실패했는데, 원인이 전부 프레임워크가
+아니라 **`trainbench` 코어의 핀**이었다. 코어는 모든 env에 path 의존성으로 들어가므로
+여기서 고정한 것이 그대로 전파된다.
+
+| 코어 핀 | 깨진 env | 프레임워크 측 제약 |
+|---|---|---|
+| `torch>=2.13` | unsloth | `unsloth>=2026.7`이 `torch<2.12` 요구 |
+| `huggingface-hub>=1.26` | axolotl | `axolotl==0.18.0`이 `huggingface-hub==1.17.0` 정확히 고정 |
+| `pillow>=12.0` | ms-swift | `ms-swift>=4.4` -> gradio -> `pillow<12` |
+| `hydra-core>=1.3` | axolotl | hydra/omegaconf가 `antlr4==4.9.*`, axolotl이 `antlr4==4.13.2` |
+
+앞의 셋은 코어 하한을 실제 필요 수준으로 낮춰 해소했다. **hydra는 해소가
+불가능하다** — 양쪽 다 antlr4를 정확히 고정하기 때문이다.
+
+해결: **pod은 Hydra를 쓰지 않는다.** 조합은 실험을 정의하는 로컬에서 일어나고,
+pod은 이미 해석된 config JSON을 받아 검증만 한다. Hydra는 `compose` extra로 빼서
+프레임워크 이미지에 들어가지 않는다. 부수 효과로 이미지에서 hydra/omegaconf/antlr가
+빠지고, 실제로 실행된 config가 그대로 기록된다.
+
+교훈: 벤치마크 하네스의 코어는 **최대한 아무것도 강제하지 않아야 한다.**
+
+### env별 해석 결과 — 5/5 성공
+
+`uv lock` 기준. `envs/<fw>/uv.lock`에 커밋되어 있다.
+
+| env | 패키지 수 | torch | transformers | datasets | accelerate | peft | hf-hub | numpy | pillow |
+|---|---|---|---|---|---|---|---|---|---|
+| native | 112 | 2.13.0 | 5.14.1 | 5.0.1 | 1.14.0 | 0.20.0 | 1.26.0 | 2.5.1 | 12.3.0 |
+| unsloth | 103 | **2.11.0** | **5.5.0** | 4.3.0 | 1.14.0 | 0.20.0 | 1.26.0 | 2.5.1 | 12.3.0 |
+| axolotl | 237 | **2.12.1** | 5.14.1 | 4.8.4 | 1.13.0 | 0.19.1 | **1.17.0** | 2.4.6 | 11.3.0 |
+| ms-swift | 152 | 2.13.0 | 5.12.1 | 4.8.4 | 1.14.0 | 0.19.1 | 1.26.0 | 2.5.1 | 11.3.0 |
+| sentence-transformers | 65 | 2.13.0 | 5.14.1 | - | - | - | 1.26.0 | 2.5.1 | - |
+| tevatron | 79 | 2.13.0 | 5.14.1 | 5.0.1 | - | - | 1.26.0 | 2.5.1 | - |
+
+프레임워크 자체 버전: unsloth 2026.7.6 / axolotl 0.18.0 / ms-swift 4.4.2 /
+sentence-transformers 5.6.1 / tevatron 0.0.1(git HEAD).
+
+**측정 유효성 경고 — Phase 3 설계에 반영 필요**
+
+torch가 env마다 **2.11.0 / 2.12.1 / 2.13.0**으로 갈리고 transformers도
+**5.5.0 ~ 5.14.1** 범위로 흩어진다. 이 상태의 프레임워크 비교는 "프레임워크 차이"가
+아니라 "프레임워크 + torch 버전 차이"를 재게 된다.
+
+두 가지 해석이 모두 성립한다.
+
+1. **실사용 관점**: 각 프레임워크를 설치하면 실제로 저 스택을 받는다. 그것이
+   사용자가 겪는 성능이다
+2. **통제 관점**: 프레임워크만 분리해 비교하려면 공통 스택(최저 공통분모인
+   torch 2.11.0)으로 고정해야 한다
+
+Phase 3에서 어느 쪽을 (또는 둘 다) 채택할지 결정해야 한다. 현재는 1번 상태이며,
+모든 run이 해석된 버전을 함께 기록한다.
+
+**추가 확인 필요**: unsloth env의 transformers 5.5.0이 gemma-4-E2B(config상
+`transformers_version: 5.5.0.dev0`)와 Qwen3-VL-Embedding을 실제로 지원하는지.
+probe로 판정한다. tevatron이 git HEAD에서 0.0.1로 잡히는데, 이것이 논문의
+Tevatron 2.0인지도 확인 대상이다.
 
 ### native 하네스 기준 환경 — 확정
 
