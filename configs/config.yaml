@@ -1,0 +1,29 @@
+# Every experiment variant is a composition of these groups. Adding an ablation axis
+# means adding a group here, never editing code (convention 02).
+defaults:
+  - run: timing
+  - model: qwen3_vl_emb_2b
+  - data: speed
+  - attn: sdpa
+  - kernel: none
+  - precision: bf16
+  - compile: none
+  - optim: adamw_fused
+  - loss: mnrl
+  - peft: full
+  - freeze: none
+  - dataloader: torch
+  - parallel: single
+  - framework: native
+  - train: default
+  - _self_
+
+# null lets trainbench.device pick the accelerator; set `device=cpu` to force CPU.
+device: null
+
+hydra:
+  run:
+    dir: outputs/${model.name}-${framework.name}-${now:%Y%m%d-%H%M%S}
+  sweep:
+    dir: multirun/${now:%Y%m%d-%H%M%S}
+    subdir: ${model.name}-${framework.name}-${hydra.job.num}

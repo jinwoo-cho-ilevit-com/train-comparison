@@ -1,0 +1,7 @@
+batch_size: 16
+grad_accum: 1
+steps: 120
+warmup_discard_steps: 10
+gradient_checkpointing: none
+seed: 1234
+deterministic: false

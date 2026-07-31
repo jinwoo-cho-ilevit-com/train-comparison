@@ -1,0 +1,4 @@
+name: qwen3_vl_emb_2b
+hf_id: Qwen/Qwen3-VL-Embedding-2B
+arch: qwen3_vl
+revision: null

@@ -1,0 +1,4 @@
+name: qwen3_5_0_8b
+hf_id: Qwen/Qwen3.5-0.8B
+arch: qwen3_5
+revision: null
