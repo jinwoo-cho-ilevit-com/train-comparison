@@ -202,3 +202,16 @@ pod 실행으로 판정한다.
 **주의 — Task 3에 반영 필요**: 쿼리 텍스트에 MMEB 자체 placeholder `<|image_1|>`가
 들어 있다. 모델의 이미지 토큰이 아니므로 그대로 넣으면 image token 0개 대 feature N개
 불일치로 forward가 실패한다. 모델별 `apply_chat_template`으로 변환해야 한다.
+
+### 고정 서브셋 생성 완료 (2026-08-01)
+
+| | |
+|---|---|
+| 저장소 | `jinwoo-cho/mmeb-subset` (private) |
+| revision | `b750b9c3263e9ef5dce225fd50aa25d7c58f1d5f` |
+| 행 수 | 2048 / 2048 (요청 대비 정확) |
+| 기여 config | 20 / 20 (0행 config 없음) |
+| sample_seed | 1234 |
+
+revision을 `configs/data/speed.yaml`에 고정했다. 이 값이 모든 run의 데이터 버전으로
+기록된다. `data/quality.yaml`은 행 수가 달라 별도 서브셋이 필요하므로 아직 미고정이다.
