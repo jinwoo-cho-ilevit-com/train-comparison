@@ -1,0 +1,33 @@
+# Shared layer for all framework images: OS, CUDA toolchain, uv, Infisical CLI.
+#
+# Deliberately contains no project source and no Python packages. Source lives in
+# the framework images so that editing trainbench does not invalidate the layer
+# every image shares — which is the entire reason this base exists.
+#
+# devel rather than runtime: causal-conv1d and similar kernels compile from source.
+FROM nvidia/cuda:13.0.1-cudnn-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        build-essential \
+    && curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | bash \
+    && apt-get update && apt-get install -y --no-install-recommends infisical \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+ENV UV_PYTHON=3.13 \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    # Model and dataset caches must land on pod-local NVMe. Reading training data
+    # over network storage would make the dataloader axis measure the volume
+    # rather than the pipeline.
+    HF_HOME=/workspace/hf \
+    HF_XET_HIGH_PERFORMANCE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /workspace/train-comparison

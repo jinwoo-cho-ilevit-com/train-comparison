@@ -1,0 +1,24 @@
+# One image per framework. They cannot share an environment: measured conflicts
+# are recorded in docs/support-matrix.md.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG FRAMEWORK
+
+# Root project first: envs/<framework> depends on it by path, and its metadata
+# changes far less often than the framework lock.
+COPY pyproject.toml uv.lock README.md ./
+COPY trainbench ./trainbench
+
+COPY envs/${FRAMEWORK} ./envs/${FRAMEWORK}
+# --frozen so an image can never silently resolve something other than the lock
+# that was reviewed. A stale lock fails the build instead.
+RUN cd envs/${FRAMEWORK} && uv sync --frozen
+
+COPY scripts ./scripts
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENV TRAINBENCH_ENV_DIR=/workspace/train-comparison/envs/${FRAMEWORK}
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -67,3 +67,15 @@ def test_info_nce_is_lower_when_pairs_align():
     shuffled = torch.eye(4).flip(0)
 
     assert info_nce(aligned, aligned, 0.02) < info_nce(aligned, shuffled, 0.02)
+
+
+def test_proportional_quota_preserves_composition_and_total():
+    from scripts.prepare_data import proportional_quota
+
+    counts = {"big": 900_000, "small": 100_000}
+    quota = proportional_quota(counts, 1000)
+
+    assert sum(quota.values()) == 1000
+    # Composition is preserved, which is the whole point: a subset that over-weights
+    # one config would make the measured sequence-length distribution wrong.
+    assert quota["big"] > quota["small"] * 5

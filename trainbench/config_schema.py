@@ -28,8 +28,17 @@ class ModelConfig(Strict):
 
 
 class DataConfig(Strict):
+    # The fixed subset we train on, pushed by scripts/prepare_data.py. Its revision
+    # is the data version recorded with every run (convention 07).
     repo_id: str
     revision: str | None = None
+    # Upstream the subset is drawn from. A community mirror of MMEB-train that
+    # embeds images; the authoritative TIGER-Lab repo stores paths only.
+    source_repo: str
+    subset_rows: int = Field(gt=0)
+    sample_seed: int
+    # Pushing creates/overwrites a Hub repo, so it is opt-in per invocation.
+    push_subset: bool = False
     # Small-sample runs (convention 04). None means the full split.
     limit: int | None = Field(default=None, gt=0)
     # Visual token count differs per model for the same image (merge/pooling differ),
