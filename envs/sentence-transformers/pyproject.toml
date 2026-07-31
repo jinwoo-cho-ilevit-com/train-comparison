@@ -18,6 +18,7 @@ environments = ["sys_platform == 'linux'"]
 [tool.uv.sources]
 trainbench = { path = "../..", editable = true }
 torch = [{ index = "pytorch-cuda" }]
+torchvision = [{ index = "pytorch-cuda" }]
 
 [[tool.uv.index]]
 name = "pytorch-cuda"

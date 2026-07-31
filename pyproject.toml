@@ -21,6 +21,10 @@ requires-python = ">=3.13,<3.14"
 # lives in the `compose` extra and never enters a framework image.
 dependencies = [
     "torch>=2.4",
+    # The VLM processors under test import torchvision (Qwen3VLVideoProcessor and
+    # friends), so image preprocessing fails at load time without it. Version is
+    # left to the resolver: torchvision pins its own compatible torch.
+    "torchvision>=0.19",
     "huggingface-hub>=0.34",
     "pydantic>=2.7",
     "numpy>=1.26",
@@ -65,6 +69,10 @@ dev = ["pytest", "ruff", "pre-commit"]
 
 [tool.uv.sources]
 torch = [
+    { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+    { index = "pytorch-cuda", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
     { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
     { index = "pytorch-cuda", marker = "sys_platform == 'linux'" },
 ]

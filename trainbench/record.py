@@ -105,6 +105,8 @@ def write_json(path: Path, payload: dict[str, Any]) -> Path:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    # default=str so one unserializable value degrades to its repr instead of
+    # losing the entire result file — a probe must always produce output.
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True, default=str))
     os.replace(tmp, path)
     return path

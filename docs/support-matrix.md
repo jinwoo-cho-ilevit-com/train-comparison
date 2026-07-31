@@ -122,27 +122,69 @@ Tevatron 2.0인지도 확인 대상이다.
 
 ## 모델 x 프레임워크 적재 검증
 
-미실행. `scripts/orchestrate.py` 실행 후 `scripts/report.py`가 채운다.
+native 열은 로컬 macOS CPU 실측. 나머지는 이미지가 필요하므로 pod에서 채운다.
 
 | | Qwen3-VL-Embedding-2B | Qwen3.5-0.8B | gemma-4-E2B |
 |---|---|---|---|
-| native | 미확인 | 미확인 | 미확인 |
+| native | **OK (7/7)** | **OK (7/7)** | 미확인 (CPU fp32 20GB, pod에서 확인) |
 | unsloth | 미확인 | 미확인 | 미확인 |
 | ms-swift | 미확인 | 미확인 | 미확인 |
 | sentence-transformers | 미확인 | 미확인 | 미확인 |
 | tevatron | 미확인 | 미확인 | 미확인 |
 | axolotl | 미확인 | 미확인 | 미확인 |
 
-## 세부 검증 항목
+### native probe 실측 (2026-07-31, macOS CPU / transformers 5.14.1 / torch 2.13.0)
 
-전부 미확인. `PLAN.md` Phase 0 체크리스트 참조.
+통과 항목: processor_load, model_load, text_tokenize, visual_tokens,
+text_embed_forward, infonce_backward, multimodal_embed_forward.
 
-- 세 모델이 동일 transformers 5.14.x에서 로드되는가
-- sentence-transformers 5.6.x x transformers v5 호환
-- Qwen3.5 GDN 레이어가 `fla` 없이 학습되는가 / `fla` 설치 시 커널 경로
-- gemma-4-E2B PLE의 freeze 가능 여부, LoRA target module 인식
+| | Qwen3-VL-Embedding-2B | Qwen3.5-0.8B |
+|---|---|---|
+| 448x448 이미지의 visual token | **196** | **196** |
+| image token id | 151655 | 248056 |
+| 임베딩 차원 | 2048 | 1024 |
+| InfoNCE 1 step loss | 4.2736 | 3.0991 |
+| grad 받은 파라미터 / 전체 | 310 / 625 | 320 / 473 |
+
+`AutoModel`(생성 헤드 없음)로 적재하고 last-token pooling + InfoNCE로 1 step
+backward까지 확인했다. 텍스트 전용 배치라 vision tower는 grad를 받지 않는다.
+
+**gemma-4-E2B는 config상 `vision_soft_tokens_per_image: 280`이므로 같은 이미지가
+Qwen 계열의 196과 다른 비용을 갖는다.** pod 실측으로 확정한다. 모델 간 속도 비교는
+이 값을 보정한 뒤에만 의미가 있다.
+
+### Qwen3.5 GDN 커널 — 확정
+
+Qwen3.5-0.8B 적재 시 transformers가 출력한다.
+
+```
+[transformers] The fast path is not available because one of the required library
+is not installed. Falling back to torch implementation. To install follow
+flash-linear-attention#installation and Dao-AILab/causal-conv1d
+```
+
+`fla`와 `causal-conv1d`가 없으면 **레이어의 75%를 차지하는 Gated DeltaNet 경로가
+조용히 느린 torch 구현으로 떨어진다.** 예외도 경고 반환도 아닌 로그 한 줄이라 놓치기
+쉽다. 이 모델의 측정은 두 패키지의 설치 여부를 반드시 기록해야 하며, 미설치 상태의
+수치는 아키텍처가 아니라 fallback을 잰 것이다.
+
+### 프로세서 사용법 — 확정
+
+- 멀티모달 배치는 `processor(text=..., images=...)`만으로 만들어지지 않는다. 텍스트에
+  이미지 placeholder가 없으면 image token 0개 대 image feature 392개로 forward가
+  실패한다. `apply_chat_template`로 이미지 블록을 넣는 것이 필수다
+- 이 VLM 프로세서들은 **`torchvision`을 임포트한다**(Qwen3VLVideoProcessor 등).
+  없으면 `AutoProcessor.from_pretrained`가 ImportError로 죽는다
+
+## 남은 세부 검증 항목
+
+pod 실행으로 판정한다.
+
+- gemma-4-E2B 적재, PLE freeze 가능 여부, LoRA target module 인식
+- gemma-4-E2B의 실제 visual token 수 (config상 280 예상)
 - Unsloth 일반 VLM 경로 + 커스텀 InfoNCE에서 패칭이 깨지지 않는가
 - Unsloth `FastSentenceTransformer`가 VLM 체크포인트를 실제로 거부하는가
 - Axolotl의 Qwen3-VL 지원
-- Tevatron 2.0의 세 모델 지원
-- 모델별 동일 이미지의 실제 visual token 수
+- Tevatron 패키지의 정체 (git HEAD가 0.0.1로 보고됨) 및 세 모델 지원
+- sentence-transformers가 생성형 VLM 2종에서 module layout 없이 기본 pooling으로
+  떨어지는지

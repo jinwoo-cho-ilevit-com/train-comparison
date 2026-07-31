@@ -1,0 +1,79 @@
+"""Probe for Sentence Transformers.
+
+Qwen3-VL-Embedding-2B ships with a sentence-transformers config, so this path is
+expected to work for it; the open question is the two generative VLMs, which have
+no ST module layout and must fall back to default pooling.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+
+from trainbench.config_schema import BenchConfig
+from trainbench.embedding import info_nce
+from trainbench.probe.fixtures import PROBE_PAIRS
+from trainbench.probe.types import ProbeReport
+
+
+def run(config: BenchConfig, device: torch.device) -> ProbeReport:
+    report = ProbeReport(framework="sentence_transformers", model=config.model.name)
+    import sentence_transformers
+    from sentence_transformers import SentenceTransformer
+
+    report.add_version(sentence_transformers)
+
+    loaded: dict[str, Any] = {}
+
+    def _load() -> dict[str, Any]:
+        model = SentenceTransformer(config.model.hf_id, device=str(device))
+        loaded["model"] = model
+        return {
+            "modules": [type(m).__name__ for m in model],
+            "embedding_dim": model.get_sentence_embedding_dimension(),
+            # Present only when the checkpoint carries an ST module layout;
+            # otherwise ST fell back to default pooling and the embedding may not
+            # match what the model was trained to produce.
+            "has_module_layout": len(list(model)) > 1,
+        }
+
+    if not report.run("sentence_transformer_load", _load)[0]:
+        report.skip("encode", "model did not load")
+        report.skip("mnrl_backward", "model did not load")
+        return report
+
+    model = loaded["model"]
+    texts = [q for q, _ in PROBE_PAIRS] + [d for _, d in PROBE_PAIRS]
+
+    report.run(
+        "encode",
+        lambda: {"shape": list(model.encode(texts, convert_to_tensor=True).shape)},
+    )
+
+    def _backward() -> dict[str, Any]:
+        # Uses the shared info_nce rather than ST's loss class so the loss is
+        # identical across frameworks; comparing frameworks under different loss
+        # implementations would not be a framework comparison.
+        features = model.tokenize(texts)
+        features = {k: v.to(device) if hasattr(v, "to") else v for k, v in features.items()}
+        pooled = model(features)["sentence_embedding"]
+        half = pooled.shape[0] // 2
+        loss = info_nce(pooled[:half], pooled[half:], config.loss.temperature)
+        loss.backward()
+        with_grad = sum(1 for p in model.parameters() if p.requires_grad and p.grad is not None)
+        model.zero_grad(set_to_none=True)
+        return {"loss": float(loss.detach()), "params_with_grad": with_grad}
+
+    report.run("mnrl_backward", _backward)
+
+    def _cached_loss_available() -> dict[str, Any]:
+        from sentence_transformers.losses import CachedMultipleNegativesRankingLoss
+
+        CachedMultipleNegativesRankingLoss(model, mini_batch_size=config.loss.mini_batch or 8)
+        return {"available": True}
+
+    # GradCache is the axis where reported overhead disagrees (20% vs 2-2.4x), so
+    # its availability per model matters.
+    report.run("cached_mnrl_constructs", _cached_loss_available)
+    return report
