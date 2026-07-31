@@ -1,0 +1,75 @@
+[project]
+name = "trainbench"
+version = "0.1.0"
+description = "Embedding training speed benchmark across Qwen3-VL-Embedding-2B, Qwen3.5-0.8B, and gemma-4-E2B"
+readme = "README.md"
+# Upper bound pins resolution to 3.13: torch ships cp314 wheels but the training
+# frameworks under test do not all support 3.14 yet.
+requires-python = ">=3.13,<3.14"
+# Lower bounds are load-bearing, not cosmetic. Without them uv backtracks to satisfy
+# the most constrained framework group and silently downgrades the shared stack
+# (observed: transformers 5.3.0, ms-swift 1.4.0). gemma-4 needs transformers >=5.5,
+# and the models under test only exist in recent releases.
+dependencies = [
+    "torch>=2.13",
+    "transformers>=5.14",
+    "accelerate>=1.14",
+    "peft>=0.20",
+    "datasets>=5.0",
+    "huggingface-hub[hf-xet]>=1.26",
+    "hydra-core>=1.3",
+    "pydantic>=2.13",
+    "trackio>=0.34",
+    "pillow>=12.0",
+    "numpy>=2.5",
+    "rich>=15.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["trainbench"]
+
+[dependency-groups]
+dev = ["pytest", "ruff", "pre-commit"]
+
+# The frameworks under test are deliberately NOT dependency groups here.
+# `[tool.uv] conflicts` still forces one shared lockfile, and a shared lock forces
+# one version per shared package. Measured consequence: with the frameworks as
+# groups, uv backtracked the whole stack (transformers 5.3.0, ms-swift 1.4.0);
+# with lower bounds enforced it failed outright, because unsloth 2026.7.x requires
+# datasets<4.4.0 while the models under test need datasets>=5.0.
+# Each framework therefore gets an independent project + independent lock under
+# envs/<framework>/, depending on this package by path. See docs/support-matrix.md.
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+    { index = "pytorch-cuda", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+testpaths = ["tests"]

@@ -1,0 +1,22 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Hydra run outputs and local benchmark artifacts
+outputs/
+multirun/
+runs/
+trackio_data/
+
+# Model weights and datasets are pulled to pod-local disk at runtime, never committed
+data/
+models/
+
+# Agent session state, not project content
+.omc/
