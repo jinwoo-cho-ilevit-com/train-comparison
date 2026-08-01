@@ -621,6 +621,30 @@ class ProbeReport:
   전자는 실측으로 통과시켰다(`--all-extras`도 통과). baseline 항목 추가는 계약 위반
   이므로(§1 "새 실패는 baseline이 아니라 수정으로 해소한다") 항목을 넣지 않았다.
 
+- 2026-08-02 **`axis-values`가 데이터 모양에 따라 갈리는 값을 하나로 뭉개고 있었다**
+  (`audit_plan.py`, `tests/test_audit.py`). loss 레인 제보(판정서 발견 5).
+  `loss=cached_mnrl`은 `axes._split_rows`가 `pixel_values`를 실은 배치를 전부 거부하고,
+  이 연구의 두 서브셋은 모두 이미지를 싣는 MMEB 드로우다. 즉 **구현은 있으나 이 연구가
+  설정한 어떤 런에서도 켤 수 없다.** 그런데 감사가 텍스트 전용 fixture 하나만 쓰고 있어
+  `loss 2/2`로 셌고, 그 숫자는 "GradCache 측정 준비됨"으로 읽힌다.
+  - **감사 레인의 이전 보고를 정정한다.** 직전 라운드에 `loss` 축의 3->2 이동을
+    "진짜 개선"이라고 보고했고 baseline note가 그 문장 위에 쓰였다. 절반만 맞았다 —
+    dataset이 None이라 거부되던 것은 감사의 결함이 맞지만, 이미지 데이터에서의 거부는
+    **사실**이다. note에 정정을 남기고 count를 회수했다.
+  - 수리: variant마다 **행이 이미지를 싣는지만 다른 두 fixture**로 시도하고, 한쪽에서만
+    통과하는 값은 `applicable`로 세지 않고 `data-dependent`로 이름을 부른다. 두 질문을
+    가르는 방법으로 fixture를 이미지 쪽으로 **교체**하지 않은 이유는 그러면 같은 fixture를
+    쓰는 dataloader 축의 의미가 함께 바뀌기 때문이다(제보가 지적한 그대로). 두 개를 두고
+    **차이를 관측**하면 "이 값은 데이터에 의존한다"가 선언이 아니라 발견이 된다 — MMEB가
+    이미지를 싣는다는 지식을 체크에 하드코딩하지 않아도 된다.
+  - 실측: 두 fixture가 실제로 갈라놓는 값은 `loss/cached_mnrl` 하나뿐이다. dataloader 4종
+    (torch / packed / pretokenized / packed_pretokenized)과 optim·peft는 양쪽 동일했다.
+    fixture의 이미지 값은 `None`이 아니라 텐서다 — `image_columns`가 `None`을 "컬럼이 비었다"로
+    읽고 torch 기본 collate가 스택하지 못해, 두 fixture가 두 가지로 달라져 버린다.
+  - baseline `axis-values` 2->4는 **전부 이 레인 몫이고 퇴화가 아니다.** loss가 1/2로
+    돌아오고(+1 inert) cached_mnrl이 data-dependent로 잡힌다(+1). 이전 2가 실제보다
+    낙관적이었던 것이다.
+
 **새 레인 의무 — 파일을 추가하면 `PLAN.md` 구조 블록에 한 줄 추가한다.**
 위 반대 방향 때문에 생긴다. 열거되는 디렉터리(저장소 루트, `configs/`,
 `trainbench/`, `scripts/`, `tests/`, `docs/`)에 추적되는 파일이나 디렉터리를 새로
