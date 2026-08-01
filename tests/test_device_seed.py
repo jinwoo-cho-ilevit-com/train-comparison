@@ -42,6 +42,19 @@ def test_deterministic_flag_drives_torch_state():
     assert torch.backends.cudnn.benchmark is True
 
 
+def test_warn_only_keeps_determinism_without_raising_on_unsupported_ops():
+    """Probes seed with warn_only. Without it, an op that merely lacks a
+    deterministic kernel raises, and the probe records that as the framework
+    refusing the model — a false entry in the support matrix, made by our seeding."""
+    set_seed(0, deterministic=True, warn_only=True)
+    assert torch.are_deterministic_algorithms_enabled()
+    assert torch.is_deterministic_algorithms_warn_only_enabled()
+
+    set_seed(0, deterministic=True)
+    assert torch.are_deterministic_algorithms_enabled()
+    assert not torch.is_deterministic_algorithms_warn_only_enabled()
+
+
 def test_dataloader_generator_is_seeded():
     a = torch.rand(4, generator=dataloader_generator(7))
     b = torch.rand(4, generator=dataloader_generator(7))

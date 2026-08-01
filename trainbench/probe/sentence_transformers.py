@@ -17,8 +17,7 @@ from trainbench.probe.fixtures import PROBE_PAIRS
 from trainbench.probe.types import ProbeReport
 
 
-def run(config: BenchConfig, device: torch.device) -> ProbeReport:
-    report = ProbeReport(framework="sentence_transformers", model=config.model.name)
+def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     import sentence_transformers
     from sentence_transformers import SentenceTransformer
 
@@ -41,7 +40,7 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
     if not report.run("sentence_transformer_load", _load)[0]:
         report.skip("encode", "model did not load")
         report.skip("mnrl_backward", "model did not load")
-        return report
+        return
 
     model = loaded["model"]
     texts = [q for q, _ in PROBE_PAIRS] + [d for _, d in PROBE_PAIRS]
@@ -76,4 +75,3 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
     # GradCache is the axis where reported overhead disagrees (20% vs 2-2.4x), so
     # its availability per model matters.
     report.run("cached_mnrl_constructs", _cached_loss_available)
-    return report

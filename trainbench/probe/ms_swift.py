@@ -16,8 +16,7 @@ from trainbench.probe import steps
 from trainbench.probe.types import ProbeReport
 
 
-def run(config: BenchConfig, device: torch.device) -> ProbeReport:
-    report = ProbeReport(framework="ms_swift", model=config.model.name)
+def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     import swift
 
     report.add_version(swift)
@@ -34,7 +33,7 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
 
     if not report.run("get_model_processor", _load)[0]:
         report.skip("infonce_backward", "model did not load")
-        return report
+        return
 
     model, processor = loaded["model"], loaded["processor"]
     model.to(device)
@@ -48,18 +47,14 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
     report.run("get_template", _template)
 
     tokenized: dict[str, torch.Tensor] = {}
+    side = config.model.padding_side
 
-    def _tokenize() -> dict[str, Any]:
-        tokenized.update(steps.text_batch(processor, device))
-        return {"input_ids_shape": list(tokenized["input_ids"].shape)}
-
-    if report.run("text_tokenize", _tokenize)[0]:
+    if report.run("text_tokenize", lambda: steps.tokenize_text(processor, device, tokenized))[0]:
         report.run(
             "infonce_backward",
-            lambda: steps.infonce_backward(model, tokenized, config.loss.temperature),
+            lambda: steps.infonce_backward(model, tokenized, config.loss.temperature, side),
         )
     else:
         report.skip("infonce_backward", "tokenization failed")
 
     report.run("visual_tokens", lambda: steps.visual_token_count(processor, model, device))
-    return report

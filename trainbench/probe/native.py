@@ -21,8 +21,9 @@ def _verify_axes(state: applied.AppliedState, config: BenchConfig) -> dict[str, 
     return state.to_dict()
 
 
-def run(config: BenchConfig, device: torch.device) -> ProbeReport:
-    report = ProbeReport(framework="native", model=config.model.name)
+def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
+    """Fills `report` in place. The registry owns it so that whatever was recorded
+    before a crash survives the crash (see trainbench/probe/registry.py)."""
     from transformers import AutoModel, AutoProcessor
 
     hf_id = config.model.hf_id
@@ -38,7 +39,7 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
     )
     if not ok:
         report.skip("model_load", "processor did not load")
-        return report
+        return
 
     ok, model = report.run(
         "model_load",
@@ -54,7 +55,7 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
         ),
     )
     if not ok:
-        return report
+        return
     model.to(device)
 
     built = applied.Built(model=model)
@@ -78,32 +79,30 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
     # point — the same call in the measurement harness stops the run.
     report.run("axes_verified", lambda: _verify_axes(report.applied, config))
 
-    # Whatever a check returns is recorded as its detail, so tensors are kept in a
-    # closure rather than returned.
+    # Whatever a check returns is recorded as its detail, so the tensors stay in
+    # this dict and only shapes come back out.
     tokenized: dict[str, torch.Tensor] = {}
+    side = config.model.padding_side
 
-    def _tokenize() -> dict[str, Any]:
-        tokenized.update(steps.text_batch(processor, device))
-        return {
-            "keys": sorted(tokenized),
-            "input_ids_shape": list(tokenized["input_ids"].shape),
-        }
-
-    text_ok = report.run("text_tokenize", _tokenize)[0]
+    text_ok = report.run(
+        "text_tokenize", lambda: steps.tokenize_text(processor, device, tokenized)
+    )[0]
 
     report.run("visual_tokens", lambda: steps.visual_token_count(processor, model, device))
 
     if text_ok:
-        report.run("text_embed_forward", lambda: _embed(model, tokenized))
+        report.run("text_embed_forward", lambda: _embed(model, tokenized, side))
         report.run(
             "infonce_backward",
-            lambda: steps.infonce_backward(model, tokenized, config.loss.temperature),
+            lambda: steps.infonce_backward(model, tokenized, config.loss.temperature, side),
         )
     else:
         report.skip("text_embed_forward", "tokenization failed")
         report.skip("infonce_backward", "tokenization failed")
 
-    report.run("multimodal_embed_forward", lambda: _multimodal_embed(model, processor, device))
+    report.run(
+        "multimodal_embed_forward", lambda: _multimodal_embed(model, processor, device, side)
+    )
 
     if config.model.arch == "gemma4":
         report.run("ple_parameters", lambda: _ple_report(model))
@@ -111,21 +110,21 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
     if config.peft.mode in ("lora", "qlora"):
         report.run("lora_attach", lambda: _lora_attach(model, config))
 
-    return report
 
-
-def _embed(model: Any, batch: dict[str, torch.Tensor]) -> dict[str, Any]:
+def _embed(model: Any, batch: dict[str, torch.Tensor], padding_side: str) -> dict[str, Any]:
     model.eval()
     with torch.no_grad():
-        pooled = steps.encode(model, batch)
+        pooled = steps.encode(model, batch, padding_side)
     return {"embedding_shape": list(pooled.shape)}
 
 
-def _multimodal_embed(model: Any, processor: Any, device: torch.device) -> dict[str, Any]:
+def _multimodal_embed(
+    model: Any, processor: Any, device: torch.device, padding_side: str
+) -> dict[str, Any]:
     model.eval()
     batch = steps.image_batch(processor, device)
     with torch.no_grad():
-        pooled = steps.encode(model, batch)
+        pooled = steps.encode(model, batch, padding_side)
     return {"embedding_shape": list(pooled.shape), "seq_len": int(batch["input_ids"].shape[1])}
 
 
@@ -140,6 +139,17 @@ def _ple_report(model: Any) -> dict[str, Any]:
     # shows matches nothing (docs/model-spec.md), and it would have gone on
     # disagreeing with the freeze axis that this check is about.
     matches = [(name, param.numel()) for name, param in axes.ple_parameters(model)]
+    # Zero matches is a failure, not a finding. Roughly half of gemma-4-E2B lives in
+    # these tables, so an empty match means the name marker no longer fits this
+    # checkpoint — and `freeze.ple` would then freeze nothing while reporting that
+    # it froze what it was asked to. Reporting ok on a zero match is how the second,
+    # already-drifted PLE definition went unnoticed.
+    if not matches:
+        raise ValueError(
+            f"no parameter name contains {axes.PLE_PARAM_MARKER!r} in this gemma4 "
+            f"checkpoint ({len(list(model.named_parameters()))} parameters); "
+            "freeze.ple would silently freeze nothing."
+        )
     total = sum(p.numel() for p in model.parameters())
     ple_total = sum(n for _, n in matches)
 

@@ -19,8 +19,7 @@ from trainbench.probe import steps
 from trainbench.probe.types import ProbeReport
 
 
-def run(config: BenchConfig, device: torch.device) -> ProbeReport:
-    report = ProbeReport(framework="unsloth", model=config.model.name)
+def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     import unsloth
     from unsloth import FastVisionModel
 
@@ -42,7 +41,7 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
     if not report.run("fast_vision_model_load", _load)[0]:
         report.skip("infonce_backward", "model did not load")
         report.run("fast_sentence_transformer_accepts_vlm", lambda: _try_fast_st(hf_id))
-        return report
+        return
 
     model, processor = loaded["model"], loaded["processor"]
 
@@ -50,22 +49,18 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
         report.run("get_peft_model", lambda: _peft(model, config))
 
     tokenized: dict[str, torch.Tensor] = {}
+    side = config.model.padding_side
 
-    def _tokenize() -> dict[str, Any]:
-        tokenized.update(steps.text_batch(processor, device))
-        return {"input_ids_shape": list(tokenized["input_ids"].shape)}
-
-    if report.run("text_tokenize", _tokenize)[0]:
+    if report.run("text_tokenize", lambda: steps.tokenize_text(processor, device, tokenized))[0]:
         report.run(
             "infonce_backward",
-            lambda: steps.infonce_backward(model, tokenized, config.loss.temperature),
+            lambda: steps.infonce_backward(model, tokenized, config.loss.temperature, side),
         )
     else:
         report.skip("infonce_backward", "tokenization failed")
 
     report.run("visual_tokens", lambda: steps.visual_token_count(processor, model, device))
     report.run("fast_sentence_transformer_accepts_vlm", lambda: _try_fast_st(hf_id))
-    return report
 
 
 def _peft(model: Any, config: BenchConfig) -> dict[str, Any]:

@@ -17,8 +17,7 @@ from trainbench.probe import steps
 from trainbench.probe.types import ProbeReport
 
 
-def run(config: BenchConfig, device: torch.device) -> ProbeReport:
-    report = ProbeReport(framework="axolotl", model=config.model.name)
+def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     import axolotl
 
     report.add_version(axolotl)
@@ -58,22 +57,18 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
 
     if not report.run("model_loader_load", _load)[0]:
         report.skip("infonce_backward", "model did not load")
-        return report
+        return
 
     model, tokenizer = loaded["model"], loaded["tokenizer"]
     model.to(device)
 
     tokenized: dict[str, torch.Tensor] = {}
+    side = config.model.padding_side
 
-    def _tokenize() -> dict[str, Any]:
-        tokenized.update(steps.text_batch(tokenizer, device))
-        return {"input_ids_shape": list(tokenized["input_ids"].shape)}
-
-    if report.run("text_tokenize", _tokenize)[0]:
+    if report.run("text_tokenize", lambda: steps.tokenize_text(tokenizer, device, tokenized))[0]:
         report.run(
             "infonce_backward",
-            lambda: steps.infonce_backward(model, tokenized, config.loss.temperature),
+            lambda: steps.infonce_backward(model, tokenized, config.loss.temperature, side),
         )
     else:
         report.skip("infonce_backward", "tokenization failed")
-    return report

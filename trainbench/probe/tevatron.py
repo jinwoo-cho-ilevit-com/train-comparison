@@ -19,8 +19,7 @@ from trainbench.probe import steps
 from trainbench.probe.types import ProbeReport
 
 
-def run(config: BenchConfig, device: torch.device) -> ProbeReport:
-    report = ProbeReport(framework="tevatron", model=config.model.name)
+def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     import tevatron
 
     report.add_version(tevatron)
@@ -44,7 +43,7 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
 
     if not report.run("dense_model_load", _load)[0]:
         report.skip("infonce_backward", "model did not load")
-        return report
+        return
 
     model = loaded["model"]
     model.to(device)
@@ -57,19 +56,17 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
 
     if not report.run("processor_load", _tokenizer)[0]:
         report.skip("infonce_backward", "processor did not load")
-        return report
+        return
 
     tokenized: dict[str, torch.Tensor] = {}
+    side = config.model.padding_side
 
-    def _tokenize() -> dict[str, Any]:
-        tokenized.update(steps.text_batch(loaded["processor"], device))
-        return {"input_ids_shape": list(tokenized["input_ids"].shape)}
-
-    if report.run("text_tokenize", _tokenize)[0]:
+    if report.run(
+        "text_tokenize", lambda: steps.tokenize_text(loaded["processor"], device, tokenized)
+    )[0]:
         report.run(
             "infonce_backward",
-            lambda: steps.infonce_backward(model, tokenized, config.loss.temperature),
+            lambda: steps.infonce_backward(model, tokenized, config.loss.temperature, side),
         )
     else:
         report.skip("infonce_backward", "tokenization failed")
-    return report
