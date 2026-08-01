@@ -26,6 +26,12 @@ from typing import Any
 
 MARKER = "<!-- generated: probe results -->"
 
+# The generated section's heading, and the text a rival hand-written section would
+# share with it. Two tables under the same heading, one above the marker and one
+# below, is a document that contradicts itself in the order a reader reads it.
+MATRIX_HEADING = "모델 x 프레임워크 적재 검증"
+GENERATED_HEADING = f"## {MATRIX_HEADING} (자동 생성)"
+
 FRAMEWORKS = ["native", "unsloth", "ms_swift", "sentence_transformers", "tevatron", "axolotl"]
 MODELS = ["qwen3_vl_emb_2b", "qwen3_5_0_8b", "gemma4_e2b"]
 
@@ -52,6 +58,17 @@ class Artifact:
     @property
     def produced_result(self) -> bool:
         return self.kind == "result" and self.payload.get("status") != "no_result"
+
+    @property
+    def graded_here(self) -> bool:
+        """Whether this artifact holds the probe checks this matrix is made of.
+
+        A cell is a (framework, model) pair, but an artifact is a run, and a later
+        phase produces runs of the same pair that carry no probe. Ranking on
+        recency alone would let a timing result take over the cell that a probe
+        answered, and the cell would read as if the probe had produced nothing.
+        """
+        return self.produced_result and bool(checks_of(self))
 
 
 def _combination(payload: dict[str, Any]) -> tuple[str, str]:
@@ -114,20 +131,52 @@ def newest_per_combination(
         ranked.setdefault((artifact.framework, artifact.model), []).append(artifact)
     chosen, duplicates = {}, []
     for key, group in ranked.items():
-        # A real result outranks a bare `started`, then newest wins.
-        group.sort(key=lambda a: (a.produced_result, a.kind == "result", a.timestamp), reverse=True)
+        # An artifact carrying probe checks outranks one that does not, a real
+        # result outranks a bare `started`, then newest wins.
+        group.sort(
+            key=lambda a: (a.graded_here, a.produced_result, a.kind == "result", a.timestamp),
+            reverse=True,
+        )
         chosen[key] = group[0]
         for superseded in group[1:]:
             duplicates.append(f"{key[0]} x {key[1]}: ignored {superseded.path}")
     return chosen, duplicates
 
 
-def load_ledger(path: Path | None) -> dict[tuple[str, str], dict[str, Any]]:
-    """What the orchestrator says it launched, keyed by combination."""
+def load_ledger(path: Path | None) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """What the orchestrator says it launched, grouped by combination.
+
+    Every entry is kept, not one per combination. Manifests are per pod and a
+    combination has more than one: a phase0 probe and a phase2 sweep both name
+    native x gemma4_e2b. Keeping whichever the dict happened to write last threw
+    away three of twenty-one entries and handed three cells to a phase2 entry that
+    was skipped for having no entry point — so a probe pod that launched and
+    uploaded nothing read as a pod that never launched, which is the exact
+    distinction the module docstring exists to preserve, inverted.
+    """
     if path is None or not path.exists():
         return {}
     ledger = json.loads(path.read_text())
-    return {(entry["framework"], entry["model"]): entry for entry in ledger.get("experiments", [])}
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for entry in ledger.get("experiments", []):
+        grouped.setdefault((entry["framework"], entry["model"]), []).append(entry)
+    return grouped
+
+
+def launch_state(entries: list[dict[str, Any]] | None) -> str:
+    """What the ledger says about a cell, across every experiment naming it.
+
+    Ordered by how much a reader can conclude: a pod that started is a spent
+    pod-hour whatever else happened on that combination, and only a cell no
+    manifest ever reached is untried.
+    """
+    if not entries:
+        return NOT_ATTEMPTED
+    if any(entry.get("pod_id") for entry in entries):
+        return NO_RESULT
+    if any(entry.get("launch_error") for entry in entries):
+        return LAUNCH_FAILED
+    return NOT_ATTEMPTED
 
 
 def checks_of(artifact: Artifact | None) -> list[dict[str, Any]]:
@@ -136,14 +185,10 @@ def checks_of(artifact: Artifact | None) -> list[dict[str, Any]]:
     return (artifact.payload.get("probe") or {}).get("checks") or []
 
 
-def cell(artifact: Artifact | None, launched: dict[str, Any] | None) -> str:
+def cell(artifact: Artifact | None, launched: list[dict[str, Any]] | None) -> str:
     """One matrix cell. Absent stays '미시도' — never inferred from a neighbour."""
     if artifact is None:
-        if launched is None:
-            return NOT_ATTEMPTED
-        if launched.get("launch_error"):
-            return LAUNCH_FAILED
-        return NO_RESULT if launched.get("pod_id") else NOT_ATTEMPTED
+        return launch_state(launched)
     if not artifact.produced_result:
         return NO_RESULT
     checks = checks_of(artifact)
@@ -178,7 +223,7 @@ def unexpected_passes(artifact: Artifact | None) -> list[str]:
 
 def render(
     chosen: dict[tuple[str, str], Artifact],
-    ledger: dict[tuple[str, str], dict[str, Any]],
+    ledger: dict[tuple[str, str], list[dict[str, Any]]],
     duplicates: list[str],
     skipped: list[str],
 ) -> str:
@@ -186,7 +231,7 @@ def render(
     lines = [
         MARKER,
         "",
-        "## 모델 x 프레임워크 적재 검증 (자동 생성)",
+        GENERATED_HEADING,
         "",
         f"결과 {len(results)}건, 아티팩트 {len(chosen)}건. "
         f"`{NOT_ATTEMPTED}`는 pod을 띄운 적이 없는 조합, "
@@ -261,6 +306,44 @@ def render(
     return "\n".join(lines) + "\n"
 
 
+def document_head(existing: str) -> str:
+    """The hand-written part of the matrix document, or a refusal to guess.
+
+    Only the generated section is rewritten, so whatever is above the marker
+    survives a merge. Two things above it are not survivable, and both end the
+    merge rather than producing a document nobody can act on:
+
+    * **A second marker.** Everything from the first one down is replaced, so a
+      document with two generated sections loses whatever a human wrote between
+      them. Splitting on the first marker and saying nothing did exactly that.
+    * **A rival matrix.** A hand-written table under this section's own heading is
+      read before the generated one and outranks it by position. The repository
+      shipped `OK (7/7)` above and `미시도` below, for the same cell, in the same
+      document. Neither table is wrong to exist; a reader cannot tell which is
+      current, and this script cannot delete prose it does not own.
+    """
+    if existing.count(MARKER) > 1:
+        raise ValueError(
+            f"{existing.count(MARKER)} '{MARKER}' markers; everything from the first "
+            "one down is replaced, so a merge would drop what is between them. Leave "
+            "one marker"
+        )
+    head = existing.split(MARKER)[0] if MARKER in existing else existing
+    rival = [
+        f"line {number}: {line.strip()}"
+        for number, line in enumerate(head.splitlines(), start=1)
+        if line.startswith("#") and MATRIX_HEADING in line
+    ]
+    if rival:
+        raise ValueError(
+            f"a hand-written '{MATRIX_HEADING}' section sits above the marker "
+            f"({'; '.join(rival)}). A reader meets it first and it will not agree "
+            "with the generated table for long. Fold what is still true into the "
+            "surrounding prose, or retitle it to name its own scope and evidence"
+        )
+    return head.rstrip()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", required=True, type=Path, help="directory of result JSON")
@@ -286,7 +369,11 @@ def main(argv: list[str] | None = None) -> int:
 
     generated = render(chosen, ledger, duplicates, skipped)
     existing = args.matrix.read_text() if args.matrix.exists() else ""
-    head = existing.split(MARKER)[0].rstrip() if MARKER in existing else existing.rstrip()
+    try:
+        head = document_head(existing)
+    except ValueError as exc:
+        print(f"{args.matrix}: {exc}", file=sys.stderr)
+        return 2
     args.matrix.write_text(f"{head}\n\n{generated}")
     print(f"merged {len(chosen)} artifact(s) into {args.matrix}")
     return 0
