@@ -28,24 +28,31 @@ def load_bench_config(path: str | Path) -> BenchConfig:
     return to_bench_config(json.loads(Path(path).read_text()))
 
 
-def git_commit() -> str:
-    """Commit hash recorded with every run (convention 07).
+def git_state() -> dict[str, Any]:
+    """Commit recorded with every run, and whether its tree was clean (convention 07).
 
-    Returns 'unknown' outside a repo — which is the normal case inside an image,
-    where the commit is instead passed in by the orchestrator.
+    `dirty` matters as much as the hash: a run started from a modified working
+    tree records a commit that does not contain the code that produced the number.
+    It is None when unknowable — inside an image there is no .git, so the
+    orchestrator passes the commit in and the image digest carries the real
+    identity of the code.
     """
-    # Images carry no .git, so the orchestrator passes the commit in. Without this
-    # every pod result records "unknown" and no number can be traced to its code.
     from_env = os.environ.get("TRAINBENCH_GIT_COMMIT")
     if from_env:
-        return from_env
+        return {"commit": from_env, "dirty": None, "source": "env"}
     try:
-        out = subprocess.run(
+        commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             check=True,
-        )
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return "unknown"
-    return out.stdout.strip()
+        return {"commit": "unknown", "dirty": None, "source": "unavailable"}
+    return {"commit": commit, "dirty": bool(status), "source": "git"}

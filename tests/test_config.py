@@ -99,12 +99,55 @@ def test_batch_cannot_exceed_the_sample():
         compose_cfg("data.limit=8", "train.batch_size=16")
 
 
+def test_batch_cannot_exceed_the_subset_without_a_limit():
+    """`quality.yaml` sets limit to null, so checking only the small-sample knob
+    leaves the full-size configs open to the same self-negative destruction."""
+    with pytest.raises(ValidationError, match="exceeds data.subset_rows"):
+        compose_cfg("data.limit=null", "data.subset_rows=8", "train.batch_size=16")
+
+
 def test_measured_runs_require_pinned_data():
     with pytest.raises(ValidationError, match="requires data.revision"):
         compose_cfg("run=timing", "data.revision=null")
 
     # A probe answers "does it run", so it does not need a pinned corpus.
     assert compose_cfg("run=probe", "data.revision=null")
+
+
+def test_a_branch_name_does_not_count_as_pinned():
+    """`revision: main` reads as pinned and is not — the Hub re-resolves it on
+    every pull, so two runs a week apart can train on different corpora."""
+    with pytest.raises(ValidationError, match="a branch or tag moves under the run"):
+        compose_cfg("run=timing", "data.revision=main")
+
+
+def test_attention_impl_cannot_disagree_with_its_label():
+    """A config free to name the axis fa3 while asking transformers for sdpa
+    would be labelled fa3 and certified as a match by applied.py."""
+    assert compose_cfg("attn=fa3").attn.impl == "flash_attention_3"
+    with pytest.raises(ValidationError, match="attn"):
+        compose_cfg("attn=fa3", "+attn.impl=sdpa")
+
+
+def test_a_fixed_image_token_count_belongs_only_to_gemma4():
+    """gemma4 expands every image to 280 soft tokens; both Qwen models are
+    pixel-proportional, so a declared count there is an assumption, not a fact."""
+    assert compose_cfg("model=gemma4_e2b").model.tokens_per_image == 280
+    for name in ("qwen3_vl_emb_2b", "qwen3_5_0_8b"):
+        assert compose_cfg(f"model={name}").model.tokens_per_image is None
+        with pytest.raises(ValidationError, match="must be measured, not declared"):
+            compose_cfg(f"model={name}", "model.tokens_per_image=280")
+
+    with pytest.raises(ValidationError, match="must declare it"):
+        compose_cfg("model=gemma4_e2b", "model.tokens_per_image=null")
+
+
+def test_padding_side_is_declared_per_model():
+    """The only model that pads left is the one whose pooling branch was wrong,
+    so the value has to be visible to the code that pools rather than assumed."""
+    assert compose_cfg("model=gemma4_e2b").model.padding_side == "left"
+    for name in ("qwen3_vl_emb_2b", "qwen3_5_0_8b"):
+        assert compose_cfg(f"model={name}").model.padding_side == "right"
 
 
 def test_instruction_prompt_only_for_the_official_embedding_model():

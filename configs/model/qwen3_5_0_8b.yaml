@@ -6,3 +6,10 @@ revision: null
 # an assistant <think> scaffold whose last token would become the embedding.
 add_generation_prompt: false
 instruction_prompt: null
+# tokenizer_config.json declares no padding_side, so transformers' default applies.
+padding_side: right
+# No official embedding spec; last-token matches the other two so what differs
+# between models stays the architecture rather than the pooling.
+pooling: lasttoken
+# Pixel-proportional (shortest_edge 65536 .. longest_edge 16777216).
+tokens_per_image: null

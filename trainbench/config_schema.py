@@ -7,7 +7,9 @@ a run that would silently produce a misleading number must not start at all.
 
 from __future__ import annotations
 
-from typing import Literal
+import re
+from collections.abc import Callable
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -15,9 +17,43 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # this many discarded steps the warmup leaks into the measured window.
 MAX_AUTOTUNE_MIN_WARMUP_STEPS = 20
 
+# A Hub revision is only pinned if it is a commit sha. Short shas are allowed
+# because `git rev-parse --short` output is what gets pasted in practice.
+COMMIT_SHA = re.compile(r"[0-9a-f]{7,40}")
+
 
 class Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+def Axis(*args: Any, **kwargs: Any) -> Any:  # noqa: N802 - mirrors pydantic's Field
+    """Mark a field as an ablation axis: a knob that changes what gets measured.
+
+    Axes carry an obligation. `trainbench/applied.py` refuses to let a reportable
+    run start until every one of them has been read back off the constructed model
+    and matched against the request, because every axis here has a silent-fallback
+    path. Marking is done on the schema rather than in a list elsewhere so that a
+    new axis inherits the obligation instead of having to be remembered into it.
+    """
+    extra = {**(kwargs.pop("json_schema_extra", None) or {}), "axis": True}
+    return Field(*args, json_schema_extra=extra, **kwargs)
+
+
+def axis_knobs() -> dict[str, Callable[[BenchConfig], Any]]:
+    """Every marked axis as `section.field` -> a reader for its configured value."""
+    knobs: dict[str, Callable[[BenchConfig], Any]] = {}
+    for section, info in BenchConfig.model_fields.items():
+        sub = info.annotation
+        if not (isinstance(sub, type) and issubclass(sub, Strict)):
+            continue
+        for name, spec in sub.model_fields.items():
+            if (spec.json_schema_extra or {}).get("axis"):
+                knobs[f"{section}.{name}"] = _reader(section, name)
+    return knobs
+
+
+def _reader(section: str, name: str) -> Callable[[BenchConfig], Any]:
+    return lambda config: getattr(getattr(config, section), name)
 
 
 class ModelConfig(Strict):
@@ -34,6 +70,19 @@ class ModelConfig(Strict):
     # generative models, which have no embedding spec — inventing one would add
     # an unvalidated confound.
     instruction_prompt: str | None = None
+    # From tokenizer_config.json. gemma4 pads left and the other two right, which
+    # decides which index last-token pooling must read. Declared here rather than
+    # branched on `arch` in code so that a lane reading the pooling code sees the
+    # value it has to handle instead of assuming one.
+    padding_side: Literal["left", "right"]
+    # How the embedding is formed. Only qwen3_vl has an official answer
+    # (1_Pooling/config.json); for the generative models this is our choice, and
+    # writing it down is what makes it reviewable.
+    pooling: Literal["lasttoken"]
+    # Visual tokens one image becomes. gemma4 is fixed at 280; the Qwen models are
+    # pixel-proportional, so None means "measure it, do not assume it". Fixing a
+    # single budget across models was abandoned (docs/model-spec.md decision 3).
+    tokens_per_image: int | None = Field(default=None, gt=0)
 
 
 class DataConfig(Strict):
@@ -50,74 +99,95 @@ class DataConfig(Strict):
     push_subset: bool = False
     # Small-sample runs (convention 04). None means the full split.
     limit: int | None = Field(default=None, gt=0)
-    # Visual token count differs per model for the same image (merge/pooling differ),
-    # so it is pinned explicitly and corrected per model after measurement.
-    image_token_budget: int = Field(gt=0)
     max_seq_len: int = Field(gt=0)
     num_workers: int = Field(ge=0)
 
+    @property
+    def effective_rows(self) -> int:
+        """Rows a run actually draws from: the small-sample limit, else the subset."""
+        return self.limit if self.limit is not None else self.subset_rows
+
+
+# transformers' own name for each attention axis value. Derived from `name`
+# rather than configured alongside it: a config free to say `name: fa3` with
+# `impl: sdpa` would label the run fa3 while trainbench/applied.py certified
+# sdpa-requested-sdpa-applied as a match, which is the exact failure applied.py
+# exists to prevent.
+ATTN_IMPL = {
+    "sdpa": "sdpa",
+    "fa2": "flash_attention_2",
+    "fa3": "flash_attention_3",
+    "fa4": "flash_attention_4",
+    "flex": "flex_attention",
+}
+
 
 class AttnConfig(Strict):
-    name: Literal["sdpa", "fa2", "fa3", "fa4", "flex"]
-    impl: str
+    name: Literal["sdpa", "fa2", "fa3", "fa4", "flex"] = Axis()
+
+    @property
+    def impl(self) -> str:
+        return ATTN_IMPL[self.name]
 
 
 class KernelConfig(Strict):
-    name: Literal["none", "liger", "fla", "kernels_hub"]
+    name: Literal["none", "liger", "fla", "kernels_hub"] = Axis()
 
 
 class PrecisionConfig(Strict):
-    name: Literal["bf16", "mxfp8", "nvfp4"]
+    name: Literal["bf16", "mxfp8", "nvfp4"] = Axis()
 
 
 class CompileConfig(Strict):
     # "none" rather than "off": YAML parses a bare `off` as boolean False.
-    mode: Literal["none", "default", "max-autotune", "regional"]
+    mode: Literal["none", "default", "max-autotune", "regional"] = Axis()
 
 
 class OptimConfig(Strict):
-    name: Literal["adamw_fused", "adamw_8bit", "muon"]
+    name: Literal["adamw_fused", "adamw_8bit", "muon"] = Axis()
     lr: float = Field(gt=0)
     weight_decay: float = Field(ge=0)
 
 
 class LossConfig(Strict):
-    name: Literal["mnrl", "cached_mnrl"]
+    name: Literal["mnrl", "cached_mnrl"] = Axis()
     temperature: float = Field(gt=0)
     # GradCache mini-batch. Only meaningful for cached_mnrl.
     mini_batch: int | None = Field(default=None, gt=0)
 
 
 class PeftConfig(Strict):
-    mode: Literal["full", "lora", "qlora"]
+    mode: Literal["full", "lora", "qlora"] = Axis()
     r: int = Field(default=0, ge=0)
     alpha: int = Field(default=0, ge=0)
     dropout: float = Field(default=0.0, ge=0, le=1)
 
 
 class FreezeConfig(Strict):
-    vision_tower: bool = False
+    vision_tower: bool = Axis(False)
     # Per-layer embeddings, gemma4 only.
-    ple: bool = False
+    ple: bool = Axis(False)
 
 
 class DataloaderConfig(Strict):
-    backend: Literal["torch", "dali"]
-    packing: bool = False
+    backend: Literal["torch", "dali"] = Axis()
+    packing: bool = Axis(False)
     # Tokenise ahead of the timed window instead of inside the dataloader.
-    pretokenize: bool = False
+    pretokenize: bool = Axis(False)
 
 
 class ParallelConfig(Strict):
-    strategy: Literal["single", "ddp", "fsdp2", "zero2", "zero3"]
+    strategy: Literal["single", "ddp", "fsdp2", "zero2", "zero3"] = Axis()
     # All-gather embeddings across ranks so in-batch negatives span the whole
     # world. This is the only parallelism axis specific to contrastive training,
     # and the project's central claim is that batch size dominates here.
-    cross_device_negatives: bool = False
+    cross_device_negatives: bool = Axis(False)
 
 
 class FrameworkConfig(Strict):
-    name: Literal["native", "unsloth", "ms_swift", "sentence_transformers", "tevatron", "axolotl"]
+    name: Literal[
+        "native", "unsloth", "ms_swift", "sentence_transformers", "tevatron", "axolotl"
+    ] = Axis()
 
 
 class TrainConfig(Strict):
@@ -125,8 +195,8 @@ class TrainConfig(Strict):
     grad_accum: int = Field(default=1, gt=0)
     steps: int = Field(gt=0)
     warmup_discard_steps: int = Field(ge=0)
-    gradient_checkpointing: Literal["none", "full", "selective"] = "none"
-    offload: Literal["none", "optimizer", "param", "both"] = "none"
+    gradient_checkpointing: Literal["none", "full", "selective"] = Axis("none")
+    offload: Literal["none", "optimizer", "param", "both"] = Axis("none")
     seed: int
     deterministic: bool = False
 
@@ -234,23 +304,42 @@ class BenchConfig(Strict):
     @model_validator(mode="after")
     def _batch_fits_the_sample(self) -> BenchConfig:
         """A batch larger than the dataset reuses rows within one batch, which makes
-        InfoNCE compare a row against itself and quietly destroys the loss."""
-        if self.data.limit is not None and self.train.batch_size > self.data.limit:
+        InfoNCE compare a row against itself and quietly destroys the loss.
+
+        Checked against `effective_rows`, not `limit`: a config with `limit: null`
+        still draws from a finite subset, and checking only the small-sample knob
+        would leave the full-size configs unguarded.
+        """
+        rows = self.data.effective_rows
+        if self.train.batch_size > rows:
+            source = "data.limit" if self.data.limit is not None else "data.subset_rows"
             raise ValueError(
-                f"train.batch_size ({self.train.batch_size}) exceeds data.limit "
-                f"({self.data.limit}); rows would repeat inside a batch and in-batch "
-                "negatives would include the positive itself."
+                f"train.batch_size ({self.train.batch_size}) exceeds {source} ({rows}); "
+                "rows would repeat inside a batch and in-batch negatives would include "
+                "the positive itself."
             )
         return self
 
     @model_validator(mode="after")
     def _measured_runs_pin_their_data(self) -> BenchConfig:
         """A number is not reproducible if the data it came from is a moving branch
-        (convention 07 requires the data version on every run)."""
-        if self.run.purpose in ("timing", "quality") and self.data.revision is None:
+        (convention 07 requires the data version on every run).
+
+        A branch name is rejected as firmly as null. `revision: main` reads as
+        pinned and is not: the Hub resolves it again on every pull.
+        """
+        if self.run.purpose not in ("timing", "quality"):
+            return self
+        revision = self.data.revision
+        if revision is None:
             raise ValueError(
                 f"purpose={self.run.purpose} requires data.revision to be pinned; "
                 "'null' tracks a branch and makes the run unreproducible."
+            )
+        if not COMMIT_SHA.fullmatch(revision):
+            raise ValueError(
+                f"purpose={self.run.purpose} requires data.revision to be a commit sha, "
+                f"got {revision!r}; a branch or tag moves under the run."
             )
         return self
 
@@ -262,6 +351,25 @@ class BenchConfig(Strict):
             raise ValueError(
                 f"model.instruction_prompt is set for arch={self.model.arch}, which has "
                 "no official embedding prompt. See docs/model-spec.md decision 1."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _fixed_image_tokens_are_gemma4_only(self) -> BenchConfig:
+        """gemma4 expands every image to a fixed 280 soft tokens; both Qwen models
+        are pixel-proportional. Declaring a fixed count for a dynamic model would
+        reintroduce the cross-model token budget that decision 3 abandoned as
+        impossible (docs/model-spec.md)."""
+        fixed = self.model.tokens_per_image is not None
+        if fixed and self.model.arch != "gemma4":
+            raise ValueError(
+                f"model.tokens_per_image is set for arch={self.model.arch}, whose image "
+                "token count is pixel-proportional and must be measured, not declared."
+            )
+        if not fixed and self.model.arch == "gemma4":
+            raise ValueError(
+                "arch=gemma4 has a fixed image_seq_length; model.tokens_per_image must "
+                "declare it so token accounting does not silently assume a dynamic one."
             )
         return self
 

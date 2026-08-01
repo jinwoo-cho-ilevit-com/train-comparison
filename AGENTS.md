@@ -14,7 +14,10 @@ Secrets come from Infisical. Wrap every command:
 
 - Test: `infisical run --env=dev -- uv run pytest`
 - lint/format: `uv run ruff check && uv run ruff format --check`
-- Small-sample smoke: `infisical run --env=dev -- uv run python scripts/env_report.py device=cpu model=qwen3_5_0_8b framework=native data.limit=4`
+- Small-sample smoke: `infisical run --env=dev -- uv run python scripts/env_report.py device=cpu model=qwen3_5_0_8b framework=native data.limit=4 train.batch_size=4`
+
+`train.batch_size` moves with `data.limit`: a batch wider than the sample makes
+InfoNCE compare a row against itself, and the schema refuses to start such a run.
 
 `scripts/env_report.py` walks the whole harness path (compose -> validate -> device ->
 seed -> atomic write) without loading a model. Model x framework probing

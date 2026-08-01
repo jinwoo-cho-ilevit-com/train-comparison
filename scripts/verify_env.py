@@ -33,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     set_seed(config.train.seed, deterministic=True)
 
     report = run_probe(config, device)
-    record = build_record(config, device, probe=report.to_dict())
+    record = build_record(config, device, applied=report.applied, probe=report.to_dict())
     write_json(args.out, record)
 
     failed = [c.name for c in report.checks if not c.ok]

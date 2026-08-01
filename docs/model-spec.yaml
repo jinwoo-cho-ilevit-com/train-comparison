@@ -1,0 +1,62 @@
+# Machine-readable half of docs/model-spec.md.
+#
+# The prose document explains the decisions; this file is what a check can
+# compare. `scripts/audit_plan.py` asserts that every value under `config`
+# equals the corresponding field in `configs/model/<name>.yaml`, so flipping one
+# of them alone fails the audit instead of silently drifting.
+#
+# `source` names the repository file the value was read from, or states that it
+# is our decision. Values marked as a decision have no upstream to check against;
+# values with a repository file can be re-verified with the Hugging Face API.
+
+models:
+  qwen3_vl_emb_2b:
+    hf_id: Qwen/Qwen3-VL-Embedding-2B
+    config:
+      add_generation_prompt: true
+      instruction_prompt: "Represent the user's input."
+      padding_side: right
+      pooling: lasttoken
+      tokens_per_image: null
+    source:
+      add_generation_prompt: sentence_bert_config.json
+      instruction_prompt: config_sentence_transformers.json
+      # No padding_side key; transformers' default is right.
+      padding_side: tokenizer_config.json
+      pooling: 1_Pooling/config.json
+      # min_pixels 4096 .. max_pixels 1310720: proportional, so no fixed count.
+      tokens_per_image: preprocessor_config.json
+
+  qwen3_5_0_8b:
+    hf_id: Qwen/Qwen3.5-0.8B
+    config:
+      add_generation_prompt: false
+      instruction_prompt: null
+      padding_side: right
+      pooling: lasttoken
+      tokens_per_image: null
+    source:
+      # decision 2: true would append an assistant <think> scaffold, and its last
+      # token would become the embedding.
+      add_generation_prompt: decision
+      instruction_prompt: decision
+      padding_side: tokenizer_config.json
+      pooling: decision
+      # shortest_edge 65536 .. longest_edge 16777216.
+      tokens_per_image: preprocessor_config.json
+
+  gemma4_e2b:
+    hf_id: google/gemma-4-E2B
+    config:
+      add_generation_prompt: false
+      instruction_prompt: null
+      padding_side: left
+      pooling: lasttoken
+      tokens_per_image: 280
+    source:
+      add_generation_prompt: decision
+      instruction_prompt: decision
+      padding_side: tokenizer_config.json
+      pooling: decision
+      # image_seq_length 280, fixed regardless of input resolution.
+      tokens_per_image: processor_config.json

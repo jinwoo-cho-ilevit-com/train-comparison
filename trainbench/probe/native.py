@@ -10,9 +10,15 @@ from typing import Any
 
 import torch
 
+from trainbench import applied, axes
 from trainbench.config_schema import BenchConfig
 from trainbench.probe import steps
 from trainbench.probe.types import ProbeReport
+
+
+def _verify_axes(state: applied.AppliedState, config: BenchConfig) -> dict[str, Any]:
+    applied.assert_matches(state, config)
+    return state.to_dict()
 
 
 def run(config: BenchConfig, device: torch.device) -> ProbeReport:
@@ -34,11 +40,25 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
         "model_load",
         # AutoModel rather than the generative head: an embedding model never
         # materialises the LM head, which for gemma4 is 262144 x 1536.
-        lambda: AutoModel.from_pretrained(hf_id, revision=revision, dtype=steps.dtype_for(device)),
+        # Axis settings come from trainbench/axes.py so that there is one place
+        # that asks for them and one place that reads them back.
+        lambda: AutoModel.from_pretrained(
+            hf_id,
+            revision=revision,
+            dtype=steps.dtype_for(device),
+            **axes.load_kwargs(config),
+        ),
     )
     if not ok:
         return report
     model.to(device)
+
+    report.run("axes_apply", lambda: {"applied": axes.apply(model, config)})
+    report.applied = applied.capture(model, config)
+    # Records the verdict rather than aborting: a probe answers "does it run", and
+    # purpose=probe is not enforced. A reportable purpose raises here, which is the
+    # point — the same call in the measurement harness stops the run.
+    report.run("axes_verified", lambda: _verify_axes(report.applied, config))
 
     # Whatever a check returns is recorded as its detail, so tensors are kept in a
     # closure rather than returned.

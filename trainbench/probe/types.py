@@ -7,6 +7,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from trainbench.applied import AppliedState
+
 # Truncated so one exploding traceback cannot dominate a result file.
 MAX_TRACEBACK_CHARS = 4000
 
@@ -43,16 +45,24 @@ class ProbeReport:
     framework: str
     model: str
     checks: list[Check] = field(default_factory=list)
+    # What the constructed model actually ended up running. Set by adapters that
+    # build a model; None means no model was built, not that the axes were fine.
+    applied: AppliedState | None = None
 
     def add(self, check: Check) -> Check:
         self.checks.append(check)
         return check
 
-    def run(self, name: str, fn: Callable[[], Any]) -> tuple[bool, Any]:
+    def run(
+        self, name: str, fn: Callable[[], Any], expected_failure: bool = False
+    ) -> tuple[bool, Any]:
         """Run one check, converting any exception into a recorded failure.
 
         Returns (ok, value) so the caller can decide whether later checks are
         still meaningful — a failed model load makes a forward pass moot.
+
+        `expected_failure` marks a check that documents a known limitation. It is
+        settable here so an adapter never has to hand-build a Check just to say so.
         """
         try:
             value = fn()
@@ -61,6 +71,7 @@ class ProbeReport:
                 Check(
                     name=name,
                     ok=False,
+                    expected_failure=expected_failure,
                     error=str(exc)[:1000],
                     error_type=type(exc).__name__,
                     traceback=traceback.format_exc()[-MAX_TRACEBACK_CHARS:],
@@ -68,11 +79,19 @@ class ProbeReport:
             )
             return False, None
         detail = value if isinstance(value, dict) else {}
-        self.add(Check(name=name, ok=True, detail=detail))
+        self.add(Check(name=name, ok=True, expected_failure=expected_failure, detail=detail))
         return True, value
 
-    def skip(self, name: str, reason: str) -> None:
-        self.add(Check(name=name, ok=False, error=f"skipped: {reason}", error_type="Skipped"))
+    def skip(self, name: str, reason: str, expected_failure: bool = False) -> None:
+        self.add(
+            Check(
+                name=name,
+                ok=False,
+                expected_failure=expected_failure,
+                error=f"skipped: {reason}",
+                error_type="Skipped",
+            )
+        )
 
     def add_version(self, module: Any) -> None:
         """Record the framework's own version. Each image ships a different stack,
@@ -89,10 +108,22 @@ class ProbeReport:
     def all_ok(self) -> bool:
         return all(c.ok or c.expected_failure for c in self.checks)
 
+    @property
+    def unexpected_passes(self) -> list[str]:
+        """Checks marked as documented limitations that have started to succeed.
+
+        The support matrix says these cannot work. When one passes, the matrix is
+        wrong and the run is the only place that knows — `all_ok` cannot say so,
+        because an expected failure that passes is still not a failure.
+        """
+        return [c.name for c in self.checks if c.expected_failure and c.ok]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "framework": self.framework,
             "model": self.model,
             "all_ok": self.all_ok,
+            "unexpected_passes": self.unexpected_passes,
+            "applied": self.applied.to_dict() if self.applied is not None else None,
             "checks": [c.to_dict() for c in self.checks],
         }

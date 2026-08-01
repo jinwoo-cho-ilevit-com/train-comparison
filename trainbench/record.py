@@ -18,7 +18,8 @@ from typing import Any
 
 import torch
 
-from trainbench.config import git_commit
+from trainbench.applied import AppliedState
+from trainbench.config import git_state
 from trainbench.config_schema import BenchConfig
 
 # Recorded for every run so a pod's hardware is attributable after the fact. Pods
@@ -86,14 +87,26 @@ def _cpu_quota() -> float | None:
     box reports 128. Dataloading is the axis most sensitive to this, and PLAN.md
     names host vCPU differences as the thing cross-pod deviation must be attributed
     to — recording the wrong number defeats that.
+
+    Both cgroup versions are read. A v1 host is exactly where an unbounded
+    os.cpu_count() is most misleading, so answering None there would leave the
+    field blank in the case it was added for.
     """
     try:
         quota = Path("/sys/fs/cgroup/cpu.max").read_text().split()
     except OSError:
+        quota = []
+    if len(quota) == 2 and quota[0] != "max":
+        return int(quota[0]) / int(quota[1])
+    try:
+        v1_quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text().strip())
+        v1_period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text().strip())
+    except (OSError, ValueError):
         return None
-    if len(quota) != 2 or quota[0] == "max":
+    # -1 is cgroup v1's "no limit".
+    if v1_quota <= 0 or v1_period <= 0:
         return None
-    return int(quota[0]) / int(quota[1])
+    return v1_quota / v1_period
 
 
 def _total_memory_gb() -> float | None:
@@ -140,14 +153,32 @@ def host_spec() -> dict[str, Any]:
     }
 
 
-def build_record(config: BenchConfig, device: torch.device, **extra: Any) -> dict[str, Any]:
+def build_record(
+    config: BenchConfig,
+    device: torch.device,
+    applied: AppliedState | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Everything needed to interpret a number after the run is gone.
+
+    `applied` is what separates "requested fa3" from "ran fa3". Without it the
+    result JSON records the request and nothing else, and the whole point of
+    trainbench/applied.py — that the two are not the same claim — never reaches
+    the file anyone actually reads afterwards. None means the caller did not
+    construct a model (an env report), not that the axes were verified.
+    """
+    git = git_state()
     return {
-        "git_commit": git_commit(),
+        "git_commit": git["commit"],
+        # A dirty tree means the recorded commit does not contain the measured code.
+        "git_dirty": git["dirty"],
+        "git_source": git["source"],
         # Which image produced this number. Without it a result cannot be traced
         # back to the code and package set that generated it.
         "image": os.environ.get("TRAINBENCH_IMAGE"),
         "image_digest": os.environ.get("TRAINBENCH_IMAGE_DIGEST"),
         "config": config.model_dump(mode="json"),
+        "applied": applied.to_dict() if applied is not None else None,
         "device": str(device),
         "packages": package_versions(),
         "host": host_spec(),
@@ -159,12 +190,18 @@ def write_json(path: Path, payload: dict[str, Any]) -> Path:
     """Atomic write: temp file in the same directory, then replace.
 
     A pod can vanish mid-write; a half-written result that parses is worse than
-    no result at all.
+    no result at all. The rename is only atomic with respect to data that already
+    reached the disk, so the temp file is fsynced before it happens — otherwise
+    the rename can land while the contents have not.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     # default=str so one unserializable value degrades to its repr instead of
     # losing the entire result file — a probe must always produce output.
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True, default=str))
+    text = json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True, default=str)
+    with open(tmp, "w") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, path)
     return path

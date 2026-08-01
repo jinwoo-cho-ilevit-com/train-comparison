@@ -29,7 +29,7 @@
 | 입력 형식 | `message` 모달리티가 `format: "structured"` — interleaved 이미지·텍스트를 구조화 메시지로 | `sentence_bert_config.json` | 평문 text + images | **차이** |
 | 이미지 해상도 | **동적**. `min_pixels 4096`, `max_pixels 1310720`, `patch_size 16`, `merge_size 2` | `preprocessor_config.json` | 448 정사각 고정 이미지로 196 토큰 측정 | **차이** |
 | MRL | 미확인 (README 미독) | - | - | 미확인 |
-| `padding_side` | 미확인 | - | - | 미확인 |
+| `padding_side` | **키 없음 -> transformers 기본값 `right`** | `tokenizer_config.json` (5404B 전문 확인) | - | 일치 |
 
 ### 차이의 영향
 
@@ -144,6 +144,11 @@ Qwen3-VL-Embedding은 공식 임베딩 모델이라 `true`가 규격이지만, �
 
 ## 확정된 결정 (2026-08-01, 사용자)
 
+결정 1·2와 여기서 확인한 `padding_side`·`tokens_per_image`는 `docs/model-spec.yaml`에
+기계 판독 가능한 형태로도 적혀 있고, `scripts/audit_plan.py`의 `model-spec` 체크가
+`configs/model/*.yaml`과 **값 대 값으로** 대조한다. 이 문서와 config가 어긋나면
+게이트가 막는다.
+
 ### 관통 원칙 — 각 모델을 그 모델이 의도한 방식으로 쓴다
 
 입력 조건을 인위적으로 동일하게 맞추는 쪽(비교 공정성)이 아니라, 공식 규격이
@@ -234,7 +239,7 @@ template을 적용하는 것은 **널리 쓰이는 관행이지 공식 규격이
 
 | 항목 | 비고 |
 |---|---|
-| Qwen3-VL-Embedding-2B `padding_side` | `tokenizer_config.json` 미독 |
+| **모델별 vision tower 모듈 이름** | `freeze.vision_tower` 축이 이것 없이는 구현 불가. 추측으로 `visual`/`vision_tower`를 넣지 않는다 — 틀리면 0개를 얼리고 성공으로 기록된다(PLE에서 이미 겪은 실패). D 레인이 `model.safetensors.index.json`으로 확인한 뒤 구현 |
 | MRL(Matryoshka) 지원 차원 | 세 모델 모두 README 미독. 지원하면 임베딩 차원이 축이 될 수 있다 |
 | 모델별 LoRA target module 관례 | 현재 `all-linear`는 "모델별 target module 인식" 질문을 회피한다 |
 | gemma-4 placeholder 확장의 실제 관측값 | probe 미실행. `image_seq_length: 280`이 실제로 280개 토큰으로 나오는지 |

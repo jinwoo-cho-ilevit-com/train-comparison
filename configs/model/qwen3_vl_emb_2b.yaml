@@ -6,3 +6,8 @@ revision: null
 # true, and config_sentence_transformers.json sets the default prompt.
 add_generation_prompt: true
 instruction_prompt: "Represent the user's input."
+# tokenizer_config.json declares no padding_side, so transformers' default applies.
+padding_side: right
+pooling: lasttoken
+# Pixel-proportional (min_pixels 4096 .. max_pixels 1310720), so it is measured.
+tokens_per_image: null

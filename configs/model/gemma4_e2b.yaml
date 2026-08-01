@@ -5,3 +5,9 @@ revision: null
 # Generative model, no embedding spec.
 add_generation_prompt: false
 instruction_prompt: null
+# tokenizer_config.json: "padding_side": "left". The only one of the three that
+# pads left, and therefore the only one exercising that pooling branch.
+padding_side: left
+pooling: lasttoken
+# processor_config.json: image_seq_length 280, fixed regardless of resolution.
+tokens_per_image: 280
