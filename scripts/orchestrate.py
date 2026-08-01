@@ -71,10 +71,17 @@ PURPOSES_WITHOUT_BASELINE = frozenset({"probe"})
 # learn that the entry point is missing.
 RUNNABLE_PURPOSES = frozenset({"probe"})
 
-# Never handed to an experiment pod. RUNPOD_API_KEY is account-wide and would let
-# a probe delete the sweep that created it; GITHUB_TOKEN carries write:packages
-# and belongs to the image build alone.
-FORBIDDEN_ON_POD = ("RUNPOD_API_KEY", "GITHUB_TOKEN")
+# Never reachable from an experiment pod. RUNPOD_API_KEY is account-wide and would
+# let a probe delete the sweep that created it; GITHUB_TOKEN carries write:packages
+# and belongs to the image build alone. The universal-auth pair is on the list
+# because an identity that can mint its own tokens makes a short-lived token
+# pointless.
+FORBIDDEN_ON_POD = (
+    "RUNPOD_API_KEY",
+    "GITHUB_TOKEN",
+    "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
+    "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+)
 
 # The pod kills itself this long before the orchestrator's own deadline, so a hung
 # run stops billing on its own even if the orchestrator dies first.
@@ -344,10 +351,73 @@ def pod_env(
         # A machine-identity token has no project of its own; the CLI refuses to
         # fetch secrets without one.
         env["INFISICAL_PROJECT_ID"] = project_id
+    # Checking `env` alone was security theatre: it is a literal built fifteen lines
+    # above from a fixed set of keys, so the comprehension could never match. What
+    # reaches the pod is not this dict — entrypoint.sh runs the workload under
+    # `infisical run`, which injects everything the token can read. See
+    # pod_reachable_secret_names.
     leaked = [name for name in FORBIDDEN_ON_POD if name in env]
     if leaked:
         raise RuntimeError(f"refusing to launch: {', '.join(leaked)} would reach an experiment pod")
     return env
+
+
+def pod_reachable_secret_names(token: str, project_id: str) -> set[str]:
+    """Secret NAMES the pod's own token can read. Never values.
+
+    The pod does not receive secrets through its env dict; it receives a token,
+    and `entrypoint.sh` runs the workload under `infisical run`, which injects the
+    whole environment that token can see. So the only meaningful question is what
+    the token's scope is, and the only way to answer it is to ask with the token.
+
+    The subprocess gets a sanitised environment so that what the orchestrator
+    already holds cannot be mistaken for what the pod can reach.
+    """
+    clean = {
+        "PATH": os.environ["PATH"],
+        "HOME": os.environ.get("HOME", ""),
+        "INFISICAL_TOKEN": token,
+    }
+    out = subprocess.run(
+        [
+            "infisical",
+            "run",
+            f"--env={os.environ.get('INFISICAL_ENV', 'dev')}",
+            f"--projectId={project_id}",
+            "--",
+            sys.executable,
+            "-c",
+            # chr(10) rather than an escape: this source is passed through argv,
+            # where a literal newline inside the quotes is a syntax error.
+            "import os;print(chr(10).join(sorted(os.environ)))",
+        ],
+        env=clean,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(f"could not read the pod token's scope: {out.stderr.strip()[:300]}")
+    return set(out.stdout.split()) - set(clean)
+
+
+def assert_pod_scope_is_safe(token: str, project_id: str) -> set[str]:
+    """Refuse to launch while the pod's token can read secrets it has no business with.
+
+    This is the check `pod_env` was supposed to be. It measures the property that
+    matters — what the pod can obtain — rather than what we chose to hand it.
+    """
+    reachable = pod_reachable_secret_names(token, project_id)
+    leaked = sorted(set(FORBIDDEN_ON_POD) & reachable)
+    if leaked:
+        raise RuntimeError(
+            "refusing to launch: the pod's Infisical token can read "
+            f"{', '.join(leaked)}. entrypoint.sh injects everything that token can "
+            "see, so an experiment pod would hold them. Scope the machine identity "
+            "to a pod-only secret set (or a separate Infisical environment) — "
+            "lengthening FORBIDDEN_ON_POD cannot reach this."
+        )
+    return reachable
 
 
 def pod_timeout_seconds(args: argparse.Namespace) -> int:
@@ -458,10 +528,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         token = infisical_token()
+        # What the pod can obtain, not what we chose to hand it. Names only.
+        reachable = assert_pod_scope_is_safe(token, args.infisical_project_id)
     except (RuntimeError, subprocess.SubprocessError) as exc:
         console.print(f"[red]{exc}[/red]")
         return 2
-    console.print("infisical token acquired for pod injection")
+    console.print(
+        f"infisical token acquired; pod scope is {len(reachable)} secret(s), none forbidden"
+    )
 
     pending = list(experiments)
     watch = pods.PodWatch(timeout_seconds=args.timeout_minutes * 60)
