@@ -587,7 +587,9 @@ CPU에서 구현·검증이 끝나는 것과 GPU가 있어야 판정되는 것�
 
 `train.gradient_checkpointing=selective`도 같은 형태였으나 **양쪽 다 랜딩됐다**
 (`axes.py`의 `create_selective_checkpoint_contexts` + `_capture_gradient_checkpointing`이
-`context_fn`으로 `full`과 구분). 남은 것은 위 3건이다.
+`context_fn`이 실어나르는 **정책의 동일성**으로 `full`과 구분한다 — `context_fn`의 존재
+자체는 근거가 아니다. 같은 팩토리로 만든 남의 정책은 `none`이나 `full`의 backward를
+`selective` 라벨 아래 넣으므로 undetermined로 거부된다). 남은 것은 위 3건이다.
 
 ### Task 4 — Phase 2 ablation (B200, 12~18 pod 병렬)
 

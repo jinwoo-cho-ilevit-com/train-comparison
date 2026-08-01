@@ -28,7 +28,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import yaml
 
@@ -1156,6 +1156,46 @@ AXIS_VALUE_COMPANIONS: dict[str, tuple[str, ...]] = {
 }
 
 
+def flag_knob_values() -> tuple[dict[str, list[str]], list[str]]:
+    """Axis knobs varied by dotted override, and their offered values.
+
+    `axis-values` enumerates variant *files* per config group, so a group that
+    varies by `train.gradient_checkpointing=selective` instead of by a file per
+    value was invisible to it — `train` is in `NON_AXIS_GROUPS` and every value of
+    both its knobs went uncounted. That is not an exemption anyone chose: the
+    group's `default.yaml` explains why a file per value would mean a file per
+    cell of the cross with `train.offload`, and then records that the audit cannot
+    see the two knobs as the cost. This is the cost being paid instead.
+
+    Read off the schema rather than listed here, so a new `Axis()` in one of these
+    sections is counted without being remembered into a list. A knob whose values
+    cannot be enumerated is returned as a problem rather than skipped — silence is
+    how the group got here.
+    """
+    from trainbench.config_schema import BenchConfig, Strict
+
+    knobs: dict[str, list[str]] = {}
+    problems: list[str] = []
+    for section, info in BenchConfig.model_fields.items():
+        sub = info.annotation
+        if section not in NON_AXIS_GROUPS:
+            continue
+        if not (isinstance(sub, type) and issubclass(sub, Strict)):
+            continue
+        for name, spec in sub.model_fields.items():
+            if not (spec.json_schema_extra or {}).get("axis"):
+                continue
+            values = [str(v) for v in get_args(spec.annotation)]
+            if not values:
+                problems.append(
+                    f"{section}.{name} is an axis whose values are not enumerable from "
+                    f"{spec.annotation!r}, so this check cannot try them"
+                )
+                continue
+            knobs[f"{section}.{name}"] = values
+    return knobs, problems
+
+
 @check("axis-values")
 def every_offered_axis_value_can_be_applied() -> Result:
     """How many of the values each axis group offers can actually be applied.
@@ -1197,16 +1237,34 @@ def every_offered_axis_value_can_be_applied() -> Result:
     is `tests/test_axes.py`'s question and the capture probe's, not this one's.
     """
     sys.path.insert(0, str(REPO))
+    import functools
+
     import torch
     from hydra import compose, initialize_config_dir
 
-    from trainbench import axes
+    from trainbench import applied, axes
     from trainbench.compose import resolve
 
     class _Tiny(torch.nn.Module):
+        """The stub every value is pushed through.
+
+        It carries transformers' checkpointing hook because `train.gradient_checkpointing`
+        is applied through it (`PreTrainedModel._set_gradient_checkpointing`, 5.14.1),
+        and a stub without it would report `full` and `selective` inapplicable — the
+        check inventing a defect rather than finding one, the same way ragged rows
+        would have made `dataloader/torch` fail on a rectangle the audit built.
+        """
+
         def __init__(self) -> None:
             super().__init__()
             self.block = torch.nn.Linear(4, 4)
+            self.block.gradient_checkpointing = False
+
+        def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
+            self.block.gradient_checkpointing = True
+            self.block._gradient_checkpointing_func = functools.partial(
+                torch.utils.checkpoint.checkpoint, **dict(gradient_checkpointing_kwargs or {})
+            )
 
     variants: dict[str, list[str]] = {}
     for path in sorted(CONFIGS.rglob("*.yaml")):
@@ -1214,11 +1272,26 @@ def every_offered_axis_value_can_be_applied() -> Result:
         if path.parent == CONFIGS or group in NON_AXIS_GROUPS:
             continue
         variants.setdefault(group, []).append(path.stem)
+    # Knobs that vary by dotted override instead of by a file per value. Keyed by
+    # the knob's dotted name, which is also the override spelling, so they go
+    # through the same loop rather than a second one — and are reported apart from
+    # each other, since `train`'s two knobs are crossed rather than alternatives.
+    knobs, unenumerable = flag_knob_values()
+    variants.update(knobs)
     if empty := _nothing_to_check(variants, "axis config groups"):
         return Result("axis-values", False, empty)
 
-    def attempt(config: Any, dataset: Any) -> Exception | None:
-        """`None` if every call site accepted the value, else what refused it."""
+    def attempt(config: Any, dataset: Any, verify: str | None = None) -> Exception | None:
+        """`None` if every call site accepted the value, else what refused it.
+
+        `verify` names a knob to read back off what was built. Only the flag knobs
+        pass one: applicability alone is a weak reading — an apply site gutted to
+        `return []` raises nothing and would be counted applied — and for these the
+        stub is a model the probe can actually answer about. For a variant *file*
+        the same read-back would report `attn`, `precision` and the rest
+        undetermined against a four-parameter `nn.Linear`, which says nothing about
+        the axis.
+        """
         try:
             axes.patch(config)
             axes.load_kwargs(config)
@@ -1239,6 +1312,13 @@ def every_offered_axis_value_can_be_applied() -> Result:
                 next(iter(built.dataloader))
             with axes.step_context(config):
                 pass
+            if verify is not None:
+                state = next(a for a in applied.capture(built, config).axes if a.axis == verify)
+                if state.applied != state.requested:
+                    raise applied.AppliedMismatch(
+                        f"requested {state.requested!r}, read back {state.applied!r} "
+                        f"({state.detail.get('reason', state.detail)})"
+                    )
         except Exception as exc:  # noqa: BLE001 - reported, never counted as applied
             return exc
         return None
@@ -1263,7 +1343,10 @@ def every_offered_axis_value_can_be_applied() -> Result:
             except Exception as exc:  # noqa: BLE001 - a value that will not compose
                 broken.append(f"{variant} (compose {type(exc).__name__}: {str(exc)[:80]})")
                 continue
-            outcomes = {shape: attempt(config, rows()) for shape, rows in shapes.items()}
+            outcomes = {
+                shape: attempt(config, rows(), verify=group if group in knobs else None)
+                for shape, rows in shapes.items()
+            }
             unexpected = [
                 f"{variant} on {shape} data ({type(exc).__name__}: {str(exc)[:80]})"
                 for shape, exc in outcomes.items()
@@ -1292,6 +1375,8 @@ def every_offered_axis_value_can_be_applied() -> Result:
         if count <= 1 and len(variants[group]) > 1:
             inert.append(f"{group} {count}/{len(variants[group])}")
     problems = []
+    if unenumerable:
+        problems.append(f"{len(unenumerable)} axis knob(s) not tried: {'; '.join(unenumerable)}")
     if inert:
         problems.append(f"{len(inert)} group(s) offering one usable value: {', '.join(inert)}")
     if data_dependent:
@@ -1307,7 +1392,7 @@ def every_offered_axis_value_can_be_applied() -> Result:
         f"{usable}/{total} offered axis values apply on both {'/'.join(shapes)} data"
         if not problems
         else f"{usable}/{total} applicable on both {'/'.join(shapes)} data; " + "; ".join(problems),
-        count=len(inert) + len(data_dependent) + len(broken),
+        count=len(unenumerable) + len(inert) + len(data_dependent) + len(broken),
     )
 
 

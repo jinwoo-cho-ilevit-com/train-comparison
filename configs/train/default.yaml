@@ -11,10 +11,10 @@
 # `configs/experiment/phase0-*.yaml` carries `train.batch_size=8`, and
 # `audit_plan.py`'s `AXIS_VALUE_COMPANIONS` carries `train.warmup_discard_steps=20`.
 #
-# The cost is that `audit_plan.py`'s `axis-values` cannot see these two knobs:
-# it enumerates variant *files* per group and skips `train` outright
-# (`NON_AXIS_GROUPS`), so its count does not move when a value here becomes
-# applicable. Neither exposure would change that — the check counts files.
+# `axis-values` used to be unable to see these two knobs — it enumerates variant
+# *files* per group and skips `train` outright (`NON_AXIS_GROUPS`). It now reads
+# them off the schema's `Axis()` marks instead (`audit_plan.flag_knob_values`), so
+# a value here that stops applying moves its count.
 batch_size: 16
 grad_accum: 1
 steps: 120

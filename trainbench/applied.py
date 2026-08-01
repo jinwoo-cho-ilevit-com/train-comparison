@@ -22,6 +22,7 @@ and deleting a line would disable a check with nothing to notice. Marking a fiel
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, get_args
@@ -587,11 +588,16 @@ def _checkpointing_mode(module: Any) -> tuple[str | None, str | None]:
     if not module.gradient_checkpointing:
         return "none", None
     func = getattr(module, "_gradient_checkpointing_func", None)
-    if getattr(func, "func", None) is not torch.utils.checkpoint.checkpoint:
+    # `isinstance` rather than duck-typing on `.func`/`.keywords`: any object can
+    # carry those two attributes, and one that does would have its `keywords` read
+    # as the run's evidence while the callable actually installed on the block is
+    # something else entirely.
+    checkpoint = torch.utils.checkpoint.checkpoint
+    if not isinstance(func, functools.partial) or func.func is not checkpoint:
         return None, (
             f"its _gradient_checkpointing_func is {type(func).__name__} rather than a "
-            "functools.partial of torch.utils.checkpoint.checkpoint, so what it recomputes "
-            "is not readable from its keywords"
+            "functools.partial wrapping torch.utils.checkpoint.checkpoint, so what it "
+            "recomputes is not readable from its keywords"
         )
     keywords = func.keywords or {}
     reentrant = keywords.get("use_reentrant")
@@ -604,21 +610,22 @@ def _checkpointing_mode(module: Any) -> tuple[str | None, str | None]:
     context_fn = keywords.get("context_fn")
     if context_fn is None:
         return "full", None
-    if getattr(context_fn, "func", context_fn) is not (
+    # Same reason as above, and the same shape: a bare factory is legal here (torch
+    # accepts one), a partial around it is what `axes` builds, and anything else
+    # only resembling a partial is not evidence of what it saves.
+    partial = isinstance(context_fn, functools.partial)
+    if (context_fn.func if partial else context_fn) is not (
         torch.utils.checkpoint.create_selective_checkpoint_contexts
     ):
         return None, (
             "its context_fn is not torch's create_selective_checkpoint_contexts, so which "
             "operators it saves is unknown"
         )
-    bound = getattr(context_fn, "args", ()) or ()
+    bound = context_fn.args if partial else ()
     # `policy_fn_or_list` is torch 2.13.0's parameter name; a caller is free to
     # bind it by keyword, and reading only positionals would call that unnameable.
-    policy = (
-        bound[0]
-        if bound
-        else (getattr(context_fn, "keywords", None) or {}).get("policy_fn_or_list")
-    )
+    by_keyword = context_fn.keywords if partial else {}
+    policy = bound[0] if bound else by_keyword.get("policy_fn_or_list")
     if policy is selective_checkpoint_policy:
         return "selective", None
     return None, (

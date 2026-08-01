@@ -1302,6 +1302,95 @@ def test_a_checkpoint_function_whose_keywords_cannot_be_read_is_not_full(compose
         assert_matches(state, config)
 
 
+def test_a_lookalike_checkpoint_function_is_not_read_as_full(composed):
+    """An object carrying `.func` and `.keywords` is not a checkpoint.
+
+    The refusal above names `functools.partial`, and the check behind it was
+    duck-typing on those two attributes — so anything shaped like a partial had its
+    `keywords` read as the run's evidence of what the backward pass re-runs, while
+    the callable installed on the block is whatever else the object is. The reason
+    said more than the check did, and this stand-in read back as a clean `full`.
+    """
+    config = bench(composed, **{"train.gradient_checkpointing": "full"})
+    model = Checkpointing()
+    model.block.gradient_checkpointing = True
+    model.block._gradient_checkpointing_func = SimpleNamespace(
+        func=torch.utils.checkpoint.checkpoint, keywords={"use_reentrant": False}
+    )
+
+    state = capture(Built(model=model), config)
+
+    assert axis(state, "train.gradient_checkpointing").applied is None
+    assert "functools.partial" in axis(state, "train.gradient_checkpointing").detail["reason"]
+    with pytest.raises(AppliedMismatch, match="train.gradient_checkpointing"):
+        assert_matches(state, config)
+
+
+def test_a_lookalike_selective_context_is_not_read_as_selective(composed):
+    """The same hole one line further in: `context_fn` was duck-typed too, so a
+    stand-in carrying `.func` and `.args` had this axis's policy read off it while
+    the context the block enters is built by something else entirely."""
+    config = bench(composed, **{"train.gradient_checkpointing": "selective"})
+    model = Checkpointing()
+    model.block.gradient_checkpointing = True
+    model.block._gradient_checkpointing_func = functools.partial(
+        torch.utils.checkpoint.checkpoint,
+        use_reentrant=False,
+        context_fn=SimpleNamespace(
+            func=torch.utils.checkpoint.create_selective_checkpoint_contexts,
+            args=(axes.selective_checkpoint_policy,),
+        ),
+    )
+
+    state = capture(Built(model=model), config)
+
+    assert axis(state, "train.gradient_checkpointing").applied is None
+    assert (
+        "create_selective_checkpoint_contexts"
+        in axis(state, "train.gradient_checkpointing").detail["reason"]
+    )
+    with pytest.raises(AppliedMismatch, match="train.gradient_checkpointing"):
+        assert_matches(state, config)
+
+
+def test_the_policy_honours_every_operator_on_its_own_save_list():
+    """The policy against its own list, operator by operator.
+
+    `SELECTIVE_CHECKPOINT_SAVED_OPS` is transcribed from torch's
+    `compute_intensive_ops`, and everything else in this file reaches the policy
+    through a stand-in block whose forward pass contains one `aten.mm` and one
+    pointwise op. So a policy that recomputed `bmm`, `addmm`, `_scaled_mm` or
+    either SDPA packet — attention and biased linear layers, which is most of what
+    selective is for on a GPU — left every other test in this file green.
+
+    Overloads rather than the packets themselves, because an overload is what the
+    dispatcher hands the policy at run time and `overloadpacket` is the reduction
+    the policy performs on it. Passing the packet would test the list against
+    itself.
+
+    What this cannot reach is the GPU half of the list. On CPU, scaled dot product
+    attention dispatches as `_scaled_dot_product_flash_attention_for_cpu`, which is
+    not on the list at all — see `docs/methodology.md` §gradient_checkpointing.
+    """
+    saved = torch.utils.checkpoint.CheckpointPolicy.MUST_SAVE
+    recomputed = torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+
+    assert axes.SELECTIVE_CHECKPOINT_SAVED_OPS, "an empty save list saves nothing"
+    for packet in axes.SELECTIVE_CHECKPOINT_SAVED_OPS:
+        overloads = [getattr(packet, name) for name in packet.overloads()]
+        assert overloads, f"{packet} offers no overload to dispatch"
+        for overload in overloads:
+            assert axes.selective_checkpoint_policy(None, overload) is saved, (
+                f"{overload} is on the save list and would be recomputed"
+            )
+
+    # The other direction, so a policy that returns MUST_SAVE for everything —
+    # which recomputes nothing and is the backward pass of `none` — cannot satisfy
+    # the loop above. `sigmoid` is the pointwise operator the stand-in block runs.
+    for absent in (torch.ops.aten.sigmoid.default, torch.ops.aten.add.Tensor):
+        assert axes.selective_checkpoint_policy(None, absent) is recomputed
+
+
 def test_a_real_transformers_model_reads_back_at_all_three_settings(composed):
     """The probe against the thing it reads, rather than against a stand-in.
 

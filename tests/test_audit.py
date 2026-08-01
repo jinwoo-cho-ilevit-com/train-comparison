@@ -383,6 +383,40 @@ def test_gradcache_is_counted_applicable_on_both_data_shapes():
     assert "applicable only to data this study does not measure" not in result.detail
 
 
+def test_the_flag_knobs_in_the_train_group_are_counted_as_axis_values(monkeypatch):
+    """`train` varies by dotted override, and the check used to skip it entirely.
+
+    `axis-values` enumerates variant files per config group and `train` is in
+    `NON_AXIS_GROUPS`, so none of `train.gradient_checkpointing`'s three values was
+    ever pushed through the four call sites — the axis's only real gate was
+    `tests/test_axes.py`. The values come off the schema rather than a list here,
+    so a knob added to one of these sections is tried without being remembered
+    into anything.
+
+    The second half is the break. Applicability alone is a weak reading: an apply
+    site gutted to do nothing raises no exception, so counting would go on saying
+    3/3. That is why these knobs are also read back off what was built.
+    """
+    from trainbench import axes
+
+    knobs, unenumerable = audit_plan.flag_knob_values()
+
+    assert unenumerable == []
+    assert knobs["train.gradient_checkpointing"] == ["none", "full", "selective"]
+    assert knobs["train.offload"] == ["none", "optimizer", "param", "both"]
+
+    result = audit_plan.CHECKS["axis-values"]()
+    # Listed only when a value is unusable, so silence here is all three counted.
+    assert "train.gradient_checkpointing" not in result.detail
+
+    monkeypatch.setattr(axes, "_gradient_checkpointing", lambda model, config: [])
+    gutted = audit_plan.CHECKS["axis-values"]()
+
+    assert not gutted.ok
+    assert "train.gradient_checkpointing/full" in gutted.detail
+    assert "read back 'none'" in gutted.detail
+
+
 def test_axis_values_draws_a_batch_so_the_collate_actually_runs(monkeypatch):
     """Building a loader does not call its collate, and packing lives entirely in
     the collate — so passing a dataset without drawing a batch leaves the axis

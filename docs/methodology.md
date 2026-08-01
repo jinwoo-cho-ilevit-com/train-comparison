@@ -393,6 +393,46 @@ GPU도 `nvidia-smi`도 없다. 양방향(목록 안/밖, 변수 있음/없음, G
 **이 검사는 이미지에 구워진다.** `entrypoint.sh`·`bench.py`·`trainbench/`를 고치면
 이미지를 다시 빌드해야 반영된다.
 
+## 8. gradient_checkpointing — CPU가 답하는 범위와 답하지 못하는 범위
+
+이 축의 세 값(`none`/`full`/`selective`)은 세 개의 라벨이 아니라 세 개의 backward
+pass다. 어느 쪽이 CPU에서 증명되고 어느 쪽이 GPU 파드를 기다리는지를 여기 적는다.
+
+**철회.** 이전 수정자 보고의 "정책을 어느 방향으로 망가뜨려도 잡힌다"는 **거짓이며
+철회한다.** 그 문장은 재검증 F5의 종결 근거로 쓰였다. 실제로는
+`SELECTIVE_CHECKPOINT_SAVED_OPS`를 글자 그대로 둔 채 정책 함수만 목록 중 한 항목에
+`PREFER_RECOMPUTE`를 돌려주게 바꾼 변이 4종(`bmm`/`_scaled_dot_product_flash_attention`/
+`addmm`/`_scaled_mm`)이 전부 살아남았다 — 즉 어텐션과 bias 있는 선형층을 조용히
+재계산해도 스위트는 초록이었다. `tests/test_axes.py::test_the_policy_honours_every_operator_on_its_own_save_list`가
+그 구멍을 메운다(네 변이 각각 실행해 죽는 것을 확인, 2026-08-02).
+
+### CPU에서 증명되는 것
+
+| 질문 | 근거 |
+|---|---|
+| 세 값이 서로 다른 연산을 재계산하는가 | `TorchDispatchMode`로 backward의 실행 연산을 센다 (`test_the_selective_policy_saves_the_matmul_and_recomputes_the_rest`) |
+| 정책이 자기 저장 목록 전체를 지키는가 | 목록의 11개 패킷 × 모든 overload에 대해 `MUST_SAVE` 단언 |
+| 남의 정책이 `selective`로 읽히는가 | 같은 팩토리로 만든 `save_everything`/`save_nothing`이 undetermined로 거부됨 |
+| reentrant 체크포인트가 `full`로 읽히는가 | 거부. frozen tower 입력에서 recompute 자체가 사라지는 것을 실행해 확인 |
+
+### CPU가 구조적으로 볼 수 없는 것
+
+- **저장 목록의 GPU 항목.** CPU에서 SDPA는 `aten._scaled_dot_product_flash_attention_for_cpu`로
+  디스패치되고, 이 패킷은 목록에 아예 없다 — 즉 CPU에서 `selective`는 어텐션을 무조건
+  재계산한다(torch 2.13.0, 이 호스트에서 실측 2026-08-02). 목록에 있는
+  `_scaled_dot_product_flash_attention`·`_scaled_dot_product_efficient_attention`·
+  `_flash_attention_forward`·`_efficient_attention_forward`·`_scaled_mm`은 위 단언이
+  정책 함수를 직접 부르는 방식으로만 덮이고, **실제 모델의 backward에서 그 패킷이
+  캐시에서 나오는지는 GPU 파드에서만 확인된다.**
+- **활성화 메모리 — 측정 안 함.** 이 축이 재계산과 맞바꾸는 것이 그것이고, CPU에는
+  잴 대상이 없다.
+- **스텝 시간 — 측정 안 함.** `full`과 `selective`의 시간 차이가 이 축의 결과값이다.
+
+### 닫는 방법
+
+첫 GPU 파드에서 세 값 각각에 대해 `torch.cuda.max_memory_allocated`와 iteration
+time을 기록한다. 그때까지 이 축에 대해 어떤 수치도 쓰지 않는다.
+
 ## 재현 조건 — 게이트 통과와 재현 가능은 다르다
 
 Wave 0 게이트는 `102 passed`로 통과했다. 그 결과는 **`configs/data/`가 로컬에
