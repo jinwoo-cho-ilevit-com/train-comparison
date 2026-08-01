@@ -19,7 +19,7 @@ PLE가 2.390B). "모델 무관 최적 레시피"가 존재하지 않는다는 �
 시크릿은 Infisical에서 주입한다.
 
 ```bash
-uv sync --extra compose
+uv sync --extra compose --extra native
 infisical run --env=dev -- uv run pytest
 infisical run --env=dev -- uv run python scripts/env_report.py device=cpu data.limit=4 train.batch_size=4
 ```

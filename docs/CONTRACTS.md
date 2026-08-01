@@ -395,6 +395,232 @@ class ProbeReport:
     안을 보지 않는다.** dot 항목과 `__init__.py`는 제외이며, 이 범위는 체크가
     통과할 때도 자기 출력에 적는다 — 무엇을 안 봤는지가 보여야 한다.
 
+- 2026-08-02 **`config_schema.py`의 `RunConfig` docstring에서 출처 없는 "20~44%"를
+  제거한다** (공유 파일 변경 요청, 스키마 변경 아님). `PLAN.md`/`README.md`/`AGENTS.md`
+  세 곳에서는 이미 제거했고 `docs/methodology.md` §1이 조사 기록과 함께 "미측정"으로
+  추적하고 있는데, 이 파일에만 숫자가 남아 **코드가 문서보다 강하게 주장하는** 상태다.
+  스키마를 읽는 사람이 마지막으로 보는 것이 그 숫자다. 고칠 것은 한 줄 — 숫자를 지우고
+  "부풀림 폭은 미측정, `docs/methodology.md` §1" 로 바꾼다. **검증기 동작은 바뀌지
+  않는다**: `_timing_runs_are_uncontaminated`의 거부는 폭이 아니라 분리 규율에서
+  나오고, 그 규율은 숫자와 무관하게 유지된다(프로파일러가 스텝을 느리게 만든다는 것은
+  프로파일러의 동작 정의다). 소유 레인이 없어 아무도 손대지 못한 채 세 wave를 지났다.
+- 2026-08-02 **계획이 측정 인프라와 측정 대상 기법을 같은 것으로 취급했다** (`PLAN.md`
+  Task 3.5 신설, 레인 E). `Task 4 — Phase 2 ablation`이 "`configs/experiment/`에 축
+  그룹별 조합 정의 후 실행"만 적고 있었고, 그 축들을 **구현하는** 작업이 어느 Task에도
+  없었다. Liger 패칭, Muon, GradCache, Transformer Engine recipe, DALI, FSDP2/DDP/ZeRO —
+  전부 작업 항목이 아니었다.
+  원인은 이 프로젝트 자신의 규칙이다. `AGENTS.md`와 `PLAN.md`의 "새 실험 변형은 Hydra
+  config 조합에서 나오지 코드 변경에서 나오지 않는다"는 축을 *변화시키는 방법*으로는
+  맞지만 조용히 **축이 이미 존재한다**는 전제를 깔았다. ms-swift나 axolotl을 쓴다면
+  맞는 전제다 — 우리는 `native` 하네스를 자체로 만들고 있고 거기서는 축 하나가 config
+  한 줄이 아니라 구현 하나다. 그 결과 `axis-values`가 그 구멍을 정확히 보고하고 있었는데
+  (`26/43`, 6개 그룹이 비활성값 하나만 수용) 계획에는 그것을 닫는 작업이 없어서,
+  감사가 말하는 것과 계획이 하는 일이 서로를 참조하지 않았다.
+  **다음 레인이 읽어야 할 것**: 축 하나를 켜는 일은 `axes.py`의 적용 지점 + `applied.py`의
+  capture 확장 **두 개가 한 커밋**이다. `applied=None`은 불일치와 동일하게 timing을
+  차단하므로(§2 불변식), 구현만 랜딩한 축은 "구현됐지만 영구히 측정 불가"라는 상태로
+  들어간다. 현재 그 상태가 예정된 것 3건(`optim=adamw_8bit`의 철자 불일치,
+  `train.offload`의 deepspeed undetermined, `precision=mxfp8/nvfp4`의 step-내 캐스팅)이며
+  `PLAN.md` Task 3.5가 표로 추적한다.
+
+- 2026-08-02 **파드 시크릿 가드가 금지 목록에서 허용 목록으로 바뀐다**
+  (`scripts/orchestrate.py`의 `ALLOWED_ON_POD` 신설, 레인 C). 결정이 아니라 측정으로
+  바꿨다: `infisical run --env=dev` 아래 `os.environ`을 맨 셸과 diff한 결과 `dev`가
+  **27개 이름**을 주입하고, `FORBIDDEN_ON_POD`이 아는 것은 4개, 파드가 쓰는 것은
+  `HF_TOKEN` 1개다. **나머지 22개가 가드를 통과해 파드에 도달**하고 있었다 — 클라우드·
+  데이터베이스·모델 제공자 자격증명들이며 목록에 올릴 생각을 아무도 하지 않은 것들이다.
+  가드 자신의 에러 메시지가 이미 "lengthening FORBIDDEN_ON_POD cannot reach this"라고
+  적어두고 있었는데, 정작 검사는 그 목록으로 하고 있었다.
+  허용 목록의 근거는 `.env.example`이다 — "Experiment pods: model/dataset pull, result
+  push, Trackio Space sync"로 `HF_TOKEN` 하나를 지목하고 나머지 셋을 오케스트레이터·
+  빌드 전용으로 명시한다. `TRAINBENCH_*`와 `INFISICAL_*`은 Infisical이 아니라 파드 env
+  dict로 건네지므로 이 목록에 들어가지 않는다.
+  **양방향 거부다.** 초과분(보안)과 `HF_TOKEN` 부재(측정 타당성) 둘 다 막는다. 후자는
+  이 저장소에 이미 기록된 실패다 — 토큰이 없어 게이트 모델이 401을 냈고 그 조합이
+  "미지원"으로 기록됐다. 빈 스코프도 같은 이유로 통과가 아니다(§6 "빈 입력은 통과가
+  아니라 실패다").
+  `FORBIDDEN_ON_POD`은 남는다: `pod_env`의 dict 검사와, 거부 메시지에서 어느 초과분이
+  account-wide인지 지목하는 용도다.
+- 2026-08-02 **스코프 검사가 파드와 다른 Infisical 환경을 보고 있었다**
+  (`scripts/orchestrate.py`, 레인 C). `pod_env`는 파드에 `args.infisical_env`를 주는데
+  `pod_reachable_secret_names`는 `os.environ["INFISICAL_ENV"]`로 검사하고 있었다. 둘 다
+  우연히 `dev`라 발동하지 않았을 뿐, `--infisical-env pod`으로 띄우는 순간 **가드가
+  파드가 쓰지 않을 환경을 검사**한다. 그리고 그 분리는 가드 자신이 권하는 해법이므로,
+  조언을 따르는 순간 가드가 눈을 감는 구조였다. `env`를 인자로 넘기도록 고쳤다.
+  이것이 이 저장소의 "검사는 돌고 통과하는데 검사 대상이 실제 대상이 아니다" 패턴의
+  아홉 번째이며, 처음으로 보안 가드에서 나왔다.
+
+- 2026-08-02 **가드를 실물에 물려보니 두 가지가 더 나왔다** (`scripts/orchestrate.py`,
+  레인 C). 둘 다 스텁으로는 드러나지 않았고 실제 Infisical 환경 두 개에 대고 돌려서
+  나왔다. 이 저장소의 "검사가 옳은 질문을 던지는데 잘못된 양을 재고 있다" 패턴이다.
+  - **프로브가 시크릿이 아니라 자식 프로세스의 환경변수를 셌다.** `clean` 세 개만
+    빼고 있었는데 OS가 자식에 붙이는 것(macOS의 `LC_CTYPE`,
+    `__CF_USER_TEXT_ENCODING`)이 남아, 시크릿 1개짜리 올바른 `pod` 환경이 **3개를
+    가졌다는 이유로 거부**됐다. Infisical 자신은 "Injecting 1 secret"이라고 말하고
+    있었다. 이제 같은 sanitised 환경에서 `infisical run` 있이/없이 두 번 돌려 그
+    **차집합**을 취한다 — 주입 전후의 차이가 곧 주입된 것이다. 금지 목록일 때는 로케일
+    변수가 목록에 없어 조용히 통과했으므로, 이 결함을 드러낸 것은 허용 목록 전환이다.
+  - **문서화된 실행 방식이 파드에 dev 바인딩 토큰을 넘기고 있었다.** `infisical_token()`이
+    주변 `INFISICAL_TOKEN`을 우선했는데, 이 저장소가 문서화한 실행 방식
+    (`infisical run --env=dev -- python scripts/orchestrate.py`)이 바로 그 자리에
+    dev 저장 서비스 토큰을 넣는다. 그 토큰은 `--env`를 **무시한다**(실측: `dev`·`pod`·
+    존재하지 않는 환경 모두에 같은 26개). 즉 환경을 분리해도 파드는 dev 전체를 읽을 수
+    있는 토큰을 받았다. 이제 유니버설 인증으로 발급하며, 명시적으로 넘기려면
+    `TRAINBENCH_POD_INFISICAL_TOKEN`을 쓴다 — `INFISICAL_TOKEN`은 호출자의 것이다.
+    추가로 **그 속성을 가정하지 않고 잰다**: 존재할 수 없는 환경을 요청해 답이 돌아오면
+    바인딩된 토큰이므로 거부한다. 이 검사가 없으면 `dev`가 정리되는 날 바인딩 결함이
+    조용히 통과한다(지금은 초과 시크릿 때문에 우연히 걸릴 뿐이다).
+
+- 2026-08-02 **레인 경계 침범 기록 (`optim=muon`, 레인 D).** 위 2026-08-01 레인 A
+  항목과 같은 형식으로 남긴다. 세 파일이 D 소유가 아니다.
+  - `pyproject.toml`, 루트 `uv.lock` (레인 F 소유) — `native` extra에
+    `pytorch-optimizer>=3.10` 추가. `envs/native/pyproject.toml`이 이미 이 축을 위해
+    같은 배포판을 고정하고 있고, 이 줄은 루트 락이 같은 버전을 해석하게 하는 용도다.
+    **결정이 필요한 것이 하나 남아 있고 그것은 F의 몫이다**: 이 배포판은 `native`에만
+    있어서 문서화된 셋업 명령(`uv sync --extra compose`)도, 6개 프레임워크 이미지 중
+    5개도 설치하지 않는다. `peft`가 똑같은 모양이며 그쪽은 테스트가 무조건 import한다
+    (선행 구멍이고 이 레인이 만든 것이 아니다). D가 한 조치는 `axes._optimizer`가
+    import 실패를 `UnappliedAxis`로 감싸는 것까지다 — 없는 환경에서 축이 **거부**되지
+    `assemble` 중간에 `ModuleNotFoundError`로 죽지 않는다. extra를 옮길지는 이미지
+    해석에 영향을 주므로 F가 정한다.
+  - `docs/methodology.md` (레인 E 소유) — §5 "Muon이 무엇을 최적화하는가". 코드 주석에
+    적을 수 없는 것이라 여기 있다. 이번에 추가한 것은 lr 한정 조건(config의 `lr: 1e-5`가
+    AdamW의 값 그대로이고 라이브러리 기본값은 `lr=0.02`/`adamw_lr=3e-4`로 두 경로를
+    분리한다 — throughput은 무관하지만 **수렴 곡선은 이 config로 못 잰다**), 축이
+    거부되는 세 조건, 그리고 "가중치가 움직였다"가 근거가 아닌 이유다.
+- 2026-08-02 **`_capture_optim`이 `use_muon` 분할을 기록한다** (`trainbench/applied.py`,
+  레인 D — §1에서 capture 함수는 D 소유지만 파일이 공유이므로 계약 변경으로 올린다).
+  **레코드 스키마가 넓어진다**: `optim.name`의 detail에 `newton_schulz_tensors`(Newton-Schulz를
+  통과하는 학습 가능 텐서 수)와 `use_muon`(그룹별 bool)이 추가되고, `newton_schulz_tensors == 0`이면
+  `applied`가 `"muon"`이 아니라 **`None`(undetermined)** 이다. 기존 필드
+  (`class`/`fused`/`param_groups`)와 AdamW 경로의 동작은 그대로다.
+  이유: `use_muon`은 param group 플래그이고 클래스 이름은 어느 쪽이든 `Muon`이라,
+  모든 그룹을 `use_muon=False`로 빌드한 런 — 즉 **Muon 이름을 단 AdamW** — 의
+  레코드가 정직한 런과 바이트 단위로 같았다(`{'class': 'Muon', 'fused': False,
+  'param_groups': 2}`). 발행된 수치를 사후에 어느 옵티마이저의 것으로도 귀속할 수
+  없다는 뜻이다. 이 저장소가 아홉 번 낸 "검사는 통과하는데 검사한 것이 없다"의
+  optim 판이며, 판정서가 머지 전 최소 조치로 지목했다.
+  **다른 레인이 알아야 할 것**: `optim=muon` 런의 결과 JSON에 필드 두 개가 늘어난다.
+  `scripts/report.py`가 detail을 열거하고 있다면 새 키를 만난다.
+
+- 2026-08-02 **`--infisical-env` 기본값이 `dev`에서 `pod`으로 바뀐다**
+  (`scripts/orchestrate.py`의 `POD_INFISICAL_ENV`, 레인 C). 이 인자가 이름하는 것은
+  **파드가 읽을 환경**이지 오케스트레이터가 읽을 환경이 아니다 — 오케스트레이터의
+  시크릿은 이 인자가 아니라 자기를 감싼 `infisical run --env=dev`에서 온다. 따라서
+  올바른 기본값은 처음부터 파드 환경이었고 `dev`는 파드 환경이 없던 시절의 잔재다.
+  **어느 쪽 기본값이든 fail-closed다** — 스코프 검사가 보증 못 하는 것을 거부하므로.
+  다른 것은 어느 실수가 조용한가다: `dev`가 기본이면 플래그를 잊었을 때 캠페인이
+  멈추고, `pod`이 기본이면 잊었을 때 옳게 동작한다.
+  기본값이 된 이상 문서의 실행 예시에서 이 플래그를 빼야 한다 — 예시마다 기본값을
+  반복하면 나중에 기본값이 바뀌어도 아무도 눈치채지 못한다. `AGENTS.md`를 그렇게
+  정리했다. 고정 테스트는 `test_a_launch_with_no_flag_hands_the_pod_its_own_environment`
+  이며, 리터럴 `"pod"`을 단언한다(`POD_INFISICAL_ENV`를 단언하면 상수를 `dev`로
+  되돌려도 통과한다).
+
+- 2026-08-02 **레인 경계 침범 기록 (`dataloader` 축, 레인 D).** 판정서 F9가 지적한
+  누락분(이전 라운드 3건)과 이번 라운드 1건을 함께 남긴다.
+  - `scripts/audit_plan.py`, `tests/test_applied.py`, `trainbench/embedding.py`
+    (이전 라운드) — `embedding.py`는 `packed_last_token_pool` 추가(레인 B 소유 파일,
+    packed 배치는 `last_token_pool`의 계약을 정면으로 깬다), 나머지 둘은 새 축의
+    등재·고정이다.
+  - `scripts/audit_plan.py` (이번 라운드) — `AXIS_NEEDS_NOTHING`에
+    `dataloader/torch_packed_pretokenized` 한 줄. 신규 config 값은 분류되지 않으면
+    `axis-packages`가 실패하므로, config 추가와 같은 커밋에 들어가야 한다.
+  **다른 레인이 알아야 할 것 1 — `configs/dataloader/torch_packed_pretokenized.yaml`이
+  생겼다.** `packing`이 토크나이저 없이 동작하는 유일한 조합(패딩 없는 행별 ids)이
+  `pretokenize=true`이고, 그 조합을 표현하는 config가 없었다(AGENTS.md: 새 변형은
+  config 조합에서 나온다). `axis-values`의 분모가 45 -> 46이 된다.
+  **알아야 할 것 2 — `axes.PackedCollate`의 시그니처가 `(tokenize, pad_id)`로 넓어졌고,
+  `tokenize`를 주면 `pad_id`가 필수다.** 하네스가 프로세서로 배치를 토크나이즈하는
+  경로가 이것 하나뿐인데, 배치 토크나이저는 기본이 패딩이다. 패킹된 PAD는 tokens/s가
+  실토큰으로 세고 `packed_last_token_pool`이 어떤 시퀀스의 임베딩으로 읽는 반면
+  `dataloader.packing=True` 인증은 그대로 나간다 — 즉 죽는 런이 아니라 잘못 라벨된
+  숫자다. 이제 세 지점에서 **행동으로** 막는다: `tokenize`가 2-D 텐서(=패딩된 배치)를
+  돌려주면 거부, 시퀀스에 `pad_id`가 하나라도 있으면 거부, 행이 `attention_mask`를
+  들고 오면 그 마스크를 읽어 0이 있으면 거부. pad id와 eos id가 같은 체크포인트는 이
+  방식으로 검사할 수 없고 그때는 거부가 정답이다 — `pretokenize`로 행마다 따로
+  토크나이즈하면 패딩이 애초에 쓰이지 않는다.
+- 2026-08-02 **`axis-values`가 dataloader 축에 대해 vacuous였다** (`audit_plan.py`,
+  `tests/test_audit.py`). 레인 D가 넘긴 것을 감사 레인에서 확인하고 고쳤다.
+  이 체크는 `axes.assemble(...)`을 **dataset 없이** 불렀고, `axes._dataloader`는
+  `if dataset is None`에서 packing/pretokenize에 닿기 전에 반환한다. 그래서
+  `PackedCollate.__call__`을 `raise NotImplementedError`로 갈아버려도 출력이 바이트
+  단위로 같았다.
+  - **양방향으로 틀렸다.** 거짓 양성만이 아니다 — `loss/cached_mnrl`(GradCache)은
+    구현이 있는데도 inert로 보고되고 있었다. 거부 사유가 "이 런의 dataset이 None"
+    이었기 때문이다. 감사가 자기 fixture를 안 준 탓에 멀쩡한 축이 미구현으로 보였다.
+  - 고친 내용: 합성 dataset(`_AxisValueRows`)을 넘기고, **배치를 한 개 뽑는다.**
+    dataset만 넘기면 절반만 닫힌다 — collate는 배치를 뽑기 전에는 호출되지 않고
+    packing은 전부 collate 안에 있다. `dataloader.pretokenize=true`면
+    `scripts/bench.py`가 하는 대로 `axes.pretokenize`를 먼저 부른다(`_dataloader`는
+    토큰 ids가 있는지 **보기만** 하지 만들지 않으므로, 그러지 않으면 이미 토크나이즈된
+    fixture가 축을 대신 인증한다).
+  - 모든 variant에 `data.num_workers=0`을 건다. 워커 수는 런의 속성이지 축이
+    적용되는지의 속성이 아니고, `configs/data/*.yaml`은 8을 요구한다.
+  - **여전히 증명하지 않는 것**: packing이 *올바른지*. 잘못 이어붙이는 collate도 이
+    체크에는 적용된 것으로 보인다. 등가성은 `tests/test_axes.py`와 capture probe의
+    질문이다.
+- 2026-08-02 **레인 경계 침범 기록 (`loss`/`parallel.cross_device_negatives` 축, 레인 D).**
+  판정서 발견 8이 지적한 이전 라운드 누락분이다. 두 파일 모두 §1의 "공유(수정 금지)"에
+  있고, 변경 자체는 축 등재이므로 config·구현과 같은 커밋에 들어가야 한다.
+  - `scripts/audit_plan.py` — `AXIS_PACKAGES`에서 `loss/cached_mnrl`을 빼고
+    `AXIS_NEEDS_NOTHING`으로 옮겼다(`axes._loss`가 `gradcache` 라이브러리를 import하지
+    않고 `probe/steps.py::encode` + `embedding.py::info_nce`로 직접 구현한다. 그 패키지는
+    `envs/native` 락에만 있어 import하면 나머지 이미지에서 ImportError가 된다).
+    `parallel/single_cross_device`도 같은 목록에 넣었다 — all-gather는 torch.distributed
+    자신의 것이라 설치되는 것이 없다.
+  - `tests/test_applied.py` — `UNIMPLEMENTED_AXES`에서 `loss.name: cached_mnrl`과
+    `parallel.cross_device_negatives: True` 두 줄을 지웠다(구현됐으므로). 남은 거부는
+    무조건이 아니라 조건부이고 `tests/test_axes.py`로 옮겼다.
+- 2026-08-02 **다른 레인이 알아야 할 것 — `loss=cached_mnrl`이 `assemble`에서
+  데이터에 따라 거부된다** (`trainbench/axes.py`, 레인 D. 소유 파일이라 계약 변경은
+  아니고, 두 레인의 fixture에 닿으므로 남긴다).
+  판정서 발견 5: 이미지가 섞인 MMEB 서브셋에서는 `_split_rows`가 매 배치를 거부하므로
+  이 축은 **한 배치도 못 돈다**. 그런데도 `assemble`은 적용됐다고 이름을 돌려주고
+  `assert_matches`가 통과했다 — 스텝 1에서 죽을 런을 그 전에 "적용 가능"으로 세고
+  있었다. 이제 `axes._gradcache_needs_splittable_data(dataset)`가 `assemble`에서
+  먼저 거부한다: 행에 이미지가 있으면(`datasets.Image` 피처 선언 또는
+  `qry_image`/`pos_image` 값이 실제로 있는 행) 거부, dataset이 없거나 컬럼을 읽을 수
+  없으면(=모르면) 거부.
+  - **하네스 레인(G)**: `scripts/bench.py::PairDataset`이 진짜 서브셋 행을 담으면
+    거부된다. 이것이 의도다 — 그 데이터에서 GradCache는 측정 불가다.
+    `tests/test_smoke_cpu.py`의 `rows()`는 이미지 값이 `None`이라 그대로 통과한다
+    (컬럼 이름이 아니라 **행의 값**을 본다. 20개 MMEB config 중 4개는 `qry_image`가,
+    13개는 `pos_image`가 없으므로 이름만으로 거부하면 텍스트 전용 draw까지 막힌다).
+  - **감사 레인**: `axis-values`의 `_AxisValueRows`는 텍스트 전용이라 이 값은 여전히
+    applicable로 센다. 그 숫자는 "axes.py가 적용할 수 있다"이지 "이 연구의 측정 런이
+    켤 수 있다"가 아니다. 후자는 지금 **거짓**이며 `configs/loss/cached_mnrl.yaml`
+    주석에 적어뒀다. 두 질문을 한 숫자로 읽지 않도록 하는 것이 남은 과제다.
+
+- 2026-08-02 **`doc-commands`의 설치 확인이 문자열 검사에서 import 검사로 바뀐다**
+  (`audit_plan.py`, `tests/test_audit.py`). optim(muon) 레인이 넘긴 판정서 #4를
+  감사 레인에서 확인하고 고쳤다.
+  이 체크는 `uv sync` 줄이 `--extra compose`를 달았는지만 정규식으로 봤고, 근거가
+  "tests import hydra"였다. hydra가 테스트의 유일한 의존이 아니게 된 지 오래인데
+  문구는 `install what the tests need`라고 주장하고 있었다.
+  - **놓친 것 3건**: `peft`, `datasets`, `transformers`가 전부 root `native` extra에만
+    있고 문서화된 명령 중 `--extra native`를 쓰는 것이 없다. 제보는 `peft` 하나였으나
+    import를 전수 수집하니 3건이었다.
+  - **제보의 메커니즘 서술은 정정한다.** "`tests/test_axes.py`가 `peft`를 무조건
+    import해 collection에서 실패한다"가 아니다. 세 건 다 **함수 안** import이며
+    (`test_applied.py:570`, `test_axes.py:2119`, `test_axes.py:1318`), collection은
+    통과하고 해당 테스트만 `ImportError`로 죽는다. `importorskip`이나 try/except로
+    감싸여 있지도 않으므로 skip이 아니라 error다. 결론(문서대로 설치하면 스위트가
+    녹색이 아니다)은 그대로다.
+  - 새 방식: `tests/`의 서드파티 top-level import를 AST로 전수 수집하고, 설치
+    메타데이터로 배포판 이름을 얻어(`import yaml` -> `pyyaml`, `import hydra` ->
+    `hydra-core`. 소스 어디에도 안 적혀 있다), 문서화된 `uv sync`가 만드는 lock
+    (`uv export --frozen`)에 그 배포판이 있는지 본다. **함수 안 import도 센다** —
+    질문이 "collection을 넘기는가"가 아니라 "문서대로 설치하면 스위트가 도는가"이고,
+    실제로 3건 다 함수 안이었다. 손으로 적은 목록은 잊을 목록이다.
+  - `--extra compose` 정규식은 **삭제했다.** 새 체크가 포함한다 — extra가 빠지면
+    hydra가 lock에 없어 그대로 잡힌다.
+  **이 체크는 지금 실패하며, 해소는 감사 레인 몫이 아니다.** 둘 중 하나다:
+  (E) `README.md:22` / `AGENTS.md:15`의 명령을 `uv sync --extra compose --extra native`
+  로 고치거나, (F) `native` extra의 해당 패키지를 `compose`로 옮긴다. 둘 다 확인했고
+  전자는 실측으로 통과시켰다(`--all-extras`도 통과). baseline 항목 추가는 계약 위반
+  이므로(§1 "새 실패는 baseline이 아니라 수정으로 해소한다") 항목을 넣지 않았다.
+
 **새 레인 의무 — 파일을 추가하면 `PLAN.md` 구조 블록에 한 줄 추가한다.**
 위 반대 방향 때문에 생긴다. 열거되는 디렉터리(저장소 루트, `configs/`,
 `trainbench/`, `scripts/`, `tests/`, `docs/`)에 추적되는 파일이나 디렉터리를 새로

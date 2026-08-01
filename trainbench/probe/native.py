@@ -25,6 +25,9 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     revision = config.model.revision
 
     steps.patch_axes(config, report)
+    # Before the load and not inside it: a refused load-time axis is an answer
+    # about the axis, not about the checkpoint (see steps.load_kwargs).
+    load_kwargs = steps.load_kwargs(config, report)
 
     ok, processor = report.run(
         "processor_load",
@@ -44,7 +47,7 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
             hf_id,
             revision=revision,
             dtype=steps.dtype_for(device),
-            **axes.load_kwargs(config),
+            **load_kwargs,
         ),
     )
     if not ok:

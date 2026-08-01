@@ -220,3 +220,78 @@ parquet  : {qry, qry_image, pos_text, mmeb_config, pos_image}
 C->G 이관은 꼼꼼히 기록됐는데 이건 기록이 없었다. 변경 자체는 옳고(중복 정의 제거),
 `percentile`이 타이밍 보고 모듈에 놓인 것에 대한 판단과 재검토 조건은
 `docs/CONTRACTS.md` §5에 남겼다.
+
+## D11 — `axis-values`가 dataloader 축에 대해 vacuous였다 (2026-08-02, 레인 D 제보)
+
+D8/D9와 같은 계열의 일곱 번째다. 이번에는 체크가 사실을 **양방향으로** 틀리게
+보고하고 있었다.
+
+`axis-values`가 `axes.assemble(...)`을 dataset 없이 불렀고 `axes._dataloader`는
+`if dataset is None`에서 packing/pretokenize에 닿기 전에 반환한다. 결과:
+
+- **거짓 양성** — `PackedCollate.__call__`을 `raise NotImplementedError`로 갈아도
+  체크 출력이 바이트 단위로 같았다. 축을 통째로 무력화해도 감사가 통과시킨다.
+- **거짓 음성** — `loss/cached_mnrl`(GradCache)은 구현이 있는데 inert로 보고됐다.
+  거부 사유가 "이 런의 dataset이 None"이었다. 감사가 자기 fixture를 안 준 탓에
+  멀쩡한 축이 미구현으로 보였고, `axis-values`의 inert 목록은 그만큼 과장돼 있었다.
+
+**dataset만 넘기는 것으로는 절반만 닫힌다.** collate는 배치를 뽑기 전에 호출되지
+않고 packing은 전부 collate 안에 있다. 처음에 `PackedCollate` 위쪽에 `__call__`을
+끼워 넣어 재현했다고 판단했는데, 실제 `__call__`이 클래스 본문 **뒤쪽**에 있어
+나중 정의가 이겼고 사보타주가 애초에 동작하지 않았다 — 즉 "재현했다"는 첫 판단
+자체가 틀렸다. 실제 `__call__` 본문을 갈아야 재현된다. 수리 내용과 한계는
+`docs/CONTRACTS.md` §5에 있다.
+
+### 레인 E 인계 — `docs/methodology.md`에 dataloader 축 절이 없다 (판정서 F9)
+
+레인 D가 넘긴 것을 그대로 옮긴다. `docs/methodology.md`는 E 소유라 손대지 않았다.
+결과 해석에 필요한 조건들이다.
+
+- packing의 속도 이득은 varlen 커널의 것이지 collate의 것이 아니다. GPU가 없어
+  **측정 안 함**이고, varlen 커널 없이 packing을 켜면 한 개의 긴 시퀀스에 대해
+  어텐션이 quadratic이 된다.
+- packed 배치의 **어텐션 격리(cross-sequence attention 차단)는 미검증**이다.
+  `position_ids`는 시퀀스마다 0으로 재시작하지만, 경계 넘어 attend를 막는 것은
+  커널 쪽 `cu_seqlens` 사용에 달려 있고 이 체크아웃에서 확인할 수 없다.
+- `tests/test_axes.py::test_pooling_a_packed_batch_matches_pooling_the_same_rows_padded`가
+  증명하는 것은 합성 `arange` 텐서 위의 **인덱스 산술 등가**뿐이다. 모델이 없으므로
+  "풀링 등가성 검증됨"으로 읽으면 안 된다.
+- packing x 이미지(pixel_values)는 미설계다. 현재 `PackedCollate`는 텍스트 id만 잇는다.
+- `pretokenize`의 실이득도 **측정 안 함**이다. 고정된 것은 "토크나이즈가 타임드 스텝
+  밖으로 나갔다"는 사실뿐이고(encode 호출 수를 창 양쪽에서 셈), 몇 %인지는 GPU 런의 몫.
+
+`axis-values`가 이제 packing/pretokenize 경로를 실제로 통과시키지만, 그것은 축이
+**적용된다**는 뜻이지 위 항목 중 어느 것도 측정했다는 뜻이 아니다.
+
+## D12 — `doc-commands`의 초록불이 vacuous였다 (2026-08-02, optim(muon) 레인 제보)
+
+여덟 번째. 이번에는 체크가 **자기 문구로 거짓말**을 하고 있었다.
+
+`PASS doc-commands 5 documented command(s) install what the tests need and run as
+written` — 실제로 검사한 것은 `uv sync` 줄에 `--extra compose`가 붙었는지 하나뿐이고,
+근거 주석은 "but tests import hydra"였다. hydra가 테스트의 유일한 의존이 아니게 된 지
+오래인데 문구는 "테스트가 필요로 하는 것을 설치한다"고 주장했다. **한 패키지를 지목한
+규칙으로 전체에 대한 질문에 답할 수 없다.**
+
+실측(같은 트리, 체크만 교체):
+
+```
+HEAD의 doc-commands:  PASS  5 documented command(s) install what the tests need and run as written
+새 doc-commands:      NEW   README.md: `uv sync --extra compose` installs 136 distribution(s)
+                            but the tests import 3 it does not provide:
+                              datasets (datasets, imported by test_axes.py);
+                              peft (peft, imported by test_applied.py);
+                              transformers (transformers, imported by test_axes.py, test_probe.py)
+```
+
+제보는 `peft` 1건이었고 전수 수집하니 3건이었다.
+
+**제보의 메커니즘 서술은 틀렸고 결론은 맞다.** "collection에서 실패한다"가 아니다 —
+세 건 다 함수 안 import라 collection은 통과하고 해당 테스트만 `ImportError`로 죽는다.
+`importorskip`/try 로 감싸여 있지도 않으니 skip이 아니라 error다. 문서대로 설치한
+깨끗한 clone에서 스위트가 녹색이 아니라는 결론은 그대로 선다.
+
+**남은 것은 감사 레인 몫이 아니다.** 체크는 고쳤고 지금 정직하게 실패한다. 해소는
+(E) 문서화된 명령에 `--extra native`를 더하거나 (F) `native`의 해당 패키지를 `compose`로
+옮기는 것이며, 전자는 실측으로 통과를 확인했다. 수리 내용과 판단 근거는
+`docs/CONTRACTS.md` §5에 있다.

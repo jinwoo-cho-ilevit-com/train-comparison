@@ -17,7 +17,6 @@ from typing import Any
 
 import torch
 
-from trainbench import axes
 from trainbench.config_schema import BenchConfig
 from trainbench.embedding import info_nce
 from trainbench.probe import steps
@@ -31,6 +30,11 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
 
     report.add_version(sentence_transformers)
     steps.patch_axes(config, report)
+    # Outside `_load` for the reason steps.load_kwargs gives: a refused axis here
+    # used to be recorded as a framework that cannot load this model, and this
+    # path has the extra way of getting there — `BitsAndBytesConfig` is imported
+    # on it, so an image without bitsandbytes failed the load with an ImportError.
+    load_kwargs = steps.load_kwargs(config, report)
 
     loaded: dict[str, Any] = {}
 
@@ -43,7 +47,7 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
             config.model.hf_id,
             device=str(device),
             revision=config.model.revision,
-            model_kwargs=axes.load_kwargs(config),
+            model_kwargs=load_kwargs,
         )
         loaded["model"] = model
         return {

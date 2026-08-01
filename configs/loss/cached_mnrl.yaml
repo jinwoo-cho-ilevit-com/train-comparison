@@ -1,3 +1,13 @@
+# GradCache. Requestable, and today refused by `axes.assemble` on both configured
+# subsets: `configs/data/*.yaml` are MMEB draws with an image on nearly every row,
+# every model here is a VL model, and `axes._split_rows` cannot attribute a batch's
+# `pixel_values` to rows. A run asking for this on that data dies at `assemble`
+# rather than reporting plain in-batch negatives under a cached_mnrl label.
+#
+# `axis-values` in `scripts/audit_plan.py` counts this value as applicable, and
+# that is a different question: its fixture is text-only, so it answers "axes.py
+# can apply it", not "a measured run of this study can". The refusal lifts when a
+# text-only subset is configured, or when a row->pixel mapping exists.
 name: cached_mnrl
 temperature: 0.02
 mini_batch: 8

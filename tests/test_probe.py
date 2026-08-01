@@ -330,6 +330,149 @@ def test_ple_report_fails_when_nothing_matches():
         _ple_report(torch.nn.Linear(2, 2))
 
 
+def _stub_transformers(monkeypatch):
+    """`from_pretrained` without a checkpoint, for the checks that come after it.
+
+    The probe's later checks are allowed to fail against these — what is under test
+    is which checks get *recorded*, and a stub that makes them all pass would be a
+    stub asserting itself.
+    """
+
+    def _from_pretrained(*args, **kwargs):
+        model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+        model.config = types.SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+        return model
+
+    # `from_pretrained` on the classes rather than the names on the package:
+    # `transformers` is a lazy module, and rebinding `transformers.AutoModel`
+    # leaves `from transformers import AutoModel` — which is how the probe reaches
+    # it — still resolving to the real class. That mistake downloads a 2B
+    # checkpoint into a unit test and the test still passes.
+    from transformers import AutoModel, AutoProcessor
+
+    monkeypatch.setattr(AutoModel, "from_pretrained", _from_pretrained)
+    monkeypatch.setattr(AutoProcessor, "from_pretrained", _from_pretrained)
+
+
+def _native_report(config_mapping, monkeypatch, **overrides):
+    mapping = json.loads(json.dumps(config_mapping))
+    for dotted, value in overrides.items():
+        section, key = dotted.split(".")
+        mapping[section][key] = value
+    _stub_transformers(monkeypatch)
+    return run_probe(to_bench_config(mapping), get_device("cpu"))
+
+
+def test_a_refused_load_axis_does_not_read_as_a_model_that_will_not_load(
+    config_mapping, monkeypatch
+):
+    """`peft.mode=qlora` off CUDA is refused by `axes.load_kwargs`. Evaluating that
+    refusal inside the `model_load` lambda charged it to the checkpoint — the cell
+    read "the model does not load", and `if not ok: return` ended the probe three
+    checks in, so the nine checks that have nothing to do with the axis were lost
+    from a support matrix whose job is to decide which cells get measured.
+
+    The refusal must still be visible; it is just not the load's fault.
+    """
+    report = _native_report(config_mapping, monkeypatch, **{"peft.mode": "qlora", "peft.r": 32})
+    names = [c.name for c in report.checks]
+    check = next(c for c in report.checks if c.name == "axes_load_kwargs")
+
+    assert (check.ok, check.error_type) == (False, "UnappliedAxis")
+    assert names.index("axes_load_kwargs") < names.index("model_load")
+    # The load went ahead without the kwargs, so the probe still answers its own
+    # question. Every one of these is a check the misclassification cost.
+    assert {
+        "model_load",
+        "axes_assemble",
+        "axes_verified",
+        "text_tokenize",
+        "infonce_backward",
+        "lora_attach",
+    } <= set(names), names
+    # And nobody can take the bare load for the requested one. `axes_verified`
+    # cannot say so — `assert_matches` returns immediately for `purpose=probe` —
+    # so what carries the refusal is the state it recorded and `all_ok`.
+    assert not report.all_ok
+    peft = next(a for a in report.applied.axes if a.axis == "peft.mode")
+    assert (peft.requested, peft.applied) == ("qlora", "full")
+    assert not report.applied.to_dict()["all_matched"]
+
+
+def test_the_same_refusal_does_not_read_as_a_framework_that_cannot_load(
+    config_mapping, monkeypatch
+):
+    """The sentence_transformers adapter had the load-time axes in the same place,
+    and one more way to trip over them: it is the path that imports
+    `BitsAndBytesConfig`, so an image without bitsandbytes failed the load with an
+    ImportError. Either way the cell read "this framework cannot load this model"
+    and `encode` and `mnrl_backward` were skipped for a reason that was never true.
+
+    The package is absent here, so it is stood in for — what is under test is the
+    adapter's order of operations, which is ours, not ST's behaviour.
+    """
+    module = types.ModuleType("sentence_transformers")
+
+    class _SentenceTransformer(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 2)
+
+        def __iter__(self):
+            return iter([self.linear])
+
+        def get_sentence_embedding_dimension(self):
+            return 2
+
+    module.SentenceTransformer = _SentenceTransformer
+    module.__version__ = "0.0-stub"
+    monkeypatch.setitem(sys.modules, "sentence_transformers", module)
+    mapping = json.loads(json.dumps(config_mapping))
+    mapping["framework"]["name"] = "sentence_transformers"
+    mapping["peft"]["mode"] = "qlora"
+    mapping["peft"]["r"] = 32
+
+    report = run_probe(to_bench_config(mapping), get_device("cpu"))
+    checks = {c.name: c for c in report.checks}
+
+    assert checks["axes_load_kwargs"].error_type == "UnappliedAxis"
+    assert checks["sentence_transformer_load"].ok
+    # Recorded on their own merits rather than written off with the load.
+    for name in ("encode", "mnrl_backward"):
+        assert checks[name].error_type != "Skipped", checks[name].error
+
+
+def test_the_load_axes_reach_from_pretrained_when_they_are_not_refused(config_mapping, monkeypatch):
+    """The break for the test above. Recording the refusal is worth nothing if the
+    kwargs stopped reaching the loader on the way — a `load_kwargs` helper that
+    returned `{}` unconditionally would keep every assertion above green while
+    each run built its model on default attention.
+
+    `attn.name` is the load-time axis that is not refused anywhere, so it is what
+    can be watched arriving.
+    """
+    seen: dict[str, object] = {}
+
+    def _from_pretrained(*args, **kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("no checkpoint here; the kwargs are what was asked")
+
+    from transformers import AutoModel
+
+    _stub_transformers(monkeypatch)
+    monkeypatch.setattr(AutoModel, "from_pretrained", _from_pretrained)
+    mapping = json.loads(json.dumps(config_mapping))
+    # Not the default: a helper that hardcoded sdpa would pass on the default and
+    # build every other run on the wrong kernel.
+    mapping["attn"]["name"] = "flex"
+
+    report = run_probe(to_bench_config(mapping), get_device("cpu"))
+
+    assert seen.get("attn_implementation") == "flex_attention", seen
+    check = next(c for c in report.checks if c.name == "axes_load_kwargs")
+    assert (check.ok, check.detail) == (True, {"requested": ["attn_implementation"]})
+
+
 def test_proportional_quota_preserves_composition_and_total():
     from scripts.prepare_data import proportional_quota
 

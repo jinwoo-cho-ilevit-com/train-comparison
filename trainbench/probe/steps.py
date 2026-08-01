@@ -35,6 +35,39 @@ def patch_axes(config: BenchConfig, report: ProbeReport) -> None:
     report.run("axes_patch", lambda: {"applied": axes.patch(config)})
 
 
+def load_kwargs(config: BenchConfig, report: ProbeReport) -> dict[str, Any]:
+    """`axes.load_kwargs` as a check of its own, so a refused axis is not a bad load.
+
+    The refusal and the load are different answers. `axes.load_kwargs` raises for a
+    value it cannot put into effect — `peft.mode=qlora` off CUDA is the one that
+    does today — and evaluating it inside the `model_load` lambda charged that
+    refusal to the checkpoint: the cell read "the model does not load" and the
+    adapter's `if not ok: return` ended the probe, costing the nine checks that
+    have nothing to do with the axis.
+
+    So it is recorded under its own name and the load goes ahead without the
+    kwargs, which is the shape `verify_axes` already uses for `assemble`: the axes
+    these kwargs would have carried come back undetermined rather than unexamined.
+    `applied.capture` then reads the built model and `axes_verified` refuses the
+    mismatch, so nothing here can pass a bare load off as the requested one — this
+    report has two failed checks about it and `all_ok` is False.
+
+    Only probes do this. `scripts/bench.py` calls `axes.load_kwargs` directly and
+    outside any `try`, because a measured run must die where a probe records.
+    """
+    resolved: dict[str, Any] = {}
+
+    def _resolve() -> dict[str, Any]:
+        resolved.update(axes.load_kwargs(config))
+        # The keys rather than the values: `quantization_config` is a
+        # BitsAndBytesConfig, and what this check answers is which load-time axes
+        # were asked for. What came back is `applied`'s question.
+        return {"requested": sorted(resolved)}
+
+    report.run("axes_load_kwargs", _resolve)
+    return resolved
+
+
 def verify_axes(
     model: Any,
     config: BenchConfig,

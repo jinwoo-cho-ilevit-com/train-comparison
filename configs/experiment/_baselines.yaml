@@ -22,7 +22,16 @@ canonical:
     - framework=native
     - data=speed
     - attn=sdpa
-    - kernel=none
+    # Not `none`, and the difference is not cosmetic. transformers binds fla while
+    # it imports the Qwen3.5 modelling module whenever the package, the version
+    # floor and CUDA are all present (`axes._fla_binding`, mirroring
+    # `is_flash_linear_attention_available()`), and every image in `envs/` ships it.
+    # So on this architecture there is no such thing as a run without fla, and
+    # `kernel=none` would be a label for a model built out of fla's classes.
+    # The baseline is a fixed reference workload for comparing hosts, not a point
+    # on the kernel axis, so what matters is that every pod runs the same thing —
+    # and this is what a Qwen3.5 run on these images actually is (2026-08-02).
+    - kernel=fla
     - precision=bf16
     - compile=none
     - optim=adamw_fused

@@ -456,6 +456,7 @@ train-comparison/
 │   ├── test_metrics.py
 │   ├── test_pods.py
 │   ├── test_probe.py
+│   ├── test_report.py
 │   └── test_smoke_cpu.py
 ├── docker/                    # Dockerfile.base + Dockerfile.framework + entrypoint
 ├── envs/                      # 프레임워크별 독립 프로젝트 + 독립 lock
@@ -525,11 +526,78 @@ Wave 2~3에서 이 목록에 있던 `tests/test_axes.py`, `configs/experiment/`,
 - [ ] **데이터로딩 병목 선판정** — 병목이면 DALI/사전 디코딩으로 해소 후 진행
 - [ ] 리뷰 게이트: 하네스 코드를 작성자와 분리된 레인에서 리뷰
 
+### Task 3.5 — 축 구현 (Phase 2의 선행 조건, 대부분 GPU 불필요)
+
+Task 4는 축을 **조합해서 실행**하는 것만 적고 있었고, 그 축들을 **구현하는** 작업은
+어느 Task에도 없었다. 원인은 위 "설계 결정"의 첫 줄이다 — "축을 추가할 때 코드를
+고치면 컨벤션 위반"은 축을 *변화시키는 방법*으로는 맞지만, 조용히 *축이 이미
+존재한다*는 전제를 깔았다. ms-swift나 axolotl을 쓴다면 맞는 전제다. 우리는 `native`
+하네스를 자체로 만들고 있고 거기서는 축 하나가 config 한 줄이 아니라 구현 하나다.
+**측정 인프라를 짓는 일과 측정 대상 기법을 구현하는 일은 다른 작업이다.**
+
+미구현 축은 config가 값을 제공하므로 스윕이 돌아가고, `axes.py`가 그 값을 거부하므로
+런은 기본값과 동일해진다. 그 상태로 ablation을 돌리면 라벨만 다른 동일 결과가 나오고
+**"이 기법들은 효과 없음"으로 읽힌다.**
+
+거부는 전부 `trainbench/axes.py`의 **무조건적** `UnappliedAxis`이지 import 실패가
+아니다. 따라서 **이미지를 빌드해도 이 목록은 줄지 않는다** — 패키지 설치(`axis-packages`)는
+선행 조건이지 이 작업이 아니다.
+
+**`axis-values`를 완료 근거로 쓰지 않는다.** 앞서 이 자리에 "현재 상태의 유일한
+기준은 `axis-values`"라고 적었는데 **그 문장이 틀렸다.** 이 체크가 재는 것은 축 값
+하나를 4개 호출 지점에 통과시켰을 때 `UnappliedAxis`가 나지 않는다는 것뿐이다 —
+**적용됐다가 아니라 거부되지 않았다**이다. 적대 검증에서 `dataloader` 축을 완전히
+무력화해도 이 숫자가 글자 단위로 같다는 것이 확인됐다. 그리고 이 체크는 `_Tiny`
+모듈(`torch.nn.Linear` 하나)로 돌므로 실제 모델에서만 드러나는 것은 원리적으로 볼 수
+없다.
+
+축이 실제로 무언가를 바꿨다는 근거는 **`applied.py`의 capture가 요청과 다른 값을
+읽어낼 수 있는가**와 **`tests/test_axes.py`가 그 차이를 고정하는가** 두 가지다.
+`axis-values`는 그 앞단의 하한선이고, 오르면 진전이지만 올랐다고 축이 도는 것은
+아니다. 아래 목록은 2026-08-02 01:37 스냅샷이며 축 레인이 동시에 랜딩 중이다.
+
+CPU에서 구현·검증이 끝나는 것과 GPU가 있어야 판정되는 것을 나눈다. 앞의 것을 GPU
+파드에서 디버깅하면 시간당 요금을 내며 `NotImplementedError`를 읽게 된다.
+
+| 축 값 | CPU/GPU | 비고 |
+|---|---|---|
+| `kernel=liger` / `fla` / `kernels_hub` | GPU 판정 | 패칭 자체는 CPU에서 확인 가능하나 커널 경로는 CUDA 전용 |
+| `precision=mxfp8` / `nvfp4` | **GPU** | Transformer Engine recipe + `step_context`. Blackwell 전용 |
+| `parallel=ddp` / `fsdp2` | GPU | 프로세스 그룹 필요 |
+| `parallel=zero2` / `zero3` + `train.offload` | **GPU** | `deepspeed.initialize`가 모델·옵티마이저·로더를 한 번에 만든다(`docs/CONTRACTS.md` §2) |
+| `dataloader=dali` / `dali_packed` | **GPU** | 하드웨어 JPEG 디코드가 이 축의 측정 대상 |
+| `optim=adamw_8bit` | **GPU** | bitsandbytes |
+| `peft=qlora` | **GPU** | 4-bit 양자화가 CUDA 전용 |
+| `compile=regional` | CPU | |
+
+- [ ] 위 표의 미구현 값에 `axes.py` 적용 지점 추가
+- [ ] **capture probe를 같은 커밋에서 확장** — 아래 3건은 구현만으로 측정이 열리지 않는다
+- [ ] `axis-values`가 그룹당 2개 이상을 보고하는지 확인 후 Task 4 착수
+
+**capture probe 확장이 구현과 한 세트인 3건.** `applied=None`(미확인)은 불일치와
+동일하게 timing 런을 차단하므로(`docs/CONTRACTS.md` §2 불변식), 구현만 하고 probe를
+두면 그 축은 **영구히 측정 불가**다.
+
+| 축 | 지금 상태 | 구현과 함께 해야 하는 것 |
+|---|---|---|
+| `optim=adamw_8bit` | `_capture_optim`이 클래스명을 `kind.lower()`로 돌려준다 → `AdamW8bit` → `"adamw8bit"` | config 값 `adamw_8bit`와 철자가 다르다. `_REQUESTED_OVERRIDES`나 capture 쪽에서 맞춰야 영구 불일치가 안 된다 |
+| `train.offload` | deepspeed 아래에서는 **의도적으로** undetermined (`_capture_offload` docstring) | deepspeed config를 읽어내는 경로가 없으면 offload는 켜자마자 차단된다 |
+| `precision=mxfp8` / `nvfp4` | fp8 recipe는 weight가 아니라 step 안에서 캐스팅하므로 파라미터로 읽을 수 없다 → undetermined | recipe 객체에서 읽어내는 probe가 필요하다 |
+
+`train.gradient_checkpointing=selective`도 같은 형태였으나 **양쪽 다 랜딩됐다**
+(`axes.py`의 `create_selective_checkpoint_contexts` + `_capture_gradient_checkpointing`이
+`context_fn`으로 `full`과 구분). 남은 것은 위 3건이다.
+
 ### Task 4 — Phase 2 ablation (B200, 12~18 pod 병렬)
 
 - [ ] B200 스모크 테스트 1회 (A100에서 돌던 것이 Blackwell 빌드에서 도는지)
 - [ ] gemma-4-E2B full FT 적재 확인
 - [ ] `configs/experiment/`에 축 그룹별 조합 정의 후 실행
+- [ ] **`attn` 축 매니페스트.** 지금 21개 매니페스트 중 `attn`을 스윕하는 것이 0개이고
+      전부 `configs/config.yaml`의 기본값 `sdpa`로 돈다. 5개 값이 전부 적용 가능한
+      유일한 축인데(2026-08-02 `axis-values` 5/5) 한 번도 비교된 적이 없다.
+      Qwen3-VL의 병목 가설이 attention이므로 이 축이 빠지면 핵심 가설 하나가 미검증으로
+      남는다. FA3는 Hopper·FA4는 Blackwell 전용이므로 GPU 선택과 함께 정한다
 - [ ] baseline 편차 게이트 통과 여부 확인, 실패 pod 재실행
 
 ### Task 5 — Phase 3 프레임워크 (B200, 18 pod 병렬)

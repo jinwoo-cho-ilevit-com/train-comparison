@@ -1,170 +1,207 @@
-# Wave 2.5 (LoRA) + Wave 3 (측정 하네스)
+# 축 구현 + 측정 개시 (A~D + Phase 0/3)
 
 ## Context
 
-Wave 2가 닫혔다. 축 15개에 적용 지점과 capture probe가 붙었고, 축별 패키지가 env에
-들어갔고, 감사 계층이 실패 중인 체크 안의 변화를 보게 됐다(게이트 8/12, pytest 337).
+Wave 3 게이트가 닫혔다. 하네스는 정직해졌다 — 타이밍 창이 데이터 파이프라인을 담고,
+capture probe가 17축을 검증하고, sweep이 잰 것을 올린다. 게이트는 403 passed / 감사 10/12.
 
-**그런데 이 저장소는 아직 학습을 돌릴 수 없다.** `scripts/bench.py`도
-`trainbench/metrics/`도 없다. 결과적으로:
+**그런데 이 저장소는 아직 측정을 시작할 수 없다.** 탐색으로 확인한 사실:
 
-- 축이 학습 스텝에서 켜진 적이 **0회**다. D가 검증한 것은 전부 가짜 객체 상대다.
-- throughput·step time·peak VRAM을 계산하는 코드가 저장소 어디에도 없다
-  (`max_memory_allocated`/`torch.cuda.Event`/`synchronize`/`torch.profiler` 호출 0건).
-- `docs/methodology.md`가 두 개의 측정 부채를 "bench.py가 생기면 실행한다"로 미뤄뒀다
-  — 프로파일러 오버헤드, deterministic on/off 비용. 둘 다 보고 숫자 바로 밑에 깔린다.
-- `axis-values`가 12개 ablation 그룹 중 7개는 아직 비활성값 하나만 받는다고 보고한다.
+- **축 12개 중 6개가 비활성값 하나만 받는다.** kernel·precision·optim·dataloader·loss·parallel.
+  전부 `axes.py`의 무조건적 `not implemented`이고 import 실패가 아니라, 이미지를 빌드해도
+  움직이지 않는다. 저장소의 유일한 timing 매니페스트 3개가 하필 `loss` 축인데
+  `cached_mnrl`이 즉사한다.
+- **`PLAN.md`가 이 구현들을 일정에 넣은 적이 없다.** Task 4는 "축 그룹별 조합 정의 후 실행"뿐이다.
+  "새 변형은 config 조합에서 나온다"는 규칙이 조용히 "축이 이미 존재한다"를 전제했다.
+- **`scripts/report.py`가 timing 결과를 읽지 못한다.** `payload["probe"]["checks"]`만 보는데
+  `bench.py` 레코드에는 `probe` 키가 없다(`record.py:156`). 측정에 성공한 런이
+  `결과 없음(기동됨)`으로 렌더된다(`report.py:194`). 그리고 **3% 편차를 계산하는 코드가
+  저장소 전체에 0줄이다** — `_baselines.yaml`의 canonical은 계획·구성·전송·실행되지만
+  아무도 그 결과를 되읽지 않는다.
+- **Phase 0가 한 번도 실행된 적이 없다.** probe 매니페스트 18개(프레임워크 6 x 모델 3)는
+  오늘 그대로 돌고 `report.py`가 정확히 렌더하는데, 파드가 뜬 적이 없어 결과가 0건이다.
+- **파드 기동이 `assert_pod_scope_is_safe`(`orchestrate.py:462`)에 막혀 있다.** 파드 토큰이
+  `RUNPOD_API_KEY` 등 4개를 읽을 수 있어서 거부된다. 가드는 옳고, 사용자가 Infisical
+  스코프를 고치기로 했다(2026-08-02).
 
-그리고 `peft=lora`가 `UnappliedAxis`로 죽는다. 거부는 옳지만 `PLAN.md`의 표제 산출물
-절반("full FT vs LoRA 손익분기점")이 막혀 있다.
+**결정 (2026-08-02)**: 파드를 지금 띄워 GPU 트랙과 CPU 트랙을 병행한다. 구현은 workflow
+팬아웃 + 적대 검증으로 진행한다. Phase 3도 함께 진행한다.
 
-**사용자 결정 2건 (2026-08-01)**
-
-1. **LoRA는 Wave 3 착수 전 필수로 구현한다.**
-2. **sweep은 설정마다 프로세스를 재기동한다.** 재사용된 프로세스는 autotune 캐시,
-   컴파일된 그래프, 얼로케이터 단편화를 다음 설정으로 넘긴다. `kernel`·`attn` 축은
-   애초에 모델 재생성이 필수라 재사용이 불가능하다.
-3. **측정 단위는 `train.steps`를 유지하고 실제 소비 토큰을 측정해 기록**한다.
-   `PLAN.md`가 "고정 토큰 예산 기준(고정 step 아님)"이라고 적고 있으므로 **그 서술을
-   고쳐야 한다**(레인 E). 코드와 문서가 어긋난 채로 두지 않는다.
-
----
-
-## Wave 2.5 — LoRA
-
-순서가 있다. 뒤집으면 검증 없이 정의를 박게 된다.
-
-1. **F 영역**: `peft`를 `envs/native`에 넣고 재-lock. 축 패키지들과 같은 방식.
-2. **의미론 결정 — 실제 peft 모델로 확인한 뒤.** peft는 base 파라미터를 전부 얼린다.
-   `freeze.ple=false` 요청이 "얼지 않음"인지 "peft가 얼린 것에 더해 얼지 않음"인지
-   정해야 한다. `docs/CONTRACTS.md` §2가 이 충돌을 예고해뒀고, D는 검증할 수 없어
-   거부를 택했다. 이번엔 패키지가 있으니 실물로 확인하고 정한다. 결정 자체가 리포트의
-   한정 조건이 되므로 `docs/model-spec.md`나 `methodology.md`에 근거와 함께 남긴다.
-3. **D 영역**: `axes._peft` 적용 + capture 확장. capture는 `peft_config`/래퍼 클래스/
-   4bit 여부를 읽는 구현이 이미 있다. `configs/peft/{lora,qlora}.yaml`도 이미 있다.
-4. **`axis-values`가 움직이는지 확인** — peft 1/3 → 3/3이 되어야 한다. 안 움직이면
-   구현이 값을 받지 못한 것이다.
+**이 계획이 끝나면 "측정을 시작할 수 있는 상태"가 된다.** 캠페인 실행과 `docs/report.md`는
+그 다음이다.
 
 ---
 
-## Wave 3 — 측정 하네스 (순차, 병렬 금지)
+## P0 — 파드 가드 해제 (선행, 일부는 사용자 작업)
 
-### 3-0. 소유권 이관을 먼저 한다
+1. **사용자**: Infisical 머신 아이덴티티를 `HF_TOKEN`만 읽도록 스코프한다(별도 환경 또는
+   경로 스코프 중 편한 쪽). `pod_reachable_secret_names`(`orchestrate.py:423`)가 읽는 것은
+   토큰의 가시 범위이므로 둘 다 통한다.
+2. `orchestrate`가 그 환경을 쓰도록 `--infisical-env` 기본값/문서를 맞춘다.
+3. **`assert_pod_scope_is_safe`에 테스트가 없다.** 금지 시크릿이 보이는 토큰으로 기동이
+   거부되는지, 스코프된 토큰으로 통과하는지 둘 다 건다. 이 가드는 사용자 제약을 강제하는
+   유일한 코드인데 지금 아무도 지키지 않는다.
 
-`docs/CONTRACTS.md:42-47`이 명시한다: **Wave 3 착수 시점에 `docker/entrypoint.sh`와
-`scripts/orchestrate.py`의 `RUNNABLE_PURPOSES`가 레인 C에서 G로 이관된다.** 이관을
-기록하지 않고 손대면 병합된 레인의 파일을 되돌리는 일이 된다. `CONTRACTS.md` §1 표와
-계약 변경 이력을 함께 갱신한다.
-
-### 3-1. `scripts/bench.py`
-
-`assert-called`가 요구하는 것은 AST에서 보이는 **실제 호출** 5개다
-(`scripts/audit_plan.py:382`, `ENTRY_POINT_CALLS`): `patch`, `load_kwargs`, `assemble`,
-`step_context`, `assert_matches`. 문자열·docstring은 만족시키지 못한다.
-
-**함정 하나**: `trainbench/probe/steps.py:38` `verify_axes`가 `assemble`/`capture`/
-`assert_matches`를 이미 호출하지만 `report.run(...)`으로 감싸서 **예외를 삼킨다.**
-그대로 재사용하면 `assert-called`는 초록인데 불일치가 런을 못 멈춘다 — `CONTRACTS.md`
-§2가 경고한 바로 그 실패다. bench.py는 `assert_matches`를 **직접** 호출한다.
-
-**재사용할 것** (전부 존재, 재작성 금지):
-
-| 이미 있는 것 | 위치 |
-|---|---|
-| forward + InfoNCE + backward | `trainbench/probe/steps.py:279` `infonce_backward` |
-| pooling / 패딩 방향 강제 | `trainbench/embedding.py:22`, `steps.py:80` |
-| 배치 구성(텍스트·이미지) | `steps.py:115`, `:140` |
-| visual token 계수 — tokens/s의 분모 | `steps.py:202` `visual_token_count` |
-| 레코드 골격 + 호스트 스펙 | `trainbench/record.py:156` `build_record`, `:132` `host_spec` |
-| device/seed | `trainbench/device.py`, `trainbench/seed.py` |
-
-**새로 만들 것**: 옵티마이저 스텝(`Built.optimizer`가 지금 쓰이지 않는다),
-`step_context()` 래핑, grad-accum 내부 루프, MMEB 서브셋을 읽는 실제 데이터로더,
-warmup 폐기 + CUDA sync를 갖춘 타이밍 루프, 그리고 지표.
-
-`verify_env.py:36`이 `deterministic=True`를 하드코딩한다. 타이밍 런은
-`config.train.deterministic`을 따라야 한다(스키마가 `purpose=timing`에서 False를 강제).
-
-### 3-2. `trainbench/metrics/`
-
-step time p50/p95, samples/s, tokens/s, peak VRAM. MFU는 **tokens/s를 1차 지표로 두고
-격하**한다 — GDN linear attention·PLE lookup·sliding window에서 표준 FLOP 공식이 세
-모델 모두 깨지므로, 모델별 공식을 유닛 테스트로 검증한 뒤에만 제시한다.
-
-peak VRAM은 `torch.cuda.max_memory_allocated` + `reset_peak_memory_stats`로 잰다.
-`prepare_data.py:792` `_peak_rss_bytes()`가 호스트 RSS에 대해 같은 일을 하고, 그
-테스트 docstring이 왜 샘플링이 아니라 high-water mark여야 하는지를 이미 적어뒀다.
-
-레코드에는 `build_record(..., metrics=...)`로 싣는다. `**extra`가 확장 지점이고
-`tests/test_pods.py:669`가 `metrics` 키를 이미 전제한다.
-
-### 3-3. entrypoint의 sweep 루프
-
-`docker/entrypoint.sh:33-35`가 `resolved_plan.json`을 쓰지만 **아무도 읽지 않는다.**
-결정대로 entrypoint가 그 목록을 읽어 **설정마다 bench.py를 새로 실행**한다.
-`:107-120`의 purpose 분기에 `timing|profile|quality` 팔을 추가한다. 그 뒤
-`RUNNABLE_PURPOSES`를 넓힌다 — 순서가 반대면 실행 불가능한 pod을 띄우게 된다.
-
-### 3-4. 측정 전에 실측으로 정해야 하는 것들
-
-이것들이 없으면 나오는 숫자를 해석할 수 없다.
-
-- **데이터로딩 병목 선판정.** 이게 병목이면 Phase 2 전체가 무의미하다.
-- **모델별 visual token 분포 실측.** 196:196:280 보정은 448 정사각 1장 가정이다.
-  Qwen은 픽셀 비례, gemma-4는 280 고정이라 모델 간 토큰 예산 고정이 원리적으로
-  불가능할 수 있고, 그러면 리포트 범위를 "모델 내 축 효과"로 좁혀야 한다.
-- **baseline 3% 임계값 교정.** 동일 pod 동일 설정 5회 반복 편차를 먼저 재고 그 2~3배로
-  잡는다. 지금 값은 근거 없이 적힌 숫자다.
-- **profiler 오버헤드 / deterministic on-off 비용.** `docs/methodology.md:57-62`가
-  절차까지 적어뒀다. 재기 전까지 어떤 퍼센트도 인용하지 않는다.
-- **GradCache 수치 등가성** — 검증 없이 재면 GradCache 버그가 GradCache 속도 향상으로
-  보고된다.
-
-### 3-5. 남은 knob 소비
-
-`config-consumed` 13개 중 하네스 몫: `train.steps`, `train.grad_accum`,
-`train.warmup_discard_steps`, `run.profiler`, `run.trackio_*`, `model.pooling`,
-`model.add_generation_prompt`, `model.instruction_prompt`.
-
-`data.*` 4개는 **오탐이다** — `prepare_data.py:1020`의 `data = config.data` 별칭 때문에
-`_reads_dotted`가 못 본다. 게이트 리뷰의 판정은 체커가 아니라 **호출부를 고치는 것**
-이었다(별칭 추적은 `data`라는 이름의 함수 파라미터를 통한 읽기를 못 잡거나, 잡으려면
-이미 제거된 오탐 계열을 되살린다). knob당 최소 1회를 `config.data.X`로 읽게 한다 —
-레인 A, 약 4줄.
+부수 확인: dirty tree(`:552`)와 미해결 이미지 digest(`:636`)도 기동을 막는다. 둘 다 우회
+플래그가 있으므로 차단은 아니지만 첫 기동 전에 상태를 확인한다.
 
 ---
 
-## 레인 E 인계 (문서, 이번에 직접 고치지 않음)
+## 트랙 1 — `report.py` (모든 측정 해석의 선행 조건)
 
-`docs/review-findings.md`의 인계 절에 추가한다. 앞의 3건은 이미 적혀 있다.
+`scripts/report.py`, `docs/support-matrix.md` 생성 블록.
 
-- **`PLAN.md`의 "고정 토큰 예산 기준 비교(고정 step 아님)"** — 결정과 어긋난다.
-  step 기준 + 토큰 실측 기록으로 고친다.
-- **`trainbench/metrics/`가 `PLAN.md` 저장소 구조 블록에 없다.** `plan-files` 체크가 그
-  블록을 트리로 파싱하므로 디렉터리를 만들면 문서도 함께 고쳐야 한다.
-- **LoRA 관련 서술**은 Wave 2.5가 구현하면 유지된다. 구현이 미뤄지면 그때 철회한다.
-- `docs/support-matrix.md`의 "이미지 7개 중 6/7 성공" 표가 **존재하지 않는 Dockerfile**을
-  서술한다(F가 base·framework를 바꾸고 native를 약 30 → 142 패키지로 키웠다).
-- gemma-4의 `audio_tower` 751 텐서(2011의 37%)를 어떤 freeze 축도 건드리지 않는다.
-  이미지만 쓰는 벤치마크에서 학습되지도 얼려지지도 않은 채 옵티마이저 상태를 차지하므로
-  `docs/methodology.md`에 기록이 필요하다.
+1. **timing 레코드를 렌더한다.** `cell()`이 `probe` 키 부재를 "결과 없음"으로 읽지 않게 하고,
+   `metrics` 키를 가진 레코드를 별도 표로 낸다: step p50/p95, samples/s, tokens/s,
+   peak memory, `steps_discarded`, `profiled`, 그리고 `METRIC_DEFINITIONS`.
+2. **baseline 편차를 계산한다.** 각 파드의 `baseline:canonical` 결과를 모아 기준선과 비교하고
+   3% 게이트를 적용한다. 임계값은 상수 하나로 두고 **교정 전까지 "미교정"으로 표시**한다
+   (`methodology.md:127` — 3%는 근거 없는 값이다).
+3. **baseline 결과 충돌을 푼다.** 지금은 모든 파드의 canonical이 `(native, qwen3_5_0_8b)`
+   셀로 들어가 phase0 probe와 겹치고 중복으로 버려진다(`newest_per_combination:136`).
+   baseline은 지원 매트릭스 셀이 아니라 파드 귀속으로 파일링되어야 한다.
+
+**부술 것**: 편차 초과 파드를 만들어 게이트가 실제로 그 파드를 무효로 표시하는지.
+timing 레코드에서 `metrics`를 빼고 렌더가 그걸 조용히 통과시키지 않는지.
 
 ---
 
-## 이번 범위에서 제외
+## 트랙 2 — CPU에서 구현·검증 가능한 축 (workflow 팬아웃)
 
-- **B200 pod 기동.** Wave 3 완료 + audit 전항목 통과 전까지 금지다. 그 시점에 Infisical
-  권한 결정이 필요하다 — pod이 필요한 시크릿은 `HF_TOKEN` 1개인데 28개에 도달하며
-  코드 가드가 기동을 막고 있다.
-- **프레임워크 probe 4종 API 수정**(tevatron forward 시그니처, axolotl `normalize_config`,
-  unsloth `for_training`) — 이미지가 빌드돼야 검증 가능하다.
-- **`tests/test_smoke_cpu.py`로 timing 경로를 검사하는 것.** CPU에서는 `adamw_fused`가
-  `adamw_unfused`로 해석돼 영구 mismatch다(`CONTRACTS.md` §6). CPU 스모크는
-  `purpose=probe`만 가능하다.
+각 축이 `axes.py`의 **다른 함수**를 건드리므로 병렬 레인이 성립한다. workflow는
+`pipeline(축, 구현, 적대검증)` 형태 — 축마다 구현→검증이 다른 축을 기다리지 않는다.
+
+| 축 | 손대는 곳 | 핵심 |
+|---|---|---|
+| `loss=cached_mnrl` | `axes._loss` | **최우선** — 유일한 timing 매니페스트 3개를 살린다 |
+| `optim=muon` | `axes._optimizer` | Muon 가설을 연다 |
+| `dataloader.pretokenize` | `axes._dataloader` | 새 config 변형 파일 필요 |
+| `dataloader.packing` | `axes._dataloader` + collate | `last_token_pool`이 packed 배치를 거부한다 |
+| `gradient_checkpointing=selective` | `axes._apply_to_model` | **capture 확장 필수** |
+| `cross_device_negatives` | `axes._loss` | gloo 2프로세스로 검증 |
+| `kernel` dispatch | `axes.patch` | 실제 패치는 GPU, 분기는 스텁 검증 |
+| `peft=qlora`의 `load_kwargs` 절반 | `axes.load_kwargs` | 4bit 적재는 GPU |
+
+**축별로 놓치면 안 되는 것 (탐색에서 확인됨):**
+
+- **GradCache**: `gradcache` 0.1.0은 의존성 없는 순수 파이썬이다. `steps.encode` + `info_nce`를
+  그대로 재사용한다. `config.loss.mini_batch`는 이미 존재하고 검증된다(`config_schema.py:304`).
+  capture는 손댈 게 없다 — 클로저에 `axis_value`/`axis_cross_device_negatives`만 달면 된다.
+  **구조적 간극**: `Built.loss_fn`은 `(queries, documents) -> tensor`인데 GradCache는 모델과
+  원본 입력이 필요하고, 측정 루프는 `built.loss_fn`을 **한 번도 부르지 않는다**
+  (`bench.py:373`이 `info_nce`를 직접 호출). 이 계약을 먼저 정해야 한다.
+  **수치 등가성 테스트가 별도로 요구된다**(`review-findings.md:155`) — 없이 재면 GradCache
+  버그가 GradCache 속도 향상으로 보고된다.
+- **Muon**: `pytorch-optimizer` 3.10.1이 이미 `envs/native`에 잠겨 있고 `py3-none-any`,
+  의존성은 numpy+torch뿐이다. 로컬 dev 환경에 추가만 하면 CPU에서 실제 스텝이 돈다.
+  capture도 손댈 게 없다(`type(opt).__name__.lower()` -> `"muon"`).
+  **설계 결정 하나**: Muon은 통상 embedding을 제외하고 AdamW에 넘긴다. gemma-4는 PLE가
+  파라미터의 46% 이상이라 param-group 분할 방식이 `_capture_optim`의 group 수 및
+  `freeze.ple`과 상호작용한다. 이건 리포트의 한정 조건이 되므로 근거와 함께 문서에 남긴다.
+- **packing**: `last_token_pool`(`embedding.py:22`)이 행당 시퀀스 1개 + 연속 패딩을 단언하고
+  **아니면 raise한다.** packed 배치는 이 계약을 정면으로 위반하므로 packed 풀링 경로가
+  같이 필요하다. `MicroBatch`의 토큰 회계도 함께 바뀐다.
+- **selective checkpointing**: `create_selective_checkpoint_contexts`는 로컬 torch 2.13.0에
+  이미 있다. 그런데 `_capture_gradient_checkpointing`(`applied.py:392`)은 `none`/`full`/`partial`
+  밖에 반환할 수 없어서, **동작해도 영구 불일치가 된다.** probe 확장이 구현과 한 세트다.
+- **config 파일이 없는 값 3개**: `gradient_checkpointing=selective`, `dataloader.pretokenize=true`,
+  `cross_device_negatives=true`. 변형 파일을 만들면 `AXIS_PACKAGES` 또는 `AXIS_NEEDS_NOTHING`
+  (`audit_plan.py:703`, `:737`)에 등록해야 `axis-packages`가 통과한다.
+
+---
+
+## 트랙 3 — GPU가 있어야 검증되는 축 (첫 파드 이후)
+
+`precision=mxfp8/nvfp4`, `optim=adamw_8bit`, `parallel=ddp/fsdp2/zero2/zero3` + `train.offload`,
+`dataloader.backend=dali`.
+
+**capture 쪽 작업이 apply 쪽만큼 중요하다** — 아래 넷은 구현해도 probe가 못 읽으면
+런이 보고 불가다:
+
+- `train.offload`: `_capture_offload`(`applied.py:576`)가 deepspeed 아래에서 **의도적으로**
+  undetermined를 반환한다. undetermined는 불일치와 똑같이 timing 런을 막는다(`applied.py:803`).
+  즉 오늘은 deepspeed가 완벽히 동작해도 결과를 낼 수 없다.
+- `precision=mxfp8/nvfp4`: `_capture_precision`이 transformer_engine/torchao 모듈이 보이면
+  undetermined를 반환한다(설계상 옳다 — 가중치의 bf16을 읽어 fp8 런을 인증하면 안 된다).
+  recipe가 실제로 걸렸는지 읽는 경로가 따로 필요하다.
+- `optim=adamw_8bit`: `_capture_optim`이 `AdamW8bit` -> `"adamw8bit"`을 반환하는데 config 값은
+  `adamw_8bit`이다. **영구 불일치**.
+- `parallel=ddp/fsdp2`: capture는 이미 완성돼 있다(`PARALLEL_WRAPPERS`, `applied.py:453`).
+  gloo로 CPU 2프로세스 검증이 가능하므로 트랙 2에서 배선까지 끝내고 측정만 GPU로 넘긴다.
+
+---
+
+## 트랙 4 — 첫 파드 (A100): Phase 0 -> 측정 부채
+
+**첫 작업은 Phase 0다.** 매니페스트 18개가 오늘 그대로 돌고, `report.py`가 이미 정확히
+렌더한다. 코드 수정 없이 산출물이 나온다 — 어느 프레임워크가 어느 모델을 적재하는지,
+axolotl 이미지가 실제로 빌드되는지(`9188fd8`이 빌드 실패를 기록해뒀다), tevatron·unsloth의
+API 문제가 무엇인지. **그게 Phase 3의 선행 조건 전부다.**
+
+그 다음, 같은 파드에서 `methodology.md`가 절차까지 적어둔 측정 부채를 닫는다:
+
+1. **3% 임계값 교정** — 동일 파드에서 canonical baseline 5회 반복, 편차 실측(§4).
+   트랙 1이 먼저 있어야 잴 수 있다. 실측이 3%를 넘으면 임계값이 아니라 측정 절차를 고친다.
+2. **프로파일러 오버헤드**(§1) — 동일 config로 `run=timing` vs `run=profile`, 동일 step/seed/
+   데이터 순서, p50/p95 배수 기록. 모델 3종.
+   부수: 출처 없는 "20~44%"가 아직 `config_schema.py:237` docstring에 남아 있다. 공유 파일이라
+   계약 변경으로 올린다.
+3. **deterministic on/off 비용**(§2) — `purpose=probe`로 GPU에서, `compile=none`/`default` 교차.
+4. **데이터로딩 병목 판정** — 이게 병목이면 Phase 2 전체가 무의미하다(`PLAN.md:258`).
+5. **모델별 visual token 분포** — 196:196:280 보정은 448 정사각 1장 가정이다.
+6. **GradCache 수치 등가성 GPU 확인** + Qwen 픽셀 비례 이미지가 `max_seq_len: 2048`을 넘는지.
+   넘으면 `Collate`가 멈춘다 — 설계된 정지이고, 픽셀 예산 knob이 필요하다는 신호다.
+7. `.item()` 동기화 크기, fork/CUDA 재초기화 경로, `StepTimer` sync 순서 — Wave 3에서
+   "측정 안 함"으로 남긴 것들.
+
+---
+
+## 트랙 5 — Phase 3 (프레임워크)
+
+1. **`bench.py:213`이 `framework="native"`를 리터럴로 넘긴다.** `framework=unsloth` 런은
+   `assert_matches`에 막힌다. 어댑터가 자기 이름을 넘기는 경로가 필요하다.
+2. **프레임워크별 실제 학습 경로 어댑터.** 지금 있는 건 적재+1스텝 probe뿐이다.
+3. probe API 수정 4종(tevatron forward 시그니처, axolotl `normalize_config`,
+   unsloth `for_training`) — Phase 0 결과가 나와야 무엇을 고칠지 정해진다.
+
+---
+
+## 트랙 6 — 남은 항목
+
+- **`attn` 축을 아무 매니페스트도 쓰지 않는다.** 21개 전부 `sdpa`다. 유일하게 5/5 적용
+  가능한 축인데 한 번도 스윕되지 않는다. Phase 2 매니페스트를 만들 때 첫 후보다.
+- `config-consumed` 4: `data.push_subset`/`data.subset_rows`는 오탐(레인 A, 호출부 4줄).
+  `run.trackio_*`는 진짜 미소비 — **스윕 도중 죽은 파드가 흔적을 안 남긴다**.
+- `axes._dataloader`의 `drop_last` 미설정 — `data.limit` 오버라이드 시 p50/p95 잡음.
+- `axes.assemble`에 collate를 넘길 경로가 없어 사후 대입이 유일하다(CONTRACTS §2 계약 변경).
+- **GPU 타입 혼용 금지에 코드가 0줄이다.** 이미 매니페스트가 섞여 있다(18 A100 / 3 B200).
+- **축 분할 금지 가드에 구멍**: `settings` 없이 `overrides`에 값을 직접 넣고 `axis`를 선언하지
+  않으면 `check_axis_not_split`(`orchestrate.py:224`)이 보지 못한다.
+- 문서: `methodology.md`와 `AGENTS.md:33`이 "`bench.py`가 아직 없다"고 적고 있다(낡음).
+  `support-matrix.md`의 "6/7 성공" 표가 존재하지 않는 Dockerfile을 서술한다.
+  gemma-4 `audio_tower` 751텐서(37%)가 어떤 freeze 축에도 안 걸린다.
+- **`PLAN.md`에 축 구현 작업을 추가한다** — 사용자가 처음 요청한 항목이다. Task 4가
+  "조합 정의 후 실행"만 담고 있어서 이 계획서의 트랙 2·3이 통째로 누락돼 있었다.
+
+---
+
+## 순서
+
+```
+P0 (Infisical) ─┬─> 트랙 4 첫 파드: Phase 0 ──> 측정 부채 ──> 트랙 3 GPU 축
+                │                          └──> 트랙 5 Phase 3
+트랙 1 (report.py) ──────────────────────────┘  (3% 교정의 선행)
+트랙 2 (CPU 축, workflow 팬아웃) ── 병렬, P0와 무관
+트랙 6 ── 아무 때나
+```
+
+트랙 2는 P0를 기다리지 않는다. 트랙 1은 측정 부채 1번의 선행이다.
 
 ---
 
 ## 검증
+
+기존 게이트를 매 단계 유지한다.
 
 ```
 uv run ruff check && uv run ruff format --check
@@ -176,22 +213,24 @@ infisical run --env=dev -- uv run python scripts/env_report.py \
 
 게이트가 움직여야 하는 방향:
 
-| 체크 | 지금 | Wave 3 후 |
-|---|---|---|
-| `assert-called` | 실패(파일 없음) | PASS |
-| `axis-values` | 25/43, 7개 그룹 | peft 3/3으로 최소 1그룹 해소 |
-| `config-consumed` | 13개 | 하네스 몫 소비 후 감소 |
+| 체크 | 지금 | 트랙 2 후 | 트랙 3 후 |
+|---|---|---|---|
+| `axis-values` | 26/43, 6그룹 | loss 2/2, optim 2/3, dataloader 3/4 | 43/43 목표 |
+| `config-consumed` | 4 | 2 (trackio는 로거를 붙일 때) | |
 
-**부숴서 확인하지 않은 검사는 증거가 아니다.** 각각에 대해:
+**부숴서 확인하지 않은 검사는 증거가 아니다.** 이 저장소는 검사가 자기 부재를 통과로
+보고한 사례를 여덟 번 냈고, 여덟 번째는 그 패턴을 잡으려고 만든 변이 하네스 안에서 나왔다.
+각 축 구현마다:
 
-- `bench.py`: 5개 호출 중 하나를 지우면 `assert-called`가 실패하는가
-- `assert_matches`: 축 하나를 불일치시키면 `purpose=timing` 런이 **숫자를 내기 전에**
-  죽는가. 이 프로젝트에서 가장 중요한 단일 안전장치이고, 지금까지 실제 런에서 한 번도
-  발동한 적이 없다
-- 지표: 알려진 입력(고정 step, 고정 배치)에서 손계산과 일치하는가
-- peak VRAM: 의도적으로 큰 배치가 값을 올리는가
+- 구현을 되돌리면 새 테스트가 실패하는가 (실패 출력을 기록한다)
+- capture probe를 불일치시키면 `purpose=timing` 런이 **숫자를 내기 전에** 죽는가
+- `axis-values`가 실제로 움직이는가 — 안 움직이면 구현이 값을 받지 못한 것이다
+- GPU 없이 검증 불가능한 부분은 **"측정 안 함"으로 명시한다.** CPU에서 통과하는 vacuous
+  테스트를 쓰지 않는다
 
-이 저장소는 검사가 자기 부재를 통과로 보고한 사례를 하루에 다섯 번 냈다(D1 행 수 게이트,
-D6 소표본 스모크, D7 형식만 보는 `data-pinned`, capture 커버리지 구멍, 멤버십만 보는
-baseline). Wave 3은 **처음으로 실제 숫자를 만드는 wave**이므로 같은 형태의 실패가
-여기서 나오면 그 숫자가 리포트에 실린다.
+## 이 범위에서 제외
+
+- **캠페인 실행 자체** (Phase 2 12~18파드, Phase 3 18파드, 품질 런). 이 계획은 그걸 시작할
+  수 있는 상태를 만드는 것까지다.
+- **`docs/report.md`** — 이 프로젝트의 산출물이고, 숫자가 나와야 쓸 수 있다.
+- 첫 파드가 낼 새 결함. 지금까지 매 wave가 그랬듯 실물 실행은 결함을 드러낸다.
