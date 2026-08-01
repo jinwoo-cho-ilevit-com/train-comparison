@@ -11,6 +11,7 @@ import json
 import shutil
 import subprocess
 import sys
+from collections import namedtuple
 from pathlib import Path
 
 import pytest
@@ -257,16 +258,7 @@ def test_a_probe_manifest_may_not_name_a_canonical_baseline(tmp_path):
 
 def test_the_pod_executes_its_own_run_and_not_the_baseline():
     """`runs[0]` was the baseline, which names its own model and framework."""
-    exp = orchestrate.Experiment(
-        name="phase2-loss-gemma4_e2b",
-        phase="phase2",
-        model="gemma4_e2b",
-        framework="native",
-        purpose="timing",
-        baseline="canonical",
-        axis="loss",
-        settings={"mnrl": ["loss=mnrl"], "cached_mnrl": ["loss=cached_mnrl"]},
-    )
+    exp = loss_sweep_experiment()
     runs = orchestrate.plan_runs(exp, orchestrate.load_baselines(orchestrate.BASELINES_PATH))
     assert runs[0].role == orchestrate.ROLE_BASELINE
     assert runs[0].config["model"]["name"] != exp.model
@@ -285,18 +277,7 @@ def test_the_pod_executes_its_own_run_and_not_the_baseline():
 
 def test_the_plan_carries_a_resolved_config_for_every_setting():
     """No pod image has Hydra, so override strings alone leave a sweep unable to run."""
-    exp = orchestrate.Experiment(
-        name="phase2-loss-gemma4_e2b",
-        phase="phase2",
-        model="gemma4_e2b",
-        framework="native",
-        purpose="timing",
-        baseline="canonical",
-        axis="loss",
-        settings={"mnrl": ["loss=mnrl"], "cached_mnrl": ["loss=cached_mnrl"]},
-    )
-    runs = orchestrate.plan_runs(exp, orchestrate.load_baselines(orchestrate.BASELINES_PATH))
-    plan = [r.summary() for r in runs]
+    plan = sweep_plan()
     assert len(plan) == 3
     assert all(entry["config"]["run"]["purpose"] for entry in plan)
     assert {entry["config"]["loss"]["name"] for entry in plan[1:]} == {"mnrl", "cached_mnrl"}
@@ -737,19 +718,38 @@ def test_a_fallback_record_reads_as_launched_and_silent(tmp_path):
 ENTRYPOINT = REPO / "docker" / "entrypoint.sh"
 
 
-def run_entrypoint(tmp_path, env):
-    """Run the real entrypoint with a stub PATH, so nothing leaves the machine.
+def stub_bin(bin_dir, calls, forward):
+    """The pod's tools, replaced so nothing leaves the machine.
 
-    `uv`, `infisical` and `python3` are replaced by a script that logs its argv and
-    succeeds; the assertions are about control flow, which is where the defect was.
+    `forward=False` logs the argv and succeeds, which is all an assertion about
+    control flow needs. `forward=True` also hands the wrapped command to the
+    interpreter running the tests, so the entrypoint's own JSON handling and the
+    real `publish_result.py` actually run — a sweep is not observable otherwise.
+
+    `uv run --frozen python` and `timeout --signal=… --kill-after=… <seconds>`
+    each take three arguments of their own before the command they wrap.
     """
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    calls = tmp_path / "calls.log"
-    for name in ("uv", "infisical", "python3", "timeout"):
+    forwarding = {
+        "uv": f'shift 3\nexec "{sys.executable}" "$@"',
+        "infisical": 'while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done\nshift\nexec "$@"',
+        "timeout": 'shift 3\nexec "$@"',
+        "python3": f'exec "{sys.executable}" "$@"',
+    }
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for name, forwards in forwarding.items():
         stub = bin_dir / name
-        stub.write_text(f'#!/usr/bin/env bash\necho "{name} $*" >> "{calls}"\nexit 0\n')
+        stub.write_text(
+            f'#!/usr/bin/env bash\necho "{name} $*" >> "{calls}"\n'
+            f"{forwards if forward else 'exit 0'}\n"
+        )
         stub.chmod(0o755)
+
+
+def run_entrypoint(tmp_path, env, forward=False):
+    """Run the real entrypoint against `stub_bin`'s PATH."""
+    bin_dir = tmp_path / "bin"
+    calls = tmp_path / "calls.log"
+    stub_bin(bin_dir, calls, forward)
     result_dir = tmp_path / "result"
     proc = subprocess.run(
         ["bash", str(ENTRYPOINT)],
@@ -812,3 +812,313 @@ def test_a_started_file_alone_means_the_pod_ran_and_said_nothing(tmp_path):
     artifacts, _ = report.load_artifacts(path.parents[3])
     chosen, _ = report.newest_per_combination(artifacts)
     assert report.cell(chosen[("native", "gemma4_e2b")], None) == report.NO_RESULT
+
+
+# --- the sweep arm: one pod, every setting of one axis ---------------------------
+#
+# The arm shipped without a test and with two defects that a test would have
+# caught: it handed `bench.py` the plan item instead of the resolved config inside
+# it, and it published `result.json`, a path the sweep never writes.
+
+FAKE_BENCH = '''\
+"""A stand-in for scripts/bench.py, which this repository does not have yet.
+
+Validates what the entrypoint handed it the way the real entry point will —
+through `BenchConfig` — so the test asserts on the shape rather than on a message,
+and writes a result only for a config it accepted.
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "__REPO__")
+
+from trainbench.config_schema import BenchConfig
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", type=Path, required=True)
+parser.add_argument("--out", type=Path, required=True)
+args = parser.parse_args()
+
+payload = json.loads(args.config.read_text())
+entry = {"out": args.out.name, "config": payload, "error": None}
+try:
+    BenchConfig.model_validate(payload)
+except Exception as exc:
+    entry["error"] = type(exc).__name__
+with open(os.environ["FAKE_BENCH_LOG"], "a") as handle:
+    handle.write(json.dumps(entry) + "\\n")
+
+if entry["error"] or args.out.stem in os.environ.get("FAKE_BENCH_FAIL", "").split(","):
+    raise SystemExit(1)
+args.out.write_text(json.dumps({"status": "ok", "config": payload}))
+'''
+
+FAKE_HUB = '''\
+"""A Hub that records where a file was asked to go, and moves nothing."""
+
+import json
+import os
+
+
+class HfApi:
+    def __init__(self, token=None):
+        self.token = token
+
+    def create_repo(self, **kwargs):
+        return None
+
+    def upload_file(self, path_or_fileobj, path_in_repo, repo_id, repo_type):
+        with open(os.environ["FAKE_HUB_LOG"], "a") as handle:
+            body = json.loads(open(path_or_fileobj).read())
+            handle.write(json.dumps({"path": path_in_repo, "body": body}) + "\\n")
+'''
+
+PUBLISH_SHIM = '''\
+"""The real publish_result.py, with a fake `huggingface_hub` ahead of it on the path."""
+
+import runpy
+import sys
+
+sys.path.insert(0, "__HUB__")
+runpy.run_path("__PUBLISH__", run_name="__main__")
+'''
+
+Sweep = namedtuple("Sweep", "proc bench uploads calls")
+
+RESULT_FILE = f"/{publish_result.RESULT_NAME}"
+
+
+def loss_sweep_experiment():
+    """One pod owning one axis: a baseline run plus every value of `loss`."""
+    return orchestrate.Experiment(
+        name="phase2-loss-gemma4_e2b",
+        phase="phase2",
+        model="gemma4_e2b",
+        framework="native",
+        purpose="timing",
+        baseline="canonical",
+        axis="loss",
+        settings={"mnrl": ["loss=mnrl"], "cached_mnrl": ["loss=cached_mnrl"]},
+    )
+
+
+def sweep_plan():
+    runs = orchestrate.plan_runs(
+        loss_sweep_experiment(), orchestrate.load_baselines(orchestrate.BASELINES_PATH)
+    )
+    return [r.summary() for r in runs]
+
+
+def pod_config(plan):
+    """What the orchestrator puts in `TRAINBENCH_CONFIG_JSON`: the pod's own first
+    run, never the baseline, which names a different model and framework."""
+    own = [item for item in plan if item["role"] == orchestrate.ROLE_EXPERIMENT]
+    return own[0]["config"]
+
+
+def read_records(path):
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def deadlines_handed_out(sweep):
+    """The seconds each `timeout` was given, in call order.
+
+    `timeout --signal=TERM --kill-after=<grace> <seconds> <command...>`, logged by
+    the stub as `timeout <argv>`.
+    """
+    return [int(line.split()[3]) for line in sweep.calls if line.startswith("timeout --signal=")]
+
+
+def sweep_pod(tmp_path, plan, purpose="timing", fail="", config=None, budget=None, floor=None):
+    """Run the entrypoint over `plan` with a fake bench.py and a fake Hub.
+
+    The image the pod would run in has neither, so both are supplied through the
+    knobs the orchestrator already uses: `TRAINBENCH_REPO_DIR` points at a scripts
+    directory holding the stand-in, and `publish_result.py` there is the real one
+    with an inert Hub in front of it — so what a test reads is the destination the
+    shipped code computed, not one the test made up.
+    """
+    scripts = tmp_path / "image-repo" / "scripts"
+    scripts.mkdir(parents=True)
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    (hub / "huggingface_hub.py").write_text(FAKE_HUB)
+    (scripts / "bench.py").write_text(FAKE_BENCH.replace("__REPO__", str(REPO)))
+    (scripts / "publish_result.py").write_text(
+        PUBLISH_SHIM.replace("__HUB__", str(hub)).replace(
+            "__PUBLISH__", str(REPO / "scripts" / "publish_result.py")
+        )
+    )
+    env_dir = tmp_path / "envs" / "native"
+    env_dir.mkdir(parents=True)
+    bench_log = tmp_path / "bench.jsonl"
+    hub_log = tmp_path / "hub.jsonl"
+    env = {
+        "TRAINBENCH_CONFIG_JSON": json.dumps(config if config is not None else pod_config(plan)),
+        "TRAINBENCH_PLAN_JSON": json.dumps(plan),
+        "TRAINBENCH_PURPOSE": purpose,
+        "TRAINBENCH_ENV_DIR": str(env_dir),
+        "TRAINBENCH_REPO_DIR": str(scripts.parent),
+        "FAKE_BENCH_LOG": str(bench_log),
+        "FAKE_HUB_LOG": str(hub_log),
+        "FAKE_BENCH_FAIL": fail,
+    }
+    if budget is not None:
+        env["TRAINBENCH_TIMEOUT_SECONDS"] = str(budget)
+    if floor is not None:
+        env["TRAINBENCH_MIN_SETTING_SECONDS"] = str(floor)
+    proc, calls = run_entrypoint(tmp_path, env, forward=True)
+    return Sweep(proc, read_records(bench_log), read_records(hub_log), calls)
+
+
+def published_results(sweep):
+    """Every upload that is a result, keyed by the path it landed on."""
+    return {u["path"]: u["body"] for u in sweep.uploads if u["path"].endswith(RESULT_FILE)}
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_sweep_hands_bench_the_resolved_config_and_not_the_plan_item(tmp_path):
+    """A plan item is `Run.summary()` — {name, role, overrides, config} — while
+    `bench.py` validates a `BenchConfig`. Dumped whole, every setting of every
+    sweep is rejected before it starts."""
+    plan = sweep_plan()
+    sweep = sweep_pod(tmp_path, plan)
+    assert [entry["error"] for entry in sweep.bench] == [None] * len(plan), sweep.proc.stderr
+    assert [entry["config"] for entry in sweep.bench] == [item["config"] for item in plan]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_every_setting_of_a_sweep_reaches_the_results_repo(tmp_path):
+    """The loop writes `result-<i>.json`; the publish block read `result.json`, so
+    the sweep always took the fallback branch and uploaded "no result file"."""
+    plan = sweep_plan()
+    sweep = sweep_pod(tmp_path, plan)
+    results = published_results(sweep)
+    assert len(results) == len(plan), sweep.uploads
+    assert all(body["status"] == "ok" for body in results.values())
+    for item in plan:
+        slug = publish_result.setting_dir(item["name"])
+        assert any(path.endswith(f"/{slug}{RESULT_FILE}") for path in results)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_one_setting_failing_does_not_take_the_rest_of_the_axis_with_it(tmp_path):
+    plan = sweep_plan()
+    sweep = sweep_pod(tmp_path, plan, fail="result-1")
+    assert len(sweep.bench) == len(plan)
+    results = published_results(sweep)
+    assert len(results) == len(plan)
+    failed = publish_result.setting_dir(plan[1]["name"])
+    by_setting = {path.split("/")[-2]: body for path, body in results.items()}
+    assert by_setting[failed]["status"] == "no_result"
+    assert plan[1]["name"] in by_setting[failed]["probe"]["checks"][0]["error"]
+    assert sorted(b["status"] for s, b in by_setting.items() if s != failed) == ["ok", "ok"]
+    assert "run exited 1" in sweep.proc.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_plan_item_without_a_resolved_config_stops_only_that_setting(tmp_path):
+    """Writing `null` instead would hand bench.py an empty config, which reads as a
+    setting that was configured rather than one that never started."""
+    plan = sweep_plan()
+    # Read before the damage: the orchestrator resolves the pod's own config
+    # separately, so a broken plan item does not leave the pod unnameable.
+    config = pod_config(plan)
+    del plan[1]["config"]
+    sweep = sweep_pod(tmp_path, plan, config=config)
+    assert "carries no resolved config" in sweep.proc.stderr
+    assert len(sweep.bench) == len(plan) - 1
+    results = published_results(sweep)
+    assert len(results) == len(plan)
+    skipped = publish_result.setting_dir(plan[1]["name"])
+    by_setting = {path.split("/")[-2]: body for path, body in results.items()}
+    assert by_setting[skipped]["status"] == "no_result"
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_the_pod_budget_is_shared_between_the_settings_not_handed_to_each(tmp_path):
+    """`DEADLINE_SECONDS` is the whole pod's budget — the orchestrator sets it just
+    under its own deadline. Given to `timeout` once per setting, an N-setting sweep
+    can bill N times it, and the guard that exists to bound the bill stops
+    bounding it."""
+    plan = sweep_plan()
+    budget = 600
+    sweep = sweep_pod(tmp_path, plan, budget=budget, floor=1)
+    slices = deadlines_handed_out(sweep)
+    assert len(slices) == len(plan)
+    assert all(0 < s <= budget for s in slices), slices
+    # The first setting gets what is left divided by the settings still to run, a
+    # second or two of startup already spent.
+    fair_share = budget // len(plan)
+    assert fair_share - 5 <= slices[0] <= fair_share, slices
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_setting_the_budget_cannot_fit_is_not_started_and_says_so(tmp_path):
+    """Skipping silently would file the setting as absent, which reads exactly like
+    a setting nobody ran — the ambiguity every record in this file exists to
+    remove."""
+    plan = sweep_plan()
+    sweep = sweep_pod(tmp_path, plan, budget=0, floor=1)
+    assert deadlines_handed_out(sweep) == []
+    assert sweep.bench == []
+    results = published_results(sweep)
+    assert len(results) == len(plan)
+    for body in results.values():
+        assert body["status"] == "no_result"
+        assert "budget" in body["probe"]["checks"][0]["error"]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_an_empty_plan_still_records_that_the_pod_produced_nothing(tmp_path):
+    sweep = sweep_pod(tmp_path, [], config=resolved_config())
+    assert sweep.proc.returncode == 0, sweep.proc.stderr
+    assert "nothing to measure" in sweep.proc.stderr
+    results = published_results(sweep)
+    assert list(results) == [f"results/native/gemma4_e2b/local{RESULT_FILE}"]
+    assert next(iter(results.values()))["status"] == "no_result"
+
+
+def test_two_settings_of_one_pod_do_not_publish_to_the_same_path():
+    directory = publish_result.result_dir_in_repo(resolved_config())
+    baseline = publish_result.result_path_in_repo(directory, "baseline:canonical")
+    setting = publish_result.result_path_in_repo(directory, "mnrl")
+    assert baseline != setting
+    # `:` never reaches a path segment; an unlabelled pod keeps the old destination.
+    assert ":" not in baseline
+    assert publish_result.result_path_in_repo(directory, None) == f"{directory}{RESULT_FILE}"
+
+
+def test_a_label_with_nothing_usable_in_it_is_refused_rather_than_shared(tmp_path):
+    with pytest.raises(ValueError):
+        publish_result.setting_dir("//")
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(resolved_config()))
+    result = tmp_path / "result.json"
+    result.write_text("{}")
+    code = publish_result.main(
+        ["--repo", "acct/r", "--config", str(config), "--result", str(result), "--label", "//"]
+    )
+    assert code == 2
+
+
+def test_a_sweeps_per_setting_results_stay_readable_by_the_report(tmp_path):
+    """Why a directory per setting and not a `result-<setting>.json`:
+    `report.load_artifacts` reads `result.json` and skips every other name, so a
+    renamed file would upload cleanly and never reach the matrix."""
+    for setting in ("mnrl", "cached_mnrl"):
+        write_artifact(
+            tmp_path,
+            "native",
+            "gemma4_e2b",
+            f"pod/{setting}",
+            publish_result.RESULT_NAME,
+            probe_payload("native", "gemma4_e2b", [{"name": "c", "ok": True}]),
+        )
+    artifacts, skipped = report.load_artifacts(tmp_path / "results")
+    assert len(artifacts) == 2
+    assert skipped == []

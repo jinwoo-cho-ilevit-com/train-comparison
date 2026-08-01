@@ -1,8 +1,9 @@
 """Upload one pod's artifacts to the shared results repo.
 
-Each pod writes to its own directory. Concurrent writes to the same file corrupt
-data, and eighteen pods finish at unpredictable times, so there is no shared file
-to write.
+Each pod writes to its own directory, and a sweep pod to one subdirectory per
+setting. Concurrent writes to the same file corrupt data, and eighteen pods finish
+at unpredictable times, so there is no shared file to write; within one pod, the
+settings of an axis would overwrite each other just as surely.
 
 Three things get published, and the difference between them is the point:
 
@@ -23,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -34,6 +36,35 @@ RETRY_DELAYS = (2, 8, 30)
 
 STARTED_NAME = "started.json"
 RESULT_NAME = "result.json"
+
+# Anything else becomes a separator. Run names carry `:` (`baseline:canonical`),
+# and a path segment is not the place to find out how a Hub repo handles it.
+UNSAFE_IN_PATH = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def setting_dir(label: str) -> str:
+    """The directory one setting of a sweep publishes into.
+
+    A sweep pod runs every value of one axis, so it produces one result per
+    setting and needs a destination derivable from the setting. The plan item's
+    `name` is that key; its index is not, because index 0 of one manifest and
+    index 0 of another are different settings that would land on the same path.
+
+    A directory rather than a `result-<setting>.json` filename because
+    `report.load_artifacts` reads files named `result.json` and skips everything
+    else — a renamed file would upload cleanly and never reach the matrix.
+    """
+    segment = UNSAFE_IN_PATH.sub("-", label).strip("-.")
+    if not segment:
+        raise ValueError(f"setting label {label!r} leaves nothing usable as a path segment")
+    return segment
+
+
+def result_path_in_repo(directory: str, label: str | None) -> str:
+    """Where one result lands. Unlabelled — a single-run pod — keeps its old path."""
+    if label is None:
+        return f"{directory}/{RESULT_NAME}"
+    return f"{directory}/{setting_dir(label)}/{RESULT_NAME}"
 
 
 def result_dir_in_repo(config: dict[str, Any]) -> str:
@@ -156,10 +187,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--result", type=Path, help="result JSON; required for result/fallback")
     parser.add_argument("--reason", default="", help="why there is no result (fallback mode)")
     parser.add_argument("--out-dir", type=Path, help="where to write a generated record")
+    parser.add_argument(
+        "--label",
+        help="name of the setting this result belongs to; a sweep pod publishes one per setting",
+    )
     args = parser.parse_args(argv)
 
     config = json.loads(args.config.read_text())
     directory = result_dir_in_repo(config)
+    try:
+        destination = result_path_in_repo(directory, args.label)
+    except ValueError as exc:
+        # Falling back to the shared name would let two settings overwrite each
+        # other, which is the failure this destination exists to prevent.
+        print(exc, file=sys.stderr)
+        return 2
 
     if args.mode == "start":
         out_dir = args.out_dir or args.config.parent
@@ -183,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no result at {args.result}", file=sys.stderr)
         return 1
 
-    publish(args.result, args.repo, f"{directory}/{RESULT_NAME}")
+    publish(args.result, args.repo, destination)
     return 0
 
 
