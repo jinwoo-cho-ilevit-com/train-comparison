@@ -215,3 +215,43 @@ pod 실행으로 판정한다.
 
 revision을 `configs/data/speed.yaml`에 고정했다. 이 값이 모든 run의 데이터 버전으로
 기록된다. `data/quality.yaml`은 행 수가 달라 별도 서브셋이 필요하므로 아직 미고정이다.
+
+## 이미지 빌드 결과 (2026-08-01, GitHub Actions / linux-amd64)
+
+베이스 1개 + 프레임워크 6개. **5/6 성공.**
+
+| 이미지 | 결과 |
+|---|---|
+| base | success |
+| native | success |
+| unsloth | success |
+| ms-swift | success |
+| sentence-transformers | success |
+| tevatron | success |
+| **axolotl** | **failure** |
+
+`uv sync --frozen`이 실제 linux/CUDA 환경에서 설치까지 도달한다는 첫 증거다. 지금까지는
+해석(`uv lock`)만 확인했었다.
+
+### axolotl 실패 원인 — 베이스 이미지의 시스템 의존성 누락
+
+```
+× Failed to download and build `zstandard==0.22.0`
+├─▶ Failed to install requirements from `build-system.requires`
+├─▶ Failed to build `cffi==1.16.0`
+    src/c/_cffi_backend.c:15:10: fatal error: ffi.h: No such file or directory
+    error: command '/usr/bin/cc' failed with exit code 1
+```
+
+`libffi-dev`가 `docker/Dockerfile.base`의 apt 목록에 없다. axolotl의 의존성 트리만
+`zstandard==0.22.0`을 끌어오고, 해당 버전에 cp313 휠이 없어 `cffi`를 소스 빌드하려다
+헤더를 못 찾았다.
+
+**이것은 Phase 0 결과가 아니다.** axolotl이 대상 모델을 지원하지 않는다는 증거가
+아니라 우리 베이스 이미지의 결함이며, `libffi-dev` 추가로 해소된다. 계획의
+"빌드되지 않는 이미지는 Phase 0 결과" 규칙을 적용할 대상이 아니므로 매트릭스의
+axolotl 행을 "미지원"으로 채우면 안 된다.
+
+**조치**: Wave 2 F 레인(이미지)에서 `libffi-dev`를 베이스에 추가하고 재빌드한다.
+지금 단독 재빌드하지 않는 이유는 F 레인이 어차피 `COPY trainbench` 순서 변경과
+digest 태깅으로 베이스/프레임워크 이미지를 함께 손볼 예정이기 때문이다.
