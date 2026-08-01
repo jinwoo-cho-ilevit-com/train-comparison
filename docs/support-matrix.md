@@ -686,23 +686,33 @@ editable로 참조하는 최소 프로젝트를 만들고 그 소스 디렉터�
 기준선이 659가 아니라 669인 것은 다른 레인이 테스트를 추가했기 때문이며, 변경 전에
 먼저 재서 확인했다.
 
-### 이 레인 것이 아닌 변화 — env lock 6종이 이미 낡아 있다
+### env lock 6종의 stale과 `--frozen`이 하지 않던 검사 (2026-08-02 해소)
 
-`envs/axolotl`에서 `uv lock`을 돌리자 `cffi` 외에 `pytorch-optimizer`가 path 의존성
-메타데이터에 함께 들어왔다. 루트 `pyproject.toml`의 `native` extra가 바뀐 뒤 env lock이
-재생성되지 않은 것이고, **내 변경이 만든 것이 아니다.**
+발견 당시 `uv lock --check`는 **axolotl을 제외한 5종을 stale**로 답했다. 원인은 루트
+`pyproject.toml`의 `native` extra에 `pytorch-optimizer`가 들어간 뒤 env lock이
+재생성되지 않은 것이다. 빌드가 깨지지 않은 이유는 Dockerfile이 `--frozen`을 썼기
+때문인데, 이 플래그는 lock 신선도를 **검사하지 않는다**(검사하는 것은 `--locked`다).
+주석은 그 검사를 한다고 적혀 있었다.
 
-`uv lock --check`로 6종을 전부 재보면 **axolotl을 제외한 5종이 stale**이다. 지금
-빌드가 깨지지 않는 이유는 Dockerfile이 `--frozen`을 쓰기 때문인데, 이 플래그는
-lock 신선도를 **검사하지 않는다**(검사하는 것은 `--locked`다). 즉
-`docker/Dockerfile.framework`의 주석 "A stale lock fails the build instead"는
-사실이 아니다.
+지금 상태:
 
-`envs/native/uv.lock`에는 `pytorch-optimizer`가 들어 있으므로(그 env의 직접 의존성)
-`optim/muon` 축은 영향받지 않는다. 나머지 5종의 stale은 이번 빌드의 성패와 무관하므로
-**이번 패스에서 재생성하지 않았다** — 비싼 첫 성공을 노리는 시점에 5개 lock을 함께
-움직이는 것이 이득보다 위험이 크다. `--frozen`을 `--locked`로 바꾸는 것과 함께 별도
-작업으로 남긴다.
+- 5종을 `uv lock`으로 재생성했다. **핀은 하나도 움직이지 않았다** — 전체 diff가
+  6줄 추가·0줄 삭제이고, 추가된 줄은 전부 lock이 기록하는 trainbench의 `requires-dist`
+  선언(`pytorch-optimizer>=3.10`)이다. `envs/native`만 한 줄이 더 붙는데, 그 env의
+  직접 의존성이라 `pytorch-optimizer 3.10.1`은 이미 lock에 있었다. 즉 이미지가 담는
+  패키지 집합은 6종 전부 그대로다.
+- Dockerfile의 세 sync 패스가 `--locked`가 됐다. 첫 패스가 싼 패스이므로 stale은
+  CUDA 컴파일 전에 멈춘다.
+- `scripts/audit_plan.py`의 `env-locks`가 매 게이트에서 두 가지를 함께 묻는다.
+
+`--locked`가 이미지 안에서 실제로 어떻게 동작하는지는 **측정 안 함**. 호스트에서
+확인한 것은 Dockerfile의 1·2 패스가 보는 것과 같은 트리(루트 `pyproject.toml` +
+`uv.lock` + `README.md` + `envs/<framework>`, `trainbench/` 소스 없음)에서 6종 전부
+`uv lock --check`가 통과한다는 것까지다 — 소스가 없어서 헛되이 실패하지는 않는다는
+증거다. 남은 것은 이미지의 uv(base가 `ghcr.io/astral-sh/uv:latest`를 가져오므로
+호스트 것과 다를 수 있다)가 이 lock을 같게 읽는가이고, 그건 빌드 한 번이 답한다:
+`uv sync --locked --only-group build`가 몇 초 안에 통과하면 답이 나온 것이고,
+`The lockfile at uv.lock needs to be updated`로 멈추면 uv 버전 차이다.
 
 ---
 

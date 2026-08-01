@@ -57,19 +57,21 @@ ENV MAX_JOBS=2 \
 # names them in no-build-isolation-package — and that in turn means torch and
 # setuptools must already be installed when they build. Pass one puts them there.
 #
-# --frozen so an image can never silently resolve something other than the lock
-# that was reviewed. A stale lock fails the build instead.
-RUN cd envs/${FRAMEWORK} && uv sync --frozen --only-group build
+# --locked, not --frozen. Both install only what the lock pins, but --frozen also
+# skips the freshness check, so a lock that no longer matches pyproject.toml built
+# an image nobody had reviewed and said nothing. This pass is the cheap one, so a
+# stale lock stops the build before the CUDA compiles rather than after them.
+RUN cd envs/${FRAMEWORK} && uv sync --locked --only-group build
 # Pass two: everything except trainbench, so that the expensive layer is finished
 # before any project source is copied. Copying trainbench first meant a one-line
 # edit re-ran the entire sync, which for axolotl is 240 packages plus CUDA
 # source builds.
-RUN cd envs/${FRAMEWORK} && uv sync --frozen --no-install-package trainbench
+RUN cd envs/${FRAMEWORK} && uv sync --locked --no-install-package trainbench
 
 # Below here layers are invalidated by ordinary edits, so nothing expensive follows.
 COPY trainbench ./trainbench
 # Pass three: trainbench itself, installed editable against the source just copied.
-RUN cd envs/${FRAMEWORK} && uv sync --frozen
+RUN cd envs/${FRAMEWORK} && uv sync --locked
 
 COPY scripts ./scripts
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh

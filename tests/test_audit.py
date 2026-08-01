@@ -599,6 +599,118 @@ def test_distribution_names_are_normalised_before_comparison():
     assert _normalise("hydra.core") == "hydra-core"
 
 
+def _dockerfile(tmp_path, *lines):
+    path = tmp_path / "Dockerfile.framework"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_uv_failing_for_another_reason_is_not_read_as_staleness(monkeypatch):
+    """Two different problems, and the report has to say which. Reading every
+    non-zero exit as staleness sends the next lane to `uv lock` for a uv that is
+    not on the PATH, and the lock it did not check stays unchecked."""
+
+    class _Run:
+        def __init__(self, returncode, stderr):
+            self.returncode, self.stderr = returncode, stderr
+
+    answers = {}
+    monkeypatch.setattr(audit_plan.subprocess, "run", lambda cmd, **kw: answers[tuple(cmd)])
+
+    command = ("uv", "lock", "--check")
+    answers[command] = _Run(0, "")
+    assert audit_plan._lock_is_current(REPO) is None
+
+    answers[command] = _Run(
+        2, "Resolved 142 packages\nThe lockfile at `uv.lock` needs to be updated"
+    )
+    assert audit_plan._lock_is_current(REPO) == "stale: regenerate with `uv lock`"
+
+    answers[command] = _Run(1, "error: No such file or directory (os error 2)")
+    assert (
+        audit_plan._lock_is_current(REPO)
+        == "unverified: error: No such file or directory (os error 2)"
+    )
+
+
+def test_a_stale_lock_is_named_rather_than_counted_silently(monkeypatch, tmp_path):
+    """The state this check was written for: the lock an image installs from no
+    longer agrees with the `pyproject.toml` it was resolved from, and the build
+    said nothing because `uv sync --frozen` never asks."""
+    monkeypatch.setattr(
+        audit_plan,
+        "_lock_is_current",
+        lambda d: "stale: regenerate with `uv lock`" if d.name == "native" else None,
+    )
+    monkeypatch.setattr(
+        audit_plan,
+        "FRAMEWORK_DOCKERFILE",
+        _dockerfile(tmp_path, "RUN cd envs/x && uv sync --locked"),
+    )
+
+    result = audit_plan.CHECKS["env-locks"]()
+
+    assert not result.ok
+    assert "envs/native/uv.lock is stale" in result.detail
+    assert result.count == 1
+
+
+def test_a_sync_that_does_not_assert_its_lock_is_a_failure(monkeypatch, tmp_path):
+    """`--frozen` installs from the lock without checking it is current. A
+    Dockerfile that only claims the check in a comment is the defect itself."""
+    monkeypatch.setattr(audit_plan, "_lock_is_current", lambda directory: None)
+    monkeypatch.setattr(
+        audit_plan,
+        "FRAMEWORK_DOCKERFILE",
+        _dockerfile(
+            tmp_path,
+            "# --frozen so a stale lock fails the build",
+            "RUN cd envs/x && uv sync --frozen --only-group build",
+            "RUN cd envs/x && uv sync --locked",
+        ),
+    )
+
+    result = audit_plan.CHECKS["env-locks"]()
+
+    assert not result.ok
+    assert "does not pass --locked" in result.detail
+    assert result.count == 1
+
+
+def test_a_dockerfile_that_only_talks_about_syncing_examines_nothing(monkeypatch, tmp_path):
+    """Prose is not an instruction. Counting a comment as an invocation would let
+    a Dockerfile that runs no sync at all satisfy the emptiness guard."""
+    monkeypatch.setattr(audit_plan, "_lock_is_current", lambda directory: None)
+    monkeypatch.setattr(
+        audit_plan,
+        "FRAMEWORK_DOCKERFILE",
+        _dockerfile(tmp_path, "# RUN cd envs/x && uv sync --locked"),
+    )
+
+    result = audit_plan.CHECKS["env-locks"]()
+
+    assert not result.ok
+    assert "found no `uv sync` invocations" in result.detail
+
+
+def test_a_lock_uv_could_not_answer_for_is_not_a_pass(monkeypatch, tmp_path):
+    """An audit that cannot reach the answer has not got the answer — reporting a
+    pass there is how a check goes hollow the first time a tool is unavailable."""
+    monkeypatch.setattr(
+        audit_plan, "_lock_is_current", lambda directory: "unverified: No such file or directory"
+    )
+    monkeypatch.setattr(
+        audit_plan,
+        "FRAMEWORK_DOCKERFILE",
+        _dockerfile(tmp_path, "RUN cd envs/x && uv sync --locked"),
+    )
+
+    result = audit_plan.CHECKS["env-locks"]()
+
+    assert not result.ok
+    assert "unverified" in result.detail
+
+
 def test_model_spec_compares_values_not_words():
     """Checking that the field name appears somewhere passes whether the value is
     true or false — the drift it was written to stop."""

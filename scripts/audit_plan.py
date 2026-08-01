@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import re
 import subprocess
 import sys
@@ -1107,6 +1108,99 @@ def documented_commands_are_runnable() -> Result:
         "doc-commands",
         not problems,
         f"every documented command runs as written and installs what this repo imports ({scope})"
+        if not problems
+        else f"{'; '.join(problems)} ({scope})",
+        count=len(problems),
+    )
+
+
+FRAMEWORK_DOCKERFILE = REPO / "docker" / "Dockerfile.framework"
+# uv reports staleness on stderr; everything else it can fail with is a different
+# problem and is reported as itself.
+LOCK_IS_STALE = "needs to be updated"
+
+
+def _lock_is_current(directory: Path) -> str | None:
+    """None if the `uv.lock` there still agrees with its `pyproject.toml`.
+
+    `uv sync --frozen` does not ask this and neither did anything else, which is
+    how five of six env locks drifted a whole dependency behind the root
+    `pyproject.toml`. `--check` is the flag that asks.
+    """
+    run = subprocess.run(
+        ["uv", "lock", "--check"],
+        cwd=directory,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "NO_COLOR": "1"},
+    )
+    if run.returncode == 0:
+        return None
+    tail = (run.stderr.strip().splitlines() or ["no output"])[-1]
+    return "stale: regenerate with `uv lock`" if LOCK_IS_STALE in tail else f"unverified: {tail}"
+
+
+@check("env-locks")
+def image_locks_agree_with_their_projects() -> Result:
+    """Every lock an image installs from is current, and the build asserts it.
+
+    Both halves are one property. A lock that has drifted from its
+    `pyproject.toml` puts something in the image other than what the study
+    declared, and version is the confound this benchmark must keep visible — so
+    the drift has to be impossible rather than merely unlikely.
+
+    Nothing asked either half for as long as both were wrong. The Dockerfile
+    synced with `--frozen`, which installs from the lock without checking that the
+    lock is current, under a comment claiming a stale lock would fail the build.
+    Five of the six env locks were stale under that comment.
+
+    A failure uv reports for some other reason is `unverified`, not a pass: an
+    audit that cannot reach the answer has not got the answer.
+    """
+    directories = sorted(path.parent for path in (REPO / "envs").glob("*/uv.lock"))
+    if empty := _nothing_to_check(directories, "envs/*/uv.lock files"):
+        return Result("env-locks", False, empty)
+    # The root lock last, because `doc-commands` exports from it and a drifted one
+    # would make that check answer about a resolution no image ever installs.
+    directories.append(REPO)
+    problems = [
+        f"{directory.relative_to(REPO) if directory != REPO else '.'}/uv.lock is {failure}"
+        for directory in directories
+        if (failure := _lock_is_current(directory))
+    ]
+    if not FRAMEWORK_DOCKERFILE.exists():
+        return Result(
+            "env-locks",
+            False,
+            f"{FRAMEWORK_DOCKERFILE.relative_to(REPO)} is absent; nothing then says how the "
+            "images install, and a fresh lock alone does not make a build honour it",
+        )
+    # Instruction lines only. A comment mentioning `uv sync --locked` is prose, and
+    # counting it would let a Dockerfile that runs nothing at all satisfy the
+    # emptiness guard below — the shape `_nothing_to_check` exists for.
+    syncs = [
+        match.group(1)
+        for line in FRAMEWORK_DOCKERFILE.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+        for match in re.finditer(r"uv sync([^\n&|]*)", line)
+    ]
+    if empty := _nothing_to_check(syncs, "`uv sync` invocations in docker/Dockerfile.framework"):
+        return Result("env-locks", False, empty)
+    problems += [
+        f"docker/Dockerfile.framework: `uv sync{flags.rstrip()}` does not pass --locked, so a "
+        "stale lock builds silently"
+        for flags in syncs
+        if "--locked" not in flags.split()
+    ]
+    scope = (
+        f"{len(directories)} lock(s) re-resolved with `uv lock --check`; {len(syncs)} "
+        "`uv sync` invocation(s) in docker/Dockerfile.framework"
+    )
+    return Result(
+        "env-locks",
+        not problems,
+        f"every lock agrees with its pyproject.toml and every image sync asserts it ({scope})"
         if not problems
         else f"{'; '.join(problems)} ({scope})",
         count=len(problems),

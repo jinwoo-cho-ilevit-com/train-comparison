@@ -843,6 +843,25 @@ class ProbeReport:
   - `None`은 그대로 '기록된 count 없음'이라 크기 비교만 꺼진다(옛 문자열 전용 항목).
     `bool`은 `int`의 하위 클래스이고 `True == 1`이라 명시적으로 걸러낸다.
 
+- 2026-08-02 **새 체크 `env-locks` — 이미지가 설치하는 lock이 최신이고, 빌드가 그것을
+  주장한다** (`audit_plan.py`, `tests/test_audit.py`, `docker/Dockerfile.framework`.
+  images 레인, 판정서 `env-locks-are-stale-and-the-dockerfile-claims-a-check-it-does-not-make`).
+  `uv sync --frozen`은 lock으로만 설치할 뿐 **lock이 최신인지 묻지 않는다**(묻는 것은
+  `--locked`다). 그런데 Dockerfile 주석은 "A stale lock fails the build instead"라고
+  적혀 있었고, 그 주석 아래에서 6종 중 5종의 env lock이 stale이었다. 이미지가 담는
+  것과 `pyproject.toml`이 선언한 것이 갈라져도 아무것도 말해주지 않는 상태였고,
+  버전은 이 연구가 보이게 유지해야 하는 교란 변수다.
+  - 체크의 두 반쪽은 한 성질이다: `envs/*/uv.lock`과 루트 lock을 `uv lock --check`로
+    전부 재보고, `docker/Dockerfile.framework`의 `uv sync` 호출이 전부 `--locked`를
+    다는지 본다. lock만 갱신하면 다음 드리프트를 다시 아무도 안 묻고, 플래그만 바꾸면
+    5종 빌드가 즉시 실패한다.
+  - uv가 다른 이유로 실패하면 통과가 아니라 `unverified`다. 답에 닿지 못한 감사는
+    답을 얻은 것이 아니다.
+  - 주석 줄의 `uv sync`는 세지 않는다. 세면 아무 sync도 실행하지 않는 Dockerfile이
+    빈 집합 가드를 만족시킨다.
+  - **다른 레인이 알아야 할 것**: `envs/*/pyproject.toml`이나 루트 `pyproject.toml`의
+    의존성을 건드리면 해당 env에서 `uv lock`을 돌려야 게이트가 녹색이 된다.
+
 **새 레인 의무 — 파일을 추가하면 `PLAN.md` 구조 블록에 한 줄 추가한다.**
 위 반대 방향 때문에 생긴다. 열거되는 디렉터리(저장소 루트, `configs/`,
 `trainbench/`, `scripts/`, `tests/`, `docs/`)에 추적되는 파일이나 디렉터리를 새로
