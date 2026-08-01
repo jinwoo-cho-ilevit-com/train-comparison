@@ -1250,6 +1250,11 @@ class PackedCollate:
     that id; rows that arrive with an `attention_mask` have already recorded where
     their padding is, and that record is read.
 
+    A row that brings neither — no mask, and no `pad_id` to scan it against — is
+    refused rather than packed. `_dataloader` builds this collate with both left
+    out, since `trainbench/axes.py` has no processor to ask for a pad id, so that
+    is the path where "checked" would otherwise mean "nothing to check with".
+
     A checkpoint whose pad id *is* its eos id cannot be checked this way: real
     sequences would end in it and this refuses them. That refusal is the honest
     outcome — pretokenize instead, where each row is tokenised alone and no padding
@@ -1291,6 +1296,7 @@ class PackedCollate:
                     "without a tokenize callable, so there is nothing to pack. Either set "
                     "dataloader.pretokenize=true or hand PackedCollate a tokenizer."
                 )
+            self._refuse_unrecorded_padding(rows)
             self._refuse_masked_padding(rows)
             sequences = [torch.as_tensor(row["input_ids"]) for row in rows]
         flat = []
@@ -1310,6 +1316,32 @@ class PackedCollate:
                 "to pool, and packing it would silently give it the previous sequence's."
             )
         return flat
+
+    def _refuse_unrecorded_padding(self, rows: list[Any]) -> None:
+        """A row with no `attention_mask` and no `pad_id` to scan it against is not
+        checkable, and this collate packs nothing it cannot check.
+
+        This is the path `_dataloader` builds: no tokenizer, so `pad_id` stays None,
+        and the mask is the only record of padding a row can bring. Without one a
+        padded row packs silently — tokens/s counts PAD as work the model did and
+        `packed_last_token_pool` reads a PAD as some sequence's embedding — while
+        the run still certifies `dataloader.packing=True`.
+        """
+        if self.pad_id is not None:
+            return
+        unrecorded = [
+            index
+            for index, row in enumerate(rows)
+            if (row.get("attention_mask") if hasattr(row, "get") else None) is None
+        ]
+        if unrecorded:
+            raise ValueError(
+                f"rows {unrecorded[:8]} carry no 'attention_mask' and this collate has no "
+                "pad_id, so nothing here can tell a padded row from an unpadded one and "
+                "packing it would concatenate PAD as real tokens. Tokenise each row on its "
+                "own and keep the attention_mask the tokenizer returns, or build "
+                "PackedCollate(pad_id=...) with the id it would have padded with."
+            )
 
     @staticmethod
     def _refuse_masked_padding(rows: list[Any]) -> None:

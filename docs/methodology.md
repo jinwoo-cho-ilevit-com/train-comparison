@@ -486,6 +486,80 @@ liger에 대해서는 위 세 거부 중 하나가 풀리는 날 — qwen3_vl �
 fla 없는 Qwen3.5 이미지가 생기거나, #1186이 닫히거나 — 같은 절차를 그 조합에서
 반복한다.
 
+## 10. dataloader 축 — packing과 pretokenize가 바꾸는 것, 그리고 미측정인 것
+
+이 축에 대해 이 문서가 담고 있던 것은 §3의 볼륨 대역폭 한 줄뿐이었다. 아래 다섯은
+전부 **2026-08-02에 이 체크아웃에서 코드를 읽어 확인한 구조적 사실**이고, 시간이나
+처리량 수치는 하나도 없다 — 이 호스트에 GPU가 없다.
+
+### 10.1 varlen 커널이 없다 — pack은 어텐션에게 한 개의 긴 시퀀스다
+
+`axes.PackedCollate.__call__`이 만든 `cu_seqlens`/`seq_lengths`는
+`scripts/bench.py::PackedBatches.__call__`이 `axes.PACKED_BOUNDARY_KEYS`로 배치에서
+빼내고, 그 뒤로는 `embedding.packed_last_token_pool`에만 간다. 모델이 받는 것은
+`input_ids`와 `position_ids` 둘뿐이다. 이 저장소에는 varlen 커널을 호출하는 코드가
+없고, `flash_attn`은 이 체크아웃에 설치돼 있지 않다
+(`importlib.util.find_spec("flash_attn") is None`, macOS, 2026-08-02).
+
+`attn=sdpa`에서 pack은 길이 `total` 한 행이므로 어텐션 비용은 `total²`에 비례한다.
+같은 토큰을 `B`행 x `L`로 패딩한 배치는 `B·L²`이므로, 같은 토큰 수에서 pack 쪽이
+`B`배다. **이것은 배치 모양에서 나오는 계산이지 측정이 아니다.** pack이 스텝 시간을
+실제로 얼마나 바꾸는지는 **측정 안 함**.
+
+`attn=fa2/fa3/fa4`에서 transformers 5.14.1이 `position_ids`로부터 시퀀스 경계를
+유도하는 경로를 타는지는 **확인하지 못했다** — flash-attn이 없어 그 코드가 이
+체크아웃에서 실행되지 않는다. 확인 전까지 packing 수치를 varlen 커널의 수치로 읽지
+않는다.
+
+**닫는 방법**: 첫 GPU 파드에서 (a) 같은 데이터·같은 배치 토큰 수로 packing on/off를
+같은 pod에서 재고, (b) `attn=fa2` 런에서 어텐션이 경계를 보았는지를 10.2의 비교로
+확정한다.
+
+### 10.2 시퀀스 격리는 검증된 적이 없다
+
+packing이 옳으려면 한 pack 안의 시퀀스가 서로의 문맥이 되지 않아야 한다. 이 저장소가
+그 방향으로 하는 일은 `position_ids`를 시퀀스마다 0에서 다시 시작시키는 것 하나뿐이다.
+블록 대각 어텐션 마스크를 만드는 코드가 없고, 격리를 검사하는 테스트도 없다.
+
+따라서 경계 정보가 어텐션에 도달하지 않는 구성(`attn=sdpa`)에서는 causal 모델의 뒤
+시퀀스가 앞 시퀀스를 문맥으로 읽는다. 그 pack의 임베딩은 같은 행들을 패딩해 얻은
+임베딩과 다른 값이며, 그 차이의 크기는 **측정 안 함**.
+
+**닫는 방법**: 실제 체크포인트로 같은 행들을 (a) 패딩 배치와 (b) pack으로 인코딩해
+임베딩을 비교한다. 일치하지 않으면 격리가 없는 것이고, 그때 packing 수치는 다른 계산의
+수치다. 이 비교에 학습은 필요 없다 — forward 한 번이면 되므로 GPU 파드의 첫 probe
+런에서 같이 받을 수 있다.
+
+### 10.3 풀링 테스트가 증명하는 것은 인덱스 산술이다
+
+`tests/test_axes.py::test_pooling_a_packed_batch_matches_pooling_the_same_rows_padded`은
+hidden_states를 `torch.arange`로 만들어 넣는다. 즉 두 풀링 함수가 **같은 위치**를
+고른다는 것을 증명하고, 모델이 그 위치에 무엇을 넣는지는 다루지 않는다. 10.2가 열려
+있는 한 "같은 위치"는 "같은 임베딩"이 아니다.
+
+### 10.4 packing과 pretokenize는 이미지를 버린다 — 경고이지 차단이 아니다
+
+`scripts/bench.py`의 `Encode`(pretokenize)와 `PackedPairs`(packing)는 둘 다
+`Collate.pair_texts(rows, with_images=False)`로 텍스트만 만들고, 두 경로가 내는
+`MicroBatch`는 `images=0`이다. 버려진 장수는 `images_dropped`로 세어 요약에 들어가고
+`scripts/report.py`가 0이 아닌 런에 경고를 붙인다. **런을 멈추는 것은 없다.**
+
+이 연구의 데이터는 MMEB 드로우이고 `configs/data/speed.yaml`은 "0 rows without a
+query image or positive"를 기록한다. 그러므로 `dataloader.packing` 또는
+`dataloader.pretokenize`를 켠 런은 **이미지 코퍼스의 텍스트 전용 뷰**를 잰다. 그
+수치를 이미지가 살아 있는 baseline과 같은 열에 놓으면 dataloader 축의 효과로 읽히는
+것의 일부가 이미지가 빠진 몫이다.
+
+### 10.5 pretokenize의 실이득은 측정 안 함
+
+`dataloader.pretokenize`는 토크나이즈를 타임 윈도우 밖으로 옮긴다. 그것이 스텝 시간을
+얼마나 줄이는지 이 저장소는 잰 적이 없다 — `Collate`(스텝 안에서 토크나이즈)와
+`PretokenizedCollate`(밖에서)를 같은 데이터로 비교한 런이 없다.
+
+**닫는 방법**: 같은 pod에서 `dataloader=torch`와 `dataloader=torch_pretokenized`를
+연속으로 재고, 두 런의 `tokens_per_step`이 같은지부터 확인한다(다르면 비교 대상이
+아니다).
+
 ## 재현 조건 — 게이트 통과와 재현 가능은 다르다
 
 Wave 0 게이트는 `102 passed`로 통과했다. 그 결과는 **`configs/data/`가 로컬에

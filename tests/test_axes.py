@@ -2561,7 +2561,10 @@ def test_a_packed_batch_cannot_be_split_by_rows(composed):
     route.
     """
     packed = axes.PackedCollate()(
-        [{"input_ids": torch.tensor([1, 2, 3])}, {"input_ids": torch.tensor([4, 5])}]
+        [
+            {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1])},
+            {"input_ids": torch.tensor([4, 5]), "attention_mask": torch.tensor([1, 1])},
+        ]
     )
     loss_fn, _ = axes._loss(cached(composed))
 
@@ -3181,8 +3184,16 @@ def test_a_dataset_that_declares_no_columns_is_undetermined(composed):
 
 
 def token_rows(lengths=(3, 5, 2)):
-    """Rows that already carry token ids, as `pretokenize` leaves them."""
-    return [{"input_ids": torch.arange(n) + 1} for n in lengths]
+    """Rows that already carry token ids, as `pretokenize` leaves them.
+
+    With the mask a tokenizer returns beside them: `PackedCollate` refuses a row
+    that records its padding nowhere, and a row tokenised on its own carries an
+    all-ones mask rather than no mask at all.
+    """
+    return [
+        {"input_ids": torch.arange(n) + 1, "attention_mask": torch.ones(n, dtype=torch.long)}
+        for n in lengths
+    ]
 
 
 class RowDataset(torch.utils.data.Dataset):
@@ -3374,7 +3385,12 @@ def test_an_empty_sequence_is_refused_rather_than_packed():
     """The break. A zero-length sequence takes no room in the pack, so its pooled
     embedding would be the previous sequence's last token under its name."""
     with pytest.raises(ValueError, match="empty"):
-        axes.PackedCollate()([{"input_ids": torch.arange(3)}, {"input_ids": torch.zeros(0)}])
+        axes.PackedCollate()(
+            [
+                {"input_ids": torch.arange(3), "attention_mask": torch.ones(3, dtype=torch.long)},
+                {"input_ids": torch.zeros(0), "attention_mask": torch.zeros(0, dtype=torch.long)},
+            ]
+        )
 
 
 # --- dataloader.packing over a tokenize callable -----------------------------
@@ -3402,6 +3418,24 @@ def test_a_padding_tokenizer_is_refused_rather_than_packed():
 
     def tokenize(rows):
         return list(pad_sequence([torch.arange(n) + 1 for n in (3, 1, 2)], batch_first=True))
+
+    with pytest.raises(ValueError, match="contain pad id 0"):
+        axes.PackedCollate(tokenize=tokenize, pad_id=0)([{}, {}, {}])
+
+
+def test_a_left_padded_sequence_is_refused_by_the_packing_collate():
+    """The same failure padded the other way. Every padded fixture beside this one
+    pads right, so a pad scan reduced to "is the last position PAD" reads as correct
+    over the whole suite — and misses gemma-4, whose `model.padding_side` is `left`
+    and whose padding lands in front of the ids rather than behind them.
+
+    Left padding is what `embedding.last_token_pool` exists to distinguish, so a
+    pack built out of these rows pools PAD positions while reporting the axis
+    applied.
+    """
+
+    def tokenize(rows):
+        return [torch.tensor([1, 2, 3]), torch.tensor([0, 0, 4]), torch.tensor([0, 5, 6])]
 
     with pytest.raises(ValueError, match="contain pad id 0"):
         axes.PackedCollate(tokenize=tokenize, pad_id=0)([{}, {}, {}])
@@ -3440,6 +3474,36 @@ def test_the_tokenize_path_packs_the_sequences_the_callable_returned():
     assert batch["input_ids"].tolist() == [[5, 6, 7, 8, 9, 10]]
     assert batch["cu_seqlens"].tolist() == [0, 3, 4, 6]
     assert batch["position_ids"].tolist() == [[0, 1, 2, 0, 0, 1]]
+
+
+def test_the_loader_axis_never_packs_rows_it_cannot_check_for_padding(composed):
+    """`_dataloader` builds `PackedCollate()` — no tokenizer, so no `pad_id`, and
+    `_refuse_pad_id` returns on the first line. A row that also brings no
+    `attention_mask` was packed with nothing at all having looked at it: the ids
+    below are padded and the batch this used to yield was `(1, 12)` of which 6
+    tokens were PAD, counted by tokens/s as work and pooled as two sequences'
+    embeddings, while `capture` still certified `dataloader.packing=True`.
+
+    Drawn through the loader `assemble` built rather than by calling the collate
+    directly, because it is that construction — the one with no processor behind
+    it — that the harness inherits when it does not replace the collate.
+    """
+    padded = axes.PretokenizedDataset(
+        [{"input_ids": torch.tensor([1, 2, 3, 0, 0, 0])} for _ in range(2)]
+    )
+    built, _ = assembled_loader(
+        composed,
+        padded,
+        **{
+            "dataloader.packing": True,
+            "dataloader.pretokenize": True,
+            "train.batch_size": 2,
+            "data.num_workers": 0,
+        },
+    )
+
+    with pytest.raises(ValueError, match="carry no 'attention_mask'"):
+        next(iter(built.dataloader))
 
 
 def test_pretokenised_rows_that_arrived_padded_are_refused_by_their_own_mask():
@@ -3486,7 +3550,13 @@ def test_packing_over_pretokenised_rows_runs_end_to_end(composed):
     """
     tokenised = axes.pretokenize(
         RowDataset([{"qry": "a"}, {"qry": "bb"}, {"qry": "ccc"}]),
-        lambda row: {"input_ids": torch.arange(len(row["qry"]) + 1) + 1},
+        # The mask a tokenizer returns beside the ids travels with the row: it is
+        # the record of padding `PackedCollate` reads, and a row carrying none is
+        # refused rather than packed unchecked.
+        lambda row: {
+            "input_ids": torch.arange(len(row["qry"]) + 1) + 1,
+            "attention_mask": torch.ones(len(row["qry"]) + 1, dtype=torch.long),
+        },
     )
     built, config = assembled_loader(
         composed,

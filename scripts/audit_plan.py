@@ -462,16 +462,80 @@ def axis_group_leaves_are_classified() -> Result:
 # docs/CONTRACTS.md; a hook missing from it is a hook nothing requires.
 ENTRY_POINT_CALLS = ("patch", "load_kwargs", "assemble", "step_context", "assert_matches")
 
+# The name the training loop binds its loss to. Every binding of it has to come
+# from the callable `assemble` built, and that is a question about this file
+# rather than about who calls whom: the hooks above are satisfied by an entry
+# point that calls `assemble`, keeps `built.model` and `built.optimizer`, and then
+# computes the loss some other way.
+LOSS_BINDING = "loss"
+BUILT_LOSS = "loss_fn"
+
+
+def _loss_bindings(path: Path) -> tuple[list[int], bool]:
+    """`(lines binding `loss` from something other than `.loss_fn`, was it used)`.
+
+    Two passes, because the object is consumed under two names. `built.loss_fn(...)`
+    reads directly; the GradCache path binds `getattr(built.loss_fn, ...)` to a name
+    outside the timed window and calls that, so a name whose value was derived from
+    `.loss_fn` counts as the same object. Everything else binding `loss` is a loss
+    the run computed for itself under a label `capture` certified off `built.loss_fn`.
+    """
+    try:
+        tree = ast.parse(path.read_text())
+    except SyntaxError:
+        return [], False
+
+    def reads_built_loss(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Attribute) and child.attr == BUILT_LOSS
+            for child in ast.walk(node)
+        )
+
+    derived = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and node.value is not None and reads_built_loss(node.value)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+
+    def from_built_loss(value: ast.expr) -> bool:
+        return reads_built_loss(value) or any(
+            isinstance(child, ast.Name) and child.id in derived for child in ast.walk(value)
+        )
+
+    stray: list[int] = []
+    used = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign) or node.value is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(isinstance(t, ast.Name) and t.id == LOSS_BINDING for t in targets):
+            continue
+        if from_built_loss(node.value):
+            used = True
+        else:
+            stray.append(node.lineno)
+    return sorted(stray), used
+
 
 @check("assert-called")
 def the_measurement_entry_point_calls_the_axis_machinery() -> Result:
-    """The harness that reports numbers must go through axes.py and applied.py.
+    """The harness that reports numbers must go through axes.py and applied.py,
+    and the loss it reports must be the one `assemble` built.
 
     "Some caller exists somewhere" is not the property that matters. The probe
     calls `assert_matches` too, and `purpose=probe` returns immediately from every
     check — so an entry point written without the call would leave this green
     while measuring unverified settings. The named entry point is what has to call
     it, and the same is true of every hook an axis is applied through.
+
+    Calling the hooks is not enough on its own. A loop that calls `assemble` and
+    then computes `info_nce` inline satisfies every name above while `loss.name`
+    is certified off a `built.loss_fn` nothing consumed — the live shape of that
+    defect, since `axes._loss` builds `cached_mnrl` as a different callable and the
+    result would carry its label over ordinary in-batch negatives. So the loss
+    bindings in the file are read too, not just its call list.
     """
     if not BENCH_ENTRY_POINT.exists():
         return Result(
@@ -482,13 +546,31 @@ def the_measurement_entry_point_calls_the_axis_machinery() -> Result:
         )
     entry = BENCH_ENTRY_POINT.relative_to(REPO).as_posix()
     missing = [name for name in ENTRY_POINT_CALLS if not _calls(BENCH_ENTRY_POINT, name)]
+    stray, used = _loss_bindings(BENCH_ENTRY_POINT)
+    problems = []
+    if missing:
+        problems.append(
+            f"never calls {', '.join(missing)}; those axes would be applied or verified "
+            "nowhere while the run still reports numbers"
+        )
+    if not used:
+        problems.append(
+            f"binds no {LOSS_BINDING} from built.{BUILT_LOSS}; the callable that "
+            "certifies loss.name would be built, read by capture, and never used"
+        )
+    if stray:
+        problems.append(
+            f"computes {LOSS_BINDING} outside built.{BUILT_LOSS} at line(s) "
+            f"{', '.join(str(line) for line in stray)}; the run would report a loss the "
+            "loss axis did not produce"
+        )
     return Result(
         "assert-called",
-        not missing,
-        f"{entry} calls {', '.join(ENTRY_POINT_CALLS)}"
-        if not missing
-        else f"{entry} never calls {', '.join(missing)}; those axes would be applied or "
-        "verified nowhere while the run still reports numbers",
+        not problems,
+        f"{entry} calls {', '.join(ENTRY_POINT_CALLS)} and takes every {LOSS_BINDING} "
+        f"from built.{BUILT_LOSS}"
+        if not problems
+        else f"{entry} " + "; ".join(problems),
     )
 
 
@@ -1147,7 +1229,11 @@ class _AxisValueRows:
 
     @property
     def column_names(self) -> list[str]:
-        return ["input_ids", *(["qry_image"] if self.carries_image else [])]
+        return [
+            "input_ids",
+            "attention_mask",
+            *(["qry_image"] if self.carries_image else []),
+        ]
 
     def __len__(self) -> int:
         return _BATCH_ROWS
@@ -1157,7 +1243,14 @@ class _AxisValueRows:
 
         if index >= _BATCH_ROWS:
             raise IndexError(index)
-        row = {"input_ids": torch.arange(_ROW_TOKENS)}
+        # The mask travels with the ids because that is what a tokenizer hands back
+        # and what `axes.PackedCollate` reads: a row that records its padding
+        # nowhere is refused, and `dataloader/torch_packed*` would then be counted
+        # inapplicable over a fixture no processor would have produced.
+        row = {
+            "input_ids": torch.arange(_ROW_TOKENS),
+            "attention_mask": torch.ones(_ROW_TOKENS, dtype=torch.long),
+        }
         if self.carries_image:
             # A tensor rather than None: `axes.image_columns` reads a `None` here as
             # the column being empty, and torch's default collate cannot stack it,

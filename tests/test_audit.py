@@ -468,6 +468,72 @@ def test_axis_values_draws_a_batch_so_the_collate_actually_runs(monkeypatch):
     assert "packing gutted" in result.detail
 
 
+def _entry_point(directory, source):
+    """`source` written where `assert-called` looks for the entry point."""
+    entry = directory / "scripts" / "bench.py"
+    entry.parent.mkdir(parents=True)
+    entry.write_text(source)
+    return entry
+
+
+def test_a_harness_that_never_calls_the_loss_it_built_is_reported(tmp_path, monkeypatch):
+    """`assert-called` asked only whether the five hooks were called. A loop that
+    calls `assemble` and then computes the loss itself passes every one of them
+    while `applied.capture` certifies `loss.name` off a `built.loss_fn` nothing
+    consumed — so `loss=cached_mnrl` would be reported over ordinary in-batch
+    negatives rather than crashing.
+
+    The real entry point is mutated rather than a sketch of one written, so the
+    check is aimed at the file it names. The pass half comes first: without it the
+    failure below is satisfied by any file at all.
+    """
+    source = audit_plan.BENCH_ENTRY_POINT.read_text()
+    mutated = source.replace("built.loss_fn(", "info_nce(")
+    assert mutated != source, "the entry point does not call built.loss_fn at all any more"
+
+    monkeypatch.setattr(audit_plan, "REPO", tmp_path / "real")
+    monkeypatch.setattr(audit_plan, "BENCH_ENTRY_POINT", _entry_point(tmp_path / "real", source))
+    assert audit_plan.CHECKS["assert-called"]().ok
+
+    monkeypatch.setattr(audit_plan, "REPO", tmp_path / "mutated")
+    monkeypatch.setattr(
+        audit_plan, "BENCH_ENTRY_POINT", _entry_point(tmp_path / "mutated", mutated)
+    )
+    result = audit_plan.CHECKS["assert-called"]()
+
+    assert not result.ok
+    assert "computes loss outside built.loss_fn" in result.detail
+
+
+def test_a_harness_that_binds_no_loss_from_the_built_one_is_reported(tmp_path, monkeypatch):
+    """The other half of the same hole, and the one the hooks hide best: every
+    named call is there, and the loss is another function's from the first line.
+    The mutation above leaves the GradCache branch reading `built.loss_fn`, so this
+    is what exercises the "never consumed at all" branch."""
+    monkeypatch.setattr(audit_plan, "REPO", tmp_path)
+    monkeypatch.setattr(
+        audit_plan,
+        "BENCH_ENTRY_POINT",
+        _entry_point(
+            tmp_path,
+            "def measure(model, config, batch):\n"
+            "    model = patch(model, config)\n"
+            "    kwargs = load_kwargs(config)\n"
+            "    built, applied = assemble(model, config, **kwargs)\n"
+            "    with step_context(config):\n"
+            "        loss = info_nce(batch.queries, batch.documents)\n"
+            "        loss.backward()\n"
+            "    assert_matches(applied, config)\n"
+            "    return loss\n",
+        ),
+    )
+
+    result = audit_plan.CHECKS["assert-called"]()
+
+    assert not result.ok
+    assert "binds no loss from built.loss_fn" in result.detail
+
+
 # `doc-commands` asked whether the `uv sync` line carried `--extra compose`,
 # justified as "but tests import hydra". It reported `5 documented command(s)
 # install what the tests need` while `peft`, `datasets` and `transformers` were

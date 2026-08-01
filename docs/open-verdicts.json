@@ -174,7 +174,11 @@
           "test_a_left_padded_sequence_is_refused_by_the_packing_collate"
         ]
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "D (axes)",
+        "evidence": "고친 것 — `_refuse_pad_id`는 손대지 않았다. 이미 전 위치를 검사하고 있었고, 구멍은 패딩 픽스처가 전부 우측 패딩이라 위치를 좁힌 검사가 정답처럼 읽힌 것이다. `tests/test_axes.py::test_a_left_padded_sequence_is_refused_by_the_packing_collate`가 `PackedCollate(tokenize=..., pad_id=0)`에 판정서가 지정한 앞쪽 패딩 시퀀스 `[[1,2,3],[0,0,4],[0,5,6]]`을 주고 거부를 단언한다 — 세 시퀀스 모두 마지막 위치가 PAD가 아니므로 '마지막 위치만' 검사는 전부 통과시킨다.\n변이 재확인 — 판정서의 명령을 현재 트리에서 그대로 재실행했다: `MUT2=pad-last-only PYTHONPATH=$CLAUDE_JOB_DIR/tmp/dl-mut uv run pytest -q -p mut_rev` -> `715 passed`. 변이는 여전히 살아 있었다(판정서의 `191 passed`는 더 오래된 트리의 수).\n부수기 증거 — 같은 변이 아래 새 테스트만 돌리면:\n    FAILED tests/test_axes.py::test_a_left_padded_sequence_is_refused_by_the_packing_collate\n      E       Failed: DID NOT RAISE ValueError\n    1 failed, 187 deselected\nGPU가 답할 몫 — 없음. 이 판정은 CPU에서 완결된다."
+      }
     },
     {
       "id": "dataloader-assemble-builds-an-unguarded-packing-collate",
@@ -196,7 +200,11 @@
           "test_the_loader_axis_never_packs_rows_it_cannot_check_for_padding"
         ]
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "D (axes)",
+        "evidence": "고친 것 — 판정서의 (a)를 택했다. `PackedCollate._refuse_unrecorded_padding`이 새로 생겨, `attention_mask`도 없고 `pad_id`도 없는 행 — 즉 패딩 여부를 물어볼 대상이 아무것도 없는 행 — 을 거부한다. (b)는 택하지 않았다: pad id는 프로세서의 속성이고 `trainbench/axes.py`에는 프로세서가 없으며, config에 넣으면 축이 아닌 값이 축 그룹에 들어간다. 클래스 도크스트링의 'Both paths are checked'도 이제 코드가 하는 만큼을 적는다.\n무엇이 열려 있었는지 실측 — 가드를 끄고 `_dataloader`가 만드는 collate에 패딩된 행 `[1,2,3,0,0,0]` 두 개를 넣으면 `input_ids` shape `(1, 12)`, 그중 PAD 6개, `cu_seqlens [0, 6, 12]`. 12토큰이 전부 실토큰으로 세어지고 두 시퀀스의 풀링 위치가 PAD다.\n부수기 증거 — 가드를 무력화한 변이 아래 앵커 테스트:\n    MUTDL=unguarded-pack ... pytest -p mut_dl -k never_packs_rows\n    FAILED tests/test_axes.py::test_the_loader_axis_never_packs_rows_it_cannot_check_for_padding\n      E       Failed: DID NOT RAISE ValueError\n픽스처 변경 — `tests/test_axes.py::token_rows`와 `scripts/audit_plan.py::_AxisValueRows`가 이제 ids 옆에 마스크를 함께 든다. 실제 토크나이저가 내주는 형태이며, 이 변경으로 `axis-values`는 `36/53`으로 그대로다(변경 전후 동일, 실행 확인).\n측정 경로에 대한 영향 — 없음. `scripts/bench.py::build_collate`가 packing 런에서 `PackedCollate(tokenize=PackedPairs, pad_id=...)`로 갈아끼우므로 pad_id가 있는 쪽 경로다."
+      }
     },
     {
       "id": "dataloader-methodology-section-has-not-landed",
@@ -216,7 +224,11 @@
         "file": "docs/methodology.md",
         "pattern": "varlen"
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "D (axes)",
+        "evidence": "쓴 것 — `docs/methodology.md` §10 (10.1~10.5). 다섯 항목 전부 이 호스트에서 코드를 읽어 확인한 구조적 사실만 적었고, 시간·처리량 수치는 하나도 없다.\n10.1 varlen — `PackedBatches.__call__`이 `axes.PACKED_BOUNDARY_KEYS`로 경계를 배치에서 빼내므로 모델은 `input_ids`/`position_ids`만 받는다. 이 저장소에 varlen 커널 호출이 없고 `flash_attn`은 미설치(`find_spec` None, 확인함). sdpa에서 `total²` 대 `B·L²`은 배치 모양에서 나오는 계산이라고 명시했고, 실제 스텝 시간 영향은 측정 안 함. transformers 5.14.1이 `position_ids`로 FA 경계를 유도하는지는 '확인하지 못했다'로 적었다 — 판정서에서 베끼지 않고 이 체크아웃에서 확인 불가임을 근거로 삼았다.\n10.2 격리 — 블록 대각 마스크를 만드는 코드도, 격리를 검사하는 테스트도 없음(grep 확인). 차이의 크기는 측정 안 함. 닫는 방법은 forward 한 번이면 되므로 첫 probe 런에 붙는다고 적었다.\n10.3 풀링 — `test_pooling_a_packed_batch_matches_pooling_the_same_rows_padded`가 `torch.arange`로 만든 hidden_states를 쓴다(파일에서 확인). 인덱스 산술만 증명한다.\n10.4 이미지 — `Encode`와 `PackedPairs` 둘 다 `pair_texts(rows, with_images=False)`이고 두 `MicroBatch`가 `images=0`. `images_dropped`는 요약에 실리고 `scripts/report.py`가 경고를 붙일 뿐 런을 세우지 않는다(코드에서 확인).\n10.5 pretokenize 실이득 — 비교 런이 없다. 측정 안 함.\nGPU가 답할 몫 — 10.1의 스텝 시간, 10.2의 임베딩 차이, 10.5의 pretokenize 이득. 각 절에 '닫는 방법'으로 무엇을 재야 하는지 적어 두었다."
+      }
     },
     {
       "id": "dataloader-documented-setup-did-not-install-what-tests-import",
@@ -490,7 +502,11 @@
           "test_a_harness_that_never_calls_the_loss_it_built_is_reported"
         ]
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "감사 레인",
+        "evidence": "고친 것 — `assert-called`가 이제 호출 목록만이 아니라 `scripts/bench.py` 안에서 `loss`가 무엇으로부터 묶이는지를 AST로 읽는다(`_loss_bindings`). `.loss_fn` 속성을 읽는 식, 그리고 그 값을 받은 이름(`gradcache_backward = getattr(built.loss_fn, ...)`)에서 나온 것만 'built.loss_fn에서 온 loss'로 세고, 나머지 `loss = ...`은 줄 번호와 함께 지목한다. 소비가 하나도 없으면 그것도 따로 보고한다.\n부수기 증거 1 (진짜 파일) — `scripts/bench.py`에서 `built.loss_fn(`을 `info_nce(`로 바꿔 복사본을 만들고 `BENCH_ENTRY_POINT`를 그리로 돌리면:\n    ok = False\n    scripts/bench.py computes loss outside built.loss_fn at line(s) 764; the run would report a loss the loss axis did not produce\n부수기 증거 2 (체크 자신) — `_loss_bindings`를 이 레인 이전 동작(`([], True)`)으로 되돌리면 새 테스트 두 개가 죽는다:\n    MUTAUDIT=hooks-only ... pytest -p mut_audit -k harness\n    FAILED tests/test_audit.py::test_a_harness_that_never_calls_the_loss_it_built_is_reported\n    FAILED tests/test_audit.py::test_a_harness_that_binds_no_loss_from_the_built_one_is_reported\n    2 failed\n앵커 테스트는 스케치가 아니라 진짜 엔트리포인트를 변이시킨다. 통과 쪽을 먼저 단언하므로 `built.loss_fn` 호출이 사라지면 변이 이전에 그 단언이 먼저 죽는다.\n판정서 요약의 전제 하나는 이미 해소돼 있었다 — 측정 루프는 `info_nce`가 아니라 `built.loss_fn`을 부른다(bench.py:764, 다른 레인이 착지시킴). 남아 있던 것은 그것을 게이트가 묻지 않는다는 쪽이고, 이 항목이 닫는 것은 그쪽이다.\nGPU가 답할 몫 — 없음."
+      }
     },
     {
       "id": "images-carry-a-code-snapshot-nothing-checks-is-current",
