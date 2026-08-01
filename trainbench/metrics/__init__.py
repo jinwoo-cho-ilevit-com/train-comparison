@@ -18,11 +18,49 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import torch
 
-__all__ = ["percentile", "summarise", "peak_memory_bytes", "reset_peak_memory", "StepTimer"]
+__all__ = [
+    "METRIC_DEFINITIONS",
+    "percentile",
+    "summarise",
+    "peak_memory_bytes",
+    "reset_peak_memory",
+    "StepTimer",
+]
+
+# What each counted name means, carried in every summary. An unstated definition
+# is how a number gets misread later: `rows` and `samples` differ by a factor of
+# two here because a contrastive batch feeds a query and a positive per sample,
+# and the two token counts differ by however much padding the batch carried.
+# These strings are the answer to "counted how?" travelling with the count.
+METRIC_DEFINITIONS: dict[str, str] = {
+    "step": (
+        "fetching the micro-batches, moving them to the device, forward, backward and the "
+        "optimizer step — everything one training step costs, including the data pipeline"
+    ),
+    "samples": (
+        "(query, positive) pairs consumed per step, summed over grad_accum micro-batches. "
+        "This is PLAN.md's samples/s"
+    ),
+    "rows": ("sequences fed to the forward pass per step: queries + positives, so twice `samples`"),
+    "tokens": (
+        "non-padding positions (attention_mask.sum()). Not what the forward computed on — "
+        "padding goes through it too, see `padded_tokens` — and not free of a per-model "
+        "constant: the query side carries config.model.instruction_prompt, which is non-null "
+        "for exactly one model (docs/CONTRACTS.md §5)"
+    ),
+    "padded_tokens": (
+        "every position the forward computed on, padding included (input_ids.numel())"
+    ),
+    "images": "images actually handed to the processor per step",
+    "images_dropped": (
+        "images present in the rows that the processor could not take, per step. Non-zero "
+        "means this model read a text-only view of an image corpus"
+    ),
+}
 
 
 def percentile(values: Sequence[float], q: float) -> float:
@@ -81,6 +119,13 @@ class StepTimer:
     Warmup steps are timed too, and discarded by `summarise` rather than skipped
     here — a discarded sample that was never taken cannot be reported, and the
     number of steps thrown away is part of how a figure was produced.
+
+    `__enter__` synchronises *before* reading the clock, which drains anything the
+    caller queued earlier. That only measures honestly if the caller queues no
+    device work outside the window: a host-to-device copy issued before `with
+    timer` would be drained by this sync and charged to nobody. The measured loop
+    (`scripts/bench.py`) fetches and transfers its batches inside the window for
+    exactly that reason.
     """
 
     def __init__(self, device: torch.device) -> None:
@@ -101,9 +146,11 @@ def summarise(
     durations: Sequence[float],
     *,
     discard: int,
-    rows_per_step: int,
-    tokens_per_step: int | None = None,
+    rows_per_step: float,
+    tokens_per_step: float | None = None,
     peak_bytes: int | None = None,
+    extra_counts: Mapping[str, float] | None = None,
+    totals: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """The reported figures, from the steps that were kept.
 
@@ -117,6 +164,16 @@ def summarise(
     tokenisers differ, and image tokens differ again (Qwen scales with pixels,
     gemma-4 is fixed at 280). A run that could not count tokens reports None
     rather than a row-derived stand-in.
+
+    The per-step counts are averages over the measured steps and are floats on
+    purpose. Flooring them to int understated every rate by up to one row per
+    step, which on a 32-row batch is 3% — the same size as the deviation that
+    invalidates a pod baseline (AGENTS.md).
+
+    `extra_counts` gets the same per-step/per-second treatment under its own
+    names, and `totals` is merged verbatim for figures that are not rates.
+    Both, and the fixed `METRIC_DEFINITIONS`, travel in the summary so a reader
+    of the result JSON never has to infer what was counted.
     """
     if discard < 0:
         raise ValueError(f"discard must not be negative, got {discard}")
@@ -143,5 +200,10 @@ def summarise(
         # by decision, not by oversight (see the module docstring).
         "mfu": None,
         "mfu_reason": "no per-model FLOP formula is validated for GDN / PLE / sliding window",
+        "metric_definitions": METRIC_DEFINITIONS,
     }
+    for name, per_step in (extra_counts or {}).items():
+        summary[f"{name}_per_step"] = per_step
+        summary[f"{name}_per_second"] = per_step * len(kept) / total
+    summary.update(totals or {})
     return summary
