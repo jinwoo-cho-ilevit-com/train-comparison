@@ -1,238 +1,327 @@
-# Task 1+2 — 저장소 부트스트랩 + Phase 0 지원 매트릭스
+# 리뷰 후속 수정 — 워크트리 병렬 개발 계획
 
 ## Context
 
-Qwen3-VL-Embedding-2B / Qwen3.5-0.8B / gemma-4-E2B 세 모델의 임베딩 학습 속도
-최적화를 실측 비교하는 연구다. 전체 설계와 근거는 `PLAN.md`에 있다.
+3레인 병렬 리뷰(module / architecture / critic)에서 치명 결함 5건이 나왔고, 전부
+코드를 직접 실행해 확정했다. 상세는 `docs/review-findings.md`.
 
-지금 필요한 것은 **측정을 시작할 수 있는 상태**다. 그런데 그 앞에 판정해야 할 것이
-있다. 세 모델은 config상 요구 transformers 버전이 갈리고(4.57.1 / 4.57.0.dev0 /
-5.5.0.dev0, 현재 안정판 5.14.1), 프레임워크 6종의 지원 여부도 문서로는 확인되지
-않는다. Unsloth의 임베딩 경로는 encoder-only로 보이고, Axolotl의 Qwen3-VL 지원은
-문서에 없으며, Tevatron의 세 모델 지원도 미확인이다.
+핵심은 **측정을 시작할 수 있는 상태가 아니라는 것**이다. 이미지는 빌드되고 config는
+통과하고 리포트는 숫자를 뱉지만, (a) 학습 데이터의 positive 54.6%가 중복이고 쿼리
+이미지 31.4%가 결측이며, (b) 12개 ablation 축 중 8개를 코드가 한 줄도 읽지 않는다.
+지금 Phase 2를 돌리면 이름만 다른 동일 실험이 나오고, 그 표는 이 프로젝트의 가설을
+구조적으로 확증한다.
 
-이 판정 없이 하네스를 만들면 만든 뒤에 전제가 무너진다. 따라서 이번 범위는
-**저장소 골격(Task 1) + 프레임워크 x 모델 적재 검증(Task 2)**이고, 산출물은
-`docs/support-matrix.md`다. 이 매트릭스가 이후 모든 실험 설계의 입력이 된다.
+이 계획의 목표는 **유효한 측정이 가능한 상태**에 도달하는 것이다. 작업량이 커서
+워크트리로 파일을 격리해 병렬 진행하되, 공유 계약을 먼저 얼리고 매 단계마다 전체
+계획과의 정합을 기계적으로 점검한다.
 
-## 핵심 설계 결정
+확정된 설계 결정 두 가지 (2026-08-01, 사용자):
+- **SFT 대조군을 두지 않는다.** 주장 범위를 "임베딩 학습 내부의 축별 효과 + 모델별
+  병목"으로 좁히고 `PLAN.md`에서 SFT 비교 주장을 철회한다.
+- **8개 축을 전부 구현한 뒤** Phase 2를 시작한다.
 
-### 1. 스토리지 — network volume 미사용
+---
 
-RunPod network volume은 통상 200~400 MB/s의 네트워크 연결형 스토리지다(HIGH
-PERFORMANCE 티어가 최대 3배 처리량/4배 IOPS). 여기에 학습 데이터를 두면
-**Phase 1의 데이터로딩 병목 판정이 파이프라인이 아니라 볼륨을 측정하게 되어
-실험 축 하나가 통째로 무효화된다.** 따라서 쓰지 않는다.
+## 파동 구조 — 왜 이렇게 나누는가
 
-원칙: 소스가 무엇이든 **측정 중에는 모든 것이 pod-local NVMe에 있어야 한다.**
-
-**의존성 = Docker 이미지 (공통 베이스 + 프레임워크별 6개)**
-
-- 베이스 이미지: CUDA + torch + transformers. 6개 프레임워크 이미지가 이 레이어를
-  공유하므로 레지스트리 저장량과 호스트 캐시가 재사용된다 — 증분만 얇게 쌓인다
-- 프레임워크 6종은 한 환경에 공존이 불가능하다. **이미지 경계로 격리**한다
-- 셋업 편차가 사라져 벤치마크 신뢰도가 오른다. 이것이 이미지를 쓰는 진짜 이유다
-- 레지스트리는 GHCR. RunPod의 container registry auth에 한 번 등록하면 pod마다
-  자격증명을 넘길 필요가 없다
-- **빌드는 amd64 네이티브에서 한다.** macOS arm64에서 QEMU 에뮬레이션으로 CUDA
-  이미지를 굽는 것은 비현실적이다. RunPod CPU pod에서 빌드·푸시하는 것을 기본으로
-  하고, GitHub Actions는 무료 러너 디스크 용량을 먼저 확인한 뒤에만 쓴다
-
-**모델·데이터 = HF Hub → pod-local NVMe**
-
-- 모델 3종은 이미 공식 HF repo에 있으므로 그대로 받는다
-- 전처리한 MMEB 고정 서브셋은 **private dataset repo**로 올린다. repo revision이
-  곧 데이터 버전이 되어 컨벤션 07의 "데이터 버전 기록" 요건을 자연히 충족한다
-- `HF_XET_HIGH_PERFORMANCE=1`을 쓴다. **`HF_HUB_ENABLE_HF_TRANSFER`는 현재
-  huggingface_hub에서 무시되므로 쓰지 않는다** (hf_xet이 대체, 적응형 동시성 최대
-  64 스트림)
-- 결과 JSON과 프로파일 산출물도 같은 private repo의 pod별 경로로 push
-
-**부수 효과: DC 종속이 사라진다**
-
-network volume이 pod을 특정 DC에 묶는 유일한 요인이었다. 제거하면:
-
-- B200 재고가 있는 3개 DC(EU-RO-1, US-NC-2, US-NE-1)를 **모두** 쓸 수 있어 18개
-  pod 확보 확률이 오른다
-- A100(Phase 0~1) -> B200(Phase 2~3) 전환 시 볼륨 재구축이 불필요하다
-- H200 fallback이 실제로 즉시 전환 가능해진다
-
-`PLAN.md`의 스토리지·DC 제약·리스크 절을 Task 1에서 이에 맞춰 갱신한다.
-
-단, **pod 간 하드웨어 편차 규칙은 그대로 유효하다.** 그것은 호스트 CPU/메모리
-대역폭 차이지 스토리지 문제가 아니다. canonical baseline 게이트는 유지한다.
-
-### 2. 프레임워크별 의존성 그룹 분리
-
-- 베이스 환경 = native 하네스 (torch + transformers + peft)
-- 프레임워크마다 `[dependency-groups]`의 별도 그룹, 이미지 하나당 그룹 하나
-- 공존 불가 자체가 Phase 0의 유효한 결과이므로 매트릭스에 기록한다
-
-이 구조가 "프레임워크 x 모델 = 18 pod" 분할과 정확히 맞물린다.
-
-### 3. deterministic 모드 — 컨벤션과의 충돌 해소
-
-컨벤션 07은 `torch.use_deterministic_algorithms(True)` + `cudnn.benchmark=False`를
-기본으로 요구한다. 그런데 이는 커널 자동선택과 cudnn autotuning을 끄는 것이라
-**속도 벤치마크의 측정 대상 자체를 왜곡한다.**
-
-컨벤션이 규정한 탈출구를 따른다: "성능 비용이 병목으로 측정되면 끄고, 그 사실을
-기록하라."
-
-- `seed.py`는 `deterministic: bool` config 필드로 양쪽을 지원
-- Phase 1에서 deterministic on/off 비용을 **1회 측정해 기록** (이것이 컨벤션이
-  요구하는 근거)
-- 본 캠페인은 deterministic off + `cudnn.benchmark=True`로 실행하고, 결정과
-  측정치를 `docs/methodology.md`에 남긴다
-- 유닛 테스트와 CPU 스모크는 deterministic on 유지
-
-같은 문서가 "GPU 세대·배치 크기·병렬 구성·프레임워크 버전이 다르면 bit-exact
-재현은 보장되지 않는다"고 명시한다. 이것이 `PLAN.md`의 GPU 혼용 금지 규칙과
-pod별 canonical baseline 규칙의 근거다.
-
-### 4. 실험 추적 — Trackio + HF Space
-
-`trackio.init(project=..., space_id=...)`로 다수 pod이 중앙 Space에 기록한다.
-백그라운드 스레드가 배치를 푸시하고, 실패 시 로컬 SQLite에 보관 후 재시도하므로
-pod 손실·네트워크 단절에 강하다. 모든 run은 resolved config + git hash + 데이터
-repo revision과 연결해 기록한다(컨벤션 07).
-
-### 5. 시크릿 — Infisical 주입 (컨벤션 13)
-
-`infisical init` 완료 상태(`.infisical.json`, workspaceId
-`a95d3bb8-6fe8-4993-9f32-cf7a92d444a9`). `defaultEnvironment`가 비어 있으므로
-환경 이름을 확인해 채우거나 매번 `--env=`를 넘긴다.
-
-- **평문 `.env`를 만들지 않는다.** 저장소에는 `.infisical.json`(민감정보 없음,
-  커밋 대상) + `.env.example`(키 이름만)만 둔다
-- 모든 실행 명령을 주입 래퍼로 감싼다: `infisical run --env=dev -- uv run ...`
-- 코드는 평소대로 `os.environ[...]`로 읽는다. SDK 직접 조회는 쓰지 않는다
-- `.gitignore`에 `.env`, `.env.*`, `!.env.example`
-- gitleaks를 pre-commit과 CI 양쪽에서 실행
-
-**최소 권한 설계**
-
-| 주체 | 필요한 시크릿 | 근거 |
-|---|---|---|
-| 로컬 오케스트레이터 | `RUNPOD_API_KEY`, `HF_TOKEN` | pod 기동/종료, 데이터 repo 준비 |
-| 이미지 빌드 pod | `GHCR_TOKEN` | 레지스트리 푸시 |
-| 실험 pod (18개) | `HF_TOKEN`만 | 모델·데이터 pull, 결과 push, Trackio Space 푸시 |
-
-**`RUNPOD_API_KEY`는 실험 pod에 절대 올리지 않는다.** pod이 자기를 기동한 계정의
-전권 키를 들고 있을 이유가 없다. GHCR 자격증명도 RunPod의 container registry auth에
-등록하므로 pod env에는 들어가지 않는다.
-
-실험 pod은 비대화형 컨테이너이므로 **machine identity(Universal Auth)**로 인증한다.
-읽기 전용·dev 범위 identity를 만들고, RunPod pod env로 `INFISICAL_TOKEN`을 주입한
-뒤 엔트리포인트에서 `infisical run -- ...`이 `HF_TOKEN`을 가져오게 한다. `HF_TOKEN`
-값 자체를 18개 pod 설정에 뿌리지 않기 위한 것이다. 컨벤션 13의 argv 노출 경고에
-따라 client-secret을 명령행 인자로 넘기지 않는다.
-
-## 생성할 파일
-
-### Task 1 — 부트스트랩 (GPU 불필요)
-
-| 파일 | 내용 |
-|---|---|
-| `pyproject.toml` | `~/Codes/develop-convention/templates/pyproject.toml` 기반. py3.13, ruff(E,F,I,UP,B, line-length 100). torch platform marker 주석 해제 — non-linux는 `pytorch-cpu`, linux는 `pytorch-cuda`(cu130, B200 드라이버에 맞춰 Task 2에서 재확인). 프레임워크별 `[dependency-groups]` 6종 |
-| `.python-version`, `uv.lock` | `uv.lock`은 커밋 |
-| `AGENTS.md` | `templates/AGENTS.md` 기반. ML 블록 유지, LLM API 블록과 docsync 블록 삭제. `[CONVENTION_PATH]`에 `~/Codes/develop-convention` |
-| `CLAUDE.md` | `@AGENTS.md` |
-| `.env.example` | `RUNPOD_API_KEY`, `HF_TOKEN`, `GHCR_TOKEN` — 키 이름만, 값 없음. Trackio Space id와 HF repo id는 시크릿이 아니므로 `configs/`에 둔다 |
-| `.infisical.json` | 이미 존재. `defaultEnvironment` 확인 후 채움 |
-| `.gitignore`, `.pre-commit-config.yaml` | `.env`/`.env.*`/`!.env.example` + `astral-sh/ruff-pre-commit` + gitleaks |
-| `trainbench/device.py` | `get_device()` — `torch.accelerator` 기반 단일 헬퍼, config로 override 가능. 인라인 `.cuda()` 금지 |
-| `trainbench/seed.py` | `set_seed(seed, deterministic)` — random/numpy/torch/CUDA + DataLoader `worker_init_fn`·`generator` |
-| `trainbench/config_schema.py` | Pydantic 모델. 잘못된 조합은 실행 전 fail-fast |
-| `configs/` | `config.yaml` + 그룹 골격 (`model/`, `data/`, `attn/`, `kernel/`, `precision/`, `compile/`, `optim/`, `loss/`, `peft/`, `freeze/`, `dataloader/`, `parallel/`, `framework/`, `experiment/`) |
-| `tests/test_config.py` | 잘못된 조합이 실행 전에 죽는지 |
-
-config group 상세는 `PLAN.md`의 "저장소 구조" 참조. 상호배타 변형이 3개 이상인
-축만 group으로 만들고, 단일 플래그(gradient checkpointing 등)는 `train.yaml` 필드다.
-
-### Task 2 — 이미지·데이터 준비 + Phase 0 검증 (A100 18 pod)
-
-| 파일 | 내용 |
-|---|---|
-| `docker/Dockerfile.base` | CUDA + torch + transformers + uv. 6개 이미지가 공유할 레이어 |
-| `docker/Dockerfile.<framework>` | 베이스 위에 `uv sync --group <framework>` 만 얹는 얇은 레이어 6개 |
-| `docker/entrypoint.sh` | `infisical run --` 로 `HF_TOKEN` 주입 -> 모델·데이터를 local NVMe로 pull -> `verify_env.py` 실행 -> 결과 push |
-| `scripts/build_images.py` | RunPod CPU pod에서 6개 이미지 빌드 후 GHCR 푸시 |
-| `scripts/prepare_data.py` | MMEB 고정 서브셋 생성(분포 보존 무작위 샘플) -> private HF dataset repo push. revision을 기록 |
-| `trainbench/probe/` | 프레임워크별 probe 어댑터 6종. 공통 인터페이스로 "모델 적재 -> 1 step 학습 -> 결과 JSON"만 수행 |
-| `scripts/verify_env.py` | Hydra 진입점. `framework=` x `model=` 한 조합을 검증하고 결과 JSON을 atomic save 후 HF repo에 push |
-| `trainbench/pods.py` | RunPod REST API 얇은 래퍼 (pod 생성/상태/종료, 이미지 지정, `INFISICAL_TOKEN` 주입) |
-| `scripts/orchestrate.py` | 조합 목록을 받아 pod 기동, 확보 실패분은 **큐잉**(전량 순차 폴백 아님), 결과 수집, 종료. DC 종속이 없으므로 재고 있는 DC 아무 곳에나 배치 |
-| `scripts/report.py` | 결과 JSON 병합 -> `docs/support-matrix.md` |
-| `docs/methodology.md` | 측정 규율 기록 시작 (deterministic 결정 포함) |
-
-**검증 항목** (`PLAN.md` Phase 0 체크리스트와 동일)
-
-- 세 모델이 동일 transformers 5.14.x에서 로드되는가
-- sentence-transformers v5.5 x transformers v5 호환
-- Qwen3.5 GDN 레이어가 `fla` 없이 학습되는가 / `fla` 설치 시 커널 경로
-- gemma-4-E2B PLE의 freeze 가능 여부, LoRA target module 인식
-- Unsloth 일반 VLM 경로 + 커스텀 InfoNCE에서 패칭이 깨지지 않는가
-- Unsloth `FastSentenceTransformer`가 VLM 체크포인트를 실제로 거부하는가
-- Axolotl의 Qwen3-VL 지원
-- Tevatron 2.0의 세 모델 지원
-- 모델별 동일 이미지의 실제 visual token 수
-
-**기록 규칙**: 셀마다 근거(로그 경로 또는 URL) + 검증한 버전. 확인 못 한 것은
-"미확인"으로 남기고 추측으로 채우지 않는다 (컨벤션 16).
-
-## 실행 순서
-
-1. Task 1 전체를 로컬에서 완료하고 lint/test/CPU 스모크 통과
-2. `PLAN.md`의 스토리지·DC·리스크 절을 network volume 미사용에 맞춰 갱신
-3. 하네스 코드를 작성자와 분리된 레인에서 리뷰 (컨벤션 09)
-4. Infisical에 `RUNPOD_API_KEY`/`HF_TOKEN`/`GHCR_TOKEN` 등록 + pod용 machine
-   identity 발급 + RunPod container registry auth 등록
-5. `prepare_data.py`로 MMEB 서브셋 생성 -> private HF dataset repo push
-6. CPU pod에서 베이스 이미지 1개 + 프레임워크 이미지 6개 빌드·푸시
-7. **pod 1개로 entrypoint -> pull -> verify -> push 전 경로 검증**
-8. 18개로 확장 -> `docs/support-matrix.md` 생성 -> 결과를 보고 Task 3 설계 조정
-
-7단계를 건너뛰면 18개 분의 비용을 날린다.
-
-## 검증 방법
-
-**Task 1 완료 조건** (전부 로컬 macOS CPU에서)
+컨벤션 09: 워크트리는 **파일 격리 수단**이므로 파일 편집이 겹칠 때만 도입하고,
+**공유 계약은 실행 전에 얼린다**. 따라서 병렬화 이전에 순차 구간이 하나 필요하다.
 
 ```
-infisical run --env=dev -- uv run ruff check
-infisical run --env=dev -- uv run ruff format --check
-infisical run --env=dev -- uv run pytest
-infisical run --env=dev -- uv run python scripts/verify_env.py \
-    device=cpu model=qwen3_5_0_8b framework=native data.limit=4
+Wave 0 (순차, 병렬 금지)  공유 계약 확정
+        │
+        ├─ Wave 1 (워크트리 4개 병렬)  A 데이터 / B 코어정확성 / C 오케스트레이션 / E 문서
+        │
+        ├─ Wave 2 (워크트리 2개 병렬)  D 축구현 / F 이미지·env
+        │
+        └─ Wave 3 (순차)  G 하네스 + baseline 게이트 + 품질 가드레일
 ```
 
-Hydra 진입점이므로 컨벤션 04의 `--limit N`은 `data.limit` config 필드로 만족시킨다.
-별도 argparse 플래그를 두면 "값은 전부 중앙 config" 규칙(02)과 충돌한다.
+Wave 0을 병렬화하면 안 되는 이유: `config_schema.py`와 신설 `applied.py`가 이후 모든
+레인의 입력이다. 이걸 각자 고치면 4개 워크트리가 서로 다른 스키마 위에서 개발하게
+되고 병합이 불가능해진다.
 
-- 마지막 명령이 macOS CPU에서 끝까지 돌아야 한다. GPU 없이 실행 불가면 컨벤션 03 위반
-- `test_config.py`에서 잘못된 config 조합이 학습 시작 전에 죽는 것을 확인
-- 평문 `.env` 파일이 생성되지 않았고, gitleaks pre-commit이 도는 것을 확인
+Wave 3을 병렬화하지 않는 이유: 하네스는 B(pooling)와 D(축 적용)의 결과물을 모두
+소비하고, baseline 게이트는 이후 모든 결과가 통과하는 지점이라 마지막에 한 번에
+확정해야 한다.
 
-**Task 2 완료 조건**
+---
 
-- 6개 프레임워크 이미지가 베이스 레이어를 공유하는 것을 확인 (`docker history`로
-  증분 크기 확인 — 공유가 깨졌으면 빌드 순서가 잘못된 것)
-- pod 1개에서 모델·데이터가 **local NVMe 경로**로 내려받아졌는지 확인
-  (network volume 마운트가 없는지 함께 확인)
-- 18개 조합 실행 후 `docs/support-matrix.md`에 18셀이 채워지고, 미확인 셀이
-  "미확인"으로 표기됨
-- Trackio Space에 18개 run이 config + git hash + 데이터 repo revision과 함께 기록됨
-- pod env에 `RUNPOD_API_KEY`와 `GHCR_TOKEN`이 없고 `INFISICAL_TOKEN`만 있는 것을 확인
-- 모든 pod이 종료되어 과금이 멈춘 것을 확인 (`list-pods`)
+## Wave 0 — 공유 계약 확정 (순차, 메인 워크트리)
 
-**완료 주장 금지 조건**: TODO/stub/skip이 남아 있거나, 실행 로그 없이 통과를
-주장하는 경우 (컨벤션 06)
+**이 구간이 끝나기 전에는 어떤 워크트리도 만들지 않는다.**
+
+| 산출물 | 내용 |
+|---|---|
+| `trainbench/config_schema.py` | 8개 축의 누락 필드 추가: `TrainConfig.offload`, `DataloaderConfig.pretokenize`, `ParallelConfig.cross_device_negatives`. 검증기 추가: `warmup_discard_steps < steps`, `purpose=profile`인데 `profiler=false` 금지, `batch_size <= data.limit`, `quality.yaml`의 `revision: null` 금지 |
+| `trainbench/applied.py` (신설) | **요청값 vs 실제 적용값** 계약. `AppliedState` 데이터클래스 + `capture(model, config) -> AppliedState` + `assert_matches(requested, applied)` 시그니처만 확정. 구현은 Wave 2(D) |
+| `trainbench/probe/types.py` | `Check.expected_failure: bool` 추가. unsloth의 `fast_sentence_transformer_accepts_vlm`처럼 실패가 예상 결과인 체크가 셀 전체를 FAIL로 만드는 문제 해소 |
+| `trainbench/record.py` | 레코드 스키마 확정: `applied`, `image_digest`, `git_commit`(env 우선), 호스트 스펙(`os.process_cpu_count()` + cgroup, `/proc/meminfo`, `torch.version.cuda`), `_TRACKED_PACKAGES`에 `flash-attn`/`causal-conv1d`/`bitsandbytes`/`deepspeed`/`torchvision` 추가 |
+| `docs/CONTRACTS.md` (신설) | 위 인터페이스를 문서로 고정. Wave 1~2의 모든 레인이 이 파일을 계약으로 삼는다 |
+| `docs/model-spec.md` (신설) | 아래 "모델별 규격 검증"의 산출물. B와 D의 입력 |
+
+### 모델별 규격 검증 (Wave 0에 포함, HuggingFace MCP 사용)
+
+현재 probe는 세 모델에 **동일한 generic 경로**를 쓴다 — `AutoModel` + 자체
+`last_token_pool` + 자체 `info_nce`. 모델이 의도한 사용법과 다르면 측정 대상이
+"모델"이 아니라 "잘못 쓴 모델"이 된다. Wave 0에 넣는 이유는 B(pooling)와 D(freeze
+대상)가 이 결과를 입력으로 받기 때문이다.
+
+HF MCP(`hub_repo_details`, `hf_fs`)로 저장소 파일을 직접 읽어 확인하고, **추측으로
+채우지 않는다**(컨벤션 16). 확인하지 못한 항목은 "미확인"으로 남긴다.
+
+| 질문 | 읽을 아티팩트 |
+|---|---|
+| 공식 pooling이 last-token인가 | `modules.json`, `1_Pooling/config.json`, `config_sentence_transformers.json`, 모델 카드 |
+| 쿼리/문서에 붙는 instruction·prompt 포맷 | 모델 카드 사용 예시, `chat_template`, `config_sentence_transformers.json`의 prompts |
+| 정규화·유사도 함수·temperature | 모델 카드, ST config |
+| MRL(Matryoshka) 지원 차원 | 모델 카드, ST config. 지원하면 임베딩 차원이 축이 될 수 있다 |
+| gemma-4 PLE 파라미터 **실제 이름** | `model.safetensors.index.json`의 weight map. 현재 `per_layer`/`altup` 문자열 매칭은 추측이며, 틀리면 `matched_count: 0`인데 `ok: True`로 통과한다 |
+| 이미지 placeholder 확장 위치(processor vs 모델 내부) | `preprocessor_config.json`, `processor_config.json`. 후자면 visual token 카운트가 1 같은 값으로 나와 모델 간 정규화 상수가 오염된다 |
+| 동적 해상도 범위 | `preprocessor_config.json`의 `min_pixels`/`max_pixels`(Qwen) vs `vision_soft_tokens_per_image`(gemma) |
+| `padding_side` | `tokenizer_config.json`. gemma-4는 `left`로 확인됨 — `last_token_pool` 결함이 노출되는 유일한 모델 |
+| LoRA target module 관례 | 모델 카드/공식 레시피. 현재 `all-linear`는 "모델별 target module 인식" 질문을 회피한다 |
+
+**산출물**: `docs/model-spec.md` — 항목마다 근거 파일 경로와 revision을 남긴다.
+generic 경로와 공식 규격이 다른 항목은 **차이를 명시**하고, 차이를 수용할지
+(단순성·비교 공정성) 모델별로 맞출지(현실성)를 결정해 기록한다. 이 결정 자체가
+리포트의 한정 조건이 된다.
+
+**완료 조건**: `uv run pytest` 통과 + 스키마 변경으로 기존 config 53개가 전부 해석됨
++ `docs/model-spec.md`의 모든 행이 근거 또는 "미확인"으로 채워짐.
+
+---
+
+## Wave 1 — 병렬 워크트리 4개
+
+각 레인은 자기 파일만 만진다. 겹침 없음을 아래 표로 보장한다.
+
+### A. 데이터 재생성 (`wt/data`)
+
+가장 심각한 결함이고 다른 모든 것의 선행 조건.
+
+| 파일 | 변경 |
+|---|---|
+| `scripts/prepare_data.py` | `SUBSET_COLUMNS`를 config별 기대 스키마로 대체. `pos_image` 보존. 기대 컬럼이 없으면 **예외**(현재는 `row.get()`이 조용히 None) |
+| `configs/data/speed.yaml`, `quality.yaml` | 손상된 revision 고정 해제, 재생성 후 새 revision 고정. `quality.yaml`도 서브셋 생성 |
+| `tests/test_data.py` (신설) | `proportional_quota(total < len(counts))` 경계, 컬럼 스키마 검증 |
+
+manifest에 추가할 품질 지표 — **이게 없어서 손상을 놓쳤다**:
+`rows_without_query_image`, `rows_without_positive_content`, `distinct_pos_text_count`,
+`duplicate_pos_text_ratio`, config별 시퀀스 길이·이미지 해상도 분포(p50/p95).
+**임계값 초과 시 push 거부.**
+
+`pos_text`가 `<|image_1|>` 같은 MMEB placeholder를 담고 있으므로 모델별
+`apply_chat_template` 변환이 필요하다는 점도 여기서 문서화(구현은 Wave 3).
+
+### B. 코어 정확성 (`wt/core`)
+
+| 파일 | 변경 |
+|---|---|
+| `trainbench/embedding.py` | `last_token_pool` left padding 수정. Qwen 공식 구현처럼 `attention_mask[:, -1].sum() == batch`로 left를 감지해 분기. **거짓 주석 제거** |
+| `trainbench/probe/steps.py` | `visual_token_count`에 `image_token_id` -> `image_token_index` -> `get_text_config()` fallback. 반환값 타당 범위(10~2000) 검사. `_tokenize` 클로저 5중 복제를 헬퍼로 흡수 |
+| `trainbench/probe/native.py` | `_ple_report`가 `matched_count == 0`이면 **실패**로 기록(현재는 아무것도 못 찾아도 `ok: True`). `requires_grad` 스냅샷 후 복원 |
+| `trainbench/probe/registry.py` | report를 registry가 만들어 `module.run(config, device, report)`로 전달 → 부분 결과 보존 |
+| `trainbench/seed.py`, `scripts/verify_env.py` | `set_seed(warn_only=)` 추가. probe는 `warn_only=True` — 결정적 구현이 없는 연산이 "프레임워크 미지원"으로 오기록되는 것 방지 |
+| `tests/test_embedding.py` | **left padding 테스트**(현재 right만 검증해 결함을 통과시켰다), `is_finished`, registry 부분 실패 보존 |
+
+### C. 오케스트레이션 견고화 (`wt/orch`)
+
+| 파일 | 변경 |
+|---|---|
+| `trainbench/pods.py` | `is_finished`를 "runtime이 non-null -> null로 **전이**" 또는 `desiredStatus == EXITED`로 수정. `get()` 예외를 `unknown` 센티널로. pod별 개별 deadline |
+| `scripts/orchestrate.py` | `pod_env`에 `INFISICAL_TOKEN`·`TRAINBENCH_GIT_COMMIT`·이미지 digest 추가. `run=probe` 하드코딩 제거 → `configs/experiment/` 소비. launch 직후 ledger 증분 기록 |
+| `configs/experiment/*.yaml` (신설) | 파일 1개 = pod 1개 작업(모델 + 축그룹 + override + **필수 `baseline:`**). 컨벤션 02 §3 "재실행 가능해야 실험이다" |
+| `docker/entrypoint.sh` | 결과 파일 없으면 fallback 레코드 기록 후 publish. `cd ... \|\| exit`. 빈 `--projectId` 플래그 제거. `timeout Nm` 자살 장치 |
+| `scripts/publish_result.py` | `create_repo(exist_ok=True)`, 백오프 재시도, probe 시작 전 `started.json` |
+| `scripts/report.py` | 타임스탬프 최신 우선 병합 + 중복 경고, 파싱 실패 파일 스킵, `expected_failure` 제외, "기동했으나 결과 없음"을 미확인과 구분 |
+
+### E. 문서 정정 (`wt/docs`)
+
+코드와 겹치지 않아 안전하게 병렬 가능.
+
+- `PLAN.md`: **SFT 비교 주장 철회**, 핵심 가설을 "임베딩 학습 내부 축별 효과 + 모델별
+  병목"으로 재작성. Liger를 "무력화"가 아니라 "FLCE 경로만 정의상 비활성"으로 정정.
+  저장소 구조의 미존재 파일 정리. 데이터 출처 표기 수정
+- `README.md`: `uv sync --group dev` → `--extra compose` (**현재 문서대로 하면 pytest가
+  hydra 부재로 실패**)
+- `AGENTS.md`: `env_report.py`를 "smoke"로 지칭한 부분 정정(모델 적재도 step도 없음)
+- `docs/methodology.md` **신설**: `config_schema.py`와 `AGENTS.md`가 참조하는데 부재.
+  "torch.profiler 20~44%"의 출처 명기 또는 미측정 표기 (현재 4곳에 출처 없이 사실로
+  반복 — 컨벤션 16 위반)
+- `docs/support-matrix.md`: "env 5/5 성공"에 "`uv lock` 성공이며 설치·빌드·실행 아님"
+  한정 추가. native 셀에 "macOS CPU fp32, 텍스트 위주, 3모델 중 2모델" 조건 명시
+
+---
+
+## Wave 2 — 병렬 워크트리 2개 (Wave 1 병합 후)
+
+### D. 8개 축 구현 (`wt/axes`)
+
+Wave 0의 `applied.py` 계약을 구현하고 축을 실제로 배선한다.
+
+축별로 **적용 지점 + 검증 방법 + 검증 가능 GPU**를 함께 정의한다. FA4/NVFP4는 B200
+전용이라 A100에서는 검증조차 불가능하므로, config 검증기가 GPU와 축의 조합을 거부해야
+한다.
+
+| 축 | 적용 | 검증(applied) | 필요 패키지 |
+|---|---|---|---|
+| attn | `attn_implementation=` | `model.config._attn_implementation` | `flash-attn` (fa2/3/4) |
+| kernel liger | Liger 패치 | 패치된 심볼 목록 | `liger-kernel` |
+| kernel fla | 설치 여부 | GDN fast path 실사용 | `flash-linear-attention` + `causal-conv1d` |
+| precision | TE / torchao | 활성 recipe | `transformer-engine` |
+| compile | `torch.compile` | `torch._dynamo.utils.counters` graph break 수 | - |
+| optim | 옵티마이저 생성 | 클래스명 + param group | `bitsandbytes`, Muon 구현체 |
+| freeze | `requires_grad` | 실제 학습 파라미터 수 | - |
+| dataloader | packing/DALI/pretokenize | 실제 경로 | `nvidia-dali` |
+| parallel | FSDP2/ZeRO/all-gather | world size + 전략 | `deepspeed` |
+
+**`purpose=timing`에서 요청값 ≠ 적용값이면 런 실패.** 이것이 이 프로젝트에서 가장
+중요한 단일 안전장치다 — 없으면 sdpa로 폴백된 런이 "FA3 1.4배"로 리포트에 실린다.
+
+### F. 이미지·env 갱신 (`wt/images`)
+
+- `envs/*/pyproject.toml`에 축별 패키지 추가 후 재-lock. **패키지 간 충돌은 Phase 0
+  결과로 기록**(예: unsloth의 torch<2.12가 특정 flash-attn과 양립 불가)
+- `Dockerfile.framework`: `COPY trainbench`를 `uv sync` **뒤로** 이동 — 현재는 소스
+  한 줄 수정이 axolotl 237패키지 sync를 매번 재실행시킨다
+- `build-images.yml`: 이미지에 digest 태그 부여(현재 `latest`만이라 어떤 이미지가
+  그 숫자를 냈는지 사후 특정 불가). GHA 캐시 10GB 상한 대응
+- **axolotl 빌드 실패 원인 규명** (미확인 상태)
+- `USE_HF=1` (ms-swift가 기본 ModelScope hub라 gemma-4를 못 찾을 위험)
+
+---
+
+## Wave 3 — 하네스 (순차, 메인 워크트리)
+
+### G. 측정 하네스 + 게이트
+
+- `scripts/bench.py` + pod 내부 **sweep 러너**: 모델 1회 적재 후 축 sweep. 현재 진입점은
+  프로세스당 모델 1회 적재라 5B 모델에서 오버헤드가 측정을 지배한다. PLAN의 "35h"는
+  이 러너를 전제해야 성립하는데 요구사항으로 적혀 있지도 않았다
+- `trainbench/metrics/`: throughput, peak VRAM, step p50/p95. **MFU는 tokens/s를 1차
+  지표로 격하** — GDN linear attention / PLE lookup / sliding window에서 표준 FLOP
+  공식이 세 모델 모두 깨진다. 모델별 공식을 유닛 테스트로 검증한 뒤에만 제시
+- **baseline 게이트**: 3% 임계값을 **동일 pod 동일 설정 5회 반복 편차를 실측한 뒤**
+  그 2~3배로 교정. 현재 값은 멀티테넌트 클라우드 편차보다 타이트할 수 있고, 그러면
+  재실행이 비용의 지배 항이 된다
+- **데이터로딩 병목 선판정**: 이것이 병목이면 Phase 2 전체가 무의미
+- **품질 가드레일**: Recall@k 이전에 **축별 수치 등가성 검사**(같은 seed로 N step 후
+  baseline 대비 loss/grad norm tolerance). GradCache는 전용 등가성 테스트 필수 —
+  검증 없이 재면 GradCache 버그가 GradCache 속도 향상으로 리포트된다
+- **모델별 visual token 분포 실측**: 합성 이미지 1장 기반 196:196:280 보정은 448 정사각
+  1장에서만 성립. Qwen은 동적 해상도(픽셀 비례), gemma-4는 280 고정이라 모델 간
+  토큰 예산 고정이 원리적으로 불가능. 실제 서브셋에서 분포를 재고, 불가능하면 리포트
+  범위를 "모델 내 축 효과만 비교"로 명시적으로 좁힌다
+
+---
+
+## 매 단계 정합 점검 — 기계화
+
+사용자 요구: "개발이 마칠 때마다 전체 계획에서 누락/오류가 없는지 항상 점검".
+사람이 체크리스트를 읽는 방식은 이번에 이미 실패했다(서브셋 손상을 검증 지표가
+완벽 통과로 보고했다). **가능한 만큼 기계로 만든다.**
+
+### `scripts/audit_plan.py` (신설, Wave 0에서 만들고 매 wave 끝에 실행)
+
+기계적으로 검증 가능한 불변식만 담는다. 실패하면 non-zero.
+
+1. **config 손잡이가 전부 소비되는가** — 모든 config leaf 필드가 코드 어딘가에서
+   읽히는지. 안 읽히면 실패. (D4를 잡았을 검사)
+2. **PLAN.md에 적힌 파일이 실제로 존재하는가** — 저장소 구조 절의 경로 전수 확인
+3. **support-matrix의 수치가 커밋된 아티팩트를 참조하는가** — 현재 `.gitignore`가
+   `outputs/`를 제외해 실측 로그가 저장소에 하나도 없다. `docs/evidence/`를 만들고
+   결과 JSON을 커밋 대상으로
+4. **축 ↔ 패키지 정합** — config group에 있는 축의 필요 패키지가 해당 env lock에
+   존재하는지
+5. **문서 명령이 실제로 도는가** — README/AGENTS의 명령을 dry-run
+6. **데이터 revision이 null이 아닌가**, manifest 품질 지표가 임계 내인가
+7. **모델별 규격 정합** — `docs/model-spec.md`에 기록된 각 모델의 공식 규격(pooling,
+   prompt 포맷, PLE 파라미터 이름, placeholder 확장 위치, `padding_side`)이 HF에
+   호스팅된 현재 파일과 여전히 일치하는가. HF MCP로 재조회해 대조하고, 업스트림이
+   바뀌었으면 실패시킨다 — 모델 저장소는 갱신되며 우리 구현은 그 시점 스냅샷 위에
+   서 있다
+
+### 각 wave 종료 게이트 (사람 + 에이전트)
+
+1. `uv run pytest` + `ruff` + `scripts/audit_plan.py` 전부 통과
+2. **작성자와 분리된 리뷰 레인 1개** (컨벤션 09). 변경이 2+ 모듈이거나 인터페이스를
+   건드리면 3레인
+3. `docs/review-findings.md`의 해당 항목을 해소 표시하고, **새로 발견된 것을 추가**
+4. 통합 검증: 워크트리 병합 후 전체 테스트 1회
+
+---
+
+## 워크트리와 team mode의 역할 분담
+
+둘은 대안이 아니라 직교한다. **워크트리는 파일 격리**, **team mode는 공유 task list
+기반 조율**이다. 병용한다.
+
+| Wave | 워크트리 | team mode | 근거 |
+|---|---|---|---|
+| 0 계약 확정 | 미사용 | 미사용 | 병렬화 자체가 금지 구간 |
+| 1 (A/B/C/E) | 사용 | 사용 | 파일 겹침 방지 + 진행 상태를 오케스트레이터 컨텍스트 밖에 유지 |
+| 2 (D/F) | 사용 | 사용 | 위와 동일 |
+| 3 하네스 | 미사용 | 미사용 | baseline 게이트가 이후 모든 결과의 통과 지점이라 한 번에 확정 |
+
+**team mode를 쓰는 진짜 이유는 처리량이 아니라 상태 외부화다.** Wave가 4개, 레인이
+6개이므로 진행 상태를 오케스트레이터의 컨텍스트에 두면 중간에 유실된다. task list가
+그것을 대신한다.
+
+**team mode가 풀지 못하는 것**: 이번에 발견된 결함 5건은 전부 정확성·판단 실패였고
+처리량 부족이 아니었다. 손이 더 많아도 잡히지 않았을 것이고, 실제로 잡은 것은
+독립적인 검증 관점이었다. 따라서 병렬 인원보다 **매 wave 게이트의 분리된 리뷰
+레인**이 우선한다. 이 우선순위를 뒤집지 않는다.
+
+## 워크트리 운용
+
+```
+.claude/worktrees/wt-data     A
+.claude/worktrees/wt-core     B
+.claude/worktrees/wt-orch     C
+.claude/worktrees/wt-docs     E
+.claude/worktrees/wt-axes     D   (Wave 2)
+.claude/worktrees/wt-images   F   (Wave 2)
+```
+
+- 각 워크트리는 Wave 0 병합 커밋에서 분기
+- **파일 소유권은 위 표가 유일한 기준.** 다른 레인의 파일을 고쳐야 하면 직접 고치지
+  말고 계약 변경으로 올린다
+- 병합 순서: A → B → C → E (충돌 최소 순). 각 병합 후 전체 테스트
+- `configs/`는 A(data), C(experiment), D(axes)가 서로 다른 하위 디렉터리만 만진다
+
+---
 
 ## 이번 범위에서 제외
 
-- 측정 하네스 본체 (throughput/MFU/VRAM, 타이밍-프로파일 분리, canonical
-  baseline 게이트) -> Task 3
-- DALI 도입 판단 -> Task 3의 데이터로딩 병목 선판정 결과에 따름
-- 실제 ablation -> Task 4
-- GitHub Actions 빌드 파이프라인 -> CPU pod 빌드로 충분하면 만들지 않는다
+- 실제 Phase 2 측정 실행 — Wave 3 완료 후 별도
+- 프레임워크 probe 4종의 API 수정(tevatron forward 시그니처, axolotl `normalize_config`,
+  unsloth `for_training`) — 이미지가 빌드돼야 검증 가능하므로 Wave 2(F) 이후 별도 wave
+- B200 pod 기동 — Wave 3 완료 및 audit 통과 전까지 금지
+
+---
+
+## 검증
+
+각 wave 종료 시:
+```
+infisical run --env=dev -- uv run ruff check
+infisical run --env=dev -- uv run pytest
+infisical run --env=dev -- uv run python scripts/audit_plan.py
+```
+
+Wave 3 종료 시 추가:
+```
+# 데이터 무결성
+infisical run --env=dev -- uv run python scripts/audit_plan.py --check data-quality
+
+# 축 적용 검증이 실제로 막는가 (패키지 없는 축을 요청하면 실패해야 함)
+infisical run --env=dev -- uv run python scripts/bench.py device=cpu attn=fa4 run=timing
+# -> 실패해야 정상. 성공하면 축 검증 계층이 동작하지 않는 것
+
+# CPU 소수 샘플 E2E
+infisical run --env=dev -- uv run python scripts/bench.py device=cpu data.limit=4 train.steps=2
+```
+
+**완료 주장 금지**: TODO/stub/skip 잔존, 실행 로그 없는 통과 주장, `audit_plan.py`
+실패 상태에서의 다음 wave 착수.
