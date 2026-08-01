@@ -724,9 +724,15 @@ AXIS_PACKAGES = {
     # no environment has a GradCache implementation at all — while three shipped
     # manifests already assign GPUs to the loss axis.
     "peft/qlora": ("bitsandbytes",),
-    # `grad-cache` is a 404. Upstream declares `name="GradCache"`, which PEP 503
-    # normalises to `gradcache`.
-    "loss/cached_mnrl": ("gradcache",),
+    # `loss/cached_mnrl` was here, needing `gradcache` (`grad-cache` is a 404;
+    # upstream declares `name="GradCache"`, which PEP 503 normalises to
+    # `gradcache`). It needs no package now: `axes._loss` implements the three
+    # passes directly against `probe/steps.py::encode` and `embedding.py::info_nce`
+    # rather than importing the library, which is only in `envs/native`'s lock —
+    # importing it would make the axis raise ImportError everywhere else while the
+    # arithmetic it needs is `torch.autograd.backward(reps, grad_tensors=cache)`.
+    # It has moved to AXIS_NEEDS_NOTHING; leaving it here would have this check
+    # fail the moment anyone drops a dependency nothing imports.
     "framework/unsloth": ("unsloth",),
     "framework/ms_swift": ("ms-swift",),
     "framework/sentence_transformers": ("sentence-transformers",),
@@ -742,13 +748,24 @@ AXIS_NEEDS_NOTHING = frozenset(
         "precision/bf16",
         "optim/adamw_fused",
         "parallel/single",
+        # The all-gather is torch.distributed's own, in the loss closure
+        # (`axes._gather_with_grad`); nothing is installed for it.
+        "parallel/single_cross_device",
         "parallel/ddp",
         "parallel/fsdp2",
         "dataloader/torch",
         "dataloader/torch_packed",
+        # Tokenising ahead of the timed window is the caller's own processor doing
+        # the same work earlier (`axes.pretokenize`); nothing is installed for it.
+        "dataloader/torch_pretokenized",
+        # Packing without a tokenizer needs rows that already carry unpadded ids,
+        # which is what pretokenize produces — the combination `axes.PackedCollate`
+        # supports with nothing handed in, and which no config could express.
+        "dataloader/torch_packed_pretokenized",
         "peft/full",
         "peft/lora",
         "loss/mnrl",
+        "loss/cached_mnrl",
         "freeze/none",
         "freeze/vision_tower",
         "freeze/ple",
@@ -818,28 +835,135 @@ def axes_have_their_packages() -> Result:
     )
 
 
+def _normalise(distribution: str) -> str:
+    """PEP 503 normalisation. `uv export` prints `pytorch-optimizer`, the metadata
+    says `pytorch_optimizer`, and comparing the two unnormalised finds nothing."""
+    return re.sub(r"[-_.]+", "-", distribution).lower()
+
+
+def _repo_module_names() -> set[str]:
+    """Modules that resolve inside this repository rather than from an install.
+
+    `tests/` adds `scripts/` to `sys.path` and imports `audit_plan`, `orchestrate`,
+    `publish_result` and `report` from it, none of which are distributions.
+    """
+    return (
+        {path.name for path in REPO.iterdir() if path.is_dir()}
+        | {path.stem for path in (REPO / "scripts").glob("*.py")}
+        | {"__future__"}
+    )
+
+
+def _test_imports() -> dict[str, set[str]]:
+    """Third-party top-level modules imported under `tests/`, and who imports them.
+
+    Function-level imports count. They do not break collection the way a
+    module-level one does, but the test still fails when the module is absent, and
+    the question this check asks is whether the documented setup runs the suite —
+    not whether it survives collection. All three gaps found here were
+    function-level.
+    """
+    modules: dict[str, set[str]] = {}
+    local = _repo_module_names()
+    for path in sorted((REPO / "tests").rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text())
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            else:
+                continue
+            for name in names:
+                root = name.split(".")[0]
+                if root not in sys.stdlib_module_names and root not in local:
+                    modules.setdefault(root, set()).add(path.name)
+    return modules
+
+
+def _distributions_for(modules: dict[str, set[str]]) -> dict[str, str]:
+    """Module name -> distribution name, read off what is installed here.
+
+    `import yaml` comes from `pyyaml` and `import hydra` from `hydra-core`; nothing
+    in the source says so, and the installed metadata is the only place that does.
+    A module this environment does not have falls back to its own name, which is
+    reported as missing either way — that is the safe direction.
+    """
+    from importlib.metadata import packages_distributions
+
+    installed = packages_distributions()
+    return {module: (installed.get(module) or [module])[0] for module in modules}
+
+
+def _locked_distributions(flags: str) -> tuple[set[str], str | None]:
+    """What `uv sync <flags>` would install, as normalised distribution names."""
+    run = subprocess.run(
+        ["uv", "export", "--frozen", "--no-hashes", *flags.split()],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if run.returncode != 0:
+        tail = (run.stderr.strip().splitlines() or ["no output"])[-1]
+        return set(), f"`uv export{flags}` exits {run.returncode}: {tail}"
+    found = re.findall(r"^([A-Za-z0-9._-]+)==", run.stdout, re.M)
+    return {_normalise(name) for name in found}, None
+
+
 @check("doc-commands")
 def documented_commands_are_runnable() -> Result:
-    """README/AGENTS commands must work as written.
+    """README/AGENTS commands must work as written, and install what the tests import.
 
     The documented bootstrap once installed no extras, so `uv run pytest` failed
     on a missing hydra while local development used a different flag set. And the
     documented smoke command was rejected by this project's own batch validator
     for as long as that validator existed, because nothing ever ran it — so the
     entry point commands are executed here rather than pattern-matched.
+
+    The install half used to be a regex asking whether the `uv sync` line carried
+    `--extra compose`, justified as "but tests import hydra". Hydra stopped being
+    the only thing the tests import long before anyone noticed: `peft`, `datasets`
+    and `transformers` are all in the `native` extra, no documented command asks
+    for it, and this reported `5 documented command(s) install what the tests need`
+    throughout. A rule naming one package cannot answer a question about all of
+    them, so the imports are collected from `tests/` and each one is looked for in
+    the lock the documented command actually resolves to.
     """
     problems = []
     found = 0
+    modules = _test_imports()
+    if empty := _nothing_to_check(modules, "third-party imports under tests/"):
+        return Result("doc-commands", False, empty)
+    distributions = _distributions_for(modules)
+    checked_locks: dict[str, set[str]] = {}
     for name in ("README.md", "AGENTS.md"):
         text = (REPO / name).read_text()
         found += len(re.findall(r"uv sync[^\n`]*", text)) + len(
             re.findall(r"python scripts/env_report\.py[^\n`]*", text)
         )
         for match in re.finditer(r"uv sync([^\n`]*)", text):
-            flags = match.group(1)
-            if "--extra compose" not in flags and "--all-extras" not in flags:
+            flags = match.group(1).rstrip()
+            if flags not in checked_locks:
+                locked, failure = _locked_distributions(flags)
+                checked_locks[flags] = locked
+                if failure:
+                    problems.append(f"{name}: {failure}")
+                    continue
+            locked = checked_locks[flags]
+            missing = sorted(
+                f"{module} ({distributions[module]}, imported by "
+                f"{', '.join(sorted(modules[module]))})"
+                for module in modules
+                if _normalise(distributions[module]) not in locked
+            )
+            if missing:
                 problems.append(
-                    f"{name}: `uv sync{flags}` omits the compose extra, but tests import hydra"
+                    f"{name}: `uv sync{flags}` installs {len(locked)} distribution(s) but the "
+                    f"tests import {len(missing)} it does not provide: {'; '.join(missing)}"
                 )
         for match in re.finditer(r"python (scripts/env_report\.py[^\n`]*)", text):
             command = match.group(1).split()
@@ -855,12 +979,18 @@ def documented_commands_are_runnable() -> Result:
                 problems.append(f"{name}: `{' '.join(command)}` exits {run.returncode}: {tail}")
     if empty := _nothing_to_check(found, "documented commands in README.md or AGENTS.md"):
         return Result("doc-commands", False, empty)
+    scope = (
+        f"{found} documented command(s); {len(modules)} third-party module(s) imported "
+        "under tests/, resolved to distributions by this environment's metadata and "
+        "looked for in the lock each documented `uv sync` produces"
+    )
     return Result(
         "doc-commands",
         not problems,
-        f"{found} documented command(s) install what the tests need and run as written"
+        f"every documented command runs as written and installs what the tests import ({scope})"
         if not problems
-        else "; ".join(problems),
+        else f"{'; '.join(problems)} ({scope})",
+        count=len(problems),
     )
 
 
@@ -937,6 +1067,81 @@ def model_spec_matches_config() -> Result:
     )
 
 
+# Rows in the synthetic dataset this check hands the dataloader axis. Equal to
+# `configs/train/default.yaml`'s `batch_size`, so one batch is one full batch and
+# no variant is judged on a short final one.
+_BATCH_ROWS = 16
+# Applied to every variant, unlike the per-variant companions below. Worker
+# processes are a property of a run, not of whether an axis value can be applied,
+# and `configs/data/*.yaml` ask for 8 of them — which this check would pay for
+# once per variant, to build one batch it pulls in-process.
+AXIS_VALUE_BASE_OVERRIDES = ("data.num_workers=0",)
+# Length of each synthetic sequence. Uniform, see `_AxisValueRows`.
+_ROW_TOKENS = 4
+
+
+class _AxisValueRows:
+    """The smallest dataset the dataloader axis will accept as real.
+
+    `axis-values` called `assemble` with no dataset until 2026-08-02, which made
+    it structurally vacuous for that axis in both directions. `axes._dataloader`
+    returns at `if dataset is None` before it reaches packing or pretokenize, so
+    `PackedCollate.__call__` could be replaced with `raise NotImplementedError`
+    and this check's output stayed identical to the byte — while `loss/cached_mnrl`
+    was reported inert for the opposite reason, GradCache refusing a `None`
+    dataset it would have accepted.
+
+    `input_ids` is declared *and* handed over, because `_dataloader` asks the two
+    questions separately: the column list is what the dataset says about itself,
+    the first row is what the timed step is actually given.
+
+    Rows are uniform length so the non-packed variants, which get torch's default
+    collate here, still stack. Ragged rows would make `dataloader/torch` fail on a
+    rectangle the audit itself built, and counting that as the axis being
+    inapplicable would be this check inventing a defect.
+
+    An axis can be applicable to one shape of data and not another, and a single
+    fixture answers for whichever shape it happens to have. So there are two, and
+    they differ in exactly one thing: whether a row carries an image. Measured
+    empirically, that difference moves `loss/cached_mnrl` and nothing else.
+    """
+
+    carries_image = False
+
+    @property
+    def column_names(self) -> list[str]:
+        return ["input_ids", *(["qry_image"] if self.carries_image else [])]
+
+    def __len__(self) -> int:
+        return _BATCH_ROWS
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        import torch
+
+        if index >= _BATCH_ROWS:
+            raise IndexError(index)
+        row = {"input_ids": torch.arange(_ROW_TOKENS)}
+        if self.carries_image:
+            # A tensor rather than None: `axes.image_columns` reads a `None` here as
+            # the column being empty, and torch's default collate cannot stack it,
+            # which would make the two fixtures differ by a second thing.
+            row["qry_image"] = torch.zeros(3, 2, 2)
+        return row
+
+
+class _AxisValueRowsWithImages(_AxisValueRows):
+    """The shape of data this study actually measures.
+
+    Both configured subsets are MMEB draws and `configs/data/speed.yaml` records
+    "0 rows without a query image or positive", so every measured run reads rows
+    that carry images. A value that applies only to the text-only fixture cannot
+    be turned on by any run this study is configured to make — which is why the
+    two are reported apart rather than averaged into one number.
+    """
+
+    carries_image = True
+
+
 # Values a group needs alongside it to compose at all. Not exemptions: without
 # these the schema rejects the override and the value would be miscounted as
 # inapplicable for a reason that has nothing to do with whether axes.py can apply
@@ -963,11 +1168,33 @@ def every_offered_axis_value_can_be_applied() -> Result:
     `docs/review-findings.md` D4 describes as "the same experiment under different
     names", and the check meant to catch it was reporting progress.
 
-    Each variant is composed and pushed through all four call sites. `UnappliedAxis`
-    is the axis refusing the value, which is the honest outcome and what gets
-    counted. Any other exception is reported as its own problem rather than folded
-    into the count — a value that fails for an unrelated reason has not been
-    measured either way.
+    Each variant is composed and pushed through all four call sites, with a
+    synthetic dataset, and one batch is pulled through whatever loader comes back.
+    `UnappliedAxis` is the axis refusing the value, which is the honest outcome and
+    what gets counted. Any other exception is reported as its own problem rather
+    than folded into the count — a value that fails for an unrelated reason has not
+    been measured either way.
+
+    The dataset and the batch are both load-bearing, and neither is obvious.
+    Passing no dataset made this vacuous for the whole dataloader axis, because
+    `axes._dataloader` returns at `if dataset is None` before it reaches packing or
+    pretokenize. Passing one but not iterating leaves it half vacuous, because a
+    collate is not called until a batch is drawn — so packing, which lives entirely
+    in the collate, would still be certified by code that never ran.
+
+    Every variant is tried against two fixtures differing in one thing — whether a
+    row carries an image — because applicability is not always a property of the
+    axis alone. A value accepted on one shape and refused on the other is reported
+    by name and *not counted*, since counting it answers a question nobody asked.
+    `loss/cached_mnrl` is the live case: GradCache is implemented, and
+    `_split_rows` refuses every batch carrying `pixel_values`, so it applies to a
+    text-only subset and to no run this study is configured to make. Counted as
+    applicable it read `loss 2/2`, which a reader takes as "GradCache is ready to
+    measure".
+
+    What it still does not prove: that packing is *correct*. A collate that
+    concatenated wrongly applies the axis as far as this check can see. Equivalence
+    is `tests/test_axes.py`'s question and the capture probe's, not this one's.
     """
     sys.path.insert(0, str(REPO))
     import torch
@@ -990,28 +1217,74 @@ def every_offered_axis_value_can_be_applied() -> Result:
     if empty := _nothing_to_check(variants, "axis config groups"):
         return Result("axis-values", False, empty)
 
+    def attempt(config: Any, dataset: Any) -> Exception | None:
+        """`None` if every call site accepted the value, else what refused it."""
+        try:
+            axes.patch(config)
+            axes.load_kwargs(config)
+            # What `scripts/bench.py` does before `assemble`, and the only place
+            # `dataloader.pretokenize=true` is actually carried out: `_dataloader`
+            # inspects the dataset for token ids but never produces them. Without
+            # this the axis was certified by a fixture that arrived tokenised.
+            if config.dataloader.pretokenize:
+                dataset = axes.pretokenize(dataset, lambda row: dict(row))
+            built, _ = axes.assemble(
+                _Tiny(), config, torch.device("cpu"), "native", dataset=dataset
+            )
+            # One batch, because building a loader does not run its collate and
+            # packing lives entirely in the collate. Constructing the loader and
+            # calling the axis applied is how a gutted `PackedCollate.__call__`
+            # left this check's output unchanged.
+            if built.dataloader is not None:
+                next(iter(built.dataloader))
+            with axes.step_context(config):
+                pass
+        except Exception as exc:  # noqa: BLE001 - reported, never counted as applied
+            return exc
+        return None
+
+    shapes = {"text-only": _AxisValueRows, "image-carrying": _AxisValueRowsWithImages}
     applicable: dict[str, int] = {}
     inert: list[str] = []
     broken: list[str] = []
+    data_dependent: list[str] = []
     for group, names in sorted(variants.items()):
         applicable[group] = 0
         for name in sorted(names):
             variant = f"{group}/{name}"
-            overrides = [f"{group}={name}", *AXIS_VALUE_COMPANIONS.get(variant, ())]
+            overrides = [
+                f"{group}={name}",
+                *AXIS_VALUE_BASE_OVERRIDES,
+                *AXIS_VALUE_COMPANIONS.get(variant, ()),
+            ]
             try:
                 with initialize_config_dir(config_dir=str(CONFIGS), version_base=None):
                     config = resolve(compose(config_name="config", overrides=overrides))[0]
-                axes.patch(config)
-                axes.load_kwargs(config)
-                axes.assemble(_Tiny(), config, torch.device("cpu"), "native")
-                with axes.step_context(config):
-                    pass
-            except axes.UnappliedAxis:
+            except Exception as exc:  # noqa: BLE001 - a value that will not compose
+                broken.append(f"{variant} (compose {type(exc).__name__}: {str(exc)[:80]})")
                 continue
-            except Exception as exc:  # noqa: BLE001 - reported, never counted as applied
-                broken.append(f"{variant} ({type(exc).__name__}: {str(exc)[:80]})")
+            outcomes = {shape: attempt(config, rows()) for shape, rows in shapes.items()}
+            unexpected = [
+                f"{variant} on {shape} data ({type(exc).__name__}: {str(exc)[:80]})"
+                for shape, exc in outcomes.items()
+                if exc is not None and not isinstance(exc, axes.UnappliedAxis)
+            ]
+            if unexpected:
+                broken.extend(unexpected)
                 continue
-            applicable[group] += 1
+            accepted = sorted(shape for shape, exc in outcomes.items() if exc is None)
+            if len(accepted) == len(outcomes):
+                applicable[group] += 1
+            elif accepted:
+                # Applicable to one shape of data and refused on the other. Counting
+                # it would answer a question nobody asked — the study measures the
+                # image-carrying shape, so a text-only-only value is a value no
+                # configured run can turn on. Named rather than counted, because
+                # `loss 2/2` reads as "GradCache is ready to measure" and it is not.
+                refusal = next(exc for exc in outcomes.values() if exc is not None)
+                data_dependent.append(
+                    f"{variant} (applies to {'/'.join(accepted)} data only: {str(refusal)[:90]})"
+                )
 
     total = sum(len(v) for v in variants.values())
     usable = sum(applicable.values())
@@ -1021,15 +1294,20 @@ def every_offered_axis_value_can_be_applied() -> Result:
     problems = []
     if inert:
         problems.append(f"{len(inert)} group(s) offering one usable value: {', '.join(inert)}")
+    if data_dependent:
+        problems.append(
+            f"{len(data_dependent)} value(s) applicable only to data this study does not "
+            f"measure: {'; '.join(data_dependent)}"
+        )
     if broken:
         problems.append(f"{len(broken)} value(s) failed for another reason: {'; '.join(broken)}")
     return Result(
         "axis-values",
         not problems,
-        f"{usable}/{total} offered axis values can be applied"
+        f"{usable}/{total} offered axis values apply on both {'/'.join(shapes)} data"
         if not problems
-        else f"{usable}/{total} applicable; " + "; ".join(problems),
-        count=len(inert) + len(broken),
+        else f"{usable}/{total} applicable on both {'/'.join(shapes)} data; " + "; ".join(problems),
+        count=len(inert) + len(data_dependent) + len(broken),
     )
 
 

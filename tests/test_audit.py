@@ -22,7 +22,9 @@ sys.path.insert(0, str(REPO / "scripts"))
 import audit_plan  # noqa: E402
 from audit_plan import (  # noqa: E402
     Result,
+    _normalise,
     _reads_dotted,
+    _test_imports,
     classify,
     merge_baseline,
     missing_plan_files,
@@ -289,6 +291,106 @@ def test_package_markers_and_dot_entries_are_out_of_scope():
     tracked = ["trainbench/__init__.py", ".github/workflows/build.yml", ".pre-commit-config.yaml"]
 
     assert undocumented_files(OPAQUE_LAYOUT, tracked) == []
+
+
+# `axis-values` was vacuous for the whole dataloader axis: it called `assemble`
+# with no dataset, and `axes._dataloader` returns at `if dataset is None` before
+# it reaches packing or pretokenize. Gutting `PackedCollate.__call__` left the
+# check's output identical to the byte. Both tests below fail if the fixture or
+# the batch draw is removed.
+def test_the_axis_value_fixture_is_a_dataset_the_loader_axis_accepts():
+    """`_dataloader` asks two separate questions — what the dataset declares, and
+    what its first row hands over. A fixture answering only the first is refused
+    with `UnappliedAxis`, which would read as the axis being inapplicable."""
+    from trainbench import axes
+
+    rows = audit_plan._AxisValueRows()
+
+    assert axes.tokenized_columns(rows) == ["input_ids"]
+    assert axes.tokenized_row(rows)
+    assert len(rows) == audit_plan._BATCH_ROWS
+    packed = axes.PackedCollate()([rows[i] for i in range(len(rows))])
+    assert packed["input_ids"].shape == (1, audit_plan._BATCH_ROWS * audit_plan._ROW_TOKENS)
+
+
+def test_the_two_axis_value_fixtures_differ_only_in_carrying_an_image():
+    """Applicability is not always a property of the axis alone, so the check asks
+    twice. If the fixtures differed in a second thing, a value refused for that
+    other reason would be misreported as depending on the data."""
+    from trainbench import axes
+
+    text_only = audit_plan._AxisValueRows()
+    with_images = audit_plan._AxisValueRowsWithImages()
+
+    assert axes.image_columns(text_only) == []
+    assert axes.image_columns(with_images) == ["qry_image"]
+    # Everything the loader axis reads is identical; only the image column is added.
+    assert axes.tokenized_columns(text_only) == axes.tokenized_columns(with_images) == ["input_ids"]
+    assert len(text_only) == len(with_images)
+    for index in range(len(text_only)):
+        assert text_only[index]["input_ids"].equal(with_images[index]["input_ids"])
+        # A tensor, not None: `image_columns` reads None as the column being empty
+        # and torch's default collate cannot stack it.
+        assert with_images[index]["qry_image"] is not None
+
+
+def test_a_value_applicable_to_only_one_data_shape_is_named_not_counted():
+    """`loss/cached_mnrl` is implemented, and `_split_rows` refuses every batch
+    carrying `pixel_values` — so it applies to a text-only subset and to no run
+    this study is configured to make. Counted as applicable it read `loss 2/2`,
+    which a reader takes as GradCache being ready to measure."""
+    result = audit_plan.CHECKS["axis-values"]()
+
+    assert "loss/cached_mnrl" in result.detail
+    assert "applicable only to data this study does not measure" in result.detail
+    assert "loss 1/2" in result.detail
+
+
+def test_axis_values_draws_a_batch_so_the_collate_actually_runs(monkeypatch):
+    """Building a loader does not call its collate, and packing lives entirely in
+    the collate — so passing a dataset without drawing a batch leaves the axis
+    certified by code that never ran."""
+    from trainbench import axes
+
+    def gutted(self, rows):
+        raise NotImplementedError("packing gutted")
+
+    monkeypatch.setattr(axes.PackedCollate, "__call__", gutted)
+
+    result = audit_plan.CHECKS["axis-values"]()
+
+    assert not result.ok
+    assert "dataloader/torch_packed" in result.detail
+    assert "packing gutted" in result.detail
+
+
+# `doc-commands` asked whether the `uv sync` line carried `--extra compose`,
+# justified as "but tests import hydra". It reported `5 documented command(s)
+# install what the tests need` while `peft`, `datasets` and `transformers` were
+# in an extra no documented command asks for. A rule naming one package cannot
+# answer a question about all of them.
+def test_the_test_imports_are_collected_from_the_tests_not_a_list():
+    """A hand-written list of what the tests need is a list of what to forget.
+    All three gaps were function-level imports, which is why they are collected."""
+    modules = _test_imports()
+
+    # `datasets` was in this set and is not any more: the one import of it under
+    # `tests/` was in `test_axes.py`, and the loss lane removed it when this check
+    # first reported it — the documented setup does not install it, so a test that
+    # needed it was a test a clean clone could not run. Left here as a name would
+    # have made this assertion demand an import nothing makes.
+    assert {"torch", "pytest", "hydra", "peft", "transformers"} <= set(modules)
+    assert "test_applied.py" in modules["peft"]
+    # First-party and stdlib are not distributions and must not be demanded of a lock.
+    assert not {"trainbench", "audit_plan", "json", "pathlib", "__future__"} & set(modules)
+
+
+def test_distribution_names_are_normalised_before_comparison():
+    """`uv export` prints `pytorch-optimizer`, the metadata says
+    `pytorch_optimizer`, and comparing them unnormalised finds nothing."""
+    assert _normalise("pytorch_optimizer") == _normalise("pytorch-optimizer")
+    assert _normalise("PyYAML") == "pyyaml"
+    assert _normalise("hydra.core") == "hydra-core"
 
 
 def test_model_spec_compares_values_not_words():
