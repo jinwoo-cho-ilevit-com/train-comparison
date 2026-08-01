@@ -60,19 +60,18 @@ Wave 0을 순차 구간으로 둔 이유가 이것이다.
 "적용했다고 주장하는 것"과 "적용된 것"이 같은 근거를 갖게 된다. 분리해야 대조가 된다.
 
 ```python
-# axes.py — 축을 켜는 유일한 지점. 이 5개가 bench.py의 호출 지점 전부다
+# axes.py — 축을 켜는 유일한 지점. 이 4개가 bench.py의 호출 지점이다
 IMPLEMENTED: frozenset[str]                            # 실제로 적용 가능한 축
+def patch(config) -> list[str]                         # 모델 생성 "이전"
 def load_kwargs(config) -> dict                        # from_pretrained kwargs
-def apply(model, config) -> tuple[Any, list[str]]      # 래핑/교체 허용
-def optimizer(params, config, device) -> tuple[Any, list[str]]
-def dataloader_kwargs(config) -> dict
-def loss_fn(config) -> tuple[Any, list[str]]
+def assemble(model, config, device, framework, dataset=None) -> tuple[Built, list[str]]
+def step_context(config) -> AbstractContextManager     # 스텝을 감싸는 컨텍스트
 class UnappliedAxis(RuntimeError)                      # 구현 없음 -> 기본값 대체 금지
 
 # applied.py — 켜졌는지 읽는 유일한 지점
 @dataclass(frozen=True)
 class Built:                          # 런이 만든 것. 축은 모델에만 있지 않다
-    model / optimizer / dataloader / loss_fn
+    model / optimizer / dataloader / loss_fn / framework
 
 @dataclass(frozen=True)
 class AxisState:
@@ -92,17 +91,58 @@ def capture(built: Built, config: BenchConfig) -> AppliedState
 def assert_matches(state: AppliedState, config: BenchConfig) -> None  # AppliedMismatch
 ```
 
-**호출 지점 5개를 Wave 0에서 고정하는 이유**: 이걸 호출할 하네스(`scripts/bench.py`)는
+**호출 지점 4개를 Wave 0에서 고정하는 이유**: 이걸 호출할 하네스(`scripts/bench.py`)는
 Wave 3에 다른 레인이 만든다. 형태가 없으면 축을 추가하는 레인과 하네스를 짓는 레인이
 각자 다른 인터페이스를 가정하게 되고, 그게 정확히 이 문서가 막으려는 것이다.
 
-`apply`가 모델을 **반환**하는 이유: 축의 절반은 모델을 변형하지 않고 교체한다.
-`torch.compile`과 `get_peft_model`은 새 객체를 돌려주고 FSDP/DeepSpeed는 감싼다.
-in-place 변형만 표현하는 시그니처로는 이들을 담을 수 없다.
+`assemble`이 조각별 빌더가 아니라 **한 번에 전부** 만드는 이유는 조각을 따로 만들 수
+없는 축이 있기 때문이다. 두 가지를 문서로 확인했다:
+
+| 근거 | 사실 | 영향 |
+|---|---|---|
+| DeepSpeed 튜토리얼(cifar-10, bert-pretraining) | `deepspeed.initialize(model=, model_parameters=, training_data=)` -> `(engine, optimizer, dataloader, scheduler)` | `parallel.strategy=zero2/3`와 `train.offload`를 독립 훅 3개로 쪼갤 수 없다 |
+| DALI 문서 | "replacing the standard DataLoader with DALIClassificationIterator" | `dataloader.backend=dali`는 kwargs가 아니라 로더 자체를 교체한다 |
+| Liger README | `apply_liger_kernel_to_llama()` 다음에 `# 2. Instantiate patched model` | `kernel.name`은 생성 이전에 적용된다. 그래서 `patch`가 별도 호출 지점이다 |
+
+`assemble`이 모델을 **반환**하는 이유도 같다. `torch.compile`과 `get_peft_model`은
+새 객체를 돌려주고 FSDP/DeepSpeed는 감싼다. in-place 변형만 표현하는 시그니처로는
+이들을 담을 수 없다.
+
+`step_context`가 따로 있는 이유: precision은 구성 시점만의 선택이 아니다. fp8 recipe는
+forward를 감싼다. 갈 곳 없는 축은 검증되지 않는 어딘가에서 적용된다.
 
 `capture`가 `Built`를 받는 이유: `optim.name`은 옵티마이저가, `dataloader.*`는
-데이터로더가, `loss.name`은 손실이 결정한다. 모델만 보는 capture는 이들을 영원히
-미확인으로 두거나, 더 나쁘게는 추측하도록 넓혀진다.
+데이터로더가, `loss.name`은 손실이, `framework.name`은 실제로 실행된 어댑터가
+결정한다. 모델만 보는 capture는 이들을 영원히 미확인으로 두거나, 더 나쁘게는 추측하도록
+넓혀진다.
+
+`framework`는 config가 아니라 **어댑터가 리터럴로** 넘긴다. config는 요청이고, 요청이
+실행의 증거가 아니라는 것이 이 모듈의 존재 이유다.
+
+### 17축이 4개 호출 지점에 전부 들어가는가
+
+`assemble` 내부는 D가 자유롭게 나눈다(`_apply_to_model` / `_optimizer` / `_dataloader` /
+`_loss`가 현재 구성이다). 계약은 **호출 지점 4개**이지 내부 구조가 아니다. 다만 순서
+하나는 고정한다 — **모델 변형이 옵티마이저 생성보다 먼저다.** FSDP2는 샤딩된 파라미터
+위에 옵티마이저가 만들어져야 하고, 순서가 뒤집히면 옵티마이저가 원본 파라미터를 잡는다.
+
+| 호출 지점 | 담는 축 |
+|---|---|
+| `patch` | `kernel.name` (liger/fla/kernels_hub) |
+| `load_kwargs` | `attn.name`, (qlora 양자화 config, precision의 적재 dtype) |
+| `assemble` -> 모델 | `freeze.vision_tower`, `freeze.ple`, `compile.mode`, `peft.mode`, `train.gradient_checkpointing`, `precision.name`의 모듈 교체(torchao) |
+| `assemble` -> 옵티마이저 | `optim.name`, `train.offload` |
+| `assemble` -> 데이터로더 | `dataloader.backend/packing/pretokenize` |
+| `assemble` -> 손실 | `loss.name`, `parallel.cross_device_negatives` |
+| `assemble` -> 공동 초기화 | `parallel.strategy` (FSDP2/DDP는 모델 래핑, ZeRO는 모델+옵티마이저+로더 동시) |
+| `assemble` -> `framework` 인자 | `framework.name` |
+| `step_context` | `precision.name`의 fp8 autocast |
+
+빠진 축이 없다. D가 이 표에서 벗어나는 축을 만나면 그것은 계약 변경이다.
+
+`framework.name`은 훅이 적용하는 것이 아니라 **어댑터가 자기 이름을 리터럴로 넘겨서**
+결정된다. `IMPLEMENTED`에 있지만 거짓 등재가 아니다 — 그 리터럴을 쓴 파일이 곧 어느
+코드 경로가 돌았는지의 증거다.
 
 **불변식**
 
@@ -147,7 +187,14 @@ vision tower가 구조적으로 FA를 못 받아 transformers가 개별 강등�
 `axes.py`에 구현이 없고(LoRA가 모든 base 파라미터를 얼려 `freeze.ple` 판정과 충돌한다 —
 freeze 축이 "얼림"인지 "peft가 얼린 것에 더해 얼림"인지는 축을 구현하는 레인이 정한다),
 `_lora_attach`는 모델을 in-place로 재작성하므로 **마지막에 실행되고 그 뒤에 어떤 체크도
-오지 않는다.** PLE 파라미터 판별은 `axes.ple_parameters` 하나뿐이다 — native.py가 갖고
+오지 않는다.**
+
+**D가 `peft.mode`를 켜는 순간 모든 LoRA timing 런이 차단된다.** 이건 열린 설계 질문이
+아니라 확정된 결과다: peft가 base 파라미터를 전부 얼리므로 `freeze.ple=false` 요청이
+`applied="True"`와 mismatch를 낸다. 그리고 이 프로젝트의 표제 비교가 full finetuning
+대 LoRA다 — 축을 켜자마자 스터디의 절반이 멈춘다. **해법은 probe 완화가 아니라
+`freeze.*` capture가 peft가 얼린 것을 기준선으로 잡고 그 위의 차분을 재는 것이다.**
+D는 축을 구현하기 전에 이걸 정하고 들어간다. PLE 파라미터 판별은 `axes.ple_parameters` 하나뿐이다 — native.py가 갖고
 있던 두 번째 정의는 제거했다(이미 죽은 `altup` 조건으로 드리프트해 있었다).
 
 ---
@@ -251,3 +298,10 @@ infisical run --env=dev -- uv run python scripts/audit_plan.py
 
 추가로 각 wave는 **작성자와 분리된 리뷰 레인**을 통과해야 한다(컨벤션 09). 2개 이상
 모듈이나 인터페이스를 건드리면 3레인.
+
+### CPU에는 timing 경로가 없다
+
+`optim.name`은 `fused=device.type=="cuda"`이므로 CPU에서는 `adamw_fused` 요청에
+`adamw_unfused`가 적용되어 영구 mismatch다. 의도된 설계다 — CPU 수치는 어차피 보고
+대상이 아니다. 다만 **CPU 통합 테스트는 `purpose=probe`로만 짤 수 있다.**
+`tests/test_smoke_cpu.py`(Wave 3 G)가 여기 부딪힌다.

@@ -26,7 +26,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, get_args
 
-from trainbench import axes
 from trainbench.config_schema import BenchConfig, RunConfig, axis_knobs
 
 # Purposes whose numbers get reported. A probe or profile run may proceed with
@@ -110,6 +109,10 @@ class Built:
     optimizer: Any = None
     dataloader: Any = None
     loss_fn: Any = None
+    # Which adapter actually ran. Set by that adapter with a literal, never copied
+    # from the config: the config is the request, and telling the two apart is the
+    # entire job of this module.
+    framework: str | None = None
 
 
 # --- per-axis capture probes -------------------------------------------------
@@ -185,6 +188,10 @@ def _capture_freeze_ple(built: Built, config: BenchConfig) -> tuple[str | None, 
     freeze of nothing — 2.39B parameters, 46.8% of gemma-4-E2B, quietly still
     training. Zero matches on gemma4 is undetermined, not False.
     """
+    # Imported here rather than at module scope: axes.py imports Built from this
+    # module, and the two would otherwise form a cycle.
+    from trainbench import axes
+
     if built.model is None:
         return None, {"reason": "no model was built"}
     params = axes.ple_parameters(built.model)
@@ -244,11 +251,24 @@ def _capture_loss(built: Built, config: BenchConfig) -> tuple[str | None, dict[s
     return str(value), {"callable": getattr(built.loss_fn, "__name__", repr(built.loss_fn))}
 
 
+def _capture_framework(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
+    """Which adapter produced the run.
+
+    A registry that routed `framework=unsloth` to the native path would otherwise
+    publish native numbers in the unsloth row, and nothing in the result would
+    say so.
+    """
+    if built.framework is None:
+        return None, {"reason": "no adapter declared itself"}
+    return str(built.framework), {}
+
+
 _CAPTURES: dict[str, CaptureFn] = {
     "attn.name": _capture_attn,
     "freeze.ple": _capture_freeze_ple,
     "optim.name": _capture_optim,
     "loss.name": _capture_loss,
+    "framework.name": _capture_framework,
 }
 
 # Where the applied value is expressed in different words from the config value.

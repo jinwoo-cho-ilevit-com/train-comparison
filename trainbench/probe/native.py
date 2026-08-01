@@ -28,6 +28,10 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
     hf_id = config.model.hf_id
     revision = config.model.revision
 
+    # Before the model exists: kernel libraries patch the transformers classes,
+    # and a model built first is a model the patch never reached.
+    report.run("axes_patch", lambda: {"applied": axes.patch(config)})
+
     ok, processor = report.run(
         "processor_load",
         lambda: AutoProcessor.from_pretrained(hf_id, revision=revision),
@@ -55,20 +59,19 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
 
     built = applied.Built(model=model)
 
-    def _apply_axes() -> dict[str, Any]:
-        # apply() may hand back a different object — peft, compile and FSDP all
-        # replace the model rather than mutating it — so its result is what
-        # everything after this point uses.
+    def _assemble() -> dict[str, Any]:
+        # assemble() may hand back a different model — peft, compile and FSDP all
+        # replace it rather than mutating it — so its result is what everything
+        # after this point uses. "native" is a literal: the config says which
+        # framework was asked for, and this file is the evidence of which one ran.
         nonlocal model, built
-        model, names = axes.apply(model, config)
-        optimizer, optim_names = axes.optimizer(model.parameters(), config, device)
-        loss, loss_names = axes.loss_fn(config)
-        built = applied.Built(model=model, optimizer=optimizer, loss_fn=loss)
-        return {"applied": names + optim_names + loss_names}
+        built, names = axes.assemble(model, config, device, framework="native")
+        model = built.model
+        return {"applied": names}
 
     # A failure here leaves `built` holding the model alone, so the axes it would
     # have covered come back undetermined rather than unexamined.
-    report.run("axes_apply", _apply_axes)
+    report.run("axes_assemble", _assemble)
     report.applied = applied.capture(built, config)
     # Records the verdict rather than aborting: a probe answers "does it run", and
     # purpose=probe is not enforced. A reportable purpose raises here, which is the

@@ -121,6 +121,17 @@ def test_a_branch_name_does_not_count_as_pinned():
         compose_cfg("run=timing", "data.revision=main")
 
 
+def test_every_attention_axis_value_has_an_implementation_name():
+    """`config.attn.impl` is what applied.py compares against. A Literal value with
+    no entry in the map would raise on read, which capture turns into undetermined
+    and therefore a blocked timing run — fail-safe, but the axis would be dead."""
+    from typing import get_args
+
+    from trainbench.config_schema import ATTN_IMPL, AttnConfig
+
+    assert set(get_args(AttnConfig.model_fields["name"].annotation)) == set(ATTN_IMPL)
+
+
 def test_attention_impl_cannot_disagree_with_its_label():
     """A config free to name the axis fa3 while asking transformers for sdpa
     would be labelled fa3 and certified as a match by applied.py."""

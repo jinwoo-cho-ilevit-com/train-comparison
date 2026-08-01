@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from types import SimpleNamespace
 
@@ -22,6 +23,13 @@ from trainbench.config_schema import axis_knobs
 from trainbench.probe.types import Check, ProbeReport
 
 CPU = torch.device("cpu")
+
+
+def torch_model():
+    """A real nn.Module: assemble() builds an optimizer from its parameters."""
+    model = torch.nn.Linear(2, 2)
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+    return model
 
 
 @pytest.fixture
@@ -393,7 +401,7 @@ def test_the_loss_axis_is_read_off_the_loss_that_was_built(config_mapping):
     """GradCache is the case this exists for: plain in-batch negatives must not be
     able to report a cached_mnrl speedup for work that was never done."""
     config = bench(config_mapping)
-    loss, names = axes.loss_fn(config)
+    loss, names = axes._loss(config)
 
     state = capture(built(loss_fn=loss), config)
 
@@ -408,31 +416,67 @@ def test_a_loss_that_declares_nothing_is_undetermined(config_mapping):
     assert "axis_value" in axis(state, "loss.name").detail["reason"]
 
 
-def test_an_axis_value_with_no_implementation_is_refused_not_substituted(config_mapping):
+UNIMPLEMENTED_AXES = (
+    {"optim.name": "muon"},
+    {"optim.name": "adamw_8bit"},
+    {"loss.name": "cached_mnrl", "loss.mini_batch": 2},
+    {"dataloader.backend": "dali"},
+    {"dataloader.packing": True},
+    {"dataloader.pretokenize": True},
+    {"parallel.strategy": "zero3"},
+    {"train.offload": "optimizer"},
+    {"parallel.cross_device_negatives": True},
+)
+
+
+@pytest.mark.parametrize("override", UNIMPLEMENTED_AXES)
+def test_an_axis_value_with_no_implementation_is_refused_not_substituted(config_mapping, override):
     """Returning the default under the requested name is the failure the whole
     module exists to prevent, and it is not less of one in our own code."""
-    for override, axis_name in (
-        ({"optim.name": "muon"}, "optim"),
-        ({"loss.name": "cached_mnrl", "loss.mini_batch": 2}, "loss"),
-        ({"dataloader.backend": "dali"}, "dataloader"),
-    ):
-        config = bench(config_mapping, **override)
-        build = {
-            "optim": lambda c: axes.optimizer([torch.nn.Parameter(torch.zeros(2))], c, CPU),
-            "loss": axes.loss_fn,
-            "dataloader": axes.dataloader_kwargs,
-        }[axis_name]
-        with pytest.raises(axes.UnappliedAxis):
-            build(config)
+    config = bench(config_mapping, **override)
+
+    with pytest.raises(axes.UnappliedAxis):
+        axes.assemble(torch_model(), config, CPU, framework="native")
 
 
-def test_apply_hands_back_the_model(config_mapping):
-    """peft, torch.compile and FSDP all replace the model rather than mutate it.
-    A hook that only mutated in place could not express them, and the lane that
-    adds those axes would have to change this signature after branching."""
-    model = fake_model("sdpa")
+def test_an_fp8_recipe_is_refused_rather_than_run_as_bf16(config_mapping):
+    """Precision is not only a construction-time choice — fp8 wraps the forward
+    pass — so an axis with nowhere to live would get applied somewhere unverified."""
+    assert isinstance(axes.step_context(bench(config_mapping)), contextlib.AbstractContextManager)
 
-    returned, applied_names = axes.apply(model, bench(config_mapping))
+    with pytest.raises(axes.UnappliedAxis):
+        axes.step_context(bench(config_mapping, **{"precision.name": "mxfp8"}))
 
-    assert returned is model
-    assert applied_names == []
+
+def test_assemble_hands_back_the_model(config_mapping):
+    """peft, torch.compile and FSDP all replace the model rather than mutate it,
+    and deepspeed.initialize returns the model, optimizer and dataloader from one
+    call. A hook that only mutated in place could not express any of them."""
+    model = torch_model()
+
+    result, applied_names = axes.assemble(model, bench(config_mapping), CPU, framework="native")
+
+    assert result.model is model
+    assert result.optimizer is not None
+    assert result.loss_fn is not None
+    assert set(applied_names) == {"optim.name", "loss.name", "framework.name"}
+
+
+def test_the_framework_axis_is_the_adapter_that_ran_not_the_one_requested(config_mapping):
+    """A registry that routed framework=unsloth to the native path would publish
+    native numbers in the unsloth row, and nothing in the result would say so."""
+    config = bench(config_mapping, **{"framework.name": "unsloth"})
+    misrouted, _ = axes.assemble(torch_model(), config, CPU, framework="native")
+
+    state = capture(misrouted, config)
+
+    assert axis(state, "framework.name").applied == "native"
+    assert not axis(state, "framework.name").matches
+    with pytest.raises(AppliedMismatch, match="framework.name"):
+        assert_matches(state, config)
+
+
+def test_an_adapter_that_declares_nothing_is_undetermined(config_mapping):
+    state = capture(built(), bench(config_mapping))
+
+    assert axis(state, "framework.name").applied is None

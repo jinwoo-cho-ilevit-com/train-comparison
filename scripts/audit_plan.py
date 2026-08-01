@@ -272,32 +272,40 @@ def axis_group_leaves_are_classified() -> Result:
     )
 
 
-@check("assert-called")
-def the_measurement_entry_point_calls_assert_matches() -> Result:
-    """The harness that reports numbers must call `assert_matches`.
+# What the measurement entry point has to invoke. Each is a place an axis is
+# either applied or verified, and each is silently skippable: a harness that never
+# calls `step_context` runs an fp8 recipe that never wrapped the forward pass,
+# while the capture probe still finds the swapped modules and reports a match.
+ENTRY_POINT_CALLS = ("assemble", "step_context", "assert_matches")
 
-    "Some caller exists" is not the property that matters. The probe calls it too,
-    and `purpose=probe` returns immediately from every check — so an entry point
-    written without the call would leave this green while measuring unverified
-    settings. The named entry point is what has to call it.
+
+@check("assert-called")
+def the_measurement_entry_point_calls_the_axis_machinery() -> Result:
+    """The harness that reports numbers must go through axes.py and applied.py.
+
+    "Some caller exists somewhere" is not the property that matters. The probe
+    calls `assert_matches` too, and `purpose=probe` returns immediately from every
+    check — so an entry point written without the call would leave this green
+    while measuring unverified settings. The named entry point is what has to call
+    it, and the same is true of every hook an axis is applied through.
     """
-    callers = [p.relative_to(REPO).as_posix() for p in _code_files() if _calls(p, "assert_matches")]
     if not BENCH_ENTRY_POINT.exists():
         return Result(
             "assert-called",
             False,
-            f"{BENCH_ENTRY_POINT.relative_to(REPO)} does not exist yet, so nothing enforces the "
-            f"axis check for a reportable run (other callers: {', '.join(callers) or 'none'})",
+            f"{BENCH_ENTRY_POINT.relative_to(REPO)} does not exist yet, so nothing enforces "
+            "the axis machinery for a reportable run",
         )
     entry = BENCH_ENTRY_POINT.relative_to(REPO).as_posix()
-    if entry not in callers:
-        return Result(
-            "assert-called",
-            False,
-            f"{entry} never calls assert_matches; a reportable run would proceed on "
-            "unverified settings",
-        )
-    return Result("assert-called", True, f"assert_matches is called from {', '.join(callers)}")
+    missing = [name for name in ENTRY_POINT_CALLS if not _calls(BENCH_ENTRY_POINT, name)]
+    return Result(
+        "assert-called",
+        not missing,
+        f"{entry} calls {', '.join(ENTRY_POINT_CALLS)}"
+        if not missing
+        else f"{entry} never calls {', '.join(missing)}; those axes would be applied or "
+        "verified nowhere while the run still reports numbers",
+    )
 
 
 TREE_PREFIX = " │├└─"
