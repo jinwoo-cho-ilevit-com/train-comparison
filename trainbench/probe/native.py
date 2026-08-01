@@ -10,15 +10,10 @@ from typing import Any
 
 import torch
 
-from trainbench import applied, axes
+from trainbench import axes
 from trainbench.config_schema import BenchConfig
 from trainbench.probe import steps
 from trainbench.probe.types import ProbeReport
-
-
-def _verify_axes(state: applied.AppliedState, config: BenchConfig) -> dict[str, Any]:
-    applied.assert_matches(state, config)
-    return state.to_dict()
 
 
 def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
@@ -29,9 +24,7 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     hf_id = config.model.hf_id
     revision = config.model.revision
 
-    # Before the model exists: kernel libraries patch the transformers classes,
-    # and a model built first is a model the patch never reached.
-    report.run("axes_patch", lambda: {"applied": axes.patch(config)})
+    steps.patch_axes(config, report)
 
     ok, processor = report.run(
         "processor_load",
@@ -58,37 +51,27 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
         return
     model.to(device)
 
-    built = applied.Built(model=model)
-
-    def _assemble() -> dict[str, Any]:
-        # assemble() may hand back a different model — peft, compile and FSDP all
-        # replace it rather than mutating it — so its result is what everything
-        # after this point uses. "native" is a literal: the config says which
-        # framework was asked for, and this file is the evidence of which one ran.
-        nonlocal model, built
-        built, names = axes.assemble(model, config, device, framework="native")
-        model = built.model
-        return {"applied": names}
-
-    # A failure here leaves `built` holding the model alone, so the axes it would
-    # have covered come back undetermined rather than unexamined.
-    report.run("axes_assemble", _assemble)
-    report.applied = applied.capture(built, config)
-    # Records the verdict rather than aborting: a probe answers "does it run", and
-    # purpose=probe is not enforced. A reportable purpose raises here, which is the
-    # point — the same call in the measurement harness stops the run.
-    report.run("axes_verified", lambda: _verify_axes(report.applied, config))
+    # "native" is a literal: the config says which framework was asked for, and
+    # this file is the evidence of which one ran.
+    model = steps.verify_axes(model, config, device, "native", report)
 
     # Whatever a check returns is recorded as its detail, so the tensors stay in
     # this dict and only shapes come back out.
     tokenized: dict[str, torch.Tensor] = {}
     side = config.model.padding_side
 
+    report.run("padding_side_alignment", lambda: steps.padding_side_alignment(processor, side))
+
     text_ok = report.run(
-        "text_tokenize", lambda: steps.tokenize_text(processor, device, tokenized)
+        "text_tokenize", lambda: steps.tokenize_text(processor, device, tokenized, side)
     )[0]
 
-    report.run("visual_tokens", lambda: steps.visual_token_count(processor, model, device))
+    report.run(
+        "visual_tokens",
+        lambda: steps.visual_token_count(
+            processor, model, device, side, config.model.tokens_per_image
+        ),
+    )
 
     if text_ok:
         report.run("text_embed_forward", lambda: _embed(model, tokenized, side))
@@ -122,7 +105,7 @@ def _multimodal_embed(
     model: Any, processor: Any, device: torch.device, padding_side: str
 ) -> dict[str, Any]:
     model.eval()
-    batch = steps.image_batch(processor, device)
+    batch = steps.image_batch(processor, device, padding_side)
     with torch.no_grad():
         pooled = steps.encode(model, batch, padding_side)
     return {"embedding_shape": list(pooled.shape), "seq_len": int(batch["input_ids"].shape[1])}

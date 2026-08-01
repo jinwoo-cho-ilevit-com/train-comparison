@@ -3,6 +3,12 @@
 Qwen3-VL-Embedding-2B ships with a sentence-transformers config, so this path is
 expected to work for it; the open question is the two generative VLMs, which have
 no ST module layout and must fall back to default pooling.
+
+No padding-side alignment here, unlike every other adapter: ST pools inside its
+own module rather than through `last_token_pool`, so `config.model.padding_side`
+is not the assumption in play, and forcing it onto ST's tokeniser would change an
+input this probe is meant to observe untouched. What pooling ST actually chose is
+already recorded as `has_module_layout`.
 """
 
 from __future__ import annotations
@@ -11,8 +17,10 @@ from typing import Any
 
 import torch
 
+from trainbench import axes
 from trainbench.config_schema import BenchConfig
 from trainbench.embedding import info_nce
+from trainbench.probe import steps
 from trainbench.probe.fixtures import PROBE_PAIRS
 from trainbench.probe.types import ProbeReport
 
@@ -22,11 +30,21 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     from sentence_transformers import SentenceTransformer
 
     report.add_version(sentence_transformers)
+    steps.patch_axes(config, report)
 
     loaded: dict[str, Any] = {}
 
     def _load() -> dict[str, Any]:
-        model = SentenceTransformer(config.model.hf_id, device=str(device))
+        # `model_kwargs` is forwarded to `AutoModel.from_pretrained` on the torch
+        # backend (SentenceTransformer.__init__), so this is the one framework
+        # path where the load-time axes can be honoured rather than left to read
+        # back as a mismatch.
+        model = SentenceTransformer(
+            config.model.hf_id,
+            device=str(device),
+            revision=config.model.revision,
+            model_kwargs=axes.load_kwargs(config),
+        )
         loaded["model"] = model
         return {
             "modules": [type(m).__name__ for m in model],
@@ -42,7 +60,7 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
         report.skip("mnrl_backward", "model did not load")
         return
 
-    model = loaded["model"]
+    model = steps.verify_axes(loaded["model"], config, device, "sentence_transformers", report)
     texts = [q for q, _ in PROBE_PAIRS] + [d for _, d in PROBE_PAIRS]
 
     report.run(

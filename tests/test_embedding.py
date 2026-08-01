@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from trainbench.embedding import info_nce, last_token_pool
+from trainbench.embedding import align_padding_side, info_nce, last_token_pool
 
 # Positions 0..3 are distinguishable, so a wrong index is visible in the value.
 HIDDEN = torch.tensor([[[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]]])
@@ -85,6 +85,77 @@ def test_padding_side_is_required():
 def test_unknown_padding_side_is_refused_not_guessed():
     with pytest.raises(ValueError, match="padding_side"):
         last_token_pool(HIDDEN, torch.ones(1, 4, dtype=torch.long), padding_side="middle")
+
+
+def test_right_padding_refuses_a_left_padded_mask():
+    """The reproduced defect. `sum-1` is index 1 here, which is a PAD: the config
+    said right, the tokeniser padded left, and the pooled embedding was padding
+    with no exception and no warning."""
+    mask = torch.tensor([[0, 0, 1, 1]])
+
+    with pytest.raises(ValueError, match="not right-padded"):
+        last_token_pool(HIDDEN, mask, padding_side="right")
+
+
+def test_left_padding_refuses_a_right_padded_mask():
+    """The mirror case. The left branch reads the last column and never looks at the
+    mask, so both existing left tests — whose masks end in 1 — could not catch it."""
+    mask = torch.tensor([[1, 1, 0, 0]])
+
+    with pytest.raises(ValueError, match="not left-padded"):
+        last_token_pool(HIDDEN, mask, padding_side="left")
+
+
+def test_a_row_with_no_attended_token_is_refused():
+    """`clamp(min=0)` turned an empty row into index 0, which is a PAD."""
+    mask = torch.tensor([[1, 1, 0, 0], [0, 0, 0, 0]])
+    hidden = HIDDEN.expand(2, 4, 2)
+
+    with pytest.raises(ValueError, match="no attended token"):
+        last_token_pool(hidden, mask, padding_side="right")
+
+
+class _Tokenizer:
+    def __init__(self, padding_side):
+        self.padding_side = padding_side
+
+
+class _Processor:
+    def __init__(self, tokenizer_side, own_side=None):
+        self.tokenizer = _Tokenizer(tokenizer_side)
+        if own_side is not None:
+            self.padding_side = own_side
+
+
+def test_align_padding_side_forces_the_configured_side_and_says_what_it_was():
+    processor = _Processor("left", own_side="left")
+
+    detail = align_padding_side(processor, "right")
+
+    assert processor.tokenizer.padding_side == "right"
+    # The processor's own copy counts: one left on the old value can win at call
+    # time, and then the batch is padded the way the check said it was not.
+    assert processor.padding_side == "right"
+    assert detail["declared_before"] == {"tokenizer": "left", "processor": "left"}
+    assert detail["disagreed"] == ["processor", "tokenizer"]
+
+
+def test_align_padding_side_refuses_a_processor_that_declares_nothing():
+    """Nothing here could then establish which side it pads, and last-token pooling
+    would read a PAD position without anything saying so."""
+    with pytest.raises(ValueError, match="declares no padding_side"):
+        align_padding_side(object(), "right")
+
+
+def test_align_padding_side_refuses_a_setting_that_does_not_take():
+    class _Frozen:
+        padding_side = "left"
+
+        def __setattr__(self, name, value):
+            pass
+
+    with pytest.raises(ValueError, match="does not take the setting"):
+        align_padding_side(_Frozen(), "right")
 
 
 def test_info_nce_is_lower_when_pairs_align():

@@ -135,8 +135,10 @@ def test_image_token_id_says_where_it_looked_when_there_is_none():
 class _Processor:
     """Emits a fixed batch so the count under test is the one written here."""
 
-    def __init__(self, input_ids):
+    def __init__(self, input_ids, padding_side="right", pad_token_id=None):
         self._input_ids = input_ids
+        self.padding_side = padding_side
+        self.pad_token_id = pad_token_id
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
         return "<image>text"
@@ -145,11 +147,15 @@ class _Processor:
         return {"input_ids": self._input_ids}
 
 
+def _count(processor, model, tokens_per_image=None):
+    return visual_token_count(processor, model, get_device("cpu"), "right", tokens_per_image)
+
+
 def test_visual_token_count_reports_the_placeholder_count():
     processor = _Processor(torch.tensor([[5, 7, 7, 7, 6], [5, 7, 7, 7, 6]]))
     model = _Model(_Config(image_token_id=7))
 
-    detail = visual_token_count(processor, model, get_device("cpu"))
+    detail = _count(processor, model)
 
     assert detail["visual_tokens_per_image"] == 3
     assert detail["image_token_id_source"] == "config.image_token_id"
@@ -163,7 +169,7 @@ def test_visual_token_count_refuses_a_zero_count():
     model = _Model(_Config(image_token_id=7))
 
     with pytest.raises(ValueError, match="outside"):
-        visual_token_count(processor, model, get_device("cpu"))
+        _count(processor, model)
 
 
 def test_visual_token_count_refuses_an_all_image_batch():
@@ -173,7 +179,146 @@ def test_visual_token_count_refuses_an_all_image_batch():
     model = _Model(_Config(image_token_id=7))
 
     with pytest.raises(ValueError, match="outside"):
-        visual_token_count(processor, model, get_device("cpu"))
+        _count(processor, model)
+
+
+def test_visual_token_count_refuses_the_pad_token_id():
+    """`0 < n < seq_len` accepts a pad id happily: padded rows are neither empty nor
+    full, so the count comes back looking like a measurement of the model when it is
+    a measurement of the batch shape."""
+    processor = _Processor(torch.tensor([[5, 7, 7, 7, 6], [5, 7, 7, 7, 6]]), pad_token_id=7)
+    model = _Model(_Config(image_token_id=7))
+
+    with pytest.raises(ValueError, match="pad token id"):
+        _count(processor, model)
+
+
+def test_visual_token_count_refuses_per_sample_disagreement():
+    """Every row carries the same image, so counts that differ mean the id matched
+    something the rows do not share. Grading per_sample[0] alone accepted this."""
+    processor = _Processor(torch.tensor([[5, 7, 7, 7, 6], [5, 7, 7, 6, 6]]))
+    model = _Model(_Config(image_token_id=7))
+
+    with pytest.raises(ValueError, match="disagree"):
+        _count(processor, model)
+
+
+def test_visual_token_count_refuses_a_count_the_model_spec_contradicts():
+    """gemma4 declares a fixed 280 regardless of resolution. A different measurement
+    is a disagreement to resolve, not a number to divide tokens/s by."""
+    processor = _Processor(torch.tensor([[5, 7, 7, 7, 6]]))
+    model = _Model(_Config(image_token_id=7))
+
+    with pytest.raises(ValueError, match="tokens_per_image"):
+        _count(processor, model, tokens_per_image=280)
+
+
+def test_visual_token_count_accepts_the_declared_count():
+    processor = _Processor(torch.tensor([[5, 7, 7, 7, 6]]))
+    model = _Model(_Config(image_token_id=7))
+
+    assert _count(processor, model, tokens_per_image=3)["declared_tokens_per_image"] == 3
+
+
+class _Tokenizer:
+    def __init__(self, padding_side):
+        self.padding_side = padding_side
+
+
+def test_padding_side_alignment_fails_loudly_when_the_checkpoint_disagrees():
+    """`config.model.padding_side` used to be a claim nothing checked: with the
+    processor padding the other way, both pooling branches returned a PAD
+    embedding without an exception or a warning."""
+    from trainbench.probe.steps import padding_side_alignment
+
+    processor = _Processor(torch.tensor([[1]]), padding_side="left")
+
+    with pytest.raises(ValueError, match="model-spec"):
+        padding_side_alignment(processor, "right")
+    # Forced anyway: the check is what makes the disagreement loud, and the checks
+    # that run after it still have to pool a real token.
+    assert processor.padding_side == "right"
+
+
+def test_padding_side_alignment_passes_when_they_agree():
+    from trainbench.probe.steps import padding_side_alignment
+
+    processor = _Processor(torch.tensor([[1]]), padding_side="left")
+    processor.tokenizer = _Tokenizer("left")
+
+    detail = padding_side_alignment(processor, "left")
+
+    assert detail["disagreed"] == []
+    assert detail["declared_before"] == {"tokenizer": "left", "processor": "left"}
+
+
+def test_verify_axes_reports_the_adapter_that_ran_not_the_framework_requested(config_mapping):
+    """docs/CONTRACTS.md §2: the framework literal an adapter passes is the evidence
+    of which code path ran. A registry routing `framework=ms_swift` to another
+    adapter must show up as a mismatch, not as a match on the request."""
+    from trainbench.probe.steps import verify_axes
+
+    mapping = json.loads(json.dumps(config_mapping))
+    mapping["framework"]["name"] = "ms_swift"
+    report = ProbeReport(framework="ms_swift", model="m")
+
+    verify_axes(
+        torch.nn.Linear(2, 2), to_bench_config(mapping), get_device("cpu"), "native", report
+    )
+
+    state = {a.axis: a for a in report.applied.axes}["framework.name"]
+    assert (state.requested, state.applied) == ("ms_swift", "native")
+    assert not state.matches
+
+
+def _unsloth_module(fast_st_accepts):
+    """Stand-in for the unsloth package, which installs only inside its own image."""
+
+    class FastVisionModel:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            raise RuntimeError("FastVisionModel does not accept this checkpoint")
+
+    class FastSentenceTransformer:
+        @staticmethod
+        def from_pretrained(hf_id, for_inference=True):
+            if not fast_st_accepts:
+                raise RuntimeError("encoder-only models only")
+            return FastSentenceTransformer()
+
+    module = types.ModuleType("unsloth")
+    module.__version__ = "0.0.0-test"
+    module.FastVisionModel = FastVisionModel
+    module.FastSentenceTransformer = FastSentenceTransformer
+    return module
+
+
+def _unsloth_report(config_mapping, monkeypatch, fast_st_accepts):
+    monkeypatch.setitem(sys.modules, "unsloth", _unsloth_module(fast_st_accepts))
+    mapping = json.loads(json.dumps(config_mapping))
+    mapping["framework"]["name"] = "unsloth"
+    report = run_probe(to_bench_config(mapping), get_device("cpu"))
+    return {c.name: c for c in report.checks}, report
+
+
+def test_a_documented_refusal_is_an_answer_not_a_broken_cell(config_mapping, monkeypatch):
+    """FastSentenceTransformer rejecting a VLM is the finding the check went for.
+    Unmarked it rendered as a plain FAIL, which is the reading docs/CONTRACTS.md §3
+    exists to prevent."""
+    checks, report = _unsloth_report(config_mapping, monkeypatch, fast_st_accepts=False)
+    check = checks["fast_sentence_transformer_accepts_vlm"]
+
+    assert (check.ok, check.expected_failure) == (False, True)
+    assert report.unexpected_passes == []
+
+
+def test_a_documented_limitation_that_disappears_is_reported(config_mapping, monkeypatch):
+    """If Unsloth starts accepting VLMs, the support matrix is wrong and this run is
+    the only place that knows. `all_ok` cannot say it."""
+    checks, report = _unsloth_report(config_mapping, monkeypatch, fast_st_accepts=True)
+
+    assert checks["fast_sentence_transformer_accepts_vlm"].ok
+    assert report.unexpected_passes == ["fast_sentence_transformer_accepts_vlm"]
 
 
 def test_ple_report_fails_when_nothing_matches():

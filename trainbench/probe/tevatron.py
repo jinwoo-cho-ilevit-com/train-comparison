@@ -4,6 +4,12 @@ The installed distribution reports version 0.0.1 from git HEAD, which does not
 match the 2.0 described in the paper, so the first question is what this package
 actually is. The module layout is recorded rather than assumed: a wrong guess at
 the API would be recorded as "unsupported" when the real answer is "probed wrong".
+
+For the same reason `axes.load_kwargs` is not forced through `DenseModel.load`:
+what that call forwards to `from_pretrained` is exactly the sort of thing this
+probe exists to find out, and a wrong keyword would be recorded as tevatron
+refusing the model. The attention axis is left to the capture side, which reads
+it off the built model and reports the mismatch.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     import tevatron
 
     report.add_version(tevatron)
+    steps.patch_axes(config, report)
 
     def _layout() -> dict[str, Any]:
         submodules = sorted(
@@ -47,11 +54,14 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
 
     model = loaded["model"]
     model.to(device)
+    model = steps.verify_axes(model, config, device, "tevatron", report)
 
     def _tokenizer() -> dict[str, Any]:
         from transformers import AutoProcessor
 
-        loaded["processor"] = AutoProcessor.from_pretrained(config.model.hf_id)
+        loaded["processor"] = AutoProcessor.from_pretrained(
+            config.model.hf_id, revision=config.model.revision
+        )
         return {"processor_class": type(loaded["processor"]).__name__}
 
     if not report.run("processor_load", _tokenizer)[0]:
@@ -61,8 +71,12 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     tokenized: dict[str, torch.Tensor] = {}
     side = config.model.padding_side
 
+    report.run(
+        "padding_side_alignment", lambda: steps.padding_side_alignment(loaded["processor"], side)
+    )
+
     if report.run(
-        "text_tokenize", lambda: steps.tokenize_text(loaded["processor"], device, tokenized)
+        "text_tokenize", lambda: steps.tokenize_text(loaded["processor"], device, tokenized, side)
     )[0]:
         report.run(
             "infonce_backward",
