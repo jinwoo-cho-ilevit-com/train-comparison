@@ -7,7 +7,7 @@ from hydra import compose, initialize_config_dir
 from pydantic import ValidationError
 
 from trainbench.compose import resolve
-from trainbench.config_schema import BenchConfig
+from trainbench.config_schema import CORRUPT_DATA_REVISIONS, BenchConfig
 
 from .conftest import CONFIG_DIR
 
@@ -176,3 +176,28 @@ def test_per_model_usage_spec_matches_documented_decisions():
         generative = compose_cfg(f"model={name}").model
         assert generative.add_generation_prompt is False
         assert generative.instruction_prompt is None
+
+
+def test_a_corrupt_subset_revision_is_refused_for_every_purpose():
+    """D1 shipped because a probe against the damaged corpus reported that the
+    pipeline worked. Restricting this to measured runs would leave that path open,
+    so the refusal is not conditioned on `run.purpose`."""
+    corrupt = next(iter(CORRUPT_DATA_REVISIONS))
+    for purpose in ("probe", "timing"):
+        with pytest.raises(ValidationError, match="known-corrupt subset"):
+            compose_cfg(f"run={purpose}", f"data.revision={corrupt}")
+
+
+def test_the_corrupt_check_accepts_the_short_shas_the_pin_check_allows():
+    """`data.revision` may be a 7-character sha, and a denylist that only matched
+    full ones would wave through the same corpus written a shorter way."""
+    corrupt = next(iter(CORRUPT_DATA_REVISIONS))
+    with pytest.raises(ValidationError, match="known-corrupt subset"):
+        compose_cfg(f"data.revision={corrupt[:7]}")
+
+
+def test_the_pinned_subsets_are_not_on_the_denylist():
+    """The configs that ship must compose. This is what caught the denylist being
+    landed before the regeneration it depends on."""
+    for name in ("speed", "quality"):
+        assert compose_cfg(f"data={name}").data.revision not in CORRUPT_DATA_REVISIONS

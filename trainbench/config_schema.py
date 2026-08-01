@@ -21,6 +21,21 @@ MAX_AUTOTUNE_MIN_WARMUP_STEPS = 20
 # because `git rev-parse --short` output is what gets pasted in practice.
 COMMIT_SHA = re.compile(r"[0-9a-f]{7,40}")
 
+# Subset revisions that must never be trained on again, with the reason a run
+# that recorded one has to be discarded. Named rather than deleted from the Hub:
+# results already exist that record this revision, and which corpus they were
+# measured on has to stay decidable after the fact.
+#
+# Enforced here rather than only in scripts/prepare_data.py because that script
+# is not in the path of a training run. A pin is copied into a config once and
+# read on every run afterwards, so the refusal belongs where every run passes.
+CORRUPT_DATA_REVISIONS = {
+    "b750b9c3263e9ef5dce225fd50aa25d7c58f1d5f": (
+        "defect D1: pos_image was dropped, so 466 rows share one placeholder "
+        "positive and 644 rows lost their query image"
+    ),
+}
+
 
 class Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -93,6 +108,12 @@ class DataConfig(Strict):
     # Upstream the subset is drawn from. A community mirror of MMEB-train that
     # embeds images; the authoritative TIGER-Lab repo stores paths only.
     source_repo: str
+    # The mirror's commit. Required, and not defaulted to None: the sampler
+    # streamed `source_repo`'s HEAD while this file's docstring and PLAN.md both
+    # said the commit was pinned, so a subset could not be traced to the upstream
+    # it came from. It is also part of the shard cache key — without it a cached
+    # draw outlives the upstream change that would have invalidated it.
+    source_revision: str
     subset_rows: int = Field(gt=0)
     sample_seed: int
     # Pushing creates/overwrites a Hub repo, so it is opt-in per invocation.
@@ -106,6 +127,17 @@ class DataConfig(Strict):
     def effective_rows(self) -> int:
         """Rows a run actually draws from: the small-sample limit, else the subset."""
         return self.limit if self.limit is not None else self.subset_rows
+
+    @model_validator(mode="after")
+    def _upstream_is_pinned_to_a_commit(self) -> DataConfig:
+        """A branch name here would put the mirror's HEAD in the sample and leave no
+        record of which HEAD, which is the state this field was added to end."""
+        if not COMMIT_SHA.fullmatch(self.source_revision):
+            raise ValueError(
+                f"data.source_revision must be a commit sha, got {self.source_revision!r}; "
+                "a branch or tag moves under the draw and cannot be recorded."
+            )
+        return self
 
 
 # transformers' own name for each attention axis value. Derived from `name`
@@ -346,6 +378,27 @@ class BenchConfig(Strict):
                 f"purpose={self.run.purpose} requires data.revision to be a commit sha, "
                 f"got {revision!r}; a branch or tag moves under the run."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _no_run_reads_a_corrupt_subset(self) -> BenchConfig:
+        """Refuse a pin that is known to name damaged data, for any purpose.
+
+        Not restricted to measured runs like the check above: a probe or a smoke
+        run against a corpus whose positives collapsed reports that the pipeline
+        works, which is how the corruption survived its first review. The
+        prefix match accepts the short shas COMMIT_SHA allows.
+        """
+        revision = self.data.revision
+        if revision is None:
+            return self
+        for corrupt, reason in CORRUPT_DATA_REVISIONS.items():
+            if corrupt.startswith(revision.lower()):
+                raise ValueError(
+                    f"data.revision={revision!r} is a known-corrupt subset of "
+                    f"{self.data.repo_id}: {reason}. Regenerate with "
+                    "scripts/prepare_data.py and pin the new revision."
+                )
         return self
 
     @model_validator(mode="after")
