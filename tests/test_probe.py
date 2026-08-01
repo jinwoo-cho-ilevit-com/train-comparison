@@ -6,7 +6,9 @@ here is the probe machinery around them.
 
 from __future__ import annotations
 
+import ast
 import json
+import pathlib
 import sys
 import types
 
@@ -147,8 +149,8 @@ class _Processor:
         return {"input_ids": self._input_ids}
 
 
-def _count(processor, model, tokens_per_image=None):
-    return visual_token_count(processor, model, get_device("cpu"), "right", tokens_per_image)
+def _count(processor, model, max_tokens_per_image=None):
+    return visual_token_count(processor, model, get_device("cpu"), "right", max_tokens_per_image)
 
 
 def test_visual_token_count_reports_the_placeholder_count():
@@ -185,12 +187,15 @@ def test_visual_token_count_refuses_an_all_image_batch():
 def test_visual_token_count_refuses_the_pad_token_id():
     """`0 < n < seq_len` accepts a pad id happily: padded rows are neither empty nor
     full, so the count comes back looking like a measurement of the model when it is
-    a measurement of the batch shape."""
+    a measurement of the batch shape.
+
+    Declared with a cap, because a pad count sits under the cap and the cap check
+    would wave it through. This gate is the one that has to catch it."""
     processor = _Processor(torch.tensor([[5, 7, 7, 7, 6], [5, 7, 7, 7, 6]]), pad_token_id=7)
     model = _Model(_Config(image_token_id=7))
 
     with pytest.raises(ValueError, match="pad token id"):
-        _count(processor, model)
+        _count(processor, model, max_tokens_per_image=280)
 
 
 def test_visual_token_count_refuses_per_sample_disagreement():
@@ -203,21 +208,84 @@ def test_visual_token_count_refuses_per_sample_disagreement():
         _count(processor, model)
 
 
-def test_visual_token_count_refuses_a_count_the_model_spec_contradicts():
-    """gemma4 declares a fixed 280 regardless of resolution. A different measurement
-    is a disagreement to resolve, not a number to divide tokens/s by."""
+def test_visual_token_count_refuses_a_count_above_the_declared_cap():
+    """The cap is what the processor can emit at most. A count above it is a count
+    of something else, and it would divide every tokens/s figure."""
     processor = _Processor(torch.tensor([[5, 7, 7, 7, 6]]))
     model = _Model(_Config(image_token_id=7))
 
-    with pytest.raises(ValueError, match="tokens_per_image"):
-        _count(processor, model, tokens_per_image=280)
+    with pytest.raises(ValueError, match="max_tokens_per_image"):
+        _count(processor, model, max_tokens_per_image=2)
 
 
-def test_visual_token_count_accepts_the_declared_count():
-    processor = _Processor(torch.tensor([[5, 7, 7, 7, 6]]))
+def test_visual_token_count_accepts_the_gemma4_count_the_processor_actually_emits():
+    """gemma-4's declared 280 is max_soft_tokens, and the processor derives each
+    image's count from its aspect ratio: 448x448 (PROBE_IMAGE_SIZE) gives 256,
+    768x256 gives 252, and 960x672 gives 280 (measured, transformers 5.14.1).
+    This used to be an equality against 280, so every gemma-4 probe died here on a
+    correct measurement — the shape that gets a gate relaxed instead of fixed."""
+    processor = _Processor(torch.tensor([[5] + [7] * 256 + [6]]))
     model = _Model(_Config(image_token_id=7))
 
-    assert _count(processor, model, tokens_per_image=3)["declared_tokens_per_image"] == 3
+    detail = _count(processor, model, max_tokens_per_image=280)
+
+    assert detail["visual_tokens_per_image"] == 256
+    assert detail["declared_max_tokens_per_image"] == 280
+
+
+def test_every_probe_adapter_hands_visual_token_count_the_declared_cap():
+    """The cap only guards anything if the adapters actually pass it.
+
+    Read off the call site rather than run, because reaching that line needs a real
+    checkpoint. Measured with in-memory mutants: replacing the argument with `None`,
+    or leaving one adapter on a stale field name after a rename, passed the whole
+    suite and would have surfaced as an AttributeError on a pod. An adapter that
+    stops calling `visual_token_count` at all is named here too — dropping the check
+    is the other way to make this pass.
+    """
+    expected = ("config", "model", "max_tokens_per_image")
+    adapters = _adapters_calling_visual_token_count()
+    wrong = {}
+    for path in adapters:
+        source = path.read_text()
+        calls = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "visual_token_count"
+        ]
+        for call in calls:
+            names = [
+                tuple(_attribute_chain(arg)) for arg in call.args if isinstance(arg, ast.Attribute)
+            ]
+            if expected not in names:
+                wrong[path.name] = ast.unparse(call)
+        if not calls:
+            wrong[path.name] = "names visual_token_count but never calls it"
+
+    assert not wrong, wrong
+    # An empty sweep would pass on nothing at all.
+    assert [path.name for path in adapters] == ["ms_swift.py", "native.py", "unsloth.py"]
+
+
+def _attribute_chain(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return reversed(parts)
+
+
+def _adapters_calling_visual_token_count():
+    probe = pathlib.Path(__file__).parent.parent / "trainbench" / "probe"
+    return [
+        path
+        for path in sorted(probe.glob("*.py"))
+        if path.name != "steps.py" and "visual_token_count" in path.read_text()
+    ]
 
 
 class _Tokenizer:

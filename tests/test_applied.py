@@ -302,7 +302,7 @@ def gemma(config_mapping, **overrides):
         **{
             "model.arch": "gemma4",
             "model.padding_side": "left",
-            "model.tokens_per_image": 280,
+            "model.max_tokens_per_image": 280,
             "model.instruction_prompt": None,
         },
         **overrides,

@@ -1449,7 +1449,16 @@ def verdict_ledger_problems(
             closed_ids.append(label)
         else:
             open_ids.append(label)
-    known = set(open_ids) | set(closed_ids)
+    # Every id the ledger still carries, whatever state it is in. `open_ids` and
+    # `closed_ids` are not enough: an item pulled into `problems` — a malformed
+    # entry, or one whose anchor holds with no `closed` record — is still present,
+    # and counting it absent reported the same item twice, once falsely. The
+    # history check asks "did this id disappear", not "is it in good order".
+    known = {
+        entry["id"]
+        for entry in payload["items"]
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    }
     problems += [
         f"{lost}: was committed to this ledger and is now absent"
         for lost in sorted(committed - known)

@@ -9,5 +9,6 @@ instruction_prompt: "Represent the user's input."
 # tokenizer_config.json declares no padding_side, so transformers' default applies.
 padding_side: right
 pooling: lasttoken
-# Pixel-proportional (min_pixels 4096 .. max_pixels 1310720), so it is measured.
-tokens_per_image: null
+# Pixel-proportional (min_pixels 4096 .. max_pixels 1310720) with no declared
+# token cap, so nothing bounds the measured count here.
+max_tokens_per_image: null

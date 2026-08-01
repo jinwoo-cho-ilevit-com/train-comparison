@@ -140,17 +140,18 @@ def test_attention_impl_cannot_disagree_with_its_label():
         compose_cfg("attn=fa3", "+attn.impl=sdpa")
 
 
-def test_a_fixed_image_token_count_belongs_only_to_gemma4():
-    """gemma4 expands every image to 280 soft tokens; both Qwen models are
-    pixel-proportional, so a declared count there is an assumption, not a fact."""
-    assert compose_cfg("model=gemma4_e2b").model.tokens_per_image == 280
+def test_an_image_token_cap_belongs_only_to_gemma4():
+    """gemma4's processor declares max_soft_tokens=280 and derives each image's count
+    from its aspect ratio; the Qwen models declare a pixel range and no token cap, so
+    a number there is our arithmetic wearing the model's spec."""
+    assert compose_cfg("model=gemma4_e2b").model.max_tokens_per_image == 280
     for name in ("qwen3_vl_emb_2b", "qwen3_5_0_8b"):
-        assert compose_cfg(f"model={name}").model.tokens_per_image is None
-        with pytest.raises(ValidationError, match="must be measured, not declared"):
-            compose_cfg(f"model={name}", "model.tokens_per_image=280")
+        assert compose_cfg(f"model={name}").model.max_tokens_per_image is None
+        with pytest.raises(ValidationError, match="the count must be measured"):
+            compose_cfg(f"model={name}", "model.max_tokens_per_image=280")
 
-    with pytest.raises(ValidationError, match="must declare it"):
-        compose_cfg("model=gemma4_e2b", "model.tokens_per_image=null")
+    with pytest.raises(ValidationError, match="must carry it"):
+        compose_cfg("model=gemma4_e2b", "model.max_tokens_per_image=null")
 
 
 def test_padding_side_is_declared_per_model():

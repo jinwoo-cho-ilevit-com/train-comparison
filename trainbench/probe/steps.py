@@ -237,7 +237,7 @@ def visual_token_count(
     model: Any,
     device: torch.device,
     padding_side: str,
-    tokens_per_image: int | None,
+    max_tokens_per_image: int | None,
 ) -> dict[str, Any]:
     """How many tokens one fixed image costs on this model.
 
@@ -256,11 +256,19 @@ def visual_token_count(
     * a count of 0, or one filling the sequence, means the id or the chat template
       is wrong — `apply_chat_template` always emits role and text tokens around
       the placeholders
-    * `config.model.tokens_per_image`, where the model declares one, is the
-      answer this is supposed to reproduce. gemma4 fixes it at 280 regardless of
-      resolution, so a different measurement is a disagreement to resolve, not a
-      measurement to publish. The Qwen models are pixel-proportional and declare
-      None, which is why this is a comparison and not a lookup.
+    * a count above `config.model.max_tokens_per_image`, where the model declares a
+      cap, cannot be a count of that model's soft tokens. gemma4's processor stops
+      at max_soft_tokens=280; exceeding it means the id matched more than the
+      placeholders, or the processor we are measuring is not the one the spec
+      describes. The Qwen models declare no cap (None), which is why this is a
+      bound and not a lookup
+
+    The bound is deliberately not an equality. It was one, against a declared 280
+    read off `image_seq_length`, and it refused every real gemma-4 batch: the
+    processor derives each image's count from its aspect ratio (448x448 -> 256,
+    768x256 -> 252) and only reaches 280 when the ratio divides evenly. An equality
+    there is a gate that fires on correct measurements, which is how it gets
+    relaxed. The count that gets published is always the measured one.
 
     A wrong number here silently rescales every tokens/s figure that divides by it.
     """
@@ -290,11 +298,11 @@ def visual_token_count(
             f"visual token count {count} is outside 0 < n < {total_seq_len} for token id "
             f"{token_id} from {source}; the placeholder id or the chat template is wrong."
         )
-    if tokens_per_image is not None and count != tokens_per_image:
+    if max_tokens_per_image is not None and count > max_tokens_per_image:
         raise ValueError(
-            f"measured {count} visual tokens but config.model.tokens_per_image declares "
-            f"{tokens_per_image}; one of the two is wrong and every tokens/s figure divides "
-            "by this number."
+            f"measured {count} visual tokens but config.model.max_tokens_per_image caps "
+            f"them at {max_tokens_per_image}; this processor cannot emit that many, so the "
+            "count is of something else and every tokens/s figure divides by this number."
         )
 
     return {
@@ -304,7 +312,7 @@ def visual_token_count(
         "pad_token_id": pad_id,
         "visual_tokens_per_image": count,
         "visual_tokens_per_sample": per_sample,
-        "declared_tokens_per_image": tokens_per_image,
+        "declared_max_tokens_per_image": max_tokens_per_image,
         "total_seq_len": total_seq_len,
     }
 

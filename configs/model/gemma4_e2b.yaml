@@ -9,5 +9,8 @@ instruction_prompt: null
 # pads left, and therefore the only one exercising that pooling branch.
 padding_side: left
 pooling: lasttoken
-# processor_config.json: image_seq_length 280, fixed regardless of resolution.
-tokens_per_image: 280
+# processor_config.json: max_soft_tokens 280. An upper bound, not a per-image
+# count — the processor derives each image's count from its aspect ratio and only
+# reaches 280 when the ratio divides evenly (measured: 448x448 -> 256,
+# 768x256 -> 252, 960x672 -> 280). See docs/model-spec.md.
+max_tokens_per_image: 280

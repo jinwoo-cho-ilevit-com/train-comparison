@@ -94,10 +94,13 @@ class ModelConfig(Strict):
     # (1_Pooling/config.json); for the generative models this is our choice, and
     # writing it down is what makes it reviewable.
     pooling: Literal["lasttoken"]
-    # Visual tokens one image becomes. gemma4 is fixed at 280; the Qwen models are
-    # pixel-proportional, so None means "measure it, do not assume it". Fixing a
-    # single budget across models was abandoned (docs/model-spec.md decision 3).
-    tokens_per_image: int | None = Field(default=None, gt=0)
+    # The most visual tokens one image can become, where the model declares a cap.
+    # No model here has a fixed per-image count: gemma4's processor computes the
+    # count from the aspect ratio and stops at max_soft_tokens=280, and the Qwen
+    # models are pixel-proportional with no declared token cap at all (None). The
+    # count itself is always measured, never assumed — fixing a single budget
+    # across models was abandoned (docs/model-spec.md decision 3).
+    max_tokens_per_image: int | None = Field(default=None, gt=0)
 
 
 class DataConfig(Strict):
@@ -444,21 +447,23 @@ class BenchConfig(Strict):
         return self
 
     @model_validator(mode="after")
-    def _fixed_image_tokens_are_gemma4_only(self) -> BenchConfig:
-        """gemma4 expands every image to a fixed 280 soft tokens; both Qwen models
-        are pixel-proportional. Declaring a fixed count for a dynamic model would
-        reintroduce the cross-model token budget that decision 3 abandoned as
-        impossible (docs/model-spec.md)."""
-        fixed = self.model.tokens_per_image is not None
-        if fixed and self.model.arch != "gemma4":
+    def _an_image_token_cap_is_gemma4_only(self) -> BenchConfig:
+        """gemma4's processor declares max_soft_tokens=280 and computes each image's
+        count from its aspect ratio, so 280 bounds the count without being it. The
+        Qwen models declare a pixel range and no token cap, so a number there would
+        be our arithmetic presented as the model's spec, and it would reintroduce the
+        cross-model token budget that decision 3 abandoned (docs/model-spec.md)."""
+        capped = self.model.max_tokens_per_image is not None
+        if capped and self.model.arch != "gemma4":
             raise ValueError(
-                f"model.tokens_per_image is set for arch={self.model.arch}, whose image "
-                "token count is pixel-proportional and must be measured, not declared."
+                f"model.max_tokens_per_image is set for arch={self.model.arch}, which "
+                "declares a pixel range and no token cap; the count must be measured."
             )
-        if not fixed and self.model.arch == "gemma4":
+        if not capped and self.model.arch == "gemma4":
             raise ValueError(
-                "arch=gemma4 has a fixed image_seq_length; model.tokens_per_image must "
-                "declare it so token accounting does not silently assume a dynamic one."
+                "arch=gemma4's processor declares max_soft_tokens; "
+                "model.max_tokens_per_image must carry it so a measured count above the "
+                "cap is caught instead of published."
             )
         return self
 

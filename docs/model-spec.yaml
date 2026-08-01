@@ -17,15 +17,15 @@ models:
       instruction_prompt: "Represent the user's input."
       padding_side: right
       pooling: lasttoken
-      tokens_per_image: null
+      max_tokens_per_image: null
     source:
       add_generation_prompt: sentence_bert_config.json
       instruction_prompt: config_sentence_transformers.json
       # No padding_side key; transformers' default is right.
       padding_side: tokenizer_config.json
       pooling: 1_Pooling/config.json
-      # min_pixels 4096 .. max_pixels 1310720: proportional, so no fixed count.
-      tokens_per_image: preprocessor_config.json
+      # min_pixels 4096 .. max_pixels 1310720 bounds the pixels, not the tokens.
+      max_tokens_per_image: preprocessor_config.json
 
   qwen3_5_0_8b:
     hf_id: Qwen/Qwen3.5-0.8B
@@ -34,7 +34,7 @@ models:
       instruction_prompt: null
       padding_side: right
       pooling: lasttoken
-      tokens_per_image: null
+      max_tokens_per_image: null
     source:
       # decision 2: true would append an assistant <think> scaffold, and its last
       # token would become the embedding.
@@ -42,8 +42,8 @@ models:
       instruction_prompt: decision
       padding_side: tokenizer_config.json
       pooling: decision
-      # shortest_edge 65536 .. longest_edge 16777216.
-      tokens_per_image: preprocessor_config.json
+      # shortest_edge 65536 .. longest_edge 16777216: again pixels, not tokens.
+      max_tokens_per_image: preprocessor_config.json
 
   gemma4_e2b:
     hf_id: google/gemma-4-E2B
@@ -52,11 +52,14 @@ models:
       instruction_prompt: null
       padding_side: left
       pooling: lasttoken
-      tokens_per_image: 280
+      max_tokens_per_image: 280
     source:
       add_generation_prompt: decision
       instruction_prompt: decision
       padding_side: tokenizer_config.json
       pooling: decision
-      # image_seq_length 280, fixed regardless of input resolution.
-      tokens_per_image: processor_config.json
+      # max_soft_tokens 280. The sibling key image_seq_length carries the same 280
+      # but Gemma4Processor never reads it; each image's count comes from its
+      # aspect ratio and 280 is where it stops. Measured, transformers 5.14.1:
+      # 448x448 -> 256, 768x256 -> 252, 960x672 -> 280. docs/model-spec.md.
+      max_tokens_per_image: processor_config.json

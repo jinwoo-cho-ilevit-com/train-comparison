@@ -511,10 +511,11 @@
       },
       "anchor": {
         "kind": "text",
-        "file": "docs/support-matrix.md",
-        "pattern": "cached_mnrl"
+        "file": "docs/evidence/README.md",
+        "pattern": "gradcache-overhead"
       },
-      "closed": null
+      "closed": null,
+      "anchor_changed": "2026-08-02 통합. 원래 anchor(docs/support-matrix.md의 `cached_mnrl`)는 그 문자열이 이미 있어 처음부터 성립했다 — GPU 측정이 있어야 닫히는 항목인데 anchor가 아무것도 기다리지 않았다. 실제로 감사가 'anchor now holds'로 보고했다. 이 항목이 기다리는 산출물은 파드에서 나온 evidence이므로 거기에 건다."
     },
     {
       "id": "model-spec-gemma4-tokens-per-image-contradicts-the-processor",
@@ -527,16 +528,23 @@
         "criterion": "model-spec의 gemma4_e2b tokens_per_image가 실측과 맞거나(고정값이 아니면 null), visual_token_count가 상한 의미로 비교하도록 고쳐질 것.",
         "command": "uv run python /Users/jwcho/.claude/jobs/ac9d76bf/tmp/probe_flat.py",
         "expected": "선언값과 실측 placeholder 수가 일치",
-        "observed": "declared 280, measured 252~256 (2026-08-02)"
+        "observed": "재현됨 (2026-08-02, transformers 5.14.1): 64x64 -> 256, 768x256 -> 252, 1024x1024 -> 256. 앞 레인 세 숫자가 모두 그대로 나왔다. 넓힌 스윕에서 448x448(`PROBE_IMAGE_SIZE`) -> 256, 1280x720 -> 264, 960x672 -> 280. 16px 격자로 4096px까지 65536개 크기를 쓸면 도달 가능한 값이 138종이고 최댓값이 280이다 — **280은 도달 가능하지만 특정 종횡비에서만이다**(280 = 2^3·5·7이라 정사각형은 256이 최대). 따라서 280은 상한이라는 해석이 맞고, `image_seq_length`는 `Gemma4Processor.__init__`이 대입만 하고 어디서도 읽지 않는 죽은 속성이다 (실제 확장은 `replace_image_token` -> `num_soft_tokens_per_image` -> `get_aspect_ratio_preserving_size`). 해소 후: 선언 상한 280 아래의 256이 통과한다."
       },
       "anchor": {
         "kind": "test",
         "file": "tests/test_probe.py",
         "names": [
-          "test_the_declared_tokens_per_image_matches_what_the_processor_emits"
+          "test_visual_token_count_accepts_the_gemma4_count_the_processor_actually_emits",
+          "test_visual_token_count_refuses_a_count_above_the_declared_cap",
+          "test_every_probe_adapter_hands_visual_token_count_the_declared_cap"
         ]
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "B (probe) / model-spec",
+        "anchor_changed": "원래 앵커는 `test_the_declared_tokens_per_image_matches_what_the_processor_emits` 였다. 이 이름은 '선언값 == 실측값'을 전제하는데, 실측 결과 그 등식이 성립하는 선언값이 존재하지 않는다 — gemma-4의 토큰 수는 종횡비의 함수라 어떤 상수도 일치할 수 없다. 그 이름으로 테스트를 쓰면 통과시키기 위해 실측을 버려야 한다. 그래서 세 이름으로 바꿨고 셋 다 실제로 정의돼 있다: 완화된 방향(상한 아래 통과)과 유지된 방향(상한 초과 거부), 그리고 그 상한이 probe까지 배선돼 있는지.",
+        "evidence": "고친 방향 — `model.tokens_per_image`를 `model.max_tokens_per_image`로 바꾸고 (스키마·`configs/model/*.yaml` 3개·`docs/model-spec.yaml` 동시), `visual_token_count`의 4번째 게이트를 `count != 선언값`에서 `count > 상한`으로 바꿨다. 이름까지 바꾼 이유는 `tokens_per_image: 280`이라는 이름 자체가 이번 오독의 출처이기 때문이다(컨벤션 01). 계약 변경은 `docs/CONTRACTS.md` §5에 남겼다.\n검증: `uv run ruff check` + `ruff format --check` 통과. `infisical run --env=dev -- uv run pytest` 658 -> 659 passed(추가된 것은 배선 테스트 1개, 게이트 테스트는 개수 그대로 의미만 바뀜). `scripts/audit_plan.py` 10/13, `model-spec` PASS(3 model(s) match value for value).\n부수기 증거 — 변이는 공유 트리 밖에서 했다(인메모리 pytest 플러그인 `$CLAUDE_JOB_DIR/tmp/mutate_plugin.py`가 디스크의 실제 소스를 읽어 한 군데 치환한 뒤 이미 임포트된 모듈에 exec하고, 파일 기반 변이는 트리 사본에서 했다). 8개 변이 전부 이름이 붙은 테스트로 죽었다: 상한 게이트 제거 -> `refuses_a_count_above_the_declared_cap`; 상한을 등식으로 되돌림 -> `accepts_the_gemma4_count_the_processor_actually_emits`(즉 이 항목이 고친 바로 그 동작이 고정돼 있다); pad-id 게이트 제거 -> `refuses_the_pad_token_id`(이 테스트에 상한을 붙여, pad 수가 상한 아래라 상한 검사가 통과시키는 상황에서도 물리는지를 고정했다); per-sample 게이트 제거 -> `refuses_per_sample_disagreement`; 범위 게이트 제거 -> `refuses_an_all_image_batch`; 스키마 검증기 무력화 -> `test_an_image_token_cap_belongs_only_to_gemma4`; config만 옛 키 이름 유지 -> audit `model-spec`이 `gemma4_e2b.max_tokens_per_image is specified but absent from the config`로 지목; spec과 config의 상한 불일치 -> `spec 256 != config 280`.\n발견해서 같이 닫은 구멍 — 어댑터 3개 중 하나에서 인자를 `None`으로 바꾸거나 옛 필드 이름을 남겨도 658개 테스트가 전부 통과했다(파드에서 AttributeError로 터졌을 것이다). `test_every_probe_adapter_hands_visual_token_count_the_declared_cap`이 호출 지점을 AST로 읽어 막는다 — 트리 사본에서 세 가지 변이(`None`/옛 이름/호출 삭제)로 확인했다."
+      }
     }
   ]
 }

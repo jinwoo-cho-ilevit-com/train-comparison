@@ -92,9 +92,10 @@ embedding이고, PLE만 따지면 **2.390B**다. 결론(옵티마이저 메모�
 | 미확인 | 비고 |
 |---|---|
 | 공식 pooling / prompt 포맷 | 생성형 모델이라 임베딩 규격이 없음. 우리가 정해야 하며 그 선택이 리포트의 한정 조건이 된다 |
-| placeholder 확장 위치 (processor vs 모델 내부) | `processor_config.json` 미독 |
-| `vision_soft_tokens_per_image: 280`의 실제 관측값 | probe 미실행 |
 | LoRA target module 관례 | 미확인 |
+
+placeholder 확장 위치와 이미지당 토큰 수는 2026-08-02에 실측으로 해소했다 —
+아래 "이미지 처리" 참조.
 
 ---
 
@@ -102,14 +103,38 @@ embedding이고, PLE만 따지면 **2.390B**다. 결론(옵티마이저 메모�
 
 | 항목 | 값 |
 |---|---|
-| `image_seq_length` / `max_soft_tokens` | **280 (고정)** |
+| `max_soft_tokens` | **280 (상한)** |
+| `image_seq_length` | 280 (같은 값이지만 프로세서가 읽지 않는다 — 아래) |
 | `patch_size` / `pooling_kernel_size` | 16 / 3 |
 | 정규화 | `do_normalize: false`, mean 0 / std 1 |
 | 비디오 soft token | 70 (32 프레임) |
 
-**해상도와 무관하게 이미지당 280 토큰으로 고정된다.** 확장은 프로세서 단계에서
-일어난다(`image_seq_length`는 프로세서 개념). Qwen 계열의 픽셀 비례 방식과 근본적으로
-다르다.
+**280은 고정값이 아니라 상한이다** (2026-08-02 정정, transformers 5.14.1 실측).
+확장은 프로세서 단계에서 일어나지만, `Gemma4Processor.replace_image_token`이 읽는
+것은 `image_seq_length`가 아니라 이미지 프로세서가 이미지마다 계산한
+`num_soft_tokens_per_image`다. `self.image_seq_length`는 생성자에서 대입될 뿐
+어디서도 읽히지 않는다 — 이 문서와 `docs/model-spec.yaml`이 그 키를 이미지당
+토큰 수로 읽은 것이 오독의 출처다.
+
+실제 계산은 `get_aspect_ratio_preserving_size`다. 종횡비를 보존한 채
+`max_patches = max_soft_tokens * pooling_kernel_size**2 = 2520` 패치 안에 들어가는
+최대 크기로 리사이즈하고, 양변을 `patch_size * pooling_kernel_size = 48`의 배수로
+내림한다. 토큰 수는 `(높이/48) * (너비/48)`이므로 **종횡비에 따라 달라지고**, 280에
+도달하려면 그 곱이 정확히 280으로 분해되어야 한다(280 = 2^3·5·7이라 정사각형은
+16x16 = 256이 최대다).
+
+| 입력 (WxH) | soft token |
+|---|---|
+| 448x448 (`PROBE_IMAGE_SIZE`) | 256 |
+| 64x64 / 1024x1024 / 16x16 | 256 |
+| 768x256 | 252 |
+| 1280x720 | 264 |
+| 960x672 / 16x1120 | **280** |
+
+16px 격자로 4096px까지 쓸어본 결과 도달 가능한 값은 138종이고 최댓값이 280이다.
+Qwen 계열의 픽셀 비례 방식과 다른 것은 맞지만, **"해상도와 무관하게 고정"은 아니다.**
+그래서 `configs/model/gemma4_e2b.yaml`의 필드 이름이 `max_tokens_per_image`이고,
+probe는 이 값과의 일치가 아니라 초과를 거부한다.
 
 ---
 
@@ -144,7 +169,7 @@ Qwen3-VL-Embedding은 공식 임베딩 모델이라 `true`가 규격이지만, �
 
 ## 확정된 결정 (2026-08-01, 사용자)
 
-결정 1·2와 여기서 확인한 `padding_side`·`tokens_per_image`는 `docs/model-spec.yaml`에
+결정 1·2와 여기서 확인한 `padding_side`·`max_tokens_per_image`는 `docs/model-spec.yaml`에
 기계 판독 가능한 형태로도 적혀 있고, `scripts/audit_plan.py`의 `model-spec` 체크가
 `configs/model/*.yaml`과 **값 대 값으로** 대조한다. 이 문서와 config가 어긋나면
 게이트가 막는다.
@@ -192,11 +217,14 @@ Qwen3-VL-Embedding이 학습된 대로 쓰이므로 오히려 정확해진다.
 |---|---|
 | Qwen3-VL-Embedding-2B | 픽셀 비례. `min_pixels 4096` ~ `max_pixels 1310720` |
 | Qwen3.5-0.8B | 픽셀 비례. `shortest_edge 65536` ~ `longest_edge 16777216` (범위가 다름) |
-| gemma-4-E2B | **해상도 무관 280 고정** |
+| gemma-4-E2B | 종횡비 비례, `max_soft_tokens 280` 상한 |
 
 **세 모델의 토큰 예산을 동시에 고정하는 것은 원리적으로 불가능하다.** 고정 가능한
-것은 입력 픽셀 수뿐이고, 그래도 gemma-4는 항상 280이며 Qwen 두 모델은 서로 다른
-픽셀 범위를 갖는다.
+것은 입력 픽셀 수뿐이고, gemma-4는 그 픽셀을 종횡비에 따라 252~280으로 접으며
+Qwen 두 모델은 서로 다른 픽셀 범위를 갖는다.
+
+(2026-08-02 정정: 이 표는 gemma-4를 "해상도 무관 280 고정"으로 적고 있었다.
+결론 — 동시 고정 불가 — 은 바뀌지 않지만 근거가 틀렸었다. 위 "이미지 처리" 참조.)
 
 따라서:
 - 입력 이미지 픽셀 분포를 고정하고, **모델별 실제 visual token 분포(p50/p95/max)를
@@ -242,4 +270,4 @@ template을 적용하는 것은 **널리 쓰이는 관행이지 공식 규격이
 | **모델별 vision tower 모듈 이름** | `freeze.vision_tower` 축이 이것 없이는 구현 불가. 추측으로 `visual`/`vision_tower`를 넣지 않는다 — 틀리면 0개를 얼리고 성공으로 기록된다(PLE에서 이미 겪은 실패). D 레인이 `model.safetensors.index.json`으로 확인한 뒤 구현 |
 | MRL(Matryoshka) 지원 차원 | 세 모델 모두 README 미독. 지원하면 임베딩 차원이 축이 될 수 있다 |
 | 모델별 LoRA target module 관례 | 현재 `all-linear`는 "모델별 target module 인식" 질문을 회피한다 |
-| gemma-4 placeholder 확장의 실제 관측값 | probe 미실행. `image_seq_length: 280`이 실제로 280개 토큰으로 나오는지 |
+| Qwen 두 모델의 실제 visual token 분포 | probe 미실행. gemma-4는 2026-08-02에 실측했다(위 "이미지 처리") |

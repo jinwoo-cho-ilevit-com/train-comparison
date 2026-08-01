@@ -76,7 +76,7 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     report.run(
         "visual_tokens",
         lambda: steps.visual_token_count(
-            processor, model, device, side, config.model.tokens_per_image
+            processor, model, device, side, config.model.max_tokens_per_image
         ),
     )
     report.run(

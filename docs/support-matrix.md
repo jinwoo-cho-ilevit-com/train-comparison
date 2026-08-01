@@ -175,9 +175,19 @@ text_embed_forward, infonce_backward, multimodal_embed_forward.
 `AutoModel`(생성 헤드 없음)로 적재하고 last-token pooling + InfoNCE로 1 step
 backward까지 확인했다. 텍스트 전용 배치라 vision tower는 grad를 받지 않는다.
 
-**gemma-4-E2B는 config상 `vision_soft_tokens_per_image: 280`이므로 같은 이미지가
-Qwen 계열의 196과 다른 비용을 갖는다.** pod 실측으로 확정한다. 모델 간 속도 비교는
-이 값을 보정한 뒤에만 의미가 있다.
+**같은 이미지가 모델마다 다른 비용을 갖는다.** 448x448(`PROBE_IMAGE_SIZE`)을 세
+프로세서에 직접 넣어 placeholder 수를 셌다(2026-08-02, transformers 5.14.1):
+
+| 모델 | 448x448의 soft token |
+|---|---|
+| Qwen3-VL-Embedding-2B | 196 |
+| Qwen3.5-0.8B | 196 |
+| gemma-4-E2B | 256 |
+
+gemma-4의 280은 `max_soft_tokens` **상한**이지 이미지당 값이 아니다 — 종횡비에 따라
+252~280으로 달라지며 정사각형에서는 256이 최대다(`docs/model-spec.md`). 이 문단은
+`vision_soft_tokens_per_image: 280`을 이미지당 값으로 적고 있었다. 모델 간 속도 비교는
+이 값을 보정한 뒤에만 의미가 있고, 보정에 쓸 수는 실측한 위 표다.
 
 ### Qwen3.5 GDN 커널 — 확정
 

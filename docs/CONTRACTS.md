@@ -704,6 +704,41 @@ class ProbeReport:
     gemma-4 probe는 이 지점에서 죽는다. `docs/model-spec.yaml`도
     `probe/steps.py`도 이 레인 소유가 아니라 손대지 않았다.
 
+- 2026-08-02 **`model.tokens_per_image`가 `model.max_tokens_per_image`로 바뀐다**
+  (`config_schema.py` 필드 이름·의미 변경 + 검증기 1건, 위 제보를 받은 레인).
+  값이 아니라 **의미가** 틀렸다. `processor_config.json`의 `image_seq_length: 280`은
+  이미지당 토큰 수가 아니라 `max_soft_tokens` 상한이고, 그나마
+  `Gemma4Processor`는 `self.image_seq_length`를 생성자에서 대입만 하고 **어디서도
+  읽지 않는다**(transformers 5.14.1). 실제 확장은
+  `replace_image_token`이 이미지 프로세서의 `num_soft_tokens_per_image`를 읽어
+  하고, 그 수는 `get_aspect_ratio_preserving_size`가 종횡비에서 계산한
+  `(높이/48) * (너비/48)`이다. 재현 실측(이 레인, transformers 5.14.1):
+  448x448 -> 256, 768x256 -> 252, 1024x1024 -> 256, 1280x720 -> 264,
+  960x672 -> **280**. 16px 격자로 4096px까지 쓸면 138종의 값이 나오고 최댓값이 280이다
+  — 즉 280은 도달 가능하지만 특정 종횡비에서만이고, 정사각형은 256이 최대다.
+  `PROBE_IMAGE_SIZE`가 448x448이므로 gemma-4 probe는 항상 256을 재고, 280과의
+  **일치**를 요구하던 `visual_token_count`는 올바른 측정에 대고 죽고 있었다.
+  **바뀐 것 3가지**:
+  - 스키마 필드 `model.tokens_per_image` -> `model.max_tokens_per_image`
+    (`configs/model/*.yaml` 3개, `docs/model-spec.yaml` 양쪽 키 동시 변경 —
+    `audit_plan.py`의 `model-spec`이 값 대 값으로 대조하므로 한쪽만 고치면 막힌다).
+    이름을 그대로 두고 비교만 바꾸는 선택지도 있었지만, `tokens_per_image: 280`이라는
+    **이름 자체가** 이번 오독을 초래했다(컨벤션 01: 의미를 반영하는 이름).
+  - 검증기 `_fixed_image_tokens_are_gemma4_only` ->
+    `_an_image_token_cap_is_gemma4_only`. 방향(gemma4만 선언, 나머지는 금지)은 그대로다
+    — gemma-4만 토큰 상한을 선언하고 Qwen 둘은 픽셀 범위만 선언한다는 사실이 바뀌지
+    않았기 때문이다. 에러 문구가 바뀌므로 `tests/test_config.py`의 match 문자열도 바뀐다.
+  - `visual_token_count`의 4번째 게이트가 `count != 선언값`에서
+    `count > 상한`으로 바뀐다. **게이트 수는 줄지 않았고 나머지 셋은 그대로다.**
+    `null`(Qwen)일 때의 동작도 그대로다. 완화 방향이므로 pad-id 게이트가 상한 아래의
+    pad 수를 여전히 잡는지 테스트에 상한을 붙여 고정했다.
+  **레코드 스키마가 좁게 바뀐다**: probe의 `visual_tokens` detail에서
+  `declared_tokens_per_image` -> `declared_max_tokens_per_image`. 값 자체
+  (`visual_tokens_per_image`, `visual_tokens_per_sample`)는 그대로다.
+  **경계 침범**: `config_schema.py`·`docs/model-spec.yaml`·`tests/{test_config,test_applied}.py`는
+  §1의 "공유(수정 금지)", `docs/model-spec.md`는 레인 E 소유다. 필드 이름 변경은
+  한 커밋에 다 들어가지 않으면 어느 쪽도 합성되지 않으므로 나눌 수 없다.
+
 **새 레인 의무 — 파일을 추가하면 `PLAN.md` 구조 블록에 한 줄 추가한다.**
 위 반대 방향 때문에 생긴다. 열거되는 디렉터리(저장소 루트, `configs/`,
 `trainbench/`, `scripts/`, `tests/`, `docs/`)에 추적되는 파일이나 디렉터리를 새로
@@ -717,11 +752,11 @@ class ProbeReport:
 `docs/model-spec.yaml`이고, `audit_plan.py`의 `model-spec`이 **값 대 값으로** 대조한다
 (문자열 존재 확인은 true를 false로 뒤집어도 통과한다).
 
-| 모델 | `add_generation_prompt` | `instruction_prompt` | `padding_side` | `tokens_per_image` |
+| 모델 | `add_generation_prompt` | `instruction_prompt` | `padding_side` | `max_tokens_per_image` |
 |---|---|---|---|---|
-| qwen3_vl_emb_2b | `true` | `"Represent the user's input."` | `right` | `null`(픽셀 비례) |
-| qwen3_5_0_8b | `false` | `null` | `right` | `null`(픽셀 비례) |
-| gemma4_e2b | `false` | `null` | **`left`** | `280`(고정) |
+| qwen3_vl_emb_2b | `true` | `"Represent the user's input."` | `right` | `null`(상한 미선언) |
+| qwen3_5_0_8b | `false` | `null` | `right` | `null`(상한 미선언) |
+| gemma4_e2b | `false` | `null` | **`left`** | `280`(상한, 고정값 아님) |
 
 `padding_side`가 config에 있는 이유: gemma-4만 left이고, 그것이 `last_token_pool`
 결함이 드러나는 유일한 모델이다. 코드가 `arch`로 분기하면 그 사실이 pooling 코드를
