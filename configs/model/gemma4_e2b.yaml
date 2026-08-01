@@ -2,3 +2,6 @@ name: gemma4_e2b
 hf_id: google/gemma-4-E2B
 arch: gemma4
 revision: null
+# Generative model, no embedding spec.
+add_generation_prompt: false
+instruction_prompt: null

@@ -25,6 +25,15 @@ class ModelConfig(Strict):
     hf_id: str
     arch: Literal["qwen3_vl", "qwen3_5", "gemma4"]
     revision: str | None = None
+    # How this model is meant to be used, per docs/model-spec.md. These live in
+    # config rather than code because they differ per model and a wrong value is
+    # invisible: with last-token pooling, add_generation_prompt changes *which*
+    # token becomes the embedding.
+    add_generation_prompt: bool
+    # Official instruction prompt, where the model has one. None for the
+    # generative models, which have no embedding spec — inventing one would add
+    # an unvalidated confound.
+    instruction_prompt: str | None = None
 
 
 class DataConfig(Strict):
@@ -95,10 +104,16 @@ class FreezeConfig(Strict):
 class DataloaderConfig(Strict):
     backend: Literal["torch", "dali"]
     packing: bool = False
+    # Tokenise ahead of the timed window instead of inside the dataloader.
+    pretokenize: bool = False
 
 
 class ParallelConfig(Strict):
     strategy: Literal["single", "ddp", "fsdp2", "zero2", "zero3"]
+    # All-gather embeddings across ranks so in-batch negatives span the whole
+    # world. This is the only parallelism axis specific to contrastive training,
+    # and the project's central claim is that batch size dominates here.
+    cross_device_negatives: bool = False
 
 
 class FrameworkConfig(Strict):
@@ -111,6 +126,7 @@ class TrainConfig(Strict):
     steps: int = Field(gt=0)
     warmup_discard_steps: int = Field(ge=0)
     gradient_checkpointing: Literal["none", "full", "selective"] = "none"
+    offload: Literal["none", "optimizer", "param", "both"] = "none"
     seed: int
     deterministic: bool = False
 
@@ -195,6 +211,57 @@ class BenchConfig(Strict):
             raise ValueError(
                 f"freeze.ple applies to per-layer embeddings, which only exist in gemma4; "
                 f"model arch is {self.model.arch}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _warmup_leaves_a_measured_window(self) -> BenchConfig:
+        """Discarding more steps than exist measures nothing at all. The
+        max-autotune rule below sets a floor on warmup; this sets the ceiling."""
+        if self.train.warmup_discard_steps >= self.train.steps:
+            raise ValueError(
+                f"train.warmup_discard_steps ({self.train.warmup_discard_steps}) must be "
+                f"less than train.steps ({self.train.steps}); nothing would be measured."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _profile_runs_actually_profile(self) -> BenchConfig:
+        if self.run.purpose == "profile" and not self.run.profiler:
+            raise ValueError("purpose=profile requires profiler=true")
+        return self
+
+    @model_validator(mode="after")
+    def _batch_fits_the_sample(self) -> BenchConfig:
+        """A batch larger than the dataset reuses rows within one batch, which makes
+        InfoNCE compare a row against itself and quietly destroys the loss."""
+        if self.data.limit is not None and self.train.batch_size > self.data.limit:
+            raise ValueError(
+                f"train.batch_size ({self.train.batch_size}) exceeds data.limit "
+                f"({self.data.limit}); rows would repeat inside a batch and in-batch "
+                "negatives would include the positive itself."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _measured_runs_pin_their_data(self) -> BenchConfig:
+        """A number is not reproducible if the data it came from is a moving branch
+        (convention 07 requires the data version on every run)."""
+        if self.run.purpose in ("timing", "quality") and self.data.revision is None:
+            raise ValueError(
+                f"purpose={self.run.purpose} requires data.revision to be pinned; "
+                "'null' tracks a branch and makes the run unreproducible."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _instruction_prompt_is_official_only(self) -> BenchConfig:
+        """Only qwen3_vl ships an official embedding prompt. Inventing one for the
+        generative models would add an unvalidated confound (docs/model-spec.md)."""
+        if self.model.instruction_prompt is not None and self.model.arch != "qwen3_vl":
+            raise ValueError(
+                f"model.instruction_prompt is set for arch={self.model.arch}, which has "
+                "no official embedding prompt. See docs/model-spec.md decision 1."
             )
         return self
 

@@ -2,3 +2,7 @@ name: qwen3_5_0_8b
 hf_id: Qwen/Qwen3.5-0.8B
 arch: qwen3_5
 revision: null
+# Generative VLM, no embedding spec. add_generation_prompt=true would append
+# an assistant <think> scaffold whose last token would become the embedding.
+add_generation_prompt: false
+instruction_prompt: null

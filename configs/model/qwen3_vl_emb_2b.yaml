@@ -2,3 +2,7 @@ name: qwen3_vl_emb_2b
 hf_id: Qwen/Qwen3-VL-Embedding-2B
 arch: qwen3_vl
 revision: null
+# Official embedding model: sentence_bert_config.json sets add_generation_prompt
+# true, and config_sentence_transformers.json sets the default prompt.
+add_generation_prompt: true
+instruction_prompt: "Represent the user's input."

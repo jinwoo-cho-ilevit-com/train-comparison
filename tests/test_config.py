@@ -81,3 +81,44 @@ def test_unknown_field_is_rejected():
 def test_limit_must_be_positive():
     with pytest.raises(ValidationError):
         compose_cfg("data.limit=0")
+
+
+def test_warmup_cannot_consume_the_whole_run():
+    with pytest.raises(ValidationError, match="nothing would be measured"):
+        compose_cfg("train.steps=10", "train.warmup_discard_steps=10")
+
+
+def test_profile_run_requires_profiler():
+    with pytest.raises(ValidationError, match="requires profiler=true"):
+        compose_cfg("run=profile", "run.profiler=false")
+
+
+def test_batch_cannot_exceed_the_sample():
+    """A batch larger than the dataset makes InfoNCE compare a row against itself."""
+    with pytest.raises(ValidationError, match="rows would repeat inside a batch"):
+        compose_cfg("data.limit=8", "train.batch_size=16")
+
+
+def test_measured_runs_require_pinned_data():
+    with pytest.raises(ValidationError, match="requires data.revision"):
+        compose_cfg("run=timing", "data.revision=null")
+
+    # A probe answers "does it run", so it does not need a pinned corpus.
+    assert compose_cfg("run=probe", "data.revision=null")
+
+
+def test_instruction_prompt_only_for_the_official_embedding_model():
+    with pytest.raises(ValidationError, match="no official embedding prompt"):
+        compose_cfg("model=qwen3_5_0_8b", "model.instruction_prompt='Represent this.'")
+
+
+def test_per_model_usage_spec_matches_documented_decisions():
+    """docs/model-spec.md decisions 1 and 2 live in config, not code."""
+    vl = compose_cfg("model=qwen3_vl_emb_2b").model
+    assert vl.add_generation_prompt is True
+    assert vl.instruction_prompt == "Represent the user's input."
+
+    for name in ("qwen3_5_0_8b", "gemma4_e2b"):
+        generative = compose_cfg(f"model={name}").model
+        assert generative.add_generation_prompt is False
+        assert generative.instruction_prompt is None

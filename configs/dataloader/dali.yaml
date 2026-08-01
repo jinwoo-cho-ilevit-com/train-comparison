@@ -1,2 +1,3 @@
 backend: dali
 packing: false
+pretokenize: false

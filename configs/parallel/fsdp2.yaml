@@ -1,1 +1,2 @@
 strategy: fsdp2
+cross_device_negatives: false

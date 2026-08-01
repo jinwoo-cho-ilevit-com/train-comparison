@@ -1,2 +1,3 @@
 backend: torch
 packing: true
+pretokenize: false

@@ -5,3 +5,4 @@ warmup_discard_steps: 10
 gradient_checkpointing: none
 seed: 1234
 deterministic: false
+offload: none

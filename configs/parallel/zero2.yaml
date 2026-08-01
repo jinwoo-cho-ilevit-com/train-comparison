@@ -1,1 +1,2 @@
 strategy: zero2
+cross_device_negatives: false

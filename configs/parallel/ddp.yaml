@@ -1,1 +1,2 @@
 strategy: ddp
+cross_device_negatives: false
