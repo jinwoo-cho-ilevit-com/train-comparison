@@ -8,6 +8,12 @@ subset is drawn proportionally across all 20 MMEB configs from a shuffled stream
     python scripts/prepare_data.py data=speed
     python scripts/prepare_data.py data=speed data.limit=40   # small sample
 
+Each config's draw is cached as a parquet shard (`sample_config`), so an
+interrupted run resumes where it stopped and the quality gate can be re-measured
+against the same rows without touching the network. `TRAINBENCH_SHARD_CACHE`
+moves the cache off the checkout, which the 65536-row draw needs on a machine
+without ~4GB free there.
+
 Upstream is MrZilinXiao/MMEB_train_with_image: the authoritative TIGER-Lab
 MMEB-train stores image *paths* only, and the images are not in that repo. That
 mirror is community-maintained, so its commit is pinned and recorded rather than
@@ -30,7 +36,13 @@ a threshold that refuses the push.
 
 from __future__ import annotations
 
+import gc
+import hashlib
+import io
 import math
+import os
+import resource
+import sys
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -41,12 +53,16 @@ from omegaconf import DictConfig
 from rich.console import Console
 
 from trainbench.compose import CONFIG_DIR, CONFIG_NAME, output_dir, resolve
-from trainbench.config_schema import BenchConfig
+from trainbench.config_schema import CORRUPT_DATA_REVISIONS, BenchConfig
 from trainbench.record import write_json
 
 console = Console()
 
 SPLIT = "original"
+# The split the subset is published under. Upstream's is "original"; renaming it
+# here would be gratuitous, but the pushed subset is what every run loads and
+# `train` is what a consumer expects to find.
+SUBSET_SPLIT = "train"
 # Rows held in memory per config while shuffling the stream. Large enough that the
 # sample is not just the head of the file, small enough to stream 55GB.
 SHUFFLE_BUFFER = 2000
@@ -58,6 +74,7 @@ MIN_SHUFFLE_BUFFER = 64
 
 QUERY_IMAGE = "qry_image"
 POSITIVE_IMAGE = "pos_image"
+IMAGE_COLUMNS = (QUERY_IMAGE, POSITIVE_IMAGE)
 
 # Columns the subset keeps. Explicit hard negatives (neg_text / neg_image) are
 # dropped: the loss under study is in-batch-negatives InfoNCE, where batch
@@ -75,6 +92,10 @@ METRIC_COLUMNS = ("pos_image_path",)
 # first is the mechanism that produced D1, and it does not stop being that
 # mechanism because the second list happens to sit in the same file.
 SUBSET_COLUMN_NAMES = ("mmeb_config", *KEPT_COLUMNS)
+
+# What a cached shard holds: the pushed columns plus the metric-only ones, which
+# is exactly what `take_row` produces. Derived for the same reason as above.
+SHARD_COLUMNS = (*SUBSET_COLUMN_NAMES, *METRIC_COLUMNS)
 
 # Per-config schema, read off the Hub's dataset-info endpoint (2026-08-01) and
 # declared here rather than discovered at runtime, for the same reason
@@ -153,18 +174,32 @@ MIN_ROWS_FOR_SHARE_GATE = 50
 # counts are recorded per config instead, which is what makes the first clean
 # regeneration a reference the next one can be compared against.
 
-# Revisions of the subset repo that must never be trained on again. Named rather
-# than deleted from the Hub: a run whose result JSON records this revision was
-# measured on the corrupt corpus, and that has to stay decidable after the fact.
-KNOWN_CORRUPT_REVISIONS = {
-    "b750b9c3263e9ef5dce225fd50aa25d7c58f1d5f": (
-        "defect D1: pos_image was dropped, so 466 rows share one placeholder "
-        "positive and 644 rows lost their query image"
-    ),
-}
+# Revisions that must never be trained on again. Defined in config_schema, which
+# refuses to build a config that pins one — a second copy here would be a second
+# definition of what "corrupt" means, and this file already has a defect named
+# after exactly that (D1, two column lists).
+KNOWN_CORRUPT_REVISIONS = CORRUPT_DATA_REVISIONS
 
 SIZE_ENDPOINT = "https://datasets-server.huggingface.co/size"
-DATA_CONFIG_DIR = Path(__file__).resolve().parent.parent / "configs" / "data"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DATA_CONFIG_DIR = REPO_ROOT / "configs" / "data"
+
+# Where each config's draw is parked so a killed run resumes instead of streaming
+# it again. Under the git-ignored `/data/`, and overridable by environment because
+# the draw is ~4GB and the machine preparing it may not have that where the
+# checkout lives.
+#
+# A module constant rather than a `DataConfig` field: that schema is frozen by
+# docs/CONTRACTS.md and forbids extra keys, and a scratch path is not an
+# experiment parameter — nothing about the pushed subset changes with it. Same
+# reasoning as the quality thresholds above.
+# Rows pulled out of the pushed parquet at a time while verifying it. Small enough
+# that a 65536-row subset is checked without holding it, large enough that the
+# per-batch overhead does not dominate the image decoding.
+ARTIFACT_BATCH_ROWS = 256
+
+SHARD_CACHE_ENV = "TRAINBENCH_SHARD_CACHE"
+DEFAULT_SHARD_CACHE = REPO_ROOT / "data" / "subset-shards"
 
 
 def data_config_pins() -> dict[str, dict[str, Any]]:
@@ -295,18 +330,167 @@ def take_row(name: str, row: dict[str, Any], declared: Sequence[str]) -> dict[st
     return kept
 
 
-def stream_rows(config: BenchConfig, name: str, want: int) -> list[dict[str, Any]]:
+def open_stream(config: BenchConfig, name: str) -> tuple[Any, tuple[str, ...]]:
+    """Open the upstream stream and check its schema against what this config declares.
+
+    Split out of `stream_rows` because the schema check has to run whether or not
+    the rows are about to be drawn. It reads `features` and no rows, so a config
+    already satisfied from the shard cache still pays only one HTTP request.
+    """
     from datasets import load_dataset
 
-    stream = load_dataset(config.data.source_repo, name=name, split=SPLIT, streaming=True)
+    stream = load_dataset(
+        config.data.source_repo,
+        name=name,
+        split=SPLIT,
+        streaming=True,
+        revision=config.data.source_revision,
+    )
     if not stream.features:
         raise RuntimeError(
             f"{name}: upstream reports no features, so the declared schema cannot be "
             "checked. Sampling blind is how the columns were lost the first time."
         )
-    declared = check_columns(name, stream.features)
+    return stream, check_columns(name, stream.features)
+
+
+def stream_rows(config: BenchConfig, name: str, want: int) -> list[dict[str, Any]]:
+    """Draw `want` rows, holding their images as encoded bytes rather than pixels.
+
+    The cast is the difference between a run that finishes and one the kernel
+    kills. `datasets` decodes an `Image` column on every row it hands out —
+    `Image.decode_example` calls `PIL.Image.load()` explicitly (features/image.py,
+    "to avoid too many open files") — and `main` accumulates every config's rows
+    until the push. Measured on MSCOCO_i2t: 270.9 KiB/row decoded against
+    15.9 KiB/row encoded, a factor of 17. At `data=quality`'s 65536 rows that is
+    tens of GB, and the first attempt was SIGKILLed at 40377 rows with 48GB of RAM
+    and 20GB of swap exhausted. `data=speed` never hit it because 2048 rows is 32x
+    smaller, not because the accumulation is bounded.
+
+    Nothing downstream needs pixels: `_image_size` reads the header, and the push
+    stores the same encoded bytes it would have re-encoded.
+    """
+    from datasets import Image
+
+    stream, declared = open_stream(config, name)
+    for column in IMAGE_COLUMNS:
+        if column in stream.features:
+            stream = stream.cast_column(column, Image(decode=False))
     stream = stream.shuffle(seed=config.data.sample_seed, buffer_size=shuffle_buffer(want))
     return [take_row(name, row, declared) for row in stream.take(want)]
+
+
+def shard_cache_dir() -> Path:
+    return Path(os.environ.get(SHARD_CACHE_ENV) or DEFAULT_SHARD_CACHE)
+
+
+def shard_path(data: Any, name: str, want: int) -> Path:
+    """Where this config's draw is cached.
+
+    Every input that changes which rows are drawn is in the filename: a different
+    upstream repo, upstream commit, seed, or quota reads a different file rather
+    than silently reusing the last one. `want` moves with the total, so
+    `data=speed` and `data=quality` never share a shard even though they share a
+    seed — and it also fixes the shuffle buffer, so the two are different draws
+    rather than one draw read to two depths.
+    """
+    source = data.source_repo.replace("/", "__")
+    return shard_cache_dir() / (
+        f"{source}@{data.source_revision[:12]}--{SPLIT}"
+        f"--seed{data.sample_seed}--{name}--{want}.parquet"
+    )
+
+
+def _shard_schema() -> Any:
+    import pyarrow as pa
+
+    # The same struct `datasets` writes for an undecoded image column, so a shard
+    # is readable by anything that reads the pushed subset.
+    image = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
+    return pa.schema(
+        [(column, image if column in IMAGE_COLUMNS else pa.string()) for column in SHARD_COLUMNS]
+    )
+
+
+def write_shard(rows: Sequence[dict[str, Any]], path: Path) -> None:
+    """Write the draw, then rename it into place.
+
+    Atomic because the failure this cache exists for is a killed process: a shard
+    half-written when the kernel arrived would be trusted on the next run and the
+    subset would quietly lose the rest of that config's quota.
+
+    The staging name carries the pid. Two processes preparing the same shard
+    otherwise write the same staging file, and whichever renames second dies on a
+    FileNotFoundError that nothing catches.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staging = path.with_suffix(f".{os.getpid()}.partial")
+    try:
+        pq.write_table(pa.Table.from_pylist(list(rows), schema=_shard_schema()), staging)
+        staging.replace(path)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def read_shard(path: Path) -> list[dict[str, Any]]:
+    """Read a cached draw, refusing a file whose columns are not the ones expected.
+
+    `pq.read_table(..., schema=...)` fills a column the file does not have with
+    nulls rather than failing, which would let a shard written by older code come
+    back as rows with a silently absent `pos_image` — defect D1's shape, reached
+    through the resume path instead of the sampler. `take_row` raises on the same
+    situation for exactly this reason, and the two have to agree.
+    """
+    import pyarrow.parquet as pq
+
+    stored = tuple(pq.read_schema(path).names)
+    if stored != SHARD_COLUMNS:
+        raise RuntimeError(
+            f"{path.name}: cached shard holds columns {list(stored)}, expected "
+            f"{list(SHARD_COLUMNS)}. It was written by different code; delete it."
+        )
+    return pq.read_table(path, schema=_shard_schema()).to_pylist()
+
+
+def sample_config(config: BenchConfig, name: str, want: int) -> tuple[list[dict[str, Any]], str]:
+    """This config's rows, from the cache if they were already drawn.
+
+    Convention 04 asks every pipeline stage to save and resume; this one did not,
+    and 24 minutes of streaming were lost to a single kill. Resuming is also what
+    makes the draw cheap to re-measure: the quality gate can be re-run against the
+    same rows without touching the network.
+
+    The upstream schema is checked on every call, cache hit or not. It was checked
+    only inside `stream_rows` at first, so a second run against a cached draw could
+    not see that upstream had dropped a column — the manifest went on recording
+    `CONFIG_COLUMNS` as the declared schema while nothing had compared it to
+    anything. That is defect D1's shape with the guard moved out of the path
+    rather than deleted, and the check costs one request because it reads no rows.
+    """
+    open_stream(config, name)
+    path = shard_path(config.data, name, want)
+    if path.exists():
+        try:
+            rows = read_shard(path)
+        except Exception as problem:
+            # A shard the cache cannot read is worse than no shard: every retry
+            # fails in the same place, so the cache built to survive a kill would
+            # make the failure permanent. Drop it and draw again.
+            console.print(f"  [yellow]{name}: discarding unreadable shard[/yellow] ({problem})")
+            path.unlink(missing_ok=True)
+        else:
+            if len(rows) == want:
+                return rows, "cached"
+            # Not repaired in place: a short shard means the draw it holds is not
+            # the one this quota asks for, and topping it up would take rows from
+            # a different position in the shuffled stream.
+            path.unlink()
+    rows = stream_rows(config, name, want)
+    write_shard(rows, path)
+    return rows, "streamed"
 
 
 def build_dataset(rows_by_config: dict[str, list[dict[str, Any]]]) -> Any:
@@ -354,16 +538,60 @@ def distribution(values: Sequence[float]) -> dict[str, float | int] | None:
 
 
 def _image_size(value: Any) -> tuple[int, int] | None:
-    """Width and height of a decoded image, or None if this is not one.
+    """Width and height of a decodable image, or None if this is not one.
+
+    The pixels are decoded and thrown away rather than only the header parsed.
+    `PIL.Image.open` is lazy — a file with an intact header and a corrupt payload
+    returns a size and raises only on `load()` — so a header-only check made
+    `MAX_ROWS_WITH_UNREADABLE_IMAGE = 0` mean "0 rows whose header parsed", not
+    "0 rows that cannot be read". Before rows were held undecoded, `datasets`
+    called `load()` on every row itself and a broken payload surfaced upstream of
+    this gate; holding encoded bytes removed that without replacing it.
+
+    One image is decoded at a time and not retained, so this does not reintroduce
+    the accumulation it replaced (measured: 2320 images in 2.2s for `data=speed`).
 
     A column can hold a value that is not an image — the authoritative TIGER-Lab
     MMEB-train stores paths, and `source_repo` is a config field. Presence checks
     cannot tell that apart from a real image, so unreadable values are counted.
     """
-    size = getattr(value, "size", None)
-    if isinstance(size, tuple | list) and len(size) == 2:
-        return int(size[0]), int(size[1])
-    return None
+    from PIL import Image as PILImage
+
+    data = value.get("bytes") if isinstance(value, Mapping) else None
+    if not data:
+        return None
+    try:
+        with PILImage.open(io.BytesIO(data)) as image:
+            width, height = image.size
+            image.load()
+    # PIL's decode failures are not one hierarchy, and every name here was reached
+    # by an actual malformed input rather than added defensively:
+    #   OSError                 truncated payload; UnidentifiedImageError derives from it
+    #   SyntaxError             a corrupt chunk found partway through load()
+    #   ValueError              a header PIL parses but cannot turn into a mode
+    #   DecompressionBombError  derives from Exception, so it escaped the first
+    #                           three and killed the run *after* all streaming and
+    #                           caching — and the cached shard then reproduced that
+    #                           death on every retry
+    except (OSError, SyntaxError, ValueError, PILImage.DecompressionBombError):
+        return None
+    return int(width), int(height)
+
+
+def image_missing(value: Any) -> bool:
+    """No image at all, as against one that is present but cannot be read.
+
+    Undecoded values arrive as `{"bytes": ..., "path": ...}`. A value carrying a
+    path but no bytes is upstream storing a reference instead of the image, which
+    is counted as unreadable (`MAX_ROWS_WITH_UNREADABLE_IMAGE`) rather than absent
+    — collapsing the two would let a repo full of dangling paths pass as a repo
+    full of images.
+    """
+    if value is None:
+        return True
+    if isinstance(value, Mapping):
+        return not value.get("bytes") and not value.get("path")
+    return False
 
 
 def _duplicate_ratio(values: Sequence[Any]) -> float:
@@ -400,7 +628,7 @@ def missing_positive(name: str, row: dict[str, Any]) -> bool:
     the check D1 would have failed on every one of its 466 rows.
     """
     if POSITIVE_IMAGE in CONFIG_COLUMNS[name]:
-        return row[POSITIVE_IMAGE] is None
+        return image_missing(row[POSITIVE_IMAGE])
     return not (row["pos_text"] or "").strip()
 
 
@@ -418,7 +646,7 @@ def config_metrics(name: str, rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         # text-only query is the config, and counting it as a defect is what makes
         # a global "31.4% missing images" number unreadable.
         "rows_without_query_image": (
-            sum(1 for row in rows if row[QUERY_IMAGE] is None) if has_query_image else 0
+            sum(1 for row in rows if image_missing(row[QUERY_IMAGE])) if has_query_image else 0
         ),
         "rows_without_positive_content": sum(1 for row in rows if missing_positive(name, row)),
         "distinct_pos_text_count": len(set(pos_texts)),
@@ -430,7 +658,7 @@ def config_metrics(name: str, rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "pos_text_chars": distribution([len(text) for text in pos_texts]),
     }
     for column, label in ((QUERY_IMAGE, "qry_image"), (POSITIVE_IMAGE, "pos_image")):
-        present = [row[column] for row in rows if row[column] is not None]
+        present = [row[column] for row in rows if not image_missing(row[column])]
         sizes = [size for value in present if (size := _image_size(value))]
         metrics[f"rows_with_unreadable_{label}"] = len(present) - len(sizes)
         metrics[f"{label}_width"] = distribution([w for w, _ in sizes])
@@ -560,6 +788,181 @@ def quality_violations(
     return violations
 
 
+def _peak_rss_bytes() -> int:
+    """Peak resident set size so far, in bytes.
+
+    `ru_maxrss` is bytes on macOS and kilobytes on Linux, and this number is meant
+    to be compared across the two, so the unit is normalised rather than recorded
+    as whatever the host returns.
+    """
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak if sys.platform == "darwin" else peak * 1024
+
+
+def ungated_configs(metrics: dict[str, Any]) -> dict[str, int]:
+    """Image-positive configs whose row count leaves the collapse gate unevaluated.
+
+    Recorded rather than inferred from the thresholds because the exemption is
+    invisible in the output that reports the gate as passed: `data=speed` draws 30
+    NIGHTS rows and 33 WebQA rows, so 2 of its 7 image-positive configs are exempt,
+    and the "largest single image positive" number quoted from that draw came from
+    one of the exempt two. A gate that did not run is not a gate that passed.
+    """
+    return {
+        name: per_config["rows"]
+        for name, per_config in metrics["per_config"].items()
+        if per_config["declares_positive_image"] and per_config["rows"] < MIN_ROWS_FOR_SHARE_GATE
+    }
+
+
+def artifact_identity(name: str, row: dict[str, Any]) -> Any:
+    """`positive_identity` recomputed from what the pushed subset actually carries.
+
+    `pos_image_path` is metric-only and never pushed, so an image positive is
+    identified downstream by the digest of its bytes. The two groupings are not
+    interchangeable in general — one path is always one byte string, but two paths
+    can hold identical bytes — so digest grouping can only merge groups, never
+    split them. The share it produces is therefore >= the manifest's, which makes
+    it a sound check to apply the same threshold to.
+    """
+    if POSITIVE_IMAGE in CONFIG_COLUMNS[name]:
+        value = row[POSITIVE_IMAGE]
+        data = value.get("bytes") if isinstance(value, Mapping) else None
+        return ("image", hashlib.sha256(data).hexdigest() if data else None)
+    return ("text", (row["pos_text"] or "").strip())
+
+
+def _declared_columns(data: Any, revision: str) -> tuple[str, ...]:
+    """The column names the pushed revision's card advertises.
+
+    Read on its own and first because this is the check that would have caught
+    defect D7 in seconds: `Dataset.push_to_hub` kept the repo's existing
+    `dataset_info`, so a corrected five-column subset shipped under the
+    four-column card left over from D1 and `load_dataset` raised CastError on it.
+    Building the streaming dataset reads the card, not the data.
+    """
+    from datasets import load_dataset
+
+    dataset = load_dataset(data.repo_id, revision=revision, split=SUBSET_SPLIT, streaming=True)
+    return tuple(sorted(dataset.features))
+
+
+def _artifact_batches(data: Any, revision: str) -> Iterable[list[dict[str, Any]]]:
+    """The pushed rows, in batches, downloaded the fast way.
+
+    Not `load_dataset(streaming=True)`: that reads through fsspec as ranged GETs on
+    one connection and measured 0.2-0.7 MB/s here, which put a 4.75GB subset out of
+    reach at hours per check — and a check that takes hours is one that gets
+    skipped, which is the same as not having it. `hf_hub_download` goes through the
+    xet client, which fetches chunks in parallel: 12.3 MiB/s measured on the same
+    connection, ~20x, turning the full pass into minutes.
+
+    Batched rather than read whole so memory stays flat regardless of subset size.
+    """
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, hf_hub_download
+
+    files = sorted(
+        name
+        for name in HfApi().list_repo_files(data.repo_id, repo_type="dataset", revision=revision)
+        if name.endswith(".parquet")
+    )
+    if not files:
+        raise RuntimeError(f"{data.repo_id}@{revision} has no parquet files to verify")
+    for name in files:
+        local = hf_hub_download(data.repo_id, name, repo_type="dataset", revision=revision)
+        parquet = pq.ParquetFile(local)
+        stored = tuple(sorted(parquet.schema_arrow.names))
+        if stored != tuple(sorted(SUBSET_COLUMN_NAMES)):
+            raise RuntimeError(
+                f"{name}: holds columns {list(stored)}, expected {sorted(SUBSET_COLUMN_NAMES)}"
+            )
+        for batch in parquet.iter_batches(batch_size=ARTIFACT_BATCH_ROWS):
+            yield batch.to_pylist()
+
+
+def verify_pushed(data: Any, revision: str, metrics: dict[str, Any]) -> list[str]:
+    """Read the revision that was just pushed and re-derive the gate from it.
+
+    The reason this exists: a push that returned a revision was treated as a
+    finished subset, and the revision it returned could not be loaded at all (D7).
+    Every number justifying that pin came from rows in memory; nothing had read the
+    artifact. `data-pinned` was green throughout, because it checks that the
+    revision string looks like a sha.
+
+    Two stages, cheap one first, so a broken card fails in seconds with a message
+    about the card rather than after a full download.
+    """
+    problems: list[str] = []
+
+    declared = _declared_columns(data, revision)
+    if declared != tuple(sorted(SUBSET_COLUMN_NAMES)):
+        problems.append(
+            f"the pushed card declares columns {list(declared)}, not "
+            f"{sorted(SUBSET_COLUMN_NAMES)}; consumers cannot read this revision"
+        )
+        # Every count below would be derived from columns that are not there.
+        return problems
+
+    seen: Counter[str] = Counter()
+    identities: dict[str, Counter[Any]] = {}
+    no_query_image: Counter[str] = Counter()
+    no_positive: Counter[str] = Counter()
+    unreadable: Counter[str] = Counter()
+    for rows in _artifact_batches(data, revision):
+        for row in rows:
+            name = row["mmeb_config"]
+            if name not in CONFIG_COLUMNS:
+                problems.append(f"the pushed subset carries an unknown config {name!r}")
+                return problems
+            seen[name] += 1
+            identities.setdefault(name, Counter())[artifact_identity(name, row)] += 1
+            if QUERY_IMAGE in CONFIG_COLUMNS[name] and image_missing(row[QUERY_IMAGE]):
+                no_query_image[name] += 1
+            if missing_positive(name, row):
+                no_positive[name] += 1
+            for column in IMAGE_COLUMNS:
+                if not image_missing(row[column]) and _image_size(row[column]) is None:
+                    unreadable[name] += 1
+
+    for name, per_config in metrics["per_config"].items():
+        for label, measured, expected in (
+            ("rows", seen[name], per_config["rows"]),
+            (
+                "rows_without_query_image",
+                no_query_image[name],
+                per_config["rows_without_query_image"],
+            ),
+            (
+                "rows_without_positive_content",
+                no_positive[name],
+                per_config["rows_without_positive_content"],
+            ),
+            (
+                "rows_with_unreadable_image",
+                unreadable[name],
+                per_config["rows_with_unreadable_qry_image"]
+                + per_config["rows_with_unreadable_pos_image"],
+            ),
+        ):
+            if measured != expected:
+                problems.append(
+                    f"{name}: the artifact has {label}={measured}, the manifest says {expected}"
+                )
+        if not per_config["declares_positive_image"] or name not in identities:
+            continue
+        share = identities[name].most_common(1)[0][1] / max(1, seen[name])
+        if seen[name] >= MIN_ROWS_FOR_SHARE_GATE and share > MAX_SINGLE_POSITIVE_SHARE:
+            problems.append(
+                f"{name}: one positive image is {share:.1%} of the pushed rows "
+                f"(max {MAX_SINGLE_POSITIVE_SHARE:.0%})"
+            )
+    extra = sorted(set(seen) - set(metrics["per_config"]))
+    if extra:
+        problems.append(f"the artifact carries configs the manifest does not describe: {extra}")
+    return problems
+
+
 def report(metrics: dict[str, Any], violations: Sequence[str], blockers: Sequence[str]) -> None:
     overall = metrics["overall"]
     console.print("\n[bold]subset quality[/bold]")
@@ -593,6 +996,13 @@ def report(metrics: dict[str, Any], violations: Sequence[str], blockers: Sequenc
             f"dup_pos={per_config['duplicate_positive_ratio']:.2f} "
             f"top_pos={per_config['max_single_positive_share']:.2f} {spread}"
         )
+    exempt = ungated_configs(metrics)
+    if exempt:
+        detail = ", ".join(f"{name} {rows}" for name, rows in sorted(exempt.items()))
+        console.print(
+            f"\n[yellow]collapse gate not evaluated[/yellow] for {len(exempt)} image-positive "
+            f"config(s) under {MIN_ROWS_FOR_SHARE_GATE} rows: {detail}"
+        )
     if violations:
         console.print("\n[bold red]quality gate failed[/bold red]")
         for problem in violations:
@@ -619,14 +1029,16 @@ def main(cfg: DictConfig) -> None:
     quota = proportional_quota(counts, requested)
 
     console.print(f"sampling {requested} rows across {len(quota)} configs")
+    console.print(f"[dim]shard cache: {shard_cache_dir()}[/dim]")
     rows_by_config: dict[str, list[dict[str, Any]]] = {}
     for name in MMEB_CONFIGS:
         want = quota[name]
         if want <= 0:
             console.print(f"  {name}: 0 (quota empty at {requested} rows)")
             continue
-        rows_by_config[name] = stream_rows(config, name, want)
-        console.print(f"  {name}: {len(rows_by_config[name])}/{want}")
+        rows, source = sample_config(config, name, want)
+        rows_by_config[name] = rows
+        console.print(f"  {name}: {len(rows)}/{want} [dim]({source})[/dim]")
     taken = {name: len(rows) for name, rows in rows_by_config.items()}
 
     metrics = subset_metrics(rows_by_config)
@@ -636,6 +1048,7 @@ def main(cfg: DictConfig) -> None:
 
     manifest = {
         "source_repo": data.source_repo,
+        "source_revision": data.source_revision,
         "subset_repo": data.repo_id,
         "subset_revision": None,
         "pushed": False,
@@ -656,8 +1069,18 @@ def main(cfg: DictConfig) -> None:
             "min_rows_for_share_gate": MIN_ROWS_FOR_SHARE_GATE,
         },
         "quality": metrics,
+        # An image-positive config under the row floor gets no collapse gate, and
+        # the output above still reports the gate as passed. Named here so a
+        # reviewer can see which numbers no gate stood behind.
+        "collapse_gate_not_evaluated": ungated_configs(metrics),
         "violations": violations,
         "push_blockers": blockers,
+        # Kernel-maintained high-water mark, not a sample. The evidence that the
+        # undecoded-rows fix worked was `ps -o rss=` every 120s, which cannot see a
+        # peak inside a sampling interval and in fact recorded a *lower* figure at
+        # 65536 rows than at 40377 — impossible for a monotone accumulator, so both
+        # samples were measuring allocator noise rather than the accumulation.
+        "peak_rss_bytes": _peak_rss_bytes(),
     }
     # Written before the push so the evidence survives a failed one, and rewritten
     # after so the revision lands next to the numbers that justify it.
@@ -679,13 +1102,45 @@ def main(cfg: DictConfig) -> None:
         console.print("[yellow]not pushed (data.push_subset=false)[/yellow]")
         return
 
+    from datasets import DatasetDict
+
     console.print(f"pushing to {data.repo_id}")
-    commit = build_dataset(rows_by_config).push_to_hub(data.repo_id, private=True)
+    # Pushed as a DatasetDict, not a bare Dataset. `Dataset.push_to_hub` onto a repo
+    # that already carries a card keeps the card's existing `dataset_info`
+    # (datasets/arrow_dataset.py, `info_to_dump = repo_info`), so a repush declares
+    # the *previous* schema. That is how a corrected five-column subset landed under
+    # defect D1's four-column card and could not be loaded at all. DatasetDict passes
+    # `remove_other_splits=True`, which takes the branch that rebuilds features.
+    commit = DatasetDict({SUBSET_SPLIT: build_dataset(rows_by_config)}).push_to_hub(
+        data.repo_id, private=True
+    )
     revision = getattr(commit, "oid", None) or str(commit)
     manifest |= {"subset_revision": revision, "pushed": True}
     write_json(path, manifest)
     console.print(f"revision {revision}")
-    console.print("[bold]pin this revision in configs/data/*.yaml[/bold]")
+
+    # The draw has been published and the metrics are already computed, so nothing
+    # below needs the rows — and holding them makes the verification slower, not
+    # just fatter. Measured on `data=quality`: with ~5GB of rows still resident the
+    # artifact came down at 3.4 MB/s against 12.3 MB/s for the same file fetched by
+    # itself, on a host whose swap was full. Verification is the one stage that
+    # cannot be resumed from the shard cache, so it is the one that should run lean.
+    rows_by_config.clear()
+    gc.collect()
+
+    console.print("verifying the pushed revision")
+    problems = verify_pushed(data, revision, metrics)
+    manifest |= {"artifact_verified": not problems, "artifact_problems": problems}
+    write_json(path, manifest)
+    if problems:
+        for problem in problems:
+            console.print(f"  [red]-[/red] {problem}")
+        raise SystemExit(
+            f"pushed {revision} but it does not match the manifest: {len(problems)} "
+            f"problem(s) (see {path}). Do not pin this revision."
+        )
+    console.print("[bold green]artifact matches the manifest[/bold green]")
+    console.print(f"[bold]pin {revision} in configs/data/*.yaml[/bold]")
 
 
 if __name__ == "__main__":

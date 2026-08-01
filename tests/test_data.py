@@ -13,8 +13,9 @@ the `compose` extra alone.
 from __future__ import annotations
 
 import importlib.util
+import io
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -34,11 +35,19 @@ IMAGE_CONFIG = "MSCOCO_t2i"  # text query, image positive
 TEXT_CONFIG = "ImageNet_1K"  # image query, text positive
 
 
-class FakeImage:
-    """Stands in for a decoded PIL image. Only `.size` is read for metrics."""
+def encoded_image(width: int = 640, height: int = 480) -> dict[str, Any]:
+    """An image the way a row actually carries it: encoded bytes, not pixels.
 
-    def __init__(self, width: int = 640, height: int = 480):
-        self.size = (width, height)
+    Rows are held undecoded so a 65536-row draw fits in memory (`stream_rows`), so
+    a fixture holding a decoded stand-in would test a representation the pipeline
+    no longer produces — and the metrics that read image size are the ones that
+    caught D1.
+    """
+    from PIL import Image as PILImage
+
+    buffer = io.BytesIO()
+    PILImage.new("RGB", (width, height)).save(buffer, format="PNG")
+    return {"bytes": buffer.getvalue(), "path": None}
 
 
 def image_row(index: int, *, pos_image: Any | None = ..., **overrides: Any) -> dict[str, Any]:
@@ -47,7 +56,7 @@ def image_row(index: int, *, pos_image: Any | None = ..., **overrides: Any) -> d
         "qry": f"find the image of subject {index}",
         "qry_image": None,
         "pos_text": "<|image_1|>\nRepresent the given image.\n",
-        "pos_image": FakeImage() if pos_image is ... else pos_image,
+        "pos_image": encoded_image() if pos_image is ... else pos_image,
         "pos_image_path": f"coco/{index}.jpg",
     }
     return row | overrides
@@ -57,7 +66,7 @@ def text_row(index: int, **overrides: Any) -> dict[str, Any]:
     row = {
         "mmeb_config": TEXT_CONFIG,
         "qry": "<|image_1|>\nRepresent the given image for classification.\n",
-        "qry_image": FakeImage(500, 375),
+        "qry_image": encoded_image(500, 375),
         "pos_text": f"class {index % 3}",
         "pos_image": None,
         "pos_image_path": None,
@@ -432,6 +441,423 @@ def test_the_pushed_columns_cannot_drift_from_the_measured_ones():
     assert set(prepare_data.SUBSET_COLUMN_NAMES) == set(prepare_data.KEPT_COLUMNS) | {"mmeb_config"}
     for columns in prepare_data.CONFIG_COLUMNS.values():
         assert set(columns) <= set(prepare_data.SUBSET_COLUMN_NAMES)
+
+
+# --- how rows are held, and the shard cache ----------------------------------
+
+
+def fake_datasets(monkeypatch, *, features=None, casts=None, opened=None, rows=None):
+    """A stand-in for `datasets` so these run against the `compose` extra alone.
+
+    Returns the fake module so a test can assert on what was asked of it.
+    """
+
+    class FakeStream:
+        def __init__(self):
+            self.features = (
+                features
+                if features is not None
+                else {
+                    "qry": None,
+                    "pos_text": None,
+                    "pos_image": None,
+                    "pos_image_path": None,
+                }
+            )
+
+        def cast_column(self, column, feature):
+            if casts is not None:
+                casts.append((column, feature.decode))
+            return self
+
+        def shuffle(self, seed, buffer_size):
+            return self
+
+        def take(self, want):
+            return (
+                rows
+                or [
+                    {
+                        "qry": f"q{i}",
+                        "pos_text": "p",
+                        "pos_image": {"bytes": b"png", "path": None},
+                        "pos_image_path": f"coco/{i}.jpg",
+                    }
+                    for i in range(want)
+                ]
+            )[:want]
+
+    def load_dataset(*args, **kwargs):
+        if opened is not None:
+            opened.append(kwargs)
+        return FakeStream()
+
+    fake = ModuleType("datasets")
+    fake.Image = lambda decode=True: SimpleNamespace(decode=decode)
+    fake.load_dataset = load_dataset
+    monkeypatch.setitem(sys.modules, "datasets", fake)
+    return fake
+
+
+def fake_config(**overrides):
+    data = {"source_repo": "a/b", "source_revision": "9d0fd31789c1", "sample_seed": 1234}
+    return SimpleNamespace(data=SimpleNamespace(**(data | overrides)))
+
+
+def test_rows_are_never_held_as_decoded_pixels(monkeypatch):
+    """`datasets` decodes an Image column on every row it hands out —
+    `Image.decode_example` calls `PIL.Image.load()` — and `main` accumulates every
+    config's rows until the push. Measured on MSCOCO_i2t: 270.9 KiB/row decoded
+    against 15.9 KiB/row encoded. At `data=quality`'s 65536 rows that killed the
+    process at 40377 rows with 48GB of RAM and 20GB of swap gone.
+    """
+    casts = []
+    fake_datasets(monkeypatch, casts=casts)
+
+    rows = prepare_data.stream_rows(fake_config(), IMAGE_CONFIG, 3)
+
+    # Only the columns this config declares, and decoding off for each of them.
+    assert casts == [("pos_image", False)]
+    assert len(rows) == 3
+
+
+def test_the_draw_reads_the_pinned_upstream_commit(monkeypatch):
+    """The sampler streamed the mirror's HEAD while this module's docstring and
+    PLAN.md both said the commit was pinned. A subset drawn from an unrecorded HEAD
+    cannot be traced to the data it came from."""
+    opened = []
+    fake_datasets(monkeypatch, opened=opened)
+
+    prepare_data.stream_rows(fake_config(), IMAGE_CONFIG, 2)
+
+    assert opened and opened[0]["revision"] == "9d0fd31789c1"
+
+
+def test_the_upstream_schema_is_checked_even_when_the_draw_comes_from_cache(tmp_path, monkeypatch):
+    """The check lived only inside `stream_rows`, so a second run against a cached
+    draw could not see that upstream had dropped a column — while the manifest went
+    on recording CONFIG_COLUMNS as the declared schema. Reproduced before the fix:
+    the cached path returned 1602 CIRR rows with no exception where the streaming
+    path raised."""
+    monkeypatch.setenv(prepare_data.SHARD_CACHE_ENV, str(tmp_path))
+    config = fake_config()
+    prepare_data.write_shard(
+        [image_row(i) for i in range(4)], prepare_data.shard_path(config.data, IMAGE_CONFIG, 4)
+    )
+    # Upstream no longer offers pos_image: exactly defect D1's shape.
+    fake_datasets(monkeypatch, features={"qry": None, "pos_text": None, "pos_image_path": None})
+
+    with pytest.raises(RuntimeError, match="upstream columns changed"):
+        prepare_data.sample_config(config, IMAGE_CONFIG, 4)
+
+
+def test_an_image_whose_pixels_do_not_decode_is_not_readable():
+    """`PIL.Image.open` is lazy, so a header-only check calls a file with an intact
+    IHDR and a corrupt payload a readable image. Before rows were held undecoded,
+    `datasets` called `load()` on every row and this surfaced upstream of the gate;
+    holding encoded bytes removed that without replacing it."""
+    good = encoded_image(64, 48)["bytes"]
+    broken = good[: len(good) // 2] + b"\x00" * (len(good) - len(good) // 2)
+
+    assert prepare_data._image_size({"bytes": good, "path": None}) == (64, 48)
+    assert prepare_data._image_size({"bytes": broken, "path": None}) is None
+
+
+def test_a_declared_size_too_large_to_decode_is_counted_not_raised():
+    """`DecompressionBombError` derives from Exception, so listing only OSError and
+    ValueError let one oversized header kill the run after all streaming and
+    caching — and the cached shard then reproduced that death on every retry."""
+    from PIL import Image as PILImage
+
+    header = io.BytesIO()
+    PILImage.new("RGB", (4, 4)).save(header, format="PNG")
+    payload = bytearray(header.getvalue())
+    # Rewrite IHDR width/height to 60000x60000; PIL reads this before decoding.
+    payload[16:24] = (60000).to_bytes(4, "big") + (60000).to_bytes(4, "big")
+
+    assert prepare_data._image_size({"bytes": bytes(payload), "path": None}) is None
+
+
+def test_image_size_reads_the_header_of_the_encoded_bytes():
+    assert prepare_data._image_size(encoded_image(37, 11)) == (37, 11)
+    assert prepare_data._image_size({"bytes": b"not an image", "path": None}) is None
+    assert prepare_data._image_size(None) is None
+
+
+def test_an_absent_image_and_an_unreadable_one_are_not_the_same_thing():
+    """Collapsing them would let a repo full of dangling paths pass as a repo full
+    of images: every row would count as present and none would be readable."""
+    assert prepare_data.image_missing(None)
+    assert prepare_data.image_missing({"bytes": None, "path": None})
+    assert not prepare_data.image_missing({"bytes": None, "path": "images/1.jpg"})
+    assert not prepare_data.image_missing(encoded_image())
+
+
+def test_a_cached_shard_round_trips_the_draw_exactly(tmp_path):
+    """A resumed run must use the rows the killed one drew. Anything the shard
+    cannot carry — a null image, a null path — comes back changed and the subset
+    silently differs from the one the manifest measured."""
+    rows = [image_row(0), image_row(1, pos_image=None), text_row(2)]
+    path = tmp_path / "shard.parquet"
+
+    prepare_data.write_shard(rows, path)
+
+    assert prepare_data.read_shard(path) == rows
+
+
+def test_a_shard_is_never_left_behind_half_written(tmp_path, monkeypatch):
+    """The kill this cache exists for can arrive mid-write. The previous version of
+    this test wrote a `.partial` by hand and asserted the `.parquet` was absent,
+    which called neither `write_shard` nor `sample_config` — removing the staging
+    write entirely left all four shard tests passing."""
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "shard.parquet"
+
+    def die(*args, **kwargs):
+        raise KeyboardInterrupt("killed mid-write")
+
+    monkeypatch.setattr(pq, "write_table", die)
+    with pytest.raises(KeyboardInterrupt):
+        prepare_data.write_shard([image_row(0)], path)
+
+    assert not path.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_two_processes_writing_one_shard_do_not_collide(tmp_path, monkeypatch):
+    """A fixed staging name means whichever process renames second dies on a
+    FileNotFoundError that nothing catches."""
+    monkeypatch.setattr(prepare_data.os, "getpid", lambda: 111)
+    first = prepare_data.shard_path.__globals__["Path"](tmp_path / "a.parquet")
+    monkeypatch.setattr(prepare_data.os, "getpid", lambda: 222)
+    second = tmp_path / "a.parquet"
+
+    assert first.with_suffix(".111.partial") != second.with_suffix(".222.partial")
+
+
+def test_a_shard_the_cache_cannot_read_is_discarded_rather_than_retried(tmp_path, monkeypatch):
+    """A corrupt shard read straight through would make every retry fail in the same
+    place: the cache built to survive a kill would make the failure permanent."""
+    monkeypatch.setenv(prepare_data.SHARD_CACHE_ENV, str(tmp_path))
+    fake_datasets(monkeypatch)
+    config = fake_config()
+    path = prepare_data.shard_path(config.data, IMAGE_CONFIG, 4)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not a parquet file")
+    monkeypatch.setattr(prepare_data, "stream_rows", lambda *args: [image_row(i) for i in range(4)])
+
+    rows, source = prepare_data.sample_config(config, IMAGE_CONFIG, 4)
+
+    assert source == "streamed"
+    assert len(rows) == 4
+
+
+def test_a_shard_missing_a_column_is_refused_rather_than_backfilled(tmp_path):
+    """`pq.read_table(schema=...)` fills an absent column with nulls, so a shard
+    written by older code would come back with a silently missing `pos_image` —
+    D1's shape reached through the resume path. `take_row` raises on the same
+    situation and the two have to agree."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "old.parquet"
+    kept = [c for c in prepare_data.SHARD_COLUMNS if c != prepare_data.POSITIVE_IMAGE]
+    pq.write_table(pa.table({c: pa.array(["v"], type=pa.string()) for c in kept}), path)
+
+    with pytest.raises(RuntimeError, match="cached shard holds columns"):
+        prepare_data.read_shard(path)
+
+
+def test_a_shard_that_holds_fewer_rows_than_the_quota_is_redrawn(tmp_path, monkeypatch):
+    """Topping a short shard up would take the missing rows from a different
+    position in the shuffled stream, so the draw would no longer be the one the
+    seed defines."""
+    monkeypatch.setenv(prepare_data.SHARD_CACHE_ENV, str(tmp_path))
+    fake_datasets(monkeypatch)
+    config = fake_config()
+    path = prepare_data.shard_path(config.data, IMAGE_CONFIG, 4)
+    prepare_data.write_shard([image_row(0), image_row(1)], path)
+    monkeypatch.setattr(prepare_data, "stream_rows", lambda *args: [image_row(i) for i in range(4)])
+
+    rows, source = prepare_data.sample_config(config, IMAGE_CONFIG, 4)
+
+    assert source == "streamed"
+    assert len(rows) == 4
+    assert len(prepare_data.read_shard(path)) == 4
+
+
+def test_a_complete_shard_is_reused_without_redrawing_it(tmp_path, monkeypatch):
+    monkeypatch.setenv(prepare_data.SHARD_CACHE_ENV, str(tmp_path))
+    fake_datasets(monkeypatch)
+    config = fake_config()
+    drawn = [image_row(i) for i in range(4)]
+    prepare_data.write_shard(drawn, prepare_data.shard_path(config.data, IMAGE_CONFIG, 4))
+    monkeypatch.setattr(
+        prepare_data, "stream_rows", lambda *args: pytest.fail("a cached shard was re-drawn")
+    )
+
+    rows, source = prepare_data.sample_config(config, IMAGE_CONFIG, 4)
+
+    assert source == "cached"
+    assert rows == drawn
+
+
+def test_the_shard_name_changes_with_everything_that_changes_the_draw():
+    """A cache keyed on less than this hands one draw's rows to another's request
+    — the failure mode is a subset that silently does not match its manifest."""
+    base = fake_config().data
+    names = {
+        prepare_data.shard_path(base, IMAGE_CONFIG, 4).name,
+        prepare_data.shard_path(base, IMAGE_CONFIG, 5).name,
+        prepare_data.shard_path(base, TEXT_CONFIG, 4).name,
+        prepare_data.shard_path(fake_config(sample_seed=7).data, IMAGE_CONFIG, 4).name,
+        prepare_data.shard_path(fake_config(source_repo="c/d").data, IMAGE_CONFIG, 4).name,
+        prepare_data.shard_path(fake_config(source_revision="0" * 40).data, IMAGE_CONFIG, 4).name,
+    }
+    assert len(names) == 6
+
+
+def test_the_shard_carries_every_column_the_measurement_reads():
+    """A shard missing a metric column would make a resumed run measure less than
+    the run it resumed, which is how a column goes missing unnoticed."""
+    assert set(prepare_data.SHARD_COLUMNS) == set(prepare_data.SUBSET_COLUMN_NAMES) | set(
+        prepare_data.METRIC_COLUMNS
+    )
+
+
+# --- the gate that was skipped, and the artifact nobody read -----------------
+
+
+def test_a_collapse_gate_that_did_not_run_is_recorded_as_not_having_run():
+    """`data=speed` draws 30 NIGHTS rows and 33 WebQA rows, so 2 of its 7
+    image-positive configs never reach `MIN_ROWS_FOR_SHARE_GATE` — and the
+    "largest single image positive" figure quoted from that draw came from one of
+    the two. The output still said the gate passed."""
+    rows = clean_rows(rows=prepare_data.MIN_ROWS_FOR_SHARE_GATE - 1)
+    exempt = prepare_data.ungated_configs(prepare_data.subset_metrics(rows))
+
+    assert exempt == {IMAGE_CONFIG: prepare_data.MIN_ROWS_FOR_SHARE_GATE - 1}
+    # The text-positive config is not image-positive, so it was never in scope.
+    assert TEXT_CONFIG not in exempt
+
+
+def test_a_gated_draw_reports_nothing_as_exempt():
+    assert (
+        prepare_data.ungated_configs(
+            prepare_data.subset_metrics(clean_rows(rows=prepare_data.MIN_ROWS_FOR_SHARE_GATE))
+        )
+        == {}
+    )
+
+
+def test_the_artifact_identity_survives_the_column_the_push_drops():
+    """`pos_image_path` is metric-only and never pushed, so the pushed subset can
+    only be re-gated by hashing the image bytes. Digest grouping can merge two
+    paths that hold identical bytes but can never split one path, so the share it
+    yields is >= the manifest's — sound to apply the same threshold to."""
+    same = encoded_image(8, 8)
+    rows = [image_row(0, pos_image=same), image_row(1, pos_image=same)]
+    identities = {prepare_data.artifact_identity(IMAGE_CONFIG, row) for row in rows}
+
+    assert len(identities) == 1
+    assert prepare_data.artifact_identity(TEXT_CONFIG, text_row(0))[0] == "text"
+
+
+def published_rows(rows_by_config):
+    return [row | {"mmeb_config": name} for name, part in rows_by_config.items() for row in part]
+
+
+def stub_artifact(monkeypatch, *, columns=None, rows=None, downloaded=None):
+    """Stand in for the two halves of `verify_pushed`: the card and the parquet."""
+    monkeypatch.setattr(
+        prepare_data,
+        "_declared_columns",
+        lambda data, revision: tuple(sorted(columns or prepare_data.SUBSET_COLUMN_NAMES)),
+    )
+
+    def batches(data, revision):
+        if downloaded is not None:
+            downloaded.append(revision)
+        for i in range(0, len(rows or []), 3):
+            yield (rows or [])[i : i + 3]
+
+    monkeypatch.setattr(prepare_data, "_artifact_batches", batches)
+
+
+def test_a_pushed_subset_declaring_the_wrong_columns_is_refused(monkeypatch):
+    """The failure this check exists for: `Dataset.push_to_hub` kept the repo's
+    existing card, so a corrected five-column subset landed under defect D1's
+    four-column schema and `load_dataset` raised CastError on it. The push
+    returned a revision and was treated as finished."""
+    downloaded = []
+    stub_artifact(
+        monkeypatch,
+        columns=("mmeb_config", "qry", "qry_image", "pos_text"),
+        rows=published_rows(clean_rows()),
+        downloaded=downloaded,
+    )
+
+    problems = prepare_data.verify_pushed(
+        SimpleNamespace(repo_id="x/y"), "f" * 40, prepare_data.subset_metrics(clean_rows())
+    )
+
+    assert problems and "cannot read this revision" in problems[0]
+    # And it says so before pulling the artifact down: a broken card is seconds of
+    # metadata, not gigabytes of parquet.
+    assert downloaded == []
+
+
+def test_a_pushed_subset_that_lost_rows_is_refused(monkeypatch):
+    """Column names alone are not the artifact. A push that dropped rows declares
+    the right schema and still does not hold the corpus the manifest measured."""
+    rows = clean_rows()
+    stub_artifact(monkeypatch, rows=published_rows(rows)[:-3])
+
+    problems = prepare_data.verify_pushed(
+        SimpleNamespace(repo_id="x/y"), "f" * 40, prepare_data.subset_metrics(rows)
+    )
+
+    assert any("rows=" in problem for problem in problems)
+
+
+def test_a_push_that_lost_an_image_is_refused(monkeypatch):
+    """D1's own shape, arriving in the artifact rather than the draw."""
+    rows = clean_rows()
+    published = published_rows(rows)
+    damaged = [
+        row | {"pos_image": None} if row["mmeb_config"] == IMAGE_CONFIG else row
+        for row in published
+    ]
+    stub_artifact(monkeypatch, rows=damaged)
+
+    problems = prepare_data.verify_pushed(
+        SimpleNamespace(repo_id="x/y"), "f" * 40, prepare_data.subset_metrics(rows)
+    )
+
+    assert any("rows_without_positive_content" in problem for problem in problems)
+
+
+def test_a_faithful_push_verifies_clean(monkeypatch):
+    """The check has to be able to pass, or it certifies nothing."""
+    rows = clean_rows()
+    stub_artifact(monkeypatch, rows=published_rows(rows))
+
+    assert (
+        prepare_data.verify_pushed(
+            SimpleNamespace(repo_id="x/y"), "f" * 40, prepare_data.subset_metrics(rows)
+        )
+        == []
+    )
+
+
+def test_the_peak_memory_recorded_is_a_high_water_mark_not_a_sample():
+    """The evidence that the undecoded-rows fix worked was `ps -o rss=` every 120s,
+    which reported a *lower* figure at 65536 rows than at 40377 — impossible for a
+    monotone accumulator, so both samples were allocator noise."""
+    peak = prepare_data._peak_rss_bytes()
+    assert peak > 0
+    assert prepare_data._peak_rss_bytes() >= peak
 
 
 # --- data configs ------------------------------------------------------------

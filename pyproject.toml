@@ -33,7 +33,11 @@ dependencies = [
 
 [project.optional-dependencies]
 # Local/orchestrator side: composes experiment variants and writes resolved JSON.
-compose = ["hydra-core>=1.3", "runpod>=1.11", "pyyaml>=6.0"]
+# pyarrow: scripts/prepare_data.py caches each config's draw as a parquet shard so
+# a killed run resumes instead of re-downloading. It arrives transitively with
+# `datasets` in the `native` extra, but the data prep runs orchestrator-side where
+# that extra is not installed.
+compose = ["hydra-core>=1.3", "runpod>=1.11", "pyyaml>=6.0", "pyarrow>=21.0"]
 native = [
     "transformers>=5.14",
     "datasets>=5.0",
