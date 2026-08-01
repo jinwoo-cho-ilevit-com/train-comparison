@@ -17,6 +17,10 @@ class Check:
 
     name: str
     ok: bool
+    # Some checks exist to confirm a documented limitation, e.g. whether Unsloth's
+    # encoder-only embedding path rejects a VLM checkpoint. Their failure is the
+    # answer, so it must not make the whole cell read as broken.
+    expected_failure: bool = False
     detail: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     error_type: str | None = None
@@ -26,6 +30,7 @@ class Check:
         return {
             "name": self.name,
             "ok": self.ok,
+            "expected_failure": self.expected_failure,
             "detail": self.detail,
             "error": self.error,
             "error_type": self.error_type,
@@ -82,7 +87,7 @@ class ProbeReport:
 
     @property
     def all_ok(self) -> bool:
-        return all(c.ok for c in self.checks)
+        return all(c.ok or c.expected_failure for c in self.checks)
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -9,6 +9,7 @@ already-resolved config and only validates it. See trainbench/compose.py.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
@@ -33,6 +34,11 @@ def git_commit() -> str:
     Returns 'unknown' outside a repo — which is the normal case inside an image,
     where the commit is instead passed in by the orchestrator.
     """
+    # Images carry no .git, so the orchestrator passes the commit in. Without this
+    # every pod result records "unknown" and no number can be traced to its code.
+    from_env = os.environ.get("TRAINBENCH_GIT_COMMIT")
+    if from_env:
+        return from_env
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"],
