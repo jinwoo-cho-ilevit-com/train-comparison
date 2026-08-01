@@ -31,15 +31,29 @@ peft is the exception, and it is imported on purpose: it *is* installed here
 adapter tests below build a real `get_peft_model` model, because the question the
 axis turns on — what `get_peft_model` does to base parameters — cannot be answered
 by a stand-in that does whatever the test sets it to do.
+
+transformers is a second exception, in one test and for the same reason. It is
+installed (5.14.1) — the paragraph above is about liger and deepspeed, which are
+not. `train.gradient_checkpointing` is read back off an attribute transformers
+sets (`_gradient_checkpointing_func`), and a stand-in that sets that attribute
+proves only that the test and the probe agree with each other. The test builds a
+real `PreTrainedModel` from a config: no weights, no network, no GPU.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import collections
+import contextlib
+import functools
+import importlib.util
+import sys
+import weakref
+from types import ModuleType, SimpleNamespace
 from typing import get_args
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from trainbench import axes
 from trainbench.applied import (
@@ -48,7 +62,15 @@ from trainbench.applied import (
     assert_matches,
     capture,
 )
-from trainbench.config_schema import ATTN_IMPL, AttnConfig, ModelConfig, axis_knobs
+from trainbench.config_schema import (
+    ATTN_IMPL,
+    AttnConfig,
+    KernelConfig,
+    ModelConfig,
+    PrecisionConfig,
+    axis_knobs,
+)
+from trainbench.embedding import last_token_pool, packed_last_token_pool
 
 # The fixture and the config builders are shared with tests/test_applied.py rather
 # than re-declared: two definitions of "a valid composed config" would drift, and
@@ -113,6 +135,133 @@ def test_every_attention_value_has_a_kwarg_to_ask_for(composed):
     declared = set(get_args(AttnConfig.model_fields["name"].annotation))
 
     assert set(ATTN_IMPL) == declared
+
+
+# --- peft.mode=qlora, the half that is a dict (load_kwargs) ------------------
+#
+# QLoRA is LoRA over a 4-bit base. The adapter half is the same `get_peft_model`
+# call as plain LoRA; the base half is a `BitsAndBytesConfig` that has to reach
+# `from_pretrained`, because weights already materialised in bf16 cannot be
+# quantised afterwards. What that call is asked for is a dict, and a dict is
+# assertable on a laptop — `BitsAndBytesConfig` is a transformers dataclass and
+# imports with bitsandbytes absent.
+#
+# What is not asserted anywhere is that 4-bit weights come back. bitsandbytes
+# quantises on CUDA, there is no GPU here, and the package is not installed: that
+# half is 측정 안 함, and the tests below are about the request rather than the
+# result. `_peft` still refuses the axis outright, so nothing in this repository
+# runs a qlora step yet on any device.
+
+
+def on_cuda(config):
+    """The same config as if `device=cuda` had been composed.
+
+    `device.get_device` takes the override at its word instead of probing for
+    hardware — that is what lets a CUDA-only branch be read on a machine without
+    one. Nothing is allocated, loaded or quantised by any test that uses this.
+    """
+    return config.model_copy(update={"device": "cuda"})
+
+
+def test_qlora_asks_from_pretrained_for_a_four_bit_base(composed):
+    config = on_cuda(bench(composed, **{"peft.mode": "qlora", "peft.r": 32}))
+
+    kwargs = axes.load_kwargs(config)
+
+    # The key is transformers' own parameter name, for the reason the attention
+    # test above gives: a misspelled one is accepted and ignored, and the run then
+    # trains a full-precision base under the qlora label.
+    assert set(kwargs) == {"attn_implementation", "quantization_config"}
+    quantisation = kwargs["quantization_config"]
+    # Named rather than imported: this file imports no transformers (see the module
+    # docstring), and what matters is the object `from_pretrained` receives.
+    assert type(quantisation).__name__ == "BitsAndBytesConfig"
+    assert quantisation.load_in_4bit is True
+    assert quantisation.bnb_4bit_quant_type == "nf4"
+    assert quantisation.bnb_4bit_use_double_quant is True
+    # bf16 is the only precision `step_context` lets a run reach; a compute dtype
+    # that disagreed with it would be a precision no axis asked for.
+    assert quantisation.bnb_4bit_compute_dtype is torch.bfloat16
+
+
+def test_full_and_lora_are_loaded_without_a_quantisation_config(composed):
+    """One half of the break: a `quantization_config` returned for every run would
+    satisfy the test above word for word, and would quantise the full finetune that
+    is this study's baseline."""
+    for mode, rank in (("full", 0), ("lora", 32)):
+        config = on_cuda(bench(composed, **{"peft.mode": mode, "peft.r": rank}))
+
+        assert set(axes.load_kwargs(config)) == {"attn_implementation"}, mode
+
+
+@pytest.mark.parametrize("device", ["cpu", "mps", "xpu"])
+def test_a_qlora_run_cannot_start_off_cuda(composed, device):
+    """The other half, and the one that matters on this machine.
+
+    bitsandbytes quantises on CUDA. Handing the config back anyway would leave the
+    quantisation to be ignored somewhere downstream, and an ignored quantisation is
+    a full-precision base whose speed gets reported as 4-bit. The device is
+    overridden explicitly rather than left to resolve, so the refusal is asserted on
+    a GPU host too.
+
+    More than one non-CUDA device, because "off cuda" is the claim. Asserting it
+    for `cpu` alone leaves `device.type == "cpu"` — one character from what is
+    written — passing the whole suite while quantising nothing on this laptop's
+    mps and on an Intel host's xpu. `get_device` takes the string at its word, so
+    none of these has to exist here.
+    """
+    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32}).model_copy(
+        update={"device": device}
+    )
+
+    with pytest.raises(axes.UnappliedAxis, match=f"device={device} would load"):
+        axes.load_kwargs(config)
+
+
+def test_qlora_gates_on_the_device_the_run_resolves_to(composed, monkeypatch):
+    """`device: null` is the config default and what every pod composes, so the
+    resolution path is the one a real run takes — and no test walked it: every
+    other qlora test names a device outright.
+
+    The accelerator is stubbed rather than read, because what is under test is the
+    gate rather than this host: a machine with no CUDA would pass a gate that
+    quantised on any accelerator it found, which is how mps would get 4-bit weights
+    it cannot make.
+    """
+    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32}).model_copy(
+        update={"device": None}
+    )
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("mps"))
+    with pytest.raises(axes.UnappliedAxis, match="device=mps"):
+        axes.load_kwargs(config)
+
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("cuda"))
+    assert "quantization_config" in axes.load_kwargs(config)
+
+
+def test_the_qlora_compute_dtype_stays_a_precision_a_run_can_reach(composed):
+    """`QLORA_4BIT` fixes bf16 compute on the grounds that `step_context` refuses
+    every other precision. That is one constant resting on another function's
+    refusal with nothing between them: the day `mxfp8` or `nvfp4` becomes
+    reachable, a qlora run under it computes in bf16 and the study prints the fp8
+    recipe's name over a bf16 number. Nothing else pins the pair together, so this
+    does — it is the notice, not the fix."""
+    reachable = []
+    for name in get_args(PrecisionConfig.model_fields["name"].annotation):
+        try:
+            axes.step_context(bench(composed, **{"precision.name": name}))
+        except axes.UnappliedAxis:
+            continue
+        reachable.append(name)
+
+    assert reachable == ["bf16"], (
+        f"precision {reachable} can be reached now, and QLORA_4BIT still computes in "
+        f"{axes.QLORA_4BIT['bnb_4bit_compute_dtype']}; decide what the combination "
+        "means before a run measures one under the other's name"
+    )
+    assert axes.QLORA_4BIT["bnb_4bit_compute_dtype"] is torch.bfloat16
 
 
 # --- compile.mode ------------------------------------------------------------
@@ -221,6 +370,21 @@ class LigerRMSNorm(torch.nn.Module):
 LigerRMSNorm.__module__ = "liger_kernel.transformers.rms_norm"
 
 
+class FusedRMSNormGated(torch.nn.Module):
+    """Stands in for the fla class transformers builds each Qwen3.5 gated norm out
+    of when the package is installed (`modeling_qwen3_5.py:409`)."""
+
+
+FusedRMSNormGated.__module__ = "fla.modules.fused_norm_gate"
+
+
+class UnslothRMSNorm(torch.nn.Module):
+    """A replacement from something that is not a kernel axis value."""
+
+
+UnslothRMSNorm.__module__ = "unsloth.models.llama"
+
+
 def test_a_plain_model_carries_no_kernel(composed):
     config = bench(composed)
 
@@ -245,10 +409,409 @@ def test_a_patched_model_is_not_kernel_none(composed):
         assert_matches(state, config)
 
 
-def test_kernel_values_with_no_patch_are_refused(composed):
-    for name in ("liger", "fla", "kernels_hub"):
-        with pytest.raises(axes.UnappliedAxis, match="kernel="):
-            axes.patch(bench(composed, **{"kernel.name": name}))
+def qwen35(mapping, **overrides):
+    """A config on Qwen3.5, the one architecture of the three with a kernel path
+    for both liger and fla. Defined here rather than in tests/test_applied.py,
+    which docs/CONTRACTS.md §1 shares across lanes; `instruction_prompt` has to go
+    with the arch because the schema refuses an invented prompt on a generative
+    model."""
+    return bench(
+        mapping,
+        **{"model.arch": "qwen3_5", "model.instruction_prompt": None},
+        **overrides,
+    )
+
+
+def test_a_request_for_liger_on_a_stock_model_is_a_mismatch(composed):
+    """The other break, and the one this axis exists to catch: the config asks for
+    liger and the built model carries none of it. `patch` reporting success is not
+    evidence — only the model is — so the run stops before it produces a number."""
+    config = qwen35(composed, **{"kernel.name": "liger"})
+
+    state = capture(Built(model=plain_model()), config)
+
+    assert axis(state, "kernel.name").applied == "none"
+    with pytest.raises(AppliedMismatch, match="kernel.name"):
+        assert_matches(state, config)
+
+
+def patched_modelling_module(monkeypatch, *, replacement) -> type[torch.nn.Module]:
+    """A transformers modelling module after a kernel library rebound one of its
+    names, and the stock class an instance built before that still carries.
+
+    This is the whole mechanism of a kernel patch — `modeling_x.Name = LigerName`
+    and then construction — so the state it produces is what tells a fully covered
+    model from a half covered one. Built here rather than with the real thing
+    because liger-kernel does not install on this machine.
+    """
+    name = "transformers.models.fake.modeling_fake"
+    module = ModuleType(name)
+
+    class StockRMSNorm(torch.nn.Module):
+        pass
+
+    StockRMSNorm.__module__ = name
+    StockRMSNorm.__qualname__ = "StockRMSNorm"
+    module.StockRMSNorm = replacement
+    monkeypatch.setitem(sys.modules, name, module)
+    return StockRMSNorm
+
+
+def test_a_model_the_kernel_only_half_reached_is_not_a_full_kernel_run(composed, monkeypatch):
+    """The fail-open case this axis makes reachable: package presence is a scan
+    over the whole model, so one patched module answers it exactly like every
+    module patched, and the throughput ships under the kernel's name either way.
+    A module still built from a class the patch superseded is the evidence that
+    the model was assembled around the patch rather than after it."""
+    stock = patched_modelling_module(monkeypatch, replacement=LigerRMSNorm)
+    config = qwen35(composed, **{"kernel.name": "liger"})
+    model = plain_model()
+    model.add_module("patched", LigerRMSNorm())
+    model.add_module("built_before_the_patch", stock())
+
+    state = capture(Built(model=model), config)
+
+    assert axis(state, "kernel.name").applied == "partial(liger)"
+    with pytest.raises(AppliedMismatch, match="kernel.name"):
+        assert_matches(state, config)
+
+
+def test_a_model_built_entirely_after_the_patch_is_a_kernel_run(composed, monkeypatch):
+    """The other half of the pair, and what keeps the check above from being a
+    refusal of the axis: liger patching the decoder and leaving the rest of the
+    model alone is the library's documented behaviour, so coverage is recorded for
+    the reader rather than judged against a threshold."""
+    patched_modelling_module(monkeypatch, replacement=LigerRMSNorm)
+    config = qwen35(composed, **{"kernel.name": "liger"})
+    model = plain_model()
+    model.add_module("patched", LigerRMSNorm())
+
+    state = capture(Built(model=model), config)
+
+    assert axis(state, "kernel.name").applied == "liger"
+    assert axis(state, "kernel.name").detail["kernel_modules"] == {"liger": 1}
+    assert "kernel.name" not in [state_.axis for state_ in state.mismatched()]
+
+
+def test_a_class_replaced_by_something_this_cannot_name_is_undetermined(composed, monkeypatch):
+    """A framework adapter that rewrites transformers under the run — what Unsloth
+    is — leaves modules whose class was superseded by no kernel this names. What
+    ran is then unknown, and unknown blocks a timing run like a mismatch does."""
+    stock = patched_modelling_module(monkeypatch, replacement=UnslothRMSNorm)
+    config = qwen35(composed)
+    model = plain_model()
+    model.add_module("built_before_the_patch", stock())
+
+    state = capture(Built(model=model), config)
+
+    assert axis(state, "kernel.name").applied is None
+    assert "kernel.name" in [state_.axis for state_ in state.undetermined()]
+
+
+def test_a_qwen35_on_an_image_with_fla_reads_back_as_fla(composed):
+    """`kernel=none` is the default of every run in configs/config.yaml, and on
+    this architecture no image can satisfy it: transformers builds the gated norms
+    out of fla whenever the package is there. Fail-closed and correct, and it is
+    why this model produces no number on any axis until the run asks for fla."""
+    config = qwen35(composed)
+    model = plain_model()
+    model.add_module("norm", FusedRMSNormGated())
+
+    state = capture(Built(model=model), config)
+
+    assert axis(state, "kernel.name").applied == "fla"
+    with pytest.raises(AppliedMismatch, match="kernel.name"):
+        assert_matches(state, config)
+
+
+# The patch calls themselves cannot run here: liger-kernel and flash-linear-attention
+# depend on triton, which publishes no macOS wheel, and `kernels` fetches
+# device-specific prebuilt kernels from the Hub. What is testable is the wiring —
+# which value routes where, what is refused before anything is imported, and what
+# happens when the package is absent or exports a different name — and that is what
+# these do, against stub modules. Whether a real patch takes inside a framework
+# image is a first-pod check; `_capture_kernel` above is what will answer it.
+
+
+def liger_stub(*, entrypoint: str | None) -> tuple[object, list[str]]:
+    """A stand-in for `liger_kernel.transformers`, plus the log of what it applied."""
+    calls: list[str] = []
+    module = SimpleNamespace(apply_liger_kernel_to_llama=lambda: calls.append("llama"))
+    if entrypoint is not None:
+        setattr(module, entrypoint, lambda: calls.append(entrypoint))
+    return module, calls
+
+
+def install_liger(monkeypatch, module) -> None:
+    """Put a stub where `importlib.import_module` will find it. `None` makes the
+    import raise, which is how an environment without the package behaves."""
+    monkeypatch.setitem(sys.modules, "liger_kernel.transformers", module)
+
+
+def test_kernel_none_patches_nothing(composed):
+    assert axes.patch(bench(composed)) == []
+
+
+def test_every_kernel_the_schema_offers_routes_to_a_patcher():
+    """A value added to the schema with no patcher would otherwise reach
+    `KERNEL_PATCHERS[name]` and die on a KeyError, which reads as a broken axis
+    rather than an unimplemented one."""
+    declared = set(get_args(KernelConfig.model_fields["name"].annotation))
+
+    assert set(axes.KERNEL_PATCHERS) | {"none"} == declared
+
+
+def test_liger_calls_the_entrypoint_for_this_architecture(composed, monkeypatch):
+    module, calls = liger_stub(entrypoint="apply_liger_kernel_to_qwen3_5")
+    install_liger(monkeypatch, module)
+    config = qwen35(composed, **{"kernel.name": "liger"})
+
+    applied = axes.patch(config)
+
+    assert applied == ["kernel.name"]
+    assert calls == ["apply_liger_kernel_to_qwen3_5"]
+
+
+def test_liger_on_gemma4_is_refused_even_with_the_package_present(composed, monkeypatch):
+    """Liger-Kernel#1186 is open. The architecture is decided before the import, so
+    an image that has liger cannot turn this into a `liger`-labelled gemma-4 run."""
+    install_liger(monkeypatch, liger_stub(entrypoint="apply_liger_kernel_to_gemma4")[0])
+    config = gemma(composed, **{"kernel.name": "liger"})
+
+    with pytest.raises(axes.UnappliedAxis, match="1186"):
+        axes.patch(config)
+
+
+def test_liger_on_gemma4_is_refused_for_the_issue_and_not_for_a_missing_package(
+    composed, monkeypatch
+):
+    """The pair that makes the order inside `_patch_liger` observable. With the
+    package present both orders refuse, so the test above passes either way; on an
+    image without liger, an import-first patcher blames the environment and the
+    reader is left thinking gemma-4 would work once the package lands."""
+    install_liger(monkeypatch, None)
+    config = gemma(composed, **{"kernel.name": "liger"})
+
+    with pytest.raises(axes.UnappliedAxis, match="1186"):
+        axes.patch(config)
+
+
+def test_liger_records_an_entrypoint_or_a_reason_but_never_both():
+    """`LIGER_UNSUPPORTED` is consulted first, so an entrypoint keyed on an
+    architecture listed there is unreachable — no refusal contradicts it and no
+    test can, and the day the issue closes and the reason is deleted, an unchecked
+    function name ships as the thing to call. The suffix rule is pinned for the
+    same reason: it is the only thing standing between this table and a guess,
+    since the package cannot be imported here to ask."""
+    assert set(axes.LIGER_ENTRYPOINTS) & set(axes.LIGER_UNSUPPORTED) == set()
+    assert axes.LIGER_ENTRYPOINTS == {
+        arch: f"apply_liger_kernel_to_{arch}" for arch in axes.LIGER_ENTRYPOINTS
+    }
+
+
+def test_liger_on_an_architecture_with_no_recorded_entrypoint_is_refused(composed, monkeypatch):
+    install_liger(monkeypatch, liger_stub(entrypoint=None)[0])
+    config = bench(composed, **{"kernel.name": "liger"})
+
+    with pytest.raises(axes.UnappliedAxis, match="no entrypoint for arch='qwen3_vl'"):
+        axes.patch(config)
+
+
+def test_liger_without_the_package_is_refused_as_an_axis_not_an_import_error(composed, monkeypatch):
+    """`UnappliedAxis` rather than the raw `ImportError`: the audit counts a refusal
+    as the axis declining a value it cannot put into effect, and anything else as a
+    value that broke for an unrelated reason."""
+    install_liger(monkeypatch, None)
+    config = qwen35(composed, **{"kernel.name": "liger"})
+
+    with pytest.raises(axes.UnappliedAxis, match="liger-kernel installed"):
+        axes.patch(config)
+
+
+def test_a_wrong_entrypoint_name_reports_what_liger_exports(composed, monkeypatch):
+    """`LIGER_ENTRYPOINTS` holds a name that could not be checked against an
+    installed package. When it is wrong the refusal has to carry the correction,
+    or the first pod reports `AttributeError: apply_liger_kernel_to_qwen3_5`."""
+    install_liger(monkeypatch, liger_stub(entrypoint=None)[0])
+    config = qwen35(composed, **{"kernel.name": "liger"})
+
+    with pytest.raises(axes.UnappliedAxis, match=r"apply_liger_kernel_to_llama"):
+        axes.patch(config)
+
+
+def test_fla_is_refused_where_transformers_takes_no_fla_path(composed, monkeypatch):
+    """Only Qwen3.5 imports fla in transformers. Asking for it on the other two
+    would name a library the model never enters, which `_capture_kernel` would then
+    read back as `none`."""
+    monkeypatch.setattr(axes, "_fla_fast_path", lambda: (True, ""))
+
+    for config in (
+        bench(composed, **{"kernel.name": "fla"}),
+        gemma(composed, **{"kernel.name": "fla"}),
+    ):
+        with pytest.raises(axes.UnappliedAxis, match="no fla kernel path"):
+            axes.patch(config)
+
+
+def test_fla_without_its_fast_path_is_refused_rather_than_measured(composed, monkeypatch):
+    """The silent-fallback case: transformers logs one line and runs the torch
+    implementation for the layers that are 75% of this model, so a run that went
+    ahead would publish the fallback's speed under fla's name."""
+    monkeypatch.setattr(axes, "_fla_fast_path", lambda: (False, "fla not installed"))
+    config = qwen35(composed, **{"kernel.name": "fla"})
+
+    with pytest.raises(axes.UnappliedAxis, match="fla not installed"):
+        axes.patch(config)
+
+
+def fla_environment(monkeypatch, *, fla: str | None = "0.5.0", causal_conv1d=True, cuda=True):
+    """The three things transformers looks at before it binds fla, and no more.
+
+    The environment is stubbed rather than the predicate: `_fla_fast_path` is the
+    entirety of what this axis decides, and a test that replaces it with a lambda
+    observes nothing about fla at all — it watches a function with no side effects
+    return a constant nobody reads.
+    """
+    installed = {"fla": fla is not None, "causal_conv1d": causal_conv1d}
+    real_find_spec = importlib.util.find_spec
+
+    def find_spec(name, *args, **kwargs):
+        if name in installed:
+            return object() if installed[name] else None
+        return real_find_spec(name, *args, **kwargs)
+
+    def version(distribution):
+        if fla is not None and distribution in axes.FLA_DISTRIBUTIONS:
+            return fla
+        raise importlib.metadata.PackageNotFoundError(distribution)
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+
+
+def test_fla_is_applied_when_the_environment_provides_it(composed, monkeypatch):
+    fla_environment(monkeypatch)
+    config = qwen35(composed, **{"kernel.name": "fla"})
+
+    assert axes.patch(config) == ["kernel.name"]
+
+
+def test_fla_below_the_version_transformers_requires_is_refused(composed, monkeypatch):
+    """`is_flash_linear_attention_available()` carries a `>= 0.2.2` floor, and
+    under it transformers binds nothing — the model comes out stock and the run
+    dies at the capture, a long way from the version that caused it."""
+    fla_environment(monkeypatch, fla="0.2.1")
+    config = qwen35(composed, **{"kernel.name": "fla"})
+
+    with pytest.raises(axes.UnappliedAxis, match="0.2.1 is below the 0.2.2"):
+        axes.patch(config)
+
+
+def test_fla_without_causal_conv1d_is_refused_though_its_classes_would_bind(composed, monkeypatch):
+    """The two predicates are not one predicate. `is_flash_linear_attention_available`
+    does not mention causal-conv1d; `is_causal_conv1d_available` is a separate gate
+    behind a separate import, and only their conjunction is the fused Gated
+    DeltaNet path. This environment is the gap between them: fla's classes are in
+    the model, the fast path is not, and a run that went ahead would publish the
+    torch gated delta rule under fla's name."""
+    fla_environment(monkeypatch, causal_conv1d=False)
+    config = qwen35(composed, **{"kernel.name": "fla"})
+
+    assert axes._fla_binding() == (True, "")
+    with pytest.raises(axes.UnappliedAxis, match="causal_conv1d not installed"):
+        axes.patch(config)
+
+
+def test_the_fla_binding_needs_the_package_a_readable_version_and_cuda(monkeypatch):
+    """The predicate itself, value by value, since everything above only sees its
+    answer. Every arm is transformers': package, floor, and
+    `is_torch_cuda_available()` — a CPU box with fla installed still runs torch."""
+    fla_environment(monkeypatch)
+    assert axes._fla_binding() == (True, "")
+
+    fla_environment(monkeypatch, cuda=False)
+    assert axes._fla_binding()[0] is False
+
+    fla_environment(monkeypatch, fla=None)
+    assert axes._fla_binding() == (False, "fla not installed")
+
+    # Installed, but no distribution answers for it and importing it fails: the
+    # floor cannot be checked, and an unchecked floor is not a satisfied one.
+    fla_environment(monkeypatch, fla=None)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a, **k: object())
+    available, reason = axes._fla_binding()
+    assert available is False
+    assert "version cannot be read" in reason
+
+
+def test_kernel_none_is_refused_where_transformers_binds_fla_anyway(composed, monkeypatch):
+    """`none` is a claim about the model like every other value. On Qwen3.5 with
+    fla installed the claim is false before the run starts — transformers binds the
+    library while it imports the modelling module — so the refusal belongs here,
+    where it can name the cause, rather than at `assert_matches` after a model has
+    been built and the message is `requested 'none', applied 'fla'`."""
+    fla_environment(monkeypatch)
+    config = qwen35(composed)
+
+    assert config.kernel.name == "none"
+    with pytest.raises(axes.UnappliedAxis, match="kernel=none on arch=qwen3_5"):
+        axes.patch(config)
+
+
+def test_a_probe_of_the_same_run_is_not_refused(composed, monkeypatch):
+    """The refusal above is a guard on reported numbers, and a probe reports none.
+    Phase 0 is where "this image cannot give you kernel=none" is supposed to be
+    discovered, so a probe has to reach the model load and let the capture record
+    `requested none, applied fla` — refusing it here would remove the only run that
+    can say so."""
+    fla_environment(monkeypatch)
+    config = qwen35(composed, **{"run.purpose": "probe"})
+
+    assert axes.patch(config) == []
+
+
+def test_kernel_none_is_refused_on_the_binding_and_not_on_the_fast_path(composed, monkeypatch):
+    """Which of the two predicates decides this. The classes land in the model as
+    soon as fla binds, whether or not causal-conv1d is there to complete the fused
+    path, so a `none` guarded by `_fla_fast_path` would wave through exactly the
+    environment where the model is made of fla and the label says otherwise."""
+    fla_environment(monkeypatch, causal_conv1d=False)
+    config = qwen35(composed)
+
+    assert axes._fla_fast_path()[0] is False
+    with pytest.raises(axes.UnappliedAxis, match="kernel=none on arch=qwen3_5"):
+        axes.patch(config)
+
+
+def test_kernel_none_stands_where_no_kernel_binds_itself(composed, monkeypatch):
+    """The other side, or the refusal above would be a blanket one: without the
+    package there is nothing to bind, and on an architecture transformers takes no
+    fla path for, an image full of fla changes nothing."""
+    fla_environment(monkeypatch, fla=None)
+    assert axes.patch(qwen35(composed)) == []
+
+    fla_environment(monkeypatch)
+    assert axes.patch(bench(composed)) == []
+    assert axes.patch(gemma(composed)) == []
+
+
+def test_kernels_hub_is_refused_with_the_entrypoints_it_actually_has(composed):
+    """Not "not implemented": transformers turns hub kernels on through
+    `from_pretrained(use_kernels=True)` and `kernelize(model)`, both of which need
+    a model. The refusal names them so the next reader knows this is a call-site
+    question (docs/CONTRACTS.md §2) rather than missing code."""
+    config = bench(composed, **{"kernel.name": "kernels_hub"})
+
+    with pytest.raises(axes.UnappliedAxis) as refusal:
+        axes.patch(config)
+
+    # Each of the three is the message doing its job: the two entrypoints that
+    # exist, and the contract that says why neither is reachable from here.
+    # Matching one word of it would pass a message that says "not implemented".
+    message = str(refusal.value)
+    for named in ("from_pretrained(use_kernels=True)", "kernelize(model)", "docs/CONTRACTS.md"):
+        assert named in message
 
 
 # --- freeze.ple --------------------------------------------------------------
@@ -367,30 +930,68 @@ def test_an_architecture_with_no_recorded_marker_is_refused():
 # --- train.gradient_checkpointing --------------------------------------------
 
 
-class Checkpointable(torch.nn.Module):
-    """A model that exposes transformers' checkpointing hook.
+class CheckpointedBlock(torch.nn.Module):
+    """One matmul and one pointwise op — the two sides of the selective policy."""
 
-    `honours` is what makes the pair of tests below possible: a model that accepts
-    the call and changes nothing is exactly what a silent no-op looks like.
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.rand(4, 4))
+        self.gradient_checkpointing = False
+
+    def forward(self, x):
+        return torch.sigmoid(x @ self.weight)
+
+
+class Checkpointing(torch.nn.Module):
+    """transformers' checkpointing mechanism, cut down to what the axis touches.
+
+    `PreTrainedModel._set_gradient_checkpointing` (transformers 5.14.1) turns the
+    kwargs into `functools.partial(torch.utils.checkpoint.checkpoint, **kwargs)`,
+    stores that partial on every module carrying the flag, and those modules call
+    it with their own `__call__`. Reproduced rather than mocked because the
+    question `selective` turns on — which operators get recomputed in the backward
+    pass — has no answer that does not run one.
+
+    Three ways the request gets swallowed are settable here, because all three are
+    silent and none raises. `honours=False` accepts the call and leaves the flag
+    off — the run trains and never trades the activation memory away.
+    `keeps_context=False` switches checkpointing on and drops the policy, which is
+    a real `full` run reported under the `selective` label. `installs=` puts the
+    model's own checkpointing on the block instead of the one asked for, which is
+    what a framework image that already checkpoints does; the kwargs are accepted
+    and never reach the block.
     """
 
-    def __init__(self, honours: bool = True):
+    def __init__(self, honours: bool = True, keeps_context: bool = True, installs: object = None):
         super().__init__()
-        self.block = torch.nn.Linear(2, 2)
-        self.block.gradient_checkpointing = False
+        self.block = CheckpointedBlock()
         self.honours = honours
+        self.keeps_context = keeps_context
+        self.installs = installs
         self.enable_calls: list = []
         self.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.enable_calls.append(gradient_checkpointing_kwargs)
-        if self.honours:
-            self.block.gradient_checkpointing = True
+        if not self.honours:
+            return
+        kwargs = dict(gradient_checkpointing_kwargs or {})
+        if not self.keeps_context:
+            kwargs.pop("context_fn", None)
+        self.block.gradient_checkpointing = True
+        self.block._gradient_checkpointing_func = self.installs or functools.partial(
+            torch.utils.checkpoint.checkpoint, **kwargs
+        )
+
+    def forward(self, x):
+        if self.block.gradient_checkpointing:
+            return self.block._gradient_checkpointing_func(self.block.__call__, x)
+        return self.block(x)
 
 
 def test_checkpointing_goes_through_the_models_own_hook(composed):
     config = bench(composed, **{"train.gradient_checkpointing": "full"})
-    model = Checkpointable()
+    model = Checkpointing()
 
     built, names = axes.assemble(model, config, CPU, framework="native")
 
@@ -406,7 +1007,7 @@ def test_a_model_that_swallows_the_request_is_caught(composed):
     """The break. The call returns cleanly, the run trains, and nothing but the
     flags on the modules says the activation memory was never traded away."""
     config = bench(composed, **{"train.gradient_checkpointing": "full"})
-    model = Checkpointable(honours=False)
+    model = Checkpointing(honours=False)
 
     built, _ = axes.assemble(model, config, CPU, framework="native")
     state = capture(built, config)
@@ -427,7 +1028,7 @@ def test_checkpointing_and_compile_compose(composed):
     that docstring now says which half of it is a choice.
     """
     config = bench(composed, **{"train.gradient_checkpointing": "full", "compile.mode": "default"})
-    model = Checkpointable()
+    model = Checkpointing()
 
     built, _ = axes.assemble(model, config, CPU, framework="native")
 
@@ -449,11 +1050,374 @@ def test_a_model_that_exposes_no_flag_is_undetermined(composed):
     assert axis(state, "train.gradient_checkpointing").applied is None
 
 
-def test_selective_checkpointing_is_refused(composed):
-    config = bench(composed, **{"train.gradient_checkpointing": "selective"})
+class ExecutedOps(TorchDispatchMode):
+    """Counts the operators that actually execute.
 
-    with pytest.raises(axes.UnappliedAxis, match="selective"):
-        axes.assemble(Checkpointable(), config, CPU, framework="native")
+    Selective checkpointing serves a saved operator's output from its cache rather
+    than running it again, so an operator that stops appearing here during the
+    backward pass is one that stopped being recomputed. This mode sits outside the
+    checkpoint's own dispatch modes, which is why a cache hit is invisible to it.
+    """
+
+    def __init__(self):
+        self.counts: collections.Counter = collections.Counter()
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        self.counts[str(getattr(func, "overloadpacket", func))] += 1
+        return func(*args, **(kwargs or {}))
+
+
+def recomputed_ops(composed, mode: str, model=None) -> collections.Counter:
+    """Operators executed during the backward pass of a run at this setting.
+
+    `model` takes a stand-in that swallows the request some other way, so what a
+    swallowed request actually recomputes is measured against the three settings
+    rather than argued about.
+    """
+    config = bench(composed, **{"train.gradient_checkpointing": mode})
+    built, _ = axes.assemble(model or Checkpointing(), config, CPU, framework="native")
+    x = torch.rand(4, 4, requires_grad=True)
+    with ExecutedOps() as counter:
+        out = built.model(x)
+        forward = counter.counts.copy()
+        out.sum().backward()
+    return counter.counts - forward
+
+
+def test_the_selective_policy_saves_the_matmul_and_recomputes_the_rest(composed):
+    """The three settings are three different backward passes, not three labels.
+
+    Runs on CPU on purpose: the policy is a dispatch-level decision, so which
+    operators re-execute is observable without a GPU. What is *not* observable
+    here is the point of the axis — the activation memory it trades for that
+    recompute, and what the trade costs in step time. Both are 측정 안 함.
+    """
+    none = recomputed_ops(composed, "none")
+    full = recomputed_ops(composed, "full")
+    selective = recomputed_ops(composed, "selective")
+
+    # `none` is the floor, and it is not zero: the two gradient matmuls run in
+    # every backward pass whatever this axis is set to. Nothing is *re*computed —
+    # the forward's activations are still alive — so the pointwise op does not
+    # reappear, and the matmul count here is what the other two are measured
+    # against.
+    assert none["aten.sigmoid"] == 0
+    # Full checkpointing re-runs the whole block: one extra matmul, one sigmoid.
+    assert full["aten.mm"] == none["aten.mm"] + 1
+    assert full["aten.sigmoid"] == 1
+    # Selective still recomputes the pointwise op — it is checkpointing, not an
+    # elaborate `none` — but the matmul comes back from the cache. That single
+    # operator is the entire difference between the two values.
+    assert selective["aten.mm"] == none["aten.mm"]
+    assert selective["aten.sigmoid"] == 1
+
+
+def test_selective_asks_for_the_policy_and_reads_back_as_selective(composed):
+    config = bench(composed, **{"train.gradient_checkpointing": "selective"})
+    model = Checkpointing()
+
+    built, names = axes.assemble(model, config, CPU, framework="native")
+
+    assert "train.gradient_checkpointing" in names
+    (kwargs,) = model.enable_calls
+    # Not a preference: `context_fn` is only honoured by the non-reentrant
+    # implementation.
+    assert kwargs["use_reentrant"] is False
+    assert kwargs["context_fn"].func is torch.utils.checkpoint.create_selective_checkpoint_contexts
+    assert axis(capture(built, config), "train.gradient_checkpointing").applied == "selective"
+
+
+def test_a_model_that_drops_the_policy_is_caught(composed):
+    """The break. Checkpointing is on, the run trains, and the only thing that
+    says the selective policy never reached the block is the partial next to the
+    flag — where it reads back as plain `full`."""
+    config = bench(composed, **{"train.gradient_checkpointing": "selective"})
+    model = Checkpointing(keeps_context=False)
+
+    built, _ = axes.assemble(model, config, CPU, framework="native")
+    state = capture(built, config)
+
+    assert model.enable_calls[0]["context_fn"], "the policy was asked for"
+    assert axis(state, "train.gradient_checkpointing").applied == "full"
+    with pytest.raises(AppliedMismatch, match="train.gradient_checkpointing"):
+        assert_matches(state, config)
+
+
+def test_a_selectively_checkpointed_model_does_not_pass_as_a_full_run(composed):
+    """The other direction: `full` and `selective` recompute different operators,
+    so a run of one reported under the other is a different measurement."""
+    selective = bench(composed, **{"train.gradient_checkpointing": "selective"})
+    built, _ = axes.assemble(Checkpointing(), selective, CPU, framework="native")
+
+    state = capture(built, bench(composed, **{"train.gradient_checkpointing": "full"}))
+
+    assert axis(state, "train.gradient_checkpointing").applied == "selective"
+    with pytest.raises(AppliedMismatch, match="train.gradient_checkpointing"):
+        assert_matches(state, bench(composed, **{"train.gradient_checkpointing": "full"}))
+
+
+def test_a_context_this_cannot_name_is_undetermined_rather_than_full(composed):
+    """A block checkpointed through somebody else's context is not `full`: which
+    operators it recomputes is unknown, and unknown blocks a reportable run."""
+    model = Checkpointing()
+    model.block.gradient_checkpointing = True
+    model.block._gradient_checkpointing_func = functools.partial(
+        torch.utils.checkpoint.checkpoint, use_reentrant=False, context_fn=lambda: None
+    )
+
+    state = capture(Built(model=model), bench(composed))
+
+    assert axis(state, "train.gradient_checkpointing").applied is None
+    assert "context_fn" in axis(state, "train.gradient_checkpointing").detail["reason"]
+
+
+def save_everything(ctx, op, *args, **kwargs):
+    """Somebody else's selective policy, one end of the range: nothing recomputes."""
+    return torch.utils.checkpoint.CheckpointPolicy.MUST_SAVE
+
+
+def save_nothing(ctx, op, *args, **kwargs):
+    """The other end: everything recomputes."""
+    return torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def selective_through(policy):
+    """The checkpoint function a model carrying its own selective policy has.
+
+    Identical in shape to the one `axes` asks transformers to build — same
+    `checkpoint`, same `use_reentrant`, same `create_selective_checkpoint_contexts`
+    — and different only in the policy inside it, which is the whole of what the
+    two settings measure.
+    """
+    return functools.partial(
+        torch.utils.checkpoint.checkpoint,
+        use_reentrant=False,
+        context_fn=functools.partial(
+            torch.utils.checkpoint.create_selective_checkpoint_contexts, policy
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("policy", "equivalent"), [(save_everything, "none"), (save_nothing, "full")]
+)
+def test_a_foreign_selective_policy_does_not_pass_as_this_axis(composed, policy, equivalent):
+    """The break. A framework image that turns on its own selective checkpointing
+    leaves the block wrapped in a context built by torch's selective factory — so
+    a probe that recognises the factory calls it `selective` — while its backward
+    pass is one of the other two settings' backward passes. Measured here rather
+    than argued: `save_everything` recomputes what `none` recomputes and
+    `save_nothing` recomputes what `full` does, and neither recomputes what this
+    axis does.
+    """
+    foreign = recomputed_ops(
+        composed, "selective", Checkpointing(installs=selective_through(policy))
+    )
+    ours = recomputed_ops(composed, "selective")
+    reference = recomputed_ops(composed, equivalent)
+    # The two operators the policy decides between; `aten.detach` differs with the
+    # wrapping rather than with what gets recomputed.
+    interesting = lambda ops: (ops["aten.mm"], ops["aten.sigmoid"])  # noqa: E731
+
+    assert interesting(foreign) == interesting(reference), "a run of the other setting"
+    assert interesting(foreign) != interesting(ours), "and not a run of this one"
+
+    config = bench(composed, **{"train.gradient_checkpointing": "selective"})
+    built, _ = axes.assemble(
+        Checkpointing(installs=selective_through(policy)), config, CPU, framework="native"
+    )
+    state = capture(built, config)
+
+    assert axis(state, "train.gradient_checkpointing").applied is None
+    assert policy.__qualname__ in axis(state, "train.gradient_checkpointing").detail["reason"]
+    with pytest.raises(AppliedMismatch, match="train.gradient_checkpointing"):
+        assert_matches(state, config)
+
+
+def test_this_axiss_policy_is_found_when_torchs_parameter_is_bound_by_keyword(composed):
+    """The other direction of the same check: `policy_fn_or_list` is torch 2.13.0's
+    parameter name, and a caller is free to bind it by keyword. Reading only
+    positional arguments would refuse a run that carries exactly this policy."""
+    config = bench(composed, **{"train.gradient_checkpointing": "selective"})
+    by_keyword = functools.partial(
+        torch.utils.checkpoint.checkpoint,
+        use_reentrant=False,
+        context_fn=functools.partial(
+            torch.utils.checkpoint.create_selective_checkpoint_contexts,
+            policy_fn_or_list=axes.selective_checkpoint_policy,
+        ),
+    )
+
+    built, _ = axes.assemble(Checkpointing(installs=by_keyword), config, CPU, framework="native")
+
+    assert axis(capture(built, config), "train.gradient_checkpointing").applied == "selective"
+
+
+def test_a_reentrant_checkpoint_does_not_pass_as_a_full_run(composed):
+    """`full` is not the flag plus any checkpoint. The reentrant implementation
+    skips the recompute when nothing entering the block requires grad — which is
+    what a frozen tower emits, and `freeze.*` is crossed with this axis — so it
+    would report `none`'s backward pass under `full`'s label. Here the cost is
+    larger than the label: the block's output leaves the autograd graph, so the
+    run trains without the checkpointed parameters ever receiving a gradient.
+    """
+    config = bench(composed, **{"train.gradient_checkpointing": "full"})
+    reentrant = functools.partial(torch.utils.checkpoint.checkpoint, use_reentrant=True)
+    built, _ = axes.assemble(Checkpointing(installs=reentrant), config, CPU, framework="native")
+    asked_for, _ = axes.assemble(Checkpointing(), config, CPU, framework="native")
+
+    frozen_output = torch.rand(4, 4)  # no requires_grad, as a frozen tower produces
+    with pytest.warns(UserWarning, match="None of the inputs have requires_grad"):
+        assert built.model(frozen_output).requires_grad is False
+    assert asked_for.model(frozen_output).requires_grad is True
+
+    state = capture(built, config)
+
+    assert axis(state, "train.gradient_checkpointing").applied is None
+    assert "use_reentrant" in axis(state, "train.gradient_checkpointing").detail["reason"]
+    with pytest.raises(AppliedMismatch, match="train.gradient_checkpointing"):
+        assert_matches(state, config)
+
+
+def test_a_checkpoint_function_whose_keywords_cannot_be_read_is_not_full(composed):
+    """The flag says checkpointing; the callable next to it is not torch's
+    `checkpoint` under a partial, so nothing about what it recomputes is readable.
+    This one recomputes nothing at all — it runs the block straight through — and
+    `full` is what it read back as while the flag alone was the evidence."""
+    config = bench(composed, **{"train.gradient_checkpointing": "full"})
+    straight_through = lambda fn, x: fn(x)  # noqa: E731
+
+    ops = recomputed_ops(composed, "full", Checkpointing(installs=straight_through))
+    none = recomputed_ops(composed, "none")
+    assert (ops["aten.mm"], ops["aten.sigmoid"]) == (none["aten.mm"], none["aten.sigmoid"])
+
+    built, _ = axes.assemble(
+        Checkpointing(installs=straight_through), config, CPU, framework="native"
+    )
+    state = capture(built, config)
+
+    assert axis(state, "train.gradient_checkpointing").applied is None
+    assert "functools.partial" in axis(state, "train.gradient_checkpointing").detail["reason"]
+    with pytest.raises(AppliedMismatch, match="train.gradient_checkpointing"):
+        assert_matches(state, config)
+
+
+def test_a_real_transformers_model_reads_back_at_all_three_settings(composed):
+    """The probe against the thing it reads, rather than against a stand-in.
+
+    Everything above builds `Checkpointing`, which sets `_gradient_checkpointing_func`
+    because this file says transformers does. That is the test and the probe
+    agreeing with each other. Here a real `PreTrainedModel` sets it: architecture
+    only, weights initialised in-process, nothing fetched.
+
+    Llama rather than one of the three models under study — those need their
+    checkpoints, and this asks about the transformers hook, which is on
+    `PreTrainedModel` rather than on any architecture. That the three do carry the
+    hook is 측정 안 함 here.
+    """
+    from transformers import AutoConfig, AutoModel
+
+    architecture = AutoConfig.for_model(
+        "llama",
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=64,
+    )
+    for mode in ("none", "full", "selective"):
+        config = bench(composed, **{"train.gradient_checkpointing": mode})
+        model = AutoModel.from_config(architecture)
+
+        built, _ = axes.assemble(model, config, CPU, framework="native")
+
+        state = capture(built, config)
+        # Not `assert_matches`: on CPU `precision.name` and `optim.name` mismatch
+        # whatever this axis does (docs/CONTRACTS.md §6), so a whole-state assert
+        # here would pass for the wrong reason and fail for one too.
+        assert axis(state, "train.gradient_checkpointing").applied == mode, mode
+
+
+def test_a_real_transformers_model_recomputes_differently_at_all_three_settings(composed):
+    """The three settings are three backward passes on a real `PreTrainedModel`,
+    not only three attributes on one.
+
+    The test above reads the attribute the probe reads, so on its own it certifies
+    that the request reached the model and nothing about what the model then does
+    with it. Here the model runs, and the operators the backward pass re-executes
+    are counted through the same dispatch mode the stand-in is measured with. The
+    axis's claim — matmuls come back from the cache, everything else is recomputed
+    — is what separates the counts.
+
+    `model.train()` is not incidental: transformers checkpoints under
+    `if self.gradient_checkpointing and self.training`, so an eval-mode model
+    recomputes nothing at any setting and all three counts would agree.
+
+    What is still 측정 안 함 here is the trade itself: the activation memory saved
+    and the step time paid. Both need the GPU pods.
+    """
+    from transformers import AutoConfig, AutoModel
+
+    architecture = AutoConfig.for_model(
+        "llama",
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=64,
+    )
+    backward: dict[str, collections.Counter] = {}
+    for mode in ("none", "full", "selective"):
+        config = bench(composed, **{"train.gradient_checkpointing": mode})
+        torch.manual_seed(0)
+        model = AutoModel.from_config(architecture)
+        built, _ = axes.assemble(model, config, CPU, framework="native")
+        built.model.train()
+        tokens = torch.randint(0, 64, (2, 8))
+        with ExecutedOps() as counter:
+            out = built.model(input_ids=tokens).last_hidden_state
+            forward = counter.counts.copy()
+            out.sum().backward()
+        backward[mode] = counter.counts - forward
+
+    none, full, selective = backward["none"], backward["full"], backward["selective"]
+    # Llama's MLP is gated: `silu` is the pointwise op that reappears only when a
+    # block is re-run, and `mm` is what the policy holds back.
+    assert none["aten.silu"] == 0, "nothing is recomputed without checkpointing"
+    assert full["aten.silu"] > 0, "full checkpointing re-runs the block"
+    assert full["aten.mm"] > none["aten.mm"], "including its matmuls"
+    assert selective["aten.silu"] == full["aten.silu"], "selective still recomputes pointwise"
+    assert selective["aten.mm"] == none["aten.mm"], "and serves every matmul from the cache"
+
+
+def test_the_saved_operators_are_torchs_own_compute_intensive_list():
+    """The policy is the axis, so the list is pinned to where it came from.
+
+    `torch._functorch.partitioners.get_default_op_list().compute_intensive_ops` is
+    the classification the min-cut partitioner uses; taking it whole is what makes
+    this policy a transcription rather than a choice. Private, so it is asserted
+    here rather than imported into `axes.py`: a framework image whose torch moved
+    it would break a measured run instead of this test.
+    """
+    from torch._functorch.partitioners import get_default_op_list
+
+    assert set(axes.SELECTIVE_CHECKPOINT_SAVED_OPS) == set(
+        get_default_op_list().compute_intensive_ops
+    )
+
+
+def test_the_policy_saves_a_matmul_and_recomputes_a_pointwise_op():
+    """The policy function itself, at the granularity torch dispatches at."""
+    policy = axes.selective_checkpoint_policy
+    save = torch.utils.checkpoint.CheckpointPolicy.MUST_SAVE
+
+    assert policy(None, torch.ops.aten.mm.default) == save
+    # An overload other than `default` is the same operator, and the packet-level
+    # comparison is what keeps it covered.
+    assert policy(None, torch.ops.aten.mm.out) == save
+    assert policy(None, torch.ops.aten.sigmoid.default) != save
 
 
 # --- peft.mode ---------------------------------------------------------------
@@ -482,13 +1446,106 @@ def test_an_adapter_nothing_here_attached_is_still_seen(composed):
         assert_matches(state, config)
 
 
-def test_qlora_is_told_apart_by_the_quantised_base(composed):
-    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32})
+def four_bit_lora_model(as_dict: bool = False, **recipe):
+    """A LoRA model over a 4-bit base, quantised by the recipe given.
+
+    Both markers are set where a real load leaves them: `is_loaded_in_4bit` on the
+    model (`quantizers/quantizer_bnb_4bit.py`) and the recipe on `model.config`
+    (`quantizers/auto.py`, which assigns it before the quantizer is even built —
+    so a model carrying the flag carries the recipe too). `as_dict` is the other
+    spelling `model.config` can hold, the one a pre-quantised checkpoint declares
+    in its own config.json.
+    """
     model = plain_model()
     model.peft_config = {"default": SimpleNamespace(peft_type="PeftType.LORA")}
     model.is_loaded_in_4bit = True
+    values = {**axes.QLORA_4BIT, **recipe}
+    model.config.quantization_config = values if as_dict else SimpleNamespace(**values)
+    return model
 
-    assert axis(capture(Built(model=model), config), "peft.mode").applied == "qlora"
+
+@pytest.mark.parametrize("as_dict", [False, True], ids=["config_object", "config_dict"])
+def test_qlora_is_told_apart_by_the_quantised_base(composed, as_dict):
+    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32})
+
+    state = capture(Built(model=four_bit_lora_model(as_dict)), config)
+
+    assert axis(state, "peft.mode").applied == "qlora"
+    # And the recipe reaches the result file. `build_record` publishes the config
+    # dump and `applied.to_dict()`, and `QLORA_4BIT` is in neither — it is a module
+    # constant, not a schema field (docs/CONTRACTS.md §5). Without this, a result
+    # says "4-bit" and no audit afterwards can say which 4-bit it was.
+    assert axis(state, "peft.mode").detail["base_quantisation"] == {
+        "load_in_4bit": True,
+        "bnb_4bit_quant_type": "nf4",
+        "bnb_4bit_use_double_quant": True,
+        # A string, because the dtype has to survive `json.dumps` into the record.
+        "bnb_4bit_compute_dtype": "bfloat16",
+    }
+
+
+@pytest.mark.parametrize(
+    "wrong",
+    [
+        {"bnb_4bit_quant_type": "fp4"},
+        {"bnb_4bit_use_double_quant": False},
+        {"bnb_4bit_compute_dtype": torch.float16},
+    ],
+    ids=["fp4", "no_double_quant", "fp16_compute"],
+)
+def test_a_four_bit_base_on_another_recipe_is_not_qlora(composed, wrong):
+    """The subtler break, and the one a "is it 4-bit at all" check waves through.
+
+    Each of these loads 4-bit weights, so `is_loaded_in_4bit` is True and the
+    adapter is the same LoRA — every marker the axis used to be read from agrees.
+    They are different techniques: fp4 and nf4 are different quantisers, double
+    quantisation is a second pass over the constants, and an fp16 compute dtype is
+    a precision no axis asked for. Measuring one and printing QLoRA's name over it
+    is this module's whole failure mode, so the applied value is one nothing can
+    match and the run stops.
+    """
+    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32, "run.purpose": "timing"})
+
+    state = capture(Built(model=four_bit_lora_model(**wrong)), config)
+
+    assert axis(state, "peft.mode").applied != "qlora"
+    # Named in the value, so the failure says which knob rather than "mismatch".
+    assert next(iter(wrong)) in axis(state, "peft.mode").applied
+    with pytest.raises(AppliedMismatch, match="peft.mode"):
+        assert_matches(state, config)
+
+
+def test_a_base_that_says_it_is_four_bit_without_saying_how_is_undetermined(composed):
+    """`is_loaded_in_4bit` with no recipe on the config. transformers never
+    produces this, but a framework adapter setting the flag its own way would, and
+    the fail-safe direction is the one this module is built on: not readable is not
+    "the usual recipe"."""
+    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32, "run.purpose": "timing"})
+    model = four_bit_lora_model()
+    del model.config.quantization_config
+
+    state = capture(Built(model=model), config)
+
+    assert axis(state, "peft.mode").applied == "qlora(recipe=unreadable)"
+    with pytest.raises(AppliedMismatch, match="peft.mode"):
+        assert_matches(state, config)
+
+
+def test_a_qlora_request_over_an_unquantised_base_blocks_the_run(composed):
+    """The break for the line above, and the outcome `load_kwargs` exists to make
+    impossible: the adapter is the same object either way, so a run that asked for
+    qlora and got a bf16 base is indistinguishable by adapter type — and its step
+    time is what the study would print for 4-bit. `purpose` is spelled out because
+    what is being asserted is that the reportable run is the one that dies."""
+    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32, "run.purpose": "timing"})
+    model = plain_model()
+    model.peft_config = {"default": SimpleNamespace(peft_type="PeftType.LORA")}
+
+    state = capture(Built(model=model), config)
+
+    assert axis(state, "peft.mode").applied == "lora"
+    with pytest.raises(AppliedMismatch, match="peft.mode"):
+        assert_matches(state, config)
 
 
 def test_lora_attaches_a_real_adapter_and_reads_back_as_lora(composed):
@@ -605,6 +1662,545 @@ def test_strategies_that_wrap_or_shard_are_refused(composed):
             axes.assemble(plain_model(), config, CPU, framework="native")
 
 
+# --- loss.name ---------------------------------------------------------------
+#
+# The equivalence test below is the one `docs/review-findings.md` asks for by
+# name, and it is the point of this section: a GradCache bug and a GradCache
+# speedup look the same from the outside. The loop still runs, the step is still
+# timed, and only the gradient is wrong.
+#
+# `scripts/bench.py` computes `info_nce` inline and never calls `built.loss_fn`,
+# so nothing in the measurement path exercises any of this yet. That is why the
+# refusal test is here too: until the harness calls it, the only protection
+# against a cached_mnrl run measuring plain in-batch negatives is that the plain
+# signature cannot be called at all.
+
+
+class TinyEncoder(torch.nn.Module):
+    """A model shaped the way `trainbench/probe/steps.py::encode` expects one.
+
+    Small enough to compare gradients in float64, and with a dropout layer,
+    because the two forward passes GradCache makes have to draw the same masks.
+
+    Counts its calls and the widest batch it was handed: encoding the whole batch
+    in one call would give identical gradients while saving none of the memory
+    this axis exists to save, and the equivalence test alone cannot tell those
+    apart.
+    """
+
+    def __init__(self, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.embed = torch.nn.Embedding(11, 6)
+        self.proj = torch.nn.Linear(6, 6)
+        self.drop = torch.nn.Dropout(dropout)
+        self.calls = 0
+        self.widest = 0
+
+    def forward(self, input_ids, attention_mask, output_hidden_states=False):
+        self.calls += 1
+        self.widest = max(self.widest, int(input_ids.shape[0]))
+        return SimpleNamespace(last_hidden_state=self.drop(self.proj(self.embed(input_ids))))
+
+
+def tiny_encoder(dropout: float = 0.0) -> TinyEncoder:
+    """Two calls give two models with identical weights, so their gradients are
+    comparable. float64 keeps the tolerance about the algorithm rather than about
+    accumulation order."""
+    torch.manual_seed(7)
+    return TinyEncoder(dropout).double().train()
+
+
+def pair_batch(rows: int = 8, width: int = 5) -> dict[str, torch.Tensor]:
+    """Right-padded rows, queries first — the shape `bench.py`'s collate produces."""
+    generator = torch.Generator().manual_seed(11)
+    lengths = torch.tensor([2 + (index % (width - 1)) for index in range(rows)])
+    return {
+        "input_ids": torch.randint(1, 11, (rows, width), generator=generator),
+        "attention_mask": (torch.arange(width) < lengths[:, None]).long(),
+    }
+
+
+def cached(composed, **overrides):
+    return bench(composed, **{"loss.name": "cached_mnrl", "loss.mini_batch": 4, **overrides})
+
+
+class SubsetRows(torch.utils.data.Dataset):
+    """Dict rows in the pinned subset's schema, declaring their columns the way
+    `scripts/bench.py::PairDataset` does — including the image columns, whose value
+    is `None` for a row that carries no image."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+        self.column_names = sorted({key for row in rows for key in row})
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict:
+        return self.rows[index]
+
+
+def subset_rows(count: int = 4, *, qry_image: bool = False, pos_image: bool = False):
+    return SubsetRows(
+        [
+            {
+                "mmeb_config": "A-OKVQA",
+                "qry": f"<|image_1|>\nq{index}",
+                "pos_text": f"p{index}",
+                "qry_image": object() if qry_image else None,
+                "pos_image": object() if pos_image else None,
+            }
+            for index in range(count)
+        ]
+    )
+
+
+def whole_batch_backward(model, batch, temperature):
+    """Reference for a model without dropout: one forward, one backward."""
+    from trainbench.embedding import info_nce
+    from trainbench.probe import steps
+
+    pooled = steps.encode(model, batch, "right")
+    half = pooled.shape[0] // 2
+    loss = info_nce(pooled[:half], pooled[half:], temperature)
+    loss.backward()
+    return loss.detach()
+
+
+def chunked_backward(model, batch, temperature, size):
+    """Reference for a model with dropout: the same chunked forward, every graph
+    kept at once.
+
+    That is the computation GradCache reproduces — it saves the memory, not the
+    arithmetic. A single unchunked forward draws its dropout masks in one call and
+    is a different function of the RNG, so it is not the right reference here.
+    """
+    from trainbench.embedding import info_nce
+    from trainbench.probe import steps
+
+    pieces = axes._split_rows(batch, size)
+    pooled = torch.cat([steps.encode(model, piece, "right") for piece in pieces])
+    half = pooled.shape[0] // 2
+    loss = info_nce(pooled[:half], pooled[half:], temperature)
+    loss.backward()
+    return loss.detach()
+
+
+def grads_differ(left, right, rtol=1e-6, atol=1e-8):
+    return [
+        name
+        for (name, want), (_, got) in zip(
+            left.named_parameters(), right.named_parameters(), strict=True
+        )
+        if not torch.allclose(got.grad, want.grad, rtol=rtol, atol=atol)
+    ]
+
+
+@pytest.mark.parametrize("mini_batch", [4, 3])
+def test_gradcache_computes_the_gradient_a_plain_backward_would(composed, mini_batch):
+    """The equivalence test `docs/review-findings.md` requires before this axis can
+    be measured. Without it, a wrong gradient is reported as a speedup.
+
+    `mini_batch=3` over eight rows is the uneven split: the schema only requires it
+    to be no larger than the batch, so the last piece is short and the cache has to
+    be sliced by what each piece actually returned rather than by a fixed stride.
+    """
+    config = cached(composed, **{"loss.mini_batch": mini_batch})
+    batch = pair_batch()
+    reference, gradcached = tiny_encoder(), tiny_encoder()
+    expected = whole_batch_backward(reference, batch, config.loss.temperature)
+
+    loss_fn, _ = axes._loss(config)
+    loss = loss_fn.gradcache_backward(gradcached, batch, padding_side="right")
+
+    assert float(loss) == pytest.approx(float(expected), rel=1e-12)
+    for (name, want), (_, got) in zip(
+        reference.named_parameters(), gradcached.named_parameters(), strict=True
+    ):
+        assert want.grad is not None, name
+        torch.testing.assert_close(got.grad, want.grad, rtol=1e-10, atol=1e-12, msg=name)
+
+
+def test_gradcache_encodes_the_batch_in_mini_batch_sized_calls(composed):
+    """The break for the test above: a `gradcache_backward` that encoded the whole
+    batch in one call would pass it exactly, and would be plain MNRL with extra
+    steps — same memory ceiling, same batch limit, reported as GradCache.
+
+    This reads the *shape of the forward calls* and nothing else. An implementation
+    that encodes piece by piece while keeping every piece's graph alive passes it
+    exactly and saves no memory at all, which is what the test below measures
+    instead. The two are not interchangeable and this one was named as if it were.
+    """
+    config = cached(composed)
+    model = tiny_encoder()
+
+    loss_fn, _ = axes._loss(config)
+    loss_fn.gradcache_backward(model, pair_batch(rows=8), padding_side="right")
+
+    assert model.widest == 4
+    # Twice per piece: once with no graph to fill the cache, once with one to
+    # consume it. Two pieces of four rows.
+    assert model.calls == 4
+
+
+class LiveActivations:
+    """Peak activation memory, measured as autograd's own saved tensors.
+
+    `saved_tensors_hooks` is called for every tensor a graph keeps for backward and
+    the packed object is dropped when that graph is freed, so holding a weak
+    reference to it and counting the ones still alive is a direct reading of how
+    much activation memory is live at once — which is the quantity this axis exists
+    to reduce, and the one `model.widest`/`model.calls` cannot see.
+
+    Elements rather than bytes: the tensors here are float64 test tensors, and the
+    comparison is between two runs of the same arithmetic on the same dtype.
+    """
+
+    class _Held:
+        __slots__ = ("tensor", "__weakref__")
+
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+    def __init__(self) -> None:
+        self.refs: list[weakref.ref] = []
+        self.peak = 0
+
+    def _pack(self, tensor):
+        held = self._Held(tensor)
+        self.refs.append(weakref.ref(held))
+        alive = [ref() for ref in self.refs]
+        alive = [held for held in alive if held is not None]
+        self.refs = [weakref.ref(held) for held in alive]
+        self.peak = max(self.peak, sum(held.tensor.numel() for held in alive))
+        return held
+
+    def _unpack(self, held):
+        return held.tensor
+
+    @contextlib.contextmanager
+    def watching(self):
+        with torch.autograd.graph.saved_tensors_hooks(self._pack, self._unpack):
+            yield
+
+
+def test_gradcache_holds_less_activation_memory_than_a_plain_backward(composed):
+    """The reason this axis exists, measured — and the break for every test above it.
+
+    Removing the `no_grad` from the first pass leaves the equivalence, the RNG
+    replay, the scale, the call count and the widest-batch assertions all green: the
+    arithmetic is unchanged and the forward calls are still piece-sized. What
+    changes is that every piece's graph stays alive in `representations`, so the run
+    holds *more* activation memory than a plain backward while reporting a GradCache
+    number into the "20% to 2.4x" argument. Nothing but a memory reading can tell
+    those apart.
+    """
+    batch = pair_batch(rows=8)
+    plain = LiveActivations()
+    with plain.watching():
+        whole_batch_backward(tiny_encoder(), batch, 0.05)
+
+    gradcached = LiveActivations()
+    loss_fn, _ = axes._loss(cached(composed))
+    with gradcached.watching():
+        loss_fn.gradcache_backward(tiny_encoder(), batch, padding_side="right")
+
+    assert plain.peak > 0, "the hooks saw no saved tensor at all; this measured nothing"
+    assert gradcached.peak < plain.peak, (
+        f"GradCache held {gradcached.peak} elements of live activation against the plain "
+        f"backward's {plain.peak}: it is paying the second forward pass and saving nothing"
+    )
+
+
+def test_the_recompute_replays_the_masks_the_cache_was_built_from(composed):
+    """Dropout is live under `model.train()`, and `peft.dropout` is an ablation
+    setting in this study."""
+    config = cached(composed)
+    batch = pair_batch()
+    reference, gradcached = tiny_encoder(0.5), tiny_encoder(0.5)
+    loss_fn, _ = axes._loss(config)
+
+    torch.manual_seed(3)
+    expected = chunked_backward(reference, batch, config.loss.temperature, 4)
+    torch.manual_seed(3)
+    loss = loss_fn.gradcache_backward(gradcached, batch, padding_side="right")
+
+    assert float(loss) == pytest.approx(float(expected), rel=1e-12)
+    assert not grads_differ(reference, gradcached, rtol=1e-10, atol=1e-12)
+
+
+def test_a_recompute_that_does_not_replay_the_rng_is_a_wrong_gradient(composed, monkeypatch):
+    """The break. The second pass draws fresh dropout masks, so the cached gradient
+    belongs to representations that no longer exist — and nothing says so: the loss
+    is unchanged, the step is timed, the number looks like a GradCache number."""
+    config = cached(composed)
+    batch = pair_batch()
+    reference, gradcached = tiny_encoder(0.5), tiny_encoder(0.5)
+    loss_fn, _ = axes._loss(config)
+    monkeypatch.setattr(axes, "_restore_rng", lambda state, device: None)
+
+    torch.manual_seed(3)
+    chunked_backward(reference, batch, config.loss.temperature, 4)
+    torch.manual_seed(3)
+    loss_fn.gradcache_backward(gradcached, batch, padding_side="right")
+
+    assert grads_differ(reference, gradcached), (
+        "the masks were replayed anyway, so the RNG handling this is meant to pin "
+        "is not what makes the equivalence test pass"
+    )
+
+
+def test_scale_multiplies_the_gradient_and_leaves_the_reported_loss_alone(composed):
+    """`grad_accum` passes `1/N`. Scaling the returned loss instead would make every
+    accumulated run's recorded loss N times too small, and that value is what a
+    quality run's curve is read from."""
+    config = cached(composed)
+    batch = pair_batch()
+    whole, halved = tiny_encoder(), tiny_encoder()
+    loss_fn, _ = axes._loss(config)
+
+    full = loss_fn.gradcache_backward(whole, batch, padding_side="right")
+    half = loss_fn.gradcache_backward(halved, batch, padding_side="right", scale=0.5)
+
+    assert float(half) == pytest.approx(float(full), rel=1e-12)
+    for (name, want), (_, got) in zip(
+        whole.named_parameters(), halved.named_parameters(), strict=True
+    ):
+        torch.testing.assert_close(got.grad, want.grad * 0.5, rtol=1e-10, atol=1e-12, msg=name)
+
+
+def test_a_batch_whose_pixels_cannot_be_attributed_to_rows_is_refused(composed):
+    """The multimodal case, and the reason this axis does not reach two of the three
+    models yet. `pixel_values` counts patches or images, not rows; splitting it by
+    position would hand one row's pixels to another and nothing downstream could
+    tell the resulting embedding from a real one."""
+    batch = pair_batch()
+    batch["pixel_values"] = torch.zeros(3, 4)
+    loss_fn, _ = axes._loss(cached(composed))
+
+    with pytest.raises(RuntimeError, match="pixel_values"):
+        loss_fn.gradcache_backward(tiny_encoder(), batch, padding_side="right")
+
+
+def test_a_packed_batch_cannot_be_split_by_rows(composed):
+    """`dataloader.packing` x `loss=cached_mnrl`, which compose together.
+
+    A packed batch is one row carrying its boundaries in `cu_seqlens`, so there is no
+    per-row leading dimension to slice and no `attention_mask` to pool with. Pooling
+    it as if there were would read some other sequence's last token while both axes
+    reported applied. `scripts/bench.py` refuses the pair before the loop opens; this
+    is the backstop under that, so the combination cannot reach a number by another
+    route.
+    """
+    packed = axes.PackedCollate()(
+        [{"input_ids": torch.tensor([1, 2, 3])}, {"input_ids": torch.tensor([4, 5])}]
+    )
+    loss_fn, _ = axes._loss(cached(composed))
+
+    with pytest.raises(RuntimeError, match="attention_mask"):
+        loss_fn.gradcache_backward(tiny_encoder(), packed, padding_side="right")
+
+
+def test_the_cuda_rng_is_saved_and_put_back_on_the_device_it_came_from(monkeypatch):
+    """Every measured run is CUDA and no test here is: this suite runs on CPU, so the
+    branch that replays a CUDA dropout mask had no execution evidence at all — and
+    replaying that mask is the whole of GradCache's correctness.
+
+    What this pins is the branch's shape: the state is read from the device the batch
+    is on and written back to that same device, and a CPU run touches neither call.
+    What it cannot pin is that a real device's generator replays; that needs a GPU
+    pod and is 측정 안 함.
+    """
+    device = torch.device("cuda", 1)
+    read, written = [], []
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_rng_state",
+        lambda where: read.append(where) or torch.tensor([7], dtype=torch.uint8),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state", lambda state, where: written.append((state, where))
+    )
+
+    axes._restore_rng(axes._rng_state(device), device)
+
+    assert read == [device]
+    assert [where for _, where in written] == [device]
+    assert [int(state[0]) for state, _ in written] == [7]
+
+    axes._restore_rng(axes._rng_state(CPU), CPU)
+
+    assert read == [device], "a CPU run read the CUDA generator"
+    assert len(written) == 1, "a CPU run wrote the CUDA generator"
+
+
+def test_a_batch_carrying_a_value_that_is_not_a_tensor_is_refused(composed):
+    """The same refusal as above for the other half of what a real batch carries.
+    `mmeb_config` is a string per row and the subset ships it; copying it into every
+    piece would attach one row's label to rows it does not describe, and there is
+    nothing downstream that could notice."""
+    batch = pair_batch()
+    batch["mmeb_config"] = ["A-OKVQA"] * 8
+    loss_fn, _ = axes._loss(cached(composed))
+
+    with pytest.raises(RuntimeError, match="mmeb_config"):
+        loss_fn.gradcache_backward(tiny_encoder(), batch, padding_side="right")
+
+
+def test_the_cached_loss_refuses_to_be_called_like_the_plain_one(composed):
+    """GradCache is a backward strategy, not a loss function: it consumes the model
+    and the batch and *produces* the pooled embeddings. A harness reaching for
+    `built.loss_fn(queries, documents)` would compute ordinary in-batch negatives
+    and label the number cached_mnrl, which is what this raise turns into a crash."""
+    loss_fn, _ = axes._loss(cached(composed))
+
+    with pytest.raises(RuntimeError, match="cannot be computed from pooled embeddings"):
+        loss_fn(torch.zeros(2, 3), torch.zeros(2, 3))
+
+
+def test_the_two_shapes_a_harness_has_to_choose_between(composed):
+    """The interface `scripts/bench.py` selects on, pinned from this side.
+
+    A plain loss is called `(queries, documents)` and has no `gradcache_backward`;
+    the cached one has `gradcache_backward` and raises on that signature. So
+    `getattr(built.loss_fn, "gradcache_backward", None)` decides which path a step
+    takes, and neither answer can be reached by accident: reaching for the plain
+    signature under a cached config raises instead of measuring in-batch negatives,
+    which is the test below this one.
+    """
+    plain, _ = axes._loss(bench(composed))
+    cached_fn, _ = axes._loss(cached(composed))
+
+    assert getattr(plain, "gradcache_backward", None) is None
+    assert callable(getattr(cached_fn, "gradcache_backward", None))
+    assert cached_fn.mini_batch == 4
+
+
+def test_the_cached_loss_is_read_back_as_cached_mnrl(composed):
+    config = cached(composed)
+
+    built, names = axes.assemble(
+        plain_model(), config, CPU, framework="native", dataset=dataset(("qry", "pos_text"))
+    )
+
+    state = capture(built, config)
+    assert axis(state, "loss.name").applied == "cached_mnrl"
+    assert axis(state, "loss.name").matches
+    assert "loss.name" in names
+
+
+def test_gradcache_is_refused_on_the_subsets_this_study_measures(composed):
+    """The axis cannot run on the data the runs read, and that has to be said where
+    the axis is counted rather than at the first batch.
+
+    `configs/data/*.yaml` are MMEB draws — speed.yaml records "0 rows without a
+    query image or positive" — and every model here is a VL model, so every batch
+    carries `pixel_values` and `_split_rows` refuses all of them. Building the loss
+    anyway would name the axis applied, satisfy `assert_matches`, be counted
+    applicable by `audit_plan.py`'s `axis-values`, and then die at step 1.
+    """
+    for column in ("qry_image", "pos_image"):
+        with pytest.raises(axes.UnappliedAxis, match=f"'{column}'"):
+            axes.assemble(
+                plain_model(),
+                cached(composed),
+                CPU,
+                framework="native",
+                dataset=subset_rows(**{column: True}),
+            )
+
+
+def test_the_same_subset_schema_without_images_in_it_is_not_refused(composed):
+    """The break for the check above. Four of the twenty MMEB configs carry no
+    `qry_image` and thirteen no `pos_image`, and `bench.py::Collate` skips a `None`
+    there — so a draw can hold the column and no image. Refusing on the column name
+    would refuse a text-only draw stored in the subset's schema, which is a
+    different claim from the one this axis is refused for, and would make the
+    refusal impossible to lift by changing the data."""
+    built, names = axes.assemble(
+        plain_model(), cached(composed), CPU, framework="native", dataset=subset_rows()
+    )
+
+    assert "loss.name" in names
+    assert axis(capture(built, cached(composed)), "loss.name").applied == "cached_mnrl"
+
+
+def test_an_image_column_under_another_name_is_still_refused(composed):
+    """The break for the check above: a name list alone would pass a subset that
+    renamed its image column, and its batches would still carry pixels.
+
+    The row's `picture` is `None`, so a reading that fell through to the rows would
+    find no image and let the run start.
+
+    `Image` here stands in for `datasets.Image`, the feature type a Hub dataset
+    declares for an image column, because the documented test environment (`uv sync
+    --extra compose`, which `audit_plan.py::doc-commands` checks) does not install
+    `datasets` — and a test that runs only where an undocumented extra happens to be
+    present is a test a clean clone skips. What that costs is stated rather than
+    hidden: this pins the reading, not the fact that `datasets` names that type
+    `Image`. That fact is recorded where the reading is, in `axes.image_columns`.
+    """
+
+    class Image:
+        pass
+
+    declared = SubsetRows([{"qry": "a", "picture": None}])
+    declared.features = {"qry": "string", "picture": Image()}
+
+    with pytest.raises(axes.UnappliedAxis, match="picture"):
+        axes.assemble(plain_model(), cached(composed), CPU, framework="native", dataset=declared)
+
+
+def test_gradcache_is_refused_when_nothing_says_the_rows_can_be_split(composed):
+    """Not knowing is not evidence that the batches split. A dataset that declares
+    no columns — and `assemble` called with none at all, which is how
+    `audit_plan.py` probes every axis value — leaves the question unanswered, and an
+    unanswered question is what this axis kept being counted on."""
+    unreadable = (
+        None,
+        # Declares nothing about itself.
+        dataset(),
+        # Declares the subset's columns, but its rows are not mappings, so what is
+        # in the image column cannot be read off them either.
+        dataset(("qry", "qry_image", "pos_text")),
+    )
+    for candidate in unreadable:
+        with pytest.raises(axes.UnappliedAxis, match="does not say whether its rows carry"):
+            axes.assemble(
+                plain_model(), cached(composed), CPU, framework="native", dataset=candidate
+            )
+
+
+def test_the_plain_loss_is_not_refused_by_the_data_the_cached_one_is(composed):
+    """The break for the three above: a refusal that fired on `loss=mnrl` too would
+    turn the image subsets into "no loss runs here at all", which is a different and
+    false statement — plain MNRL pools the batch as it comes and never splits it."""
+    built, names = axes.assemble(
+        plain_model(),
+        bench(composed),
+        CPU,
+        framework="native",
+        dataset=dataset(("mmeb_config", "qry", "qry_image", "pos_text")),
+    )
+
+    assert "loss.name" in names
+    assert axis(capture(built, bench(composed)), "loss.name").applied == "mnrl"
+
+
+def test_a_plain_loss_under_a_cached_config_stops_the_run(composed):
+    """The break for the capture probe. The config asking for GradCache is not
+    evidence that GradCache ran, and `purpose=timing` has to die here rather than
+    after the first number."""
+    config = cached(composed)
+    plain, _ = axes._loss(bench(composed))
+
+    state = capture(Built(loss_fn=plain), config)
+
+    assert axis(state, "loss.name").applied == "mnrl"
+    with pytest.raises(AppliedMismatch, match="loss.name"):
+        assert_matches(state, config)
+
+
 # --- parallel.cross_device_negatives -----------------------------------------
 
 
@@ -624,6 +2220,292 @@ def test_a_loss_from_somewhere_else_cannot_certify_this_axis(composed):
     state = capture(Built(loss_fn=lambda q, d: q), bench(composed))
 
     assert axis(state, "parallel.cross_device_negatives").applied is None
+
+
+def test_a_gathering_loss_declares_that_it_gathers(composed):
+    config = bench(composed, **{"parallel.cross_device_negatives": True})
+
+    built, names = axes.assemble(plain_model(), config, CPU, framework="native")
+
+    gathered = axis(capture(built, config), "parallel.cross_device_negatives")
+    assert gathered.applied == "True"
+    assert gathered.matches
+    # Unlike the false case, this one is an action and is named.
+    assert "parallel.cross_device_negatives" in names
+
+
+def test_the_declaration_describes_the_closure_that_was_built():
+    """The declaration `applied._capture_cross_device_negatives` reads is evidence
+    only if it comes from the branch that built the closure. Copying it off the
+    config would make the probe a mirror of the request — and because the branch is
+    chosen by that same field, no config-level test can tell the two apart. What can
+    be told apart, and is what actually goes wrong, is a declaration that disagrees
+    with what the closure does: this pins both closures' behaviour against what they
+    declare.
+    """
+    torch.manual_seed(0)
+    queries, documents = torch.randn(2, 3), torch.randn(2, 3)
+
+    gathering, declared = axes._in_batch_scoring(0.05, gather=True)
+    assert declared is True
+    with pytest.raises(RuntimeError, match="needs an initialised process group"):
+        gathering(queries, documents)
+
+    local, declared = axes._in_batch_scoring(0.05, gather=False)
+    assert declared is False
+    assert torch.isfinite(local(queries, documents))
+
+
+def test_the_gathering_loss_a_harness_calls_dies_without_a_world(composed):
+    """The fail-closed guarantee is only a guarantee where it is reached. This is the
+    loss object a harness is handed, called the way a harness calls it: on a single
+    process it raises rather than quietly scoring local in-batch negatives under the
+    cross-device label."""
+    config = bench(composed, **{"parallel.cross_device_negatives": True})
+    built, _ = axes.assemble(plain_model(), config, CPU, framework="native")
+
+    torch.manual_seed(0)
+    with pytest.raises(RuntimeError, match="needs an initialised process group"):
+        built.loss_fn(torch.randn(2, 3), torch.randn(2, 3))
+
+
+def test_the_cached_loss_gathers_when_both_axes_are_asked_for(composed):
+    """`loss=cached_mnrl parallel=single_cross_device` composes, and nothing
+    exercised it: the cached branch declares its own gathering and scores through
+    its own closure, so a cached loss that declared `False` — or scored without the
+    gather — would have been read back as a run with world-wide negatives while
+    computing local ones."""
+    config = cached(composed, **{"parallel.cross_device_negatives": True})
+
+    built, names = axes.assemble(
+        plain_model(), config, CPU, framework="native", dataset=dataset(("qry", "pos_text"))
+    )
+
+    state = capture(built, config)
+    assert axis(state, "loss.name").applied == "cached_mnrl"
+    assert axis(state, "parallel.cross_device_negatives").applied == "True"
+    assert {"loss.name", "parallel.cross_device_negatives"} <= set(names)
+    # And the gather is inside the path GradCache scores through, not only in the
+    # attribute: on one process the step dies before it produces a number.
+    with pytest.raises(RuntimeError, match="needs an initialised process group"):
+        built.loss_fn.gradcache_backward(tiny_encoder(), pair_batch(), padding_side="right")
+
+
+def test_the_axis_has_a_config_that_can_ask_for_it():
+    """An axis nothing can request is an axis that cannot be run — the shape this
+    repository keeps producing. Every other `parallel` variant sets this false, so
+    composing the group is the only place the request can be checked."""
+    from hydra import compose, initialize_config_dir
+
+    from trainbench.compose import resolve
+
+    from .conftest import CONFIG_DIR
+
+    with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
+        config = resolve(
+            compose(
+                config_name="config",
+                overrides=["device=cpu", "parallel=single_cross_device"],
+            )
+        )[0]
+
+    assert config.parallel.cross_device_negatives
+    # Paired with `single` rather than `ddp` because `assemble` still refuses every
+    # wrapper: under `ddp` the value would be refused for the strategy and the two
+    # settings of this axis would never be compared.
+    assert config.parallel.strategy == "single"
+
+
+def test_gathering_without_a_process_group_stops_the_run_before_a_number():
+    with pytest.raises(RuntimeError, match="needs an initialised process group"):
+        axes._gather_with_grad(torch.zeros(2, 3))
+
+
+def test_gathering_over_one_rank_is_plain_mnrl_and_is_refused(monkeypatch):
+    """The break. With `world_size=1` the gather is a no-op and the loss is exactly
+    the local one — while the capture probe still reports the axis as applied,
+    because the closure really does gather. Nothing downstream could tell that
+    number from a world-sized one."""
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 1)
+
+    with pytest.raises(RuntimeError, match="world_size=1"):
+        axes._gather_with_grad(torch.zeros(2, 3))
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _world_negatives_worker(rank: int, world: int, port: int) -> None:
+    """One rank of the two-process check. Its assertions are its exit code.
+
+    Module level because `torch.multiprocessing.spawn` pickles the target by
+    reference; a closure could not be sent to the child.
+    """
+    import torch.distributed as dist
+
+    from trainbench.embedding import info_nce
+
+    dist.init_process_group(
+        backend="gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world
+    )
+    try:
+        rows, dim, temperature = 3, 4, 0.05
+        # Every rank builds every rank's tensors, so each one already knows what
+        # the world matrix has to contain; the comparison is not a copy of the
+        # gather it is checking.
+        everyone = [
+            torch.randn(rows, dim, generator=torch.Generator().manual_seed(100 + other))
+            for other in range(world)
+        ]
+        queries = everyone[rank].clone().requires_grad_(True)
+        documents = (everyone[rank] + 0.5).clone().requires_grad_(True)
+
+        gathered = axes._gather_with_grad(queries)
+        assert gathered.shape == (rows * world, dim)
+        # Rank order is the whole of the label correction. `info_nce` pairs row i
+        # with column i, and that is the positive only if rank r's local row i sits
+        # at world index r * rows + i on both sides.
+        for other in range(world):
+            torch.testing.assert_close(gathered[other * rows : (other + 1) * rows], everyone[other])
+
+        scores, gathers = axes._in_batch_scoring(temperature, True)
+        assert gathers is True
+        loss = scores(queries, documents)
+
+        expected_queries = torch.cat(everyone).requires_grad_(True)
+        expected_documents = (torch.cat(everyone) + 0.5).requires_grad_(True)
+        expected = info_nce(expected_queries, expected_documents, temperature)
+        torch.testing.assert_close(loss, expected)
+
+        loss.backward()
+        expected.backward()
+        # What the grad-passing assignment buys. A plain `dist.all_gather` returns
+        # buffers with no history, so this is None: the step runs, the timer records
+        # it, and the model has learned nothing.
+        assert queries.grad is not None
+        torch.testing.assert_close(
+            queries.grad, expected_queries.grad[rank * rows : (rank + 1) * rows]
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _world_gradcache_worker(rank: int, world: int, port: int) -> None:
+    """One rank of the cached x cross-device check. Its assertions are its exit code.
+
+    The two axes compose (`loss=cached_mnrl parallel=single_cross_device`) and each
+    was only ever exercised alone. What has to hold is that GradCache's cache is
+    `d(world loss)/d(local representations)` — the gather has to happen in the pass
+    that scores the cache, not in one that never reaches the model. A cached branch
+    that scored locally would produce a smaller, wrong gradient here and nothing
+    outside a real world could tell.
+    """
+    import torch.distributed as dist
+    from hydra import compose, initialize_config_dir
+
+    from trainbench.compose import resolve
+    from trainbench.embedding import info_nce
+    from trainbench.probe import steps
+
+    from .conftest import CONFIG_DIR
+
+    dist.init_process_group(
+        backend="gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world
+    )
+    try:
+        with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
+            config = resolve(
+                compose(
+                    config_name="config",
+                    overrides=[
+                        "device=cpu",
+                        "loss=cached_mnrl",
+                        "loss.mini_batch=2",
+                        "parallel=single_cross_device",
+                    ],
+                )
+            )[0]
+        assert config.loss.name == "cached_mnrl"
+        assert config.parallel.cross_device_negatives
+
+        def rank_batch(of_rank: int) -> dict:
+            """Rank-dependent rows, known to every rank. With identical batches the
+            slices of the world matrix would be interchangeable and a wrong rank
+            order could not show up."""
+            batch = pair_batch(rows=4)
+            batch["input_ids"] = (batch["input_ids"] + of_rank) % 10 + 1
+            return batch
+
+        reference, gradcached = tiny_encoder(), tiny_encoder()
+
+        # The reference builds the world matrix itself, from every rank's rows,
+        # without gathering anything — so it shares no code with what it checks.
+        # The other ranks' embeddings are detached because that is what
+        # `_gather_with_grad` makes them: this rank ends up holding
+        # d(world loss)/d(its own embeddings) and nothing else.
+        world_queries, world_documents = [], []
+        for other in range(world):
+            pooled = steps.encode(reference, rank_batch(other), "right")
+            if other != rank:
+                pooled = pooled.detach()
+            half = pooled.shape[0] // 2
+            world_queries.append(pooled[:half])
+            world_documents.append(pooled[half:])
+        expected = info_nce(
+            torch.cat(world_queries), torch.cat(world_documents), config.loss.temperature
+        )
+        expected.backward()
+
+        batch = rank_batch(rank)
+
+        loss_fn, applied = axes._loss(config)
+        assert "parallel.cross_device_negatives" in applied
+        assert loss_fn.axis_cross_device_negatives is True
+        loss = loss_fn.gradcache_backward(gradcached, batch, padding_side="right")
+
+        torch.testing.assert_close(loss, expected.detach())
+        for (name, want), (_, got) in zip(
+            reference.named_parameters(), gradcached.named_parameters(), strict=True
+        ):
+            assert want.grad is not None, name
+            torch.testing.assert_close(got.grad, want.grad, rtol=1e-10, atol=1e-12, msg=name)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not (torch.distributed.is_available() and torch.distributed.is_gloo_available()),
+    reason="gloo is the only CPU backend that all_gathers",
+)
+def test_gradcache_caches_the_world_gradient_and_not_the_local_one():
+    """Two real processes, for the combination neither axis's own tests reach."""
+    import torch.multiprocessing as mp
+
+    mp.spawn(_world_gradcache_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
+@pytest.mark.skipif(
+    not (torch.distributed.is_available() and torch.distributed.is_gloo_available()),
+    reason="gloo is the only CPU backend that all_gathers",
+)
+def test_negatives_are_drawn_from_every_rank():
+    """Two real processes, because `dist.all_gather` cannot be exercised in one.
+
+    gloo is what makes this runnable without a GPU, and it is also the limit: the
+    NCCL path and every cost of the gather are 측정 안 함 here. Nothing in this test
+    is a measurement.
+    """
+    import torch.multiprocessing as mp
+
+    mp.spawn(_world_negatives_worker, args=(2, _free_port()), nprocs=2, join=True)
 
 
 # --- dataloader.* ------------------------------------------------------------
@@ -728,16 +2610,687 @@ def test_a_dataset_that_declares_no_columns_is_undetermined(composed):
     assert axis(capture(built, config), "dataloader.pretokenize").applied is None
 
 
-def test_packing_and_pretokenize_are_refused(composed):
-    for override in ({"dataloader.packing": True}, {"dataloader.pretokenize": True}):
-        with pytest.raises(axes.UnappliedAxis):
-            axes.assemble(
-                plain_model(),
-                bench(composed, **override),
-                CPU,
-                framework="native",
-                dataset=dataset(),
+def token_rows(lengths=(3, 5, 2)):
+    """Rows that already carry token ids, as `pretokenize` leaves them."""
+    return [{"input_ids": torch.arange(n) + 1} for n in lengths]
+
+
+class RowDataset(torch.utils.data.Dataset):
+    """A dataset of dict rows that declares nothing about itself."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return self.rows[index]
+
+
+# --- dataloader.pretokenize --------------------------------------------------
+
+
+def test_pretokenize_moves_the_tokenisation_off_the_timed_step(composed):
+    """Applied and read back: the loader is identical either way, so the dataset
+    handed to it is the only thing that can say the work moved."""
+    raw = RowDataset([{"qry": "a"}, {"qry": "b"}, {"qry": "c"}, {"qry": "d"}])
+    tokenised = axes.pretokenize(raw, lambda row: {"input_ids": torch.arange(3), **row})
+
+    built, config = assembled_loader(
+        composed, tokenised, **{"dataloader.pretokenize": True, "train.batch_size": 4}
+    )
+
+    assert "input_ids" in tokenised.column_names
+    assert axis(capture(built, config), "dataloader.pretokenize").applied == "True"
+
+
+def test_pretokenize_refuses_an_encode_that_tokenises_nothing():
+    """The break. A passthrough `encode` leaves the tokenisation inside the step
+    while the axis reports as applied — the substitution UnappliedAxis exists for."""
+    raw = RowDataset([{"qry": "a"}, {"qry": "b"}])
+
+    with pytest.raises(axes.UnappliedAxis, match="not tokenised"):
+        axes.pretokenize(raw, lambda row: row)
+
+
+def test_a_pretokenize_request_over_untokenised_rows_is_refused(composed):
+    """The break. Nothing here can tokenise — there is no processor in this module —
+    so building the loader anyway would time the tokenisation under a pretokenized
+    label."""
+    with pytest.raises(axes.UnappliedAxis, match="pretokenize"):
+        assembled_loader(
+            composed,
+            dataset(("qry", "pos_text")),
+            **{"dataloader.pretokenize": True, "train.batch_size": 4},
+        )
+
+
+class CountingEncode:
+    """An `encode` that records every row it saw, and can be armed to fail if it
+    is ever called again."""
+
+    def __init__(self):
+        self.calls = []
+        self.armed = False
+
+    def __call__(self, row):
+        if self.armed:
+            raise AssertionError(f"encode ran after the timed window opened, on {row}")
+        self.calls.append(row["qry"])
+        return {"input_ids": torch.arange(3) + 1, **row}
+
+
+def test_pretokenize_runs_every_row_now_and_nothing_inside_the_loop(composed):
+    """The break, and what the title of the test above only asserts about column
+    names. `pretokenize` is a move, not a label: an implementation that encodes
+    inside `__getitem__` and advertises `input_ids` off one probed row is
+    indistinguishable to the loader, to the capture probe and to `assert_matches` —
+    the columns are identical — while 100% of the tokenisation stays inside the
+    measured step and the run publishes it as pretokenized. Counting the calls on
+    both sides of the window is the only thing that separates the two.
+    """
+    encode = CountingEncode()
+    raw = RowDataset([{"qry": "a"}, {"qry": "b"}, {"qry": "c"}, {"qry": "d"}])
+
+    tokenised = axes.pretokenize(raw, encode)
+
+    assert encode.calls == ["a", "b", "c", "d"]
+
+    built, config = assembled_loader(
+        composed,
+        tokenised,
+        **{"dataloader.pretokenize": True, "train.batch_size": 2, "data.num_workers": 0},
+    )
+    encode.armed = True
+
+    batches = list(built.dataloader)
+
+    assert len(batches) == 2
+    assert all("input_ids" in batch for batch in batches)
+    assert axis(capture(built, config), "dataloader.pretokenize").applied == "True"
+
+
+def test_a_dataset_that_advertises_ids_it_does_not_hand_over_is_refused(composed):
+    """The break. `column_names` is what a dataset says about itself and the rows
+    are what the step is handed; a dataset answering the first question one way and
+    the second another gets the axis certified off the answer nobody trains on."""
+
+    class Advertises(torch.utils.data.Dataset):
+        column_names = ["input_ids", "qry"]
+
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, index):
+            return {"qry": "a"}
+
+    with pytest.raises(axes.UnappliedAxis, match="first row carries none"):
+        assembled_loader(
+            composed,
+            Advertises(),
+            **{"dataloader.pretokenize": True, "train.batch_size": 2},
+        )
+
+
+# --- dataloader.packing ------------------------------------------------------
+
+
+def test_a_packed_batch_is_one_row_carrying_its_own_boundaries():
+    rows = token_rows((3, 5, 2))
+
+    batch = axes.PackedCollate()(rows)
+
+    assert batch["input_ids"].shape == (1, 10)
+    assert batch["cu_seqlens"].tolist() == [0, 3, 8, 10]
+    assert batch["seq_lengths"].tolist() == [3, 5, 2]
+    # Restarted per sequence: to a positional encoding a packed batch is otherwise
+    # one long sequence, and the rows would be positioned as each other's context.
+    assert batch["position_ids"].tolist() == [[0, 1, 2, 0, 1, 2, 3, 4, 0, 1]]
+    # No padding is the point of packing, so every token in the batch is a real one.
+    # Counted off the rows that went in, not off `seq_lengths`: that vector is derived
+    # from the sequences this collate just concatenated, so comparing the two is the
+    # batch agreeing with itself and holds for a batch made entirely of PAD.
+    assert int(batch["input_ids"].numel()) == sum(row["input_ids"].numel() for row in rows) == 10
+    # What the harness has to lift out before `model(**tensors)`, and what is left
+    # once it has. A boundary key reaching the forward pass is a TypeError; a model
+    # input mistaken for a boundary is a tensor that never arrives.
+    assert set(batch) - set(axes.PACKED_BOUNDARY_KEYS) == {"input_ids", "position_ids"}
+    assert set(axes.PACKED_BOUNDARY_KEYS) <= set(batch)
+
+
+def test_packing_is_read_back_off_the_collate_the_loader_got(composed):
+    built, config = assembled_loader(
+        composed,
+        RowDataset(token_rows((3, 5, 2, 4))),
+        **{"dataloader.packing": True, "train.batch_size": 4},
+    )
+
+    assert isinstance(built.dataloader.collate_fn, axes.PackedCollate)
+    assert axis(capture(built, config), "dataloader.packing").applied == "True"
+
+
+def test_a_packed_batch_under_an_unpacked_request_is_refused(composed):
+    """The break. The collate is the evidence, so a run that packs while its config
+    says otherwise is a mismatch rather than a detail."""
+    built, _ = assembled_loader(
+        composed,
+        RowDataset(token_rows((3, 5, 2, 4))),
+        **{"dataloader.packing": True, "train.batch_size": 4},
+    )
+    asked_for_unpacked = bench(composed, **{"dataloader.packing": False})
+
+    state = capture(built, asked_for_unpacked)
+
+    assert axis(state, "dataloader.packing").applied == "True"
+    with pytest.raises(AppliedMismatch, match="dataloader.packing"):
+        assert_matches(state, asked_for_unpacked)
+
+
+def test_packing_untokenised_rows_stops_rather_than_packing_nothing(composed):
+    """The break. Without a tokenizer this collate has nothing to concatenate, and
+    a batch quietly built out of the raw dicts would be measured as packed."""
+    built, _ = assembled_loader(
+        composed,
+        dataset(("qry", "pos_text")),
+        **{"dataloader.packing": True, "train.batch_size": 4},
+    )
+
+    with pytest.raises(RuntimeError, match="input_ids"):
+        built.dataloader.collate_fn([{"qry": "a"}, {"qry": "b"}])
+
+
+def test_an_empty_sequence_is_refused_rather_than_packed():
+    """The break. A zero-length sequence takes no room in the pack, so its pooled
+    embedding would be the previous sequence's last token under its name."""
+    with pytest.raises(ValueError, match="empty"):
+        axes.PackedCollate()([{"input_ids": torch.arange(3)}, {"input_ids": torch.zeros(0)}])
+
+
+# --- dataloader.packing over a tokenize callable -----------------------------
+#
+# The `tokenize` path is the one a harness with a processor has to use — it is the
+# only way raw text reaches a pack — and it had no test at all. What it does with a
+# padding tokenizer is the failure this axis cannot survive: the PADs are
+# concatenated as real tokens, so tokens/s counts work the model never did and
+# `packed_last_token_pool` reads a PAD as some sequence's embedding, while the run
+# still certifies `dataloader.packing=True` off the class attribute.
+
+
+def test_a_tokenize_callable_without_a_pad_id_is_refused():
+    """The break. Optional `pad_id` means the default construction of this path is
+    the one that cannot recognise the padding it is about to pack."""
+    with pytest.raises(ValueError, match="needs pad_id"):
+        axes.PackedCollate(tokenize=lambda rows: [torch.arange(3)])
+
+
+def test_a_padding_tokenizer_is_refused_rather_than_packed():
+    """The break. `pad_sequence` is the natural way to turn a batch of texts into
+    tensors, and it pads; so does every HF tokenizer at its default. Without this
+    the batch below packs 3 PADs out of 6 tokens and reports them as measured."""
+    from torch.nn.utils.rnn import pad_sequence
+
+    def tokenize(rows):
+        return list(pad_sequence([torch.arange(n) + 1 for n in (3, 1, 2)], batch_first=True))
+
+    with pytest.raises(ValueError, match="contain pad id 0"):
+        axes.PackedCollate(tokenize=tokenize, pad_id=0)([{}, {}, {}])
+
+
+def test_a_tokenize_callable_returning_a_rectangle_is_refused():
+    """The break. The same padded batch, handed over as the 2-D tensor it is:
+    flattening it was how PAD entered the pack without anything raising."""
+    with pytest.raises(ValueError, match="rectangle is a padded batch"):
+        axes.PackedCollate(tokenize=lambda rows: torch.zeros(3, 4, dtype=torch.long), pad_id=0)(
+            [{}, {}, {}]
+        )
+
+
+def test_a_two_dimensional_sequence_is_refused_rather_than_flattened():
+    """The break. Per-sequence tensors straight out of `tokenizer(..., return_tensors)`
+    are `(1, n)`, and a list of them from a padded batch is a rectangle in pieces."""
+    with pytest.raises(ValueError, match="1-D sequences"):
+        axes.PackedCollate(tokenize=lambda rows: [torch.zeros(2, 3, dtype=torch.long)], pad_id=7)(
+            [{}]
+        )
+
+
+def test_the_tokenize_path_packs_the_sequences_the_callable_returned():
+    """Applied, not merely permitted: the ids in the pack are the callable's own,
+    in its own order, and the boundaries describe them."""
+    seen = []
+
+    def tokenize(rows):
+        seen.append(len(rows))
+        return [torch.tensor([5, 6, 7]), torch.tensor([8]), torch.tensor([9, 10])]
+
+    batch = axes.PackedCollate(tokenize=tokenize, pad_id=0)([{"qry": "a"}, {"qry": "b"}])
+
+    assert seen == [2]
+    assert batch["input_ids"].tolist() == [[5, 6, 7, 8, 9, 10]]
+    assert batch["cu_seqlens"].tolist() == [0, 3, 4, 6]
+    assert batch["position_ids"].tolist() == [[0, 1, 2, 0, 0, 1]]
+
+
+def test_pretokenised_rows_that_arrived_padded_are_refused_by_their_own_mask():
+    """The break on the other path. `pretokenize` hands the collate whatever the
+    caller's `encode` produced, and an `encode` that tokenised the rows as a batch
+    padded them — the mask is where the row admits it."""
+    rows = [
+        {"input_ids": torch.tensor([5, 6, 7]), "attention_mask": torch.tensor([1, 1, 1])},
+        {"input_ids": torch.tensor([8, 0, 0]), "attention_mask": torch.tensor([1, 0, 0])},
+    ]
+
+    with pytest.raises(ValueError, match="arrive padded"):
+        axes.PackedCollate()(rows)
+
+
+def test_a_mask_that_does_not_describe_its_row_is_refused():
+    """The break. A mask read against the wrong ids would report any padding it
+    liked, including none."""
+    rows = [{"input_ids": torch.tensor([5, 6, 7]), "attention_mask": torch.tensor([1, 1])}]
+
+    with pytest.raises(ValueError, match="does not describe the row"):
+        axes.PackedCollate()(rows)
+
+
+def test_unpadded_rows_keep_their_mask_and_pack():
+    """The check above must not refuse the rows it exists to protect."""
+    rows = [
+        {"input_ids": torch.tensor([5, 6, 7]), "attention_mask": torch.ones(3, dtype=torch.long)},
+        {"input_ids": torch.tensor([8]), "attention_mask": torch.ones(1, dtype=torch.long)},
+    ]
+
+    batch = axes.PackedCollate()(rows)
+
+    assert batch["input_ids"].tolist() == [[5, 6, 7, 8]]
+
+
+def test_packing_over_pretokenised_rows_runs_end_to_end(composed):
+    """Both halves of this axis on at once, through the loader `assemble` built and
+    the batch it actually yields — which is what neither the class attribute the
+    capture probe reads nor `audit_plan.py`'s dataset-free `assemble` can witness.
+
+    The rows are deliberately ragged: torch's own collate cannot stack them, so a
+    run that reached this line without packing would have raised instead.
+    """
+    tokenised = axes.pretokenize(
+        RowDataset([{"qry": "a"}, {"qry": "bb"}, {"qry": "ccc"}]),
+        lambda row: {"input_ids": torch.arange(len(row["qry"]) + 1) + 1},
+    )
+    built, config = assembled_loader(
+        composed,
+        tokenised,
+        **{
+            "dataloader.packing": True,
+            "dataloader.pretokenize": True,
+            "train.batch_size": 3,
+            "data.num_workers": 0,
+        },
+    )
+
+    batch = next(iter(built.dataloader))
+    state = capture(built, config)
+
+    assert batch["input_ids"].shape == (1, 9)
+    assert batch["seq_lengths"].tolist() == [2, 3, 4]
+    assert axis(state, "dataloader.packing").applied == "True"
+    assert axis(state, "dataloader.pretokenize").applied == "True"
+
+
+def test_a_config_offers_packing_over_pretokenised_rows():
+    """AGENTS.md: a new experiment variant comes from config composition, never a
+    code change. Packing needs unpadded per-sequence ids and `pretokenize` is what
+    produces them, yet every config offering packing left `pretokenize: false` — the
+    one combination this module supports without a tokenizer was inexpressible."""
+    from hydra import compose, initialize_config_dir
+
+    from trainbench.compose import resolve
+
+    from .conftest import CONFIG_DIR
+
+    with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
+        mapping = resolve(
+            compose(
+                config_name="config",
+                overrides=["device=cpu", "dataloader=torch_packed_pretokenized"],
             )
+        )[1]
+
+    assert mapping["dataloader"]["backend"] == "torch"
+    assert mapping["dataloader"]["packing"] is True
+    assert mapping["dataloader"]["pretokenize"] is True
+
+
+# --- packed pooling ----------------------------------------------------------
+
+
+def test_pooling_a_packed_batch_matches_pooling_the_same_rows_padded():
+    """Packing changes the layout, not the embedding. Padded and packed are pooled
+    by two different functions, so this is the only place they are compared."""
+    lengths = [3, 5, 2]
+    total = sum(lengths)
+    flat = torch.arange(total * 4, dtype=torch.float32).reshape(1, total, 4)
+    cu_seqlens = torch.tensor([0, 3, 8, 10], dtype=torch.int32)
+
+    padded = torch.zeros(len(lengths), max(lengths), 4)
+    mask = torch.zeros(len(lengths), max(lengths), dtype=torch.long)
+    for row, (start, length) in enumerate(zip([0, 3, 8], lengths, strict=True)):
+        padded[row, :length] = flat[0, start : start + length]
+        mask[row, :length] = 1
+
+    packed_pooled = packed_last_token_pool(flat, cu_seqlens)
+    padded_pooled = last_token_pool(padded, mask, padding_side="right")
+
+    assert torch.equal(packed_pooled, padded_pooled)
+
+
+def test_boundaries_that_do_not_describe_the_batch_are_refused():
+    """The break. cu_seqlens is the only description of where a sequence ends, so
+    one that disagrees with the batch pools every sequence at the wrong token."""
+    flat = torch.zeros(1, 10, 4)
+
+    with pytest.raises(ValueError, match="cu_seqlens ends at"):
+        packed_last_token_pool(flat, torch.tensor([0, 3, 8], dtype=torch.int32))
+    with pytest.raises(ValueError, match="empty or out of order"):
+        packed_last_token_pool(flat, torch.tensor([0, 3, 3, 10], dtype=torch.int32))
+    with pytest.raises(ValueError, match="start at 0"):
+        packed_last_token_pool(flat, torch.tensor([1, 3, 10], dtype=torch.int32))
+
+
+def test_a_padded_batch_is_not_pooled_by_the_packed_path():
+    """The break. `last_token_pool` checks the padding side; the packed path cannot,
+    because a packed batch has no padding — so it refuses the shape outright rather
+    than pooling a rectangle whose PADs it would read as content."""
+    with pytest.raises(ValueError, match="a packed batch is one row"):
+        packed_last_token_pool(torch.zeros(3, 5, 4), torch.tensor([0, 5], dtype=torch.int32))
+
+
+# --- optim.name = muon -------------------------------------------------------
+#
+# Muon is `pytorch-optimizer`'s, a py3-none-any wheel whose only dependencies are
+# numpy and torch, so the Newton-Schulz iteration runs on the CPU this suite runs
+# on and these tests take a real step rather than inspect a class name. What no
+# test here can show is throughput: Muon's claim is about convergence and about
+# optimizer-state memory, both of which need a GPU and a real checkpoint. 측정 안 함.
+#
+# The parameter split is the decision that qualifies every Muon row in the report,
+# and `docs/methodology.md` §5 carries it. It is pinned below as well, because a
+# note nobody can fail is a note that drifts.
+
+
+def muon(composed, **overrides):
+    return bench(composed, **{"optim.name": "muon", **overrides})
+
+
+def test_the_muon_step_moves_the_weights_because_it_read_the_gradient(composed):
+    """A real step with a control, because "the weights moved" is not evidence that
+    an optimizer optimised anything.
+
+    The earlier form of this test asserted only that every tensor differed after
+    `step()`. Decoupled weight decay satisfies that on its own — it multiplies
+    every parameter by `1 - lr*wd` before any gradient is looked at — so a Muon
+    whose `step` never reads `p.grad` passed it, which is the failure this test
+    was written to make impossible. The same build is therefore stepped twice from
+    the same initial weights, once with the gradients backward produced and once
+    with those gradients zeroed, and the two must land in different places: the
+    only difference between the runs is the gradient.
+    """
+
+    def step(*, gradients: bool) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        torch.manual_seed(0)
+        model = plain_model()
+        batch = torch.randn(4, 2)
+        built, names = axes.assemble(model, muon(composed), CPU, framework="native")
+        assert "optim.name" in names
+        assert type(built.optimizer).__name__ == "Muon"
+        started = [p.detach().clone() for p in model.parameters()]
+        model(batch).sum().backward()
+        if not gradients:
+            for p in model.parameters():
+                p.grad.zero_()
+        built.optimizer.step()
+        return started, [p.detach().clone() for p in model.parameters()]
+
+    started, stepped = step(gradients=True)
+    _, decayed = step(gradients=False)
+
+    assert all(not torch.equal(was, now) for was, now in zip(started, stepped, strict=True))
+    assert all(
+        not torch.equal(gradient, decay) for gradient, decay in zip(stepped, decayed, strict=True)
+    )
+
+
+def test_the_muon_update_is_the_orthogonalised_gradient_not_an_elementwise_one(composed):
+    """What separates Muon from the AdamW it contains, asserted on the update that
+    reached the weight rather than on the flag that was supposed to route it.
+
+    Newton-Schulz drives the singular values of the update toward one another; an
+    elementwise optimizer rescales entries and leaves the gradient's spectrum as
+    spread as it found it. So the gradient here is built with a known spectrum —
+    smallest over largest exactly 0.1 — and the update that lands on the weight is
+    measured two ways: its own spectrum must come out far flatter than the
+    gradient's, and its direction must be the gradient's orthogonalisation `U @ Vt`
+    rather than the gradient itself.
+
+    Both numbers separate the two paths by a wide margin (measured on this build:
+    Muon 0.60 flatness / 0.98 cosine, the same optimizer with `use_muon=False`
+    0.003-0.10 / 0.66-0.73), so a Muon built with every group on the AdamW side
+    fails here — the case the run record could not previously distinguish.
+    """
+    width = 16
+    torch.manual_seed(0)
+    layer = torch.nn.Linear(width, width, bias=False)
+    model = torch.nn.Sequential(layer)
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+
+    built, _ = axes.assemble(model, muon(composed), CPU, framework="native")
+
+    left, _ = torch.linalg.qr(torch.randn(width, width))
+    right, _ = torch.linalg.qr(torch.randn(width, width))
+    gradient = (left @ torch.diag(torch.logspace(0, -1, width)) @ right.T).double()
+    before = layer.weight.detach().clone()
+    layer.weight.grad = gradient.float().clone()
+    built.optimizer.step()
+    update = (layer.weight.detach() - before).double()
+
+    grad_spectrum = torch.linalg.svdvals(gradient)
+    assert float(grad_spectrum.min() / grad_spectrum.max()) == pytest.approx(0.1, abs=1e-6)
+
+    update_spectrum = torch.linalg.svdvals(update)
+    assert float(update_spectrum.min() / update_spectrum.max()) > 0.4
+
+    u, _, vt = torch.linalg.svd(gradient)
+    orthogonalised = -(u @ vt)
+    cosine = float(
+        (update.flatten() @ orthogonalised.flatten()) / (update.norm() * orthogonalised.norm())
+    )
+    assert cosine > 0.9
+
+
+def test_a_muon_that_orthogonalises_nothing_does_not_read_back_as_muon(composed):
+    """The record side of the same substitution.
+
+    `use_muon` is a param-group flag and the class name is `Muon` either way, so a
+    build that put every group on the internal AdamW side produced a run record
+    byte-identical to an honest one: `{'class': 'Muon', 'fused': False,
+    'param_groups': 2}`. A published number could not then be attributed to either
+    optimizer after the fact. `_capture_optim` now counts the trainable tensors on
+    the orthogonalised side, and zero of them is undetermined rather than `muon` —
+    which stops a timing run instead of labelling one.
+    """
+    config = muon(composed, **{"run.purpose": "timing"})
+    model = torch.nn.Sequential(
+        torch.nn.Linear(4, 4), torch.nn.LayerNorm(4), torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)
+    )
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+    matrices = [p for p in model.parameters() if p.ndim >= 2 and p.requires_grad]
+    built, _ = axes.assemble(model, config, CPU, framework="native")
+
+    honest = axis(capture(built, config), "optim.name")
+    for group in built.optimizer.param_groups:
+        group["use_muon"] = False
+    disguised_state = capture(built, config)
+    disguised = axis(disguised_state, "optim.name")
+
+    assert honest.applied == "muon"
+    # Every trainable matrix, not merely a nonzero count: a build that routed one
+    # of the three to Newton-Schulz and the rest to the internal AdamW would still
+    # report `muon`, and the number is what makes that visible in the run record.
+    assert len(matrices) == 3
+    assert honest.detail["newton_schulz_tensors"] == len(matrices)
+    assert honest.detail["use_muon"] == [True, False]
+    assert disguised.applied is None
+    assert disguised.detail["newton_schulz_tensors"] == 0
+    assert honest.detail != disguised.detail
+    with pytest.raises(AppliedMismatch, match=r"optim\.name: .*undetermined"):
+        assert_matches(disguised_state, config)
+
+
+def test_a_frozen_matrix_is_not_counted_as_a_tensor_muon_will_orthogonalise(composed):
+    """Muon skips a parameter with no gradient, so a frozen matrix sits in the
+    `use_muon` group without ever entering Newton-Schulz. The guard used to count
+    it: a model whose every matrix is frozen passed a refusal whose sentence is
+    "every tensor that steps would take the AdamW path", which is exactly what
+    would then happen — only the 1D tensors would be moving, through the internal
+    AdamW, under Muon's name.
+    """
+    model = torch.nn.Sequential(torch.nn.Linear(3, 3))
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+    model[0].weight.requires_grad_(False)
+
+    with pytest.raises(axes.UnappliedAxis, match="no trainable >=2D parameter"):
+        axes.assemble(model, muon(composed), CPU, framework="native")
+
+
+def test_muon_is_refused_rather_than_crashing_where_pytorch_optimizer_is_absent(composed):
+    """`from pytorch_optimizer import Muon` was a bare import. The documented setup
+    command is `uv sync --extra compose`, which does not install that distribution
+    — only the `native` extra and `envs/native` pin it — so on a clean clone and in
+    five of the six framework images this axis did not refuse, it took `assemble`
+    down partway through with ModuleNotFoundError. `_patch_liger` wraps its import
+    for the same reason: "this environment cannot provide the axis" is an unapplied
+    axis, not a crash.
+    """
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setitem(sys.modules, "pytorch_optimizer", None)
+
+        with pytest.raises(axes.UnappliedAxis, match="pytorch-optimizer"):
+            axes.assemble(plain_model(), muon(composed), CPU, framework="native")
+
+
+def test_the_muon_run_reads_back_as_muon(composed):
+    config = muon(composed)
+
+    built, _ = axes.assemble(plain_model(), config, CPU, framework="native")
+
+    assert axis(capture(built, config), "optim.name").applied == "muon"
+
+
+def test_muon_orthogonalises_the_matrices_and_hands_the_rest_to_adamw(composed):
+    """Two groups, split on `p.ndim`. Newton-Schulz needs a matrix, so a 1D tensor
+    in the Muon group is not a preference but a shape error waiting for the first
+    step; and a parameter in neither group is one the run never trains."""
+    model = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.LayerNorm(3))
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+
+    built, _ = axes.assemble(model, muon(composed), CPU, framework="native")
+
+    groups = built.optimizer.param_groups
+    assert [group["use_muon"] for group in groups] == [True, False]
+    assert all(p.ndim >= 2 for p in groups[0]["params"])
+    assert all(p.ndim < 2 for p in groups[1]["params"])
+    assert sum(len(group["params"]) for group in groups) == len(list(model.parameters()))
+
+
+def test_an_embedding_table_is_orthogonalised_here_rather_than_handed_to_adamw(composed):
+    """The documented deviation, made falsifiable.
+
+    Muon's own documentation says embeddings and the LM head belong to AdamW, and
+    this build cannot do that: `_optimizer` is handed `model.parameters()`, which
+    carries no names, and an embedding matrix is indistinguishable from a hidden
+    weight matrix without them. So the embedding goes through Newton-Schulz, which
+    is the condition `docs/methodology.md` §5 puts on reading a Muon row — most of
+    all gemma-4's, where PLAN.md's hypothesis is about PLE tables being handed
+    *away* from Muon.
+
+    Asserted rather than described so that the day someone gives `_optimizer` the
+    names, this test fails and the methodology note is rewritten with the code
+    instead of outliving it.
+    """
+    embedding = torch.nn.Embedding(5, 4)
+    model = torch.nn.Sequential(embedding, torch.nn.Linear(4, 4))
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+
+    built, _ = axes.assemble(model, muon(composed), CPU, framework="native")
+
+    muon_group, _ = built.optimizer.param_groups
+    assert any(p is embedding.weight for p in muon_group["params"])
+
+
+def test_under_lora_every_trained_tensor_is_on_the_muon_side(composed):
+    """The headline comparison is full finetuning against LoRA, and the two arms do
+    not get the same optimizer. Every trainable tensor an adapter adds is 2D, so the
+    internal AdamW group holds nothing but frozen 1D tensors — LoRA x muon is pure
+    Muon, while full x muon sends norms and biases to AdamW. Recorded in
+    `docs/methodology.md` §5 as a condition on comparing the two rows.
+    """
+    config = bench(
+        composed,
+        **{"optim.name": "muon", "peft.mode": "lora", "peft.r": 4, "peft.alpha": 8},
+    )
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+
+    built, _ = axes.assemble(model, config, CPU, framework="native")
+
+    trained = [p for p in built.model.parameters() if p.requires_grad]
+    assert trained and all(p.ndim >= 2 for p in trained)
+    muon_group, adamw_group = built.optimizer.param_groups
+    assert all(any(p is held for held in muon_group["params"]) for p in trained)
+    assert not any(p.requires_grad for p in adamw_group["params"])
+
+
+def test_muon_is_refused_for_a_model_with_no_matrix_to_orthogonalise(composed):
+    """Every tensor would fall through to the internal AdamW, and the run would be
+    AdamW measured under Muon's name — the substitution this module exists to
+    refuse. `applied._capture_optim` could not catch it: the class is still Muon."""
+    model = torch.nn.Sequential(torch.nn.LayerNorm(3))
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+
+    with pytest.raises(axes.UnappliedAxis, match="no trainable >=2D parameter"):
+        axes.assemble(model, muon(composed), CPU, framework="native")
+
+
+def test_adamw_8bit_is_still_refused_and_no_longer_says_muon_is(composed):
+    """The refusal was one message for two values. Narrowing it is half the work of
+    wiring one of them: a message that still names muon would be read by the next
+    lane as muon still being unimplemented."""
+    with pytest.raises(axes.UnappliedAxis) as raised:
+        axes.assemble(
+            plain_model(),
+            bench(composed, **{"optim.name": "adamw_8bit"}),
+            CPU,
+            framework="native",
+        )
+
+    assert "adamw_8bit" in str(raised.value)
+    assert "muon" not in str(raised.value)
+
+
+def test_a_muon_optimizer_under_an_adamw_request_stops_the_run(composed):
+    """The capture side of the pair. `scripts/bench.py` calls `assert_matches`
+    before `train(...)`, so this is what stops a mislabelled optimizer from
+    reaching a number."""
+    config = muon(composed, **{"run.purpose": "timing"})
+    built, _ = axes.assemble(plain_model(), config, CPU, framework="native")
+    requested_adamw = bench(composed, **{"optim.name": "adamw_fused", "run.purpose": "timing"})
+
+    state = capture(built, requested_adamw)
+
+    assert axis(state, "optim.name").applied == "muon"
+    with pytest.raises(AppliedMismatch, match=r"optim\.name: requested 'adamw_fused'"):
+        assert_matches(state, requested_adamw)
 
 
 # --- the last two to be wired ------------------------------------------------

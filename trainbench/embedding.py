@@ -77,6 +77,68 @@ def last_token_pool(
     return hidden_states[:, -1]
 
 
+def packed_last_token_pool(
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Embedding per sequence when the batch is packed into one row.
+
+    `last_token_pool` asserts one sequence per row with contiguous padding, and a
+    packed batch breaks that contract head-on: there is no padding, and one row
+    holds every sequence end to end. That assertion is not weakened to let packing
+    through — it is what stops a PAD embedding from being pooled — so packing gets
+    its own entry point and the boundaries have to be carried explicitly.
+
+    `cu_seqlens` is the cumulative-sequence-length vector varlen attention kernels
+    already take (`[0, len_0, len_0+len_1, ...]`), rather than a second, private
+    description of the same boundaries: two spellings of where a sequence ends is
+    how a packed batch gets pooled at the wrong token while both halves look
+    internally consistent.
+
+    hidden_states: (total, dim), or (1, total, dim) as the model returns it.
+    Returns (sequences, dim), in packing order.
+    """
+    if hidden_states.dim() == 3:
+        if hidden_states.size(0) != 1:
+            raise ValueError(
+                f"a packed batch is one row, got {hidden_states.size(0)}; "
+                "hidden_states shaped (batch>1, seq, dim) is a padded batch and belongs in "
+                "last_token_pool, where the padding side is checked."
+            )
+        hidden_states = hidden_states[0]
+    if hidden_states.dim() != 2:
+        raise ValueError(
+            "hidden_states must be (total, dim) or (1, total, dim), got "
+            f"{tuple(hidden_states.shape)}"
+        )
+    if cu_seqlens.dim() != 1 or cu_seqlens.numel() < 2:
+        raise ValueError(
+            f"cu_seqlens must be a 1-D vector of at least two offsets, got "
+            f"{tuple(cu_seqlens.shape)}; without a start and an end no sequence is delimited."
+        )
+    offsets = cu_seqlens.to(dtype=torch.long, device=hidden_states.device)
+    if int(offsets[0]) != 0:
+        raise ValueError(f"cu_seqlens must start at 0, got {int(offsets[0])}")
+    lengths = offsets[1:] - offsets[:-1]
+    if not bool((lengths > 0).all()):
+        empty = (lengths <= 0).nonzero().flatten().tolist()
+        raise ValueError(
+            f"sequences {empty[:8]} are empty or out of order in cu_seqlens; an empty "
+            "sequence has no last token to pool, and pooling it would read the previous "
+            "sequence's last token under its name."
+        )
+    total = hidden_states.size(0)
+    if int(offsets[-1]) != total:
+        raise ValueError(
+            f"cu_seqlens ends at {int(offsets[-1])} but the packed batch holds {total} "
+            "tokens; the boundaries do not describe this batch, so every pooled position "
+            "after the first disagreement would belong to the wrong sequence."
+        )
+    # The last token of sequence i sits at (start of i+1) - 1, which is what makes
+    # the whole of this function the same convention as `last_token_pool`.
+    return hidden_states[offsets[1:] - 1]
+
+
 def _padding_side_holders(processor: Any) -> list[tuple[str, Any]]:
     """Every object on a processor that declares a padding side.
 

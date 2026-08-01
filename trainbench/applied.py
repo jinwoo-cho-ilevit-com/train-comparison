@@ -220,16 +220,47 @@ def _capture_optim(built: Built, config: BenchConfig) -> tuple[str | None, dict[
     The fused AdamW kernel is CUDA-only, so an unfused AdamW is reported as a
     different applied value: `adamw_fused` is the name of a kernel, and a run that
     did not use it must not carry that label.
+
+    Muon needs one more read than its class name. It holds an AdamW inside itself
+    and routes each param group to Newton-Schulz or to that AdamW on the group's
+    own `use_muon` flag, so a Muon built with `use_muon=False` everywhere *is*
+    AdamW, under a class whose name is still `Muon`. Recording the number of
+    trainable tensors on the orthogonalised side is what makes the two runs
+    different in the result JSON — otherwise a published number could not be
+    attributed to either optimizer after the fact — and zero of them is reported
+    as undetermined rather than as `muon`, which stops a timing run instead of
+    labelling it.
     """
     if built.optimizer is None:
         return None, {"reason": "no optimizer was built"}
     kind = type(built.optimizer).__name__
-    fused = any(group.get("fused") for group in getattr(built.optimizer, "param_groups", []))
-    detail = {
+    groups = list(getattr(built.optimizer, "param_groups", []))
+    fused = any(group.get("fused") for group in groups)
+    detail: dict[str, Any] = {
         "class": kind,
         "fused": bool(fused),
         "param_groups": len(built.optimizer.param_groups),
     }
+    if kind == "Muon":
+        # Frozen tensors are excluded because Muon skips a parameter with no
+        # gradient: they sit in the group without ever reaching the iteration.
+        detail["newton_schulz_tensors"] = sum(
+            1
+            for group in groups
+            if group.get("use_muon")
+            for p in group["params"]
+            if p.requires_grad
+        )
+        detail["use_muon"] = [bool(group.get("use_muon")) for group in groups]
+        if not detail["newton_schulz_tensors"]:
+            detail["reason"] = (
+                "the optimizer is a Muon, but no trainable tensor is in a use_muon group, "
+                "so every tensor that steps takes its internal AdamW path. A framework "
+                "adapter bringing a different Muon whose param groups do not carry "
+                "use_muon reads the same way, and undetermined is the right answer there "
+                "too until a probe can tell what that one orthogonalises"
+            )
+            return None, detail
     if kind != "AdamW":
         return kind.lower(), detail
     return ("adamw_fused" if fused else "adamw_unfused"), detail
@@ -313,6 +344,49 @@ def _module_roots(model: Any) -> dict[str, int]:
     return roots
 
 
+def _superseded_modules(model: Any) -> list[tuple[str, str]]:
+    """Modules whose class is no longer what its own name resolves to.
+
+    A kernel library applies by rebinding names in the modelling module —
+    `modeling_qwen3_5.Qwen3_5RMSNorm = LigerRMSNorm` — and the model is built
+    afterwards, which is why `patch` runs before construction. So an instance
+    whose class is `transformers…Qwen3_5RMSNorm` while that name now resolves to a
+    class from `liger_kernel` is a module the patch did not reach: it was built
+    around the rebinding, either before it or by something that reconstructed part
+    of the model afterwards.
+
+    This is the half-covered model, and the package scan alone cannot see it: one
+    patched module and five hundred stock ones answer `_module_roots` exactly like
+    a fully covered model does, and the timing number would carry the kernel's
+    name either way.
+
+    What it deliberately does not do is judge the *fraction*. Liger's entrypoints
+    patch the text decoder and leave the vision tower alone, so a coverage
+    threshold would reject the library's own documented behaviour; and the
+    threshold could not be checked here, because liger-kernel does not install on
+    the machine this was written on. Scanned classes are limited to the ones a
+    kernel library replaces (`transformers` and the kernel packages themselves),
+    so a library that rebinds its own names for unrelated reasons is not read as a
+    half-applied kernel.
+    """
+    import sys
+
+    from trainbench import axes
+
+    scanned = ("transformers", *axes.KERNEL_MODULE_ROOTS)
+    superseded: list[tuple[str, str]] = []
+    for _, module in model.named_modules():
+        cls = type(module)
+        if cls.__module__.split(".")[0] not in scanned or "." in cls.__qualname__:
+            continue
+        owner = sys.modules.get(cls.__module__)
+        current = getattr(owner, cls.__name__, None) if owner is not None else None
+        if current is None or current is cls:
+            continue
+        superseded.append((cls.__name__, getattr(current, "__module__", "").split(".")[0]))
+    return superseded
+
+
 def _capture_kernel(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
     """Which kernel library, if any, is inside the model that was built.
 
@@ -320,6 +394,13 @@ def _capture_kernel(built: Built, config: BenchConfig) -> tuple[str | None, dict
     adapters patch transformers themselves — that is what Unsloth is — so
     `kernel=none` is a claim about the whole built model, not only about whether
     `patch()` did something.
+
+    Two answers are not schema values and are meant not to be, because both name a
+    model that belongs to no setting: `mixed(...)` for two kernel libraries at
+    once, and `partial(...)` for a model the library covers only in part
+    (`_superseded_modules`). Naming them here is what makes `assert_matches`
+    refuse the run instead of publishing its throughput under the requested
+    kernel's name.
     """
     from trainbench import axes
 
@@ -331,7 +412,36 @@ def _capture_kernel(built: Built, config: BenchConfig) -> tuple[str | None, dict
     # judged: a framework wrapper is not a kernel axis value, but a reader of the
     # result should be able to see that something else defined these modules.
     foreign = sorted(r for r in roots if r not in ("torch", "transformers", "builtins"))
-    detail = {"modules_checked": sum(roots.values()), "packages": foreign[:8]}
+    superseded = _superseded_modules(built.model)
+    detail: dict[str, Any] = {
+        "modules_checked": sum(roots.values()),
+        "packages": foreign[:8],
+        # How much of the model each kernel library defines. Recorded because the
+        # applied value alone cannot carry it, and a reader of a `liger` number
+        # has to be able to tell one patched module from three hundred.
+        "kernel_modules": {
+            axes.KERNEL_MODULE_ROOTS[r]: n
+            for r, n in sorted(roots.items())
+            if r in axes.KERNEL_MODULE_ROOTS
+        },
+        "superseded": len(superseded),
+    }
+    if superseded:
+        replacements = sorted(
+            {
+                axes.KERNEL_MODULE_ROOTS[root]
+                for _, root in superseded
+                if root in axes.KERNEL_MODULE_ROOTS
+            }
+        )
+        sample = sorted({name for name, _ in superseded})[:5]
+        if not replacements:
+            return None, {
+                **detail,
+                "reason": f"{sample} were built from classes something has since replaced, and "
+                "the replacement is not a kernel library this names, so what ran is unknown",
+            }
+        return "partial(" + ",".join(replacements) + ")", {**detail, "superseded_sample": sample}
     if not found:
         return "none", detail
     if len(found) == 1:
@@ -397,22 +507,165 @@ def _capture_gradient_checkpointing(
     Scanned rather than taken from `model.is_gradient_checkpointing`, which is
     `any(...)`: a partial enable and a full one give it the same answer, and a
     partial enable is a model whose measured memory belongs to neither setting.
+
+    The flag alone cannot separate `full` from `selective` — transformers sets the
+    same `True` for both. What differs is the callable it stores next to the flag:
+    `_set_gradient_checkpointing` hands every checkpointing module the same
+    `functools.partial(torch.utils.checkpoint.checkpoint, **kwargs)`, so that
+    partial's keywords are the run's own evidence of which operators the backward
+    pass will re-run. Read here rather than trusted from the request, which is the
+    point of this module: a model that accepts the kwargs and drops the
+    `context_fn` reads back as `full` and its timing run is refused.
+
+    A setting this cannot name is `None` rather than the nearest schema value.
+    Every way of being unnameable here is a run whose backward pass is somebody
+    else's — a foreign selective policy, a reentrant checkpoint, a checkpoint
+    function that is not torch's — and each of them produces a number under one of
+    our labels if it is rounded to the nearest one. `detail["reason"]` carries
+    which it was, because the three are fixed in different places.
     """
     if built.model is None:
         return None, {"reason": "no model was built"}
-    flags = [
-        bool(module.gradient_checkpointing)
+    readings = [
+        _checkpointing_mode(module)
         for _, module in built.model.named_modules()
         if hasattr(module, "gradient_checkpointing")
     ]
-    if not flags:
+    if not readings:
         return None, {"reason": "no module in this model exposes a gradient_checkpointing flag"}
-    detail = {"modules_with_flag": len(flags), "enabled": sum(flags)}
-    if all(flags):
-        return "full", detail
-    if not any(flags):
-        return "none", detail
+    modes = [mode for mode, _ in readings]
+    detail = {
+        "modules_with_flag": len(modes),
+        "enabled": sum(mode != "none" for mode in modes),
+        "selective": sum(mode == "selective" for mode in modes),
+    }
+    unnameable = sorted({why for mode, why in readings if mode is None})
+    if unnameable:
+        return None, {
+            **detail,
+            "reason": "a checkpointed module is set up in a way this cannot name, so which "
+            "operators get recomputed is unknown: " + "; ".join(unnameable),
+        }
+    distinct = set(modes)
+    if len(distinct) == 1:
+        return modes[0], detail
+    # Not a schema value, and deliberately so: a model checkpointed two ways at
+    # once belongs to neither setting, and naming it here is what makes
+    # `assert_matches` refuse it.
     return "partial", detail
+
+
+def _checkpointing_mode(module: Any) -> tuple[str | None, str | None]:
+    """Which checkpointing one module is set up for, and why it cannot be named.
+
+    Returns `(mode, None)` or `(None, why)`. Every branch that ends in `None` is a
+    module whose backward pass re-runs a different set of operators than any value
+    of this axis names.
+
+    The policy is checked, not just the factory that consumes it.
+    `create_selective_checkpoint_contexts` builds a context out of any save list:
+    one that saves everything recomputes nothing (the backward pass of `none`) and
+    one that saves nothing recomputes everything (the backward pass of `full`).
+    Both are built by that same factory, so recognising the factory alone would
+    put a `selective` label on either — which is the failure this module exists to
+    prevent, in the one axis whose own comment says the policy *is* the axis
+    (`axes.SELECTIVE_CHECKPOINT_SAVED_OPS`). The realistic source is `framework`:
+    an image that turns on its own selective checkpointing is exactly a foreign
+    policy under our request.
+
+    `use_reentrant` is read for the same reason rather than assumed from what
+    `axes` passes. The reentrant implementation skips the recompute entirely when
+    no input to the block requires grad — which a frozen tower produces, and
+    `freeze.*` is crossed with this axis — so a reentrant `full` is a run with
+    `none`'s backward pass under `full`'s label. It also silently ignores
+    `context_fn`, so no reentrant module can be `selective` at all.
+    """
+    import torch
+
+    from trainbench.axes import selective_checkpoint_policy
+
+    if not module.gradient_checkpointing:
+        return "none", None
+    func = getattr(module, "_gradient_checkpointing_func", None)
+    if getattr(func, "func", None) is not torch.utils.checkpoint.checkpoint:
+        return None, (
+            f"its _gradient_checkpointing_func is {type(func).__name__} rather than a "
+            "functools.partial of torch.utils.checkpoint.checkpoint, so what it recomputes "
+            "is not readable from its keywords"
+        )
+    keywords = func.keywords or {}
+    reentrant = keywords.get("use_reentrant")
+    if reentrant is not False:
+        return None, (
+            f"it checkpoints with use_reentrant={reentrant!r}, and the reentrant "
+            "implementation skips the recompute when nothing entering the block requires "
+            "grad and ignores context_fn"
+        )
+    context_fn = keywords.get("context_fn")
+    if context_fn is None:
+        return "full", None
+    if getattr(context_fn, "func", context_fn) is not (
+        torch.utils.checkpoint.create_selective_checkpoint_contexts
+    ):
+        return None, (
+            "its context_fn is not torch's create_selective_checkpoint_contexts, so which "
+            "operators it saves is unknown"
+        )
+    bound = getattr(context_fn, "args", ()) or ()
+    # `policy_fn_or_list` is torch 2.13.0's parameter name; a caller is free to
+    # bind it by keyword, and reading only positionals would call that unnameable.
+    policy = (
+        bound[0]
+        if bound
+        else (getattr(context_fn, "keywords", None) or {}).get("policy_fn_or_list")
+    )
+    if policy is selective_checkpoint_policy:
+        return "selective", None
+    return None, (
+        f"its context_fn carries the policy {getattr(policy, '__qualname__', policy)!r} rather "
+        "than this axis's selective_checkpoint_policy, and a different save list recomputes a "
+        "different set of operators"
+    )
+
+
+def _quantisation_recipe(model: Any) -> dict[str, Any] | None:
+    """The 4-bit recipe the built model carries, keyed as `axes.QLORA_4BIT` asks.
+
+    `None` means the base reads as quantised but the recipe is not on the object —
+    which is undetermined, not "the usual one". Read off `model.config` because
+    that is where transformers leaves it after `from_pretrained`, as either the
+    `BitsAndBytesConfig` or the dict a quantised checkpoint declared.
+
+    dtypes are stringified here rather than at the comparison: `torch.bfloat16`
+    and the `"bfloat16"` a checkpoint's config.json spells are the same request,
+    and this value is also written into the result JSON.
+    """
+    from trainbench.axes import QLORA_4BIT
+
+    raw = getattr(getattr(model, "config", None), "quantization_config", None)
+    if raw is None:
+        return None
+    read = raw.get if isinstance(raw, dict) else lambda key: getattr(raw, key, None)
+    return {key: _plain(read(key)) for key in QLORA_4BIT}
+
+
+def _plain(value: Any) -> Any:
+    """`torch.bfloat16` and `"bfloat16"` as one spelling, so the recipe compares
+    and serialises the same way whichever the loader left behind."""
+    text = str(value)
+    return text.removeprefix("torch.") if text.startswith("torch.") else value
+
+
+def _off_recipe(recipe: dict[str, Any] | None) -> list[str]:
+    """Where the built model's 4-bit differs from the one `peft.mode=qlora` asks
+    for, as `key=value` of what it actually got."""
+    from trainbench.axes import QLORA_4BIT
+
+    if recipe is None:
+        return ["recipe=unreadable"]
+    return [
+        f"{key}={recipe[key]}" for key, want in QLORA_4BIT.items() if recipe[key] != _plain(want)
+    ]
 
 
 def _capture_peft(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
@@ -442,7 +695,17 @@ def _capture_peft(built: Built, config: BenchConfig) -> tuple[str | None, dict[s
             getattr(built.model, "is_loaded_in_4bit", False)
             or getattr(getattr(built.model, "config", None), "quantization_config", None)
         )
-        return ("qlora" if quantised else "lora"), {**detail, "base_quantised": quantised}
+        if not quantised:
+            return "lora", {**detail, "base_quantised": False}
+        recipe = _quantisation_recipe(built.model)
+        detail = {**detail, "base_quantised": True, "base_quantisation": recipe}
+        off = _off_recipe(recipe)
+        # "qlora" names one recipe, not any 4-bit at all. fp4 weights, or double
+        # quantisation left off, are a different technique with a different memory
+        # and speed profile — and the study would print their step time as QLoRA's.
+        # An unnamed value is a mismatch, which stops the run; the recipe travels
+        # in the detail either way, so the result file says which 4-bit it was.
+        return ("qlora" if not off else "qlora(" + ";".join(off) + ")"), detail
     # Deliberately not equal to any configurable value: an adapter we cannot name
     # must be a mismatch rather than fall into the nearest one.
     return "peft(" + ",".join(kinds or ["unknown"]) + ")", detail
@@ -708,20 +971,20 @@ def _capture_dataloader_pretokenize(
     """
     if built.dataloader is None:
         return None, {"reason": "no dataloader was built"}
+    from trainbench import axes
+
     dataset = getattr(built.dataloader, "dataset", None)
-    columns = getattr(dataset, "column_names", None)
-    if columns is None:
-        features = getattr(dataset, "features", None)
-        columns = list(features) if features is not None else None
+    # Same reader as the apply site uses (`axes.declared_columns`), rather than a
+    # second copy of "what columns does this have": the two would drift, and the
+    # drift would be invisible because each half would still agree with itself.
+    columns = axes.declared_columns(dataset)
     if columns is None:
         return None, {
             "reason": f"{type(dataset).__name__} declares no column_names or features, so "
             "whether its rows are tokenised cannot be read back"
         }
-    from trainbench import axes
-
-    tokenised = sorted(set(columns) & set(axes.TOKENIZED_COLUMNS))
-    return str(bool(tokenised)), {"columns": sorted(columns)[:12], "tokenised_columns": tokenised}
+    tokenised = axes.tokenized_columns(dataset)
+    return str(bool(tokenised)), {"columns": columns[:12], "tokenised_columns": tokenised}
 
 
 def _capture_cross_device_negatives(

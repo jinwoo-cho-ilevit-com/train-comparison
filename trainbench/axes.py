@@ -43,12 +43,17 @@ exists to prevent, and it is not less of one for happening in our own code.
 from __future__ import annotations
 
 import contextlib
+import functools
+import importlib
+import importlib.metadata
+import importlib.util
 from typing import Any
 
 import torch
 
-from trainbench.applied import Built
+from trainbench.applied import ENFORCED_PURPOSES, Built
 from trainbench.config_schema import BenchConfig
+from trainbench.device import get_device
 from trainbench.embedding import info_nce
 
 # gemma-4's per-layer embeddings. Every one of the 108 PLE tensors carries this
@@ -90,10 +95,76 @@ KERNEL_MODULE_ROOTS = {
     "kernels": "kernels_hub",
 }
 
+# Liger's per-architecture entrypoint, by this repo's `model.arch`. The naming
+# form is the one the Liger README documents (`apply_liger_kernel_to_llama()`),
+# and the suffix is transformers' own `model_type`: `configuration_qwen3_5.py`,
+# `configuration_qwen3_vl.py` and `configuration_gemma4.py` in transformers 5.14.1
+# declare exactly `qwen3_5`, `qwen3_vl` and `gemma4`, which is why `arch` can be
+# used as the suffix rather than mapped through a second table.
+#
+# UNVERIFIED, and deliberately so rather than silently: liger-kernel cannot be
+# installed on the machine this was written on — it depends on triton under a
+# `sys_platform == 'linux'` marker and triton publishes no macOS wheel — so the
+# spelling below is a hypothesis about a package that could not be imported to
+# check it. `_patch_liger` therefore refuses with the `apply_liger_kernel_to_*`
+# names the installed package really exports instead of failing with an
+# AttributeError, so the first pod that runs this either applies the kernel or
+# prints the name to write here.
+LIGER_ENTRYPOINTS = {
+    # Liger-Kernel#1119 (PLAN.md).
+    "qwen3_5": "apply_liger_kernel_to_qwen3_5",
+}
+
+# Architectures Liger is known *not* to reach, with the reason. Separate from the
+# absence of an entrypoint above because "we know it does not work" and "nothing
+# is recorded either way" are different states, and only the first has a citation.
+LIGER_UNSUPPORTED = {
+    "gemma4": "Liger-Kernel#1186 is open (PLAN.md), so gemma-4 has no Liger path",
+}
+
+# Architectures whose transformers implementation takes its kernels from
+# flash-linear-attention. Of the three models under test only Qwen3.5 does:
+# `models/qwen3_5/modeling_qwen3_5.py` imports `FusedRMSNormGated` from
+# `fla.modules` and the Gated DeltaNet ops from `fla.ops.gated_delta_rule`
+# (transformers 5.14.1), while `models/qwen3_vl/` and `models/gemma4/` name fla
+# nowhere. Requesting fla on the other two would be a run labelled after a library
+# whose code the model never enters.
+FLA_ARCHS = frozenset({"qwen3_5"})
+
+# What transformers requires before it binds fla at all, mirrored here rather than
+# imported because this module never imports transformers (it is absent from the
+# orchestrator-side environment). `is_flash_linear_attention_available()` is
+# `is_torch_cuda_available() and _is_package_available("fla") and
+# version >= 0.2.2` (transformers 5.14.1, `utils/import_utils.py:869`). The floor
+# is checked here rather than left to that predicate: below it transformers binds
+# nothing, `_capture_kernel` reads `none` back off the model, and the run dies far
+# from the version that caused it.
+#
+# `fla` publishes no entry in transformers' `PACKAGE_DISTRIBUTION_MAPPING`, so
+# that predicate resolves the version by distribution name and falls back to
+# importing the package — the same two steps, in the same order, as below.
+FLA_MIN_VERSION = (0, 2, 2)
+FLA_DISTRIBUTIONS = ("flash-linear-attention", "fla")
+
 # Columns whose presence means the rows arrived already tokenised. Read off the
 # dataset the loader was built around, because that is where `pretokenize` moves
 # the work to — the loader itself looks the same either way.
 TOKENIZED_COLUMNS = ("input_ids",)
+
+# Columns that put an image in a row. These are the two `scripts/prepare_data.py`
+# writes into both subsets; they are repeated rather than imported because
+# `trainbench/` does not import from `scripts/`, and a subset that spells them
+# differently is still caught by its declared feature type (`image_columns`).
+# What reads this is `loss=cached_mnrl`: an image in the row becomes
+# `pixel_values` in the batch, and `_split_rows` cannot attribute that to rows.
+IMAGE_COLUMNS = ("qry_image", "pos_image")
+
+# What a packed batch carries. `cu_seqlens` and `seq_lengths` are boundaries, not
+# model inputs: `model(**tensors)` would reject them, so the harness has to lift
+# them out of the batch before the forward pass (they belong to pooling and to
+# token accounting). Named here so the collate and its consumers agree on one
+# spelling.
+PACKED_BOUNDARY_KEYS = ("cu_seqlens", "seq_lengths")
 
 # Axis knobs this module can actually put into effect. Required to equal
 # `applied._CAPTURES`: `audit_plan.py`'s `axis-wired` check enforces it, and
@@ -146,13 +217,280 @@ def patch(config: BenchConfig) -> list[str]:
     Kernel libraries monkey-patch the transformers classes, so patching after
     construction leaves the already-built modules untouched: the run would report
     a kernel that never ran.
+
+    Each value routes to one patcher, and a value with no patcher is refused here
+    rather than reaching a `KeyError` further in: a new kernel added to the schema
+    has to be turned on by something, and a missing entry has to say so in the
+    vocabulary the rest of this module refuses in.
+
+    `none` is refusable too, and for the same reason every other value is: it is a
+    claim about the model, not about whether this function did anything. Where the
+    architecture takes a kernel library from the environment
+    (`_environment_bound_kernel`), a run that would report a number is stopped here
+    rather than left to die at `assert_matches` after the model is built — same
+    refusal, at the site that can name the cause.
+
+    That one is limited to the purposes whose numbers are reported, unlike every
+    other refusal here. The others decline a value the run asked for; this one
+    declines the default because of what the image contains, and a probe is
+    precisely the run that exists to find that out (docs/CONTRACTS.md §2 does not
+    block probe or profile). Refusing them would delete the channel that reports
+    it.
+
+    What is proven and what is not, kept apart because only the first is evidence:
+    the routing, the refusals and the per-architecture support table are exercised
+    by `tests/test_axes.py` against stub modules. The patch calls themselves are
+    not — none of `liger_kernel`, `fla` or `kernels` installs on the machine this
+    was written on (liger and fla need triton, which has no macOS wheel; `kernels`
+    fetches device-specific prebuilt kernels from the Hub). Whether a real patch
+    takes inside a framework image is a first-pod check, and `applied._capture_kernel`
+    is what will answer it — it reads the packages that defined the built model's
+    module classes, so a patch that did not take reports `none` against a request
+    for `liger` and blocks the run.
     """
-    if config.kernel.name != "none":
+    name = config.kernel.name
+    if name == "none":
+        reported = config.run.purpose in ENFORCED_PURPOSES
+        if reported and (bound := _environment_bound_kernel(config)):
+            raise UnappliedAxis(
+                f"kernel=none on arch={config.model.arch}: transformers binds {bound} while it "
+                "imports the modelling module, so this run would build a model made of that "
+                f"library's classes and report it as `none`. Nothing here can unbind it — "
+                f"kernel={bound} is what this environment measures, and a run without it needs "
+                "an image that does not ship the package."
+            )
+        return []
+    patcher = KERNEL_PATCHERS.get(name)
+    if patcher is None:
         raise UnappliedAxis(
-            f"kernel={config.kernel.name} patches transformers classes before the model "
-            "is built; not implemented."
+            f"kernel={name} has no patcher in KERNEL_PATCHERS; nothing here can turn it on."
         )
-    return []
+    return patcher(config)
+
+
+def _patch_liger(config: BenchConfig) -> list[str]:
+    """Liger-Kernel, applied by replacing the transformers classes for one
+    architecture before anything is instantiated.
+
+    The architecture is decided before the import, so an unsupported model is
+    refused for being unsupported rather than for whatever the environment happens
+    to be missing. gemma-4 is the case that matters: Liger-Kernel#1186 is open, and
+    a patcher that silently no-ops there would put a `liger` label on a stock run.
+
+    transformers ships its own Liger integration, and it is not this one:
+    `integrations/liger.py::apply_liger_kernel` takes a built model and calls
+    `_apply_liger_kernel_to_instance(model=...)`. That is the post-construction
+    half of the same library; the call site docs/CONTRACTS.md §2 fixes for
+    `kernel.name` is this one, which is also the sequence the Liger README
+    documents ("# 2. Instantiate patched model").
+    """
+    arch = config.model.arch
+    if reason := LIGER_UNSUPPORTED.get(arch):
+        raise UnappliedAxis(f"kernel=liger on arch={arch}: {reason}.")
+    entrypoint = LIGER_ENTRYPOINTS.get(arch)
+    if entrypoint is None:
+        raise UnappliedAxis(
+            f"kernel=liger records no entrypoint for arch={arch!r}; known: "
+            f"{sorted(LIGER_ENTRYPOINTS)}. Nothing recorded is not the same as supported — "
+            "add it once a run has shown Liger reaching this architecture."
+        )
+    try:
+        module = importlib.import_module("liger_kernel.transformers")
+    except ImportError as exc:
+        raise UnappliedAxis(
+            f"kernel=liger needs liger-kernel installed before the model is built ({exc}). "
+            "It is in envs/native; a run without it would be measuring stock kernels."
+        ) from exc
+    apply = getattr(module, entrypoint, None)
+    if not callable(apply):
+        exported = sorted(n for n in dir(module) if n.startswith("apply_liger_kernel_to_"))
+        raise UnappliedAxis(
+            f"liger_kernel.transformers has no {entrypoint}(); it exports {exported}. "
+            "LIGER_ENTRYPOINTS holds a name that could not be checked against an installed "
+            "package — correct it from this list rather than patching a different model."
+        )
+    apply()
+    return ["kernel.name"]
+
+
+def _patch_fla(config: BenchConfig) -> list[str]:
+    """flash-linear-attention, whose application is a precondition rather than a call.
+
+    There is no `apply_fla_to_*`. transformers binds fla while it imports the
+    modelling module — `from fla.modules import FusedRMSNormGated` under
+    `is_flash_linear_attention_available()` — and picks the fused Gated DeltaNet
+    path per layer at construction. So the only thing a pre-construction site can
+    do is refuse a run whose fast path will not be there, and that refusal is the
+    axis: without fla the layers that are 75% of Qwen3.5 fall back to the torch
+    implementation behind a single log line, no exception and no warning
+    (docs/support-matrix.md), and the number would be published as fla's.
+
+    Nothing is asserted about the run beyond this. `applied._capture_kernel` is
+    what decides whether fla is in the built model, and it can see it: the fast
+    path installs `fla.modules.FusedRMSNormGated`, a class from the fla package,
+    as a submodule.
+    """
+    arch = config.model.arch
+    if arch not in FLA_ARCHS:
+        raise UnappliedAxis(
+            f"kernel=fla on arch={arch}: transformers takes no fla kernel path for this "
+            f"architecture; only {sorted(FLA_ARCHS)} import fla. The run would carry the label "
+            "and none of the library."
+        )
+    available, reason = _fla_fast_path()
+    if not available:
+        raise UnappliedAxis(
+            f"kernel=fla cannot take the Gated DeltaNet fast path here: {reason}. transformers "
+            "falls back to the torch implementation with one log line, so the run would measure "
+            "the fallback under fla's name."
+        )
+    return ["kernel.name"]
+
+
+def _fla_binding() -> tuple[bool, str]:
+    """Whether transformers will bind fla's classes while it imports the model.
+
+    Mirrors `is_flash_linear_attention_available()` alone — package, version floor,
+    CUDA — and nothing else. This is the predicate that decides whether
+    `modeling_qwen3_5.py:409` builds each gated norm as `fla.modules
+    .FusedRMSNormGated` or as the stock `Qwen3_5RMSNormGated`, and it is what
+    `_capture_kernel` ends up reading off the built model.
+
+    `causal_conv1d` is deliberately not here. It is a second, independent predicate
+    (`is_causal_conv1d_available()`, `import_utils.py:875`) behind a second import
+    guard (`modeling_qwen3_5.py:68` and `:73`), so a run can have fla's classes in
+    the model and still not take the fused Gated DeltaNet path.
+    """
+    if importlib.util.find_spec("fla") is None:
+        return False, "fla not installed"
+    installed = _fla_version()
+    if installed is None:
+        return False, (
+            f"fla is installed but its version cannot be read from {list(FLA_DISTRIBUTIONS)} "
+            "or fla.__version__, so the floor transformers applies cannot be checked"
+        )
+    if installed < FLA_MIN_VERSION:
+        return False, (
+            f"fla {'.'.join(map(str, installed))} is below the "
+            f"{'.'.join(map(str, FLA_MIN_VERSION))} transformers requires, so transformers "
+            "binds nothing from it"
+        )
+    if not torch.cuda.is_available():
+        return False, "no CUDA device, and transformers gates the fla import on one"
+    return True, ""
+
+
+def _fla_version() -> tuple[int, ...] | None:
+    """The installed fla release, as leading integers, or None if unreadable.
+
+    Only the release part is compared: the floor is a release and a suffix
+    (`0.5.0.dev0`, `0.4.1+cu126`) never changes which side of it a version is on.
+    """
+    for distribution in FLA_DISTRIBUTIONS:
+        try:
+            return _release(importlib.metadata.version(distribution))
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    try:
+        declared = getattr(importlib.import_module("fla"), "__version__", None)
+    except ImportError:
+        return None
+    return _release(declared) if declared else None
+
+
+def _release(version: str) -> tuple[int, ...] | None:
+    parts: list[int] = []
+    for part in version.split("."):
+        digits = ""
+        for char in part:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or None
+
+
+def _fla_fast_path() -> tuple[bool, str]:
+    """Whether transformers will take the fused Gated DeltaNet path here.
+
+    `modeling_qwen3_5.py:219` builds `is_fast_path_available` out of both imports —
+    the causal-conv1d functions and fla's chunked/recurrent gated delta rule — and
+    `:426` logs one line and runs the torch implementation when either is missing.
+    So this is the conjunction of two predicates, which is also what
+    `scripts/audit_plan.py` records as this axis's packages
+    (`flash-linear-attention`, `causal-conv1d`).
+    """
+    bound, reason = _fla_binding()
+    if not bound:
+        return False, reason
+    if importlib.util.find_spec("causal_conv1d") is None:
+        return False, "causal_conv1d not installed"
+    return True, ""
+
+
+def _environment_bound_kernel(config: BenchConfig) -> str:
+    """The kernel library this run gets whether or not it asked for one.
+
+    fla is not applied by a call: transformers imports it at module scope and
+    builds Qwen3.5's gated norms out of it, so on an image that has it there is no
+    such thing as a Qwen3.5 run without it. That makes `kernel=none` — the default
+    of every run in `configs/config.yaml` — a request nothing can satisfy on that
+    architecture, and every image in `envs/` ships fla (docs/support-matrix.md).
+    """
+    if config.model.arch not in FLA_ARCHS:
+        return ""
+    bound, _ = _fla_binding()
+    return "fla" if bound else ""
+
+
+def _patch_kernels_hub(config: BenchConfig) -> list[str]:
+    """kernels-hub dispatch, refused because its entrypoints are not this call site.
+
+    transformers 5.14.1 turns hub kernels on in two places, both of which need the
+    model: `from_pretrained(use_kernels=True)`, which ends in
+    `model.set_use_kernels(...)` (`modeling_utils.py`), and
+    `integrations/hub_kernels.py::kernelize(model)`, which reads `model.device` to
+    pick the device-specific kernel to fetch. The one pre-construction knob,
+    `USE_HUB_KERNELS`, is read when that module is first imported and only ever
+    turns dispatch *off*.
+
+    So this value cannot be applied from `patch` without pretending, and moving it
+    to `load_kwargs` or `assemble` is a contract change (docs/CONTRACTS.md §2
+    assigns `kernel.name` to this site). Refused until that is decided, rather than
+    applied at a site the contract does not name.
+    """
+    raise UnappliedAxis(
+        "kernel=kernels_hub is turned on by from_pretrained(use_kernels=True) and "
+        "integrations.hub_kernels.kernelize(model), both of which need a model; the patch site "
+        "this axis is assigned to (docs/CONTRACTS.md §2) runs before one exists."
+    )
+
+
+# The dispatch itself. `none` is not here: it is the absence of a patch, and an
+# entry for it would be a function that exists to do nothing.
+KERNEL_PATCHERS = {
+    "liger": _patch_liger,
+    "fla": _patch_fla,
+    "kernels_hub": _patch_kernels_hub,
+}
+
+
+# QLoRA's base quantisation, in the spelling `from_pretrained` takes. Fixed here
+# rather than offered as config: the axis this study measures is `peft.mode`, and
+# a knob for the quantiser's internals would be a new schema field, which
+# docs/CONTRACTS.md §5 makes a contract change. The values are QLoRA's own recipe —
+# 4-bit NF4 weights with the quantisation constants themselves quantised. The
+# compute dtype is bf16 because that is the only precision this module lets a run
+# reach (`step_context` refuses the rest), so a different one here would compute in
+# a precision no axis asked for.
+QLORA_4BIT = {
+    "load_in_4bit": True,
+    "bnb_4bit_quant_type": "nf4",
+    "bnb_4bit_use_double_quant": True,
+    "bnb_4bit_compute_dtype": torch.bfloat16,
+}
 
 
 def load_kwargs(config: BenchConfig) -> dict[str, Any]:
@@ -161,8 +499,36 @@ def load_kwargs(config: BenchConfig) -> dict[str, Any]:
     Attention is set here rather than afterwards because transformers validates
     and may downgrade the request during construction; setting it later would mean
     the model was built once with the wrong one.
+
+    `peft.mode=qlora` asks for its base quantisation here for the same reason and a
+    stronger one: 4-bit weights are produced while the checkpoint is being read, and
+    a model already materialised in bf16 cannot be turned into one afterwards.
+
+    Only the request is built here, and only where it can be honoured. bitsandbytes
+    quantises on CUDA, so on any other device this refuses instead of returning a
+    config whose effect is unknown — an ignored quantisation is the outcome that
+    matters, because the run would then train a full-precision base and report its
+    speed under the qlora label. The adapter half is refused separately and
+    unconditionally in `_peft`, so no qlora run starts from this checkout on any
+    device; this is the earlier of the two gates and the one that survives if that
+    refusal is ever lifted.
     """
-    return {"attn_implementation": config.attn.impl}
+    kwargs: dict[str, Any] = {"attn_implementation": config.attn.impl}
+    if config.peft.mode == "qlora":
+        device = get_device(config.device)
+        if device.type != "cuda":
+            raise UnappliedAxis(
+                f"peft.mode=qlora needs a 4-bit base and bitsandbytes quantises on CUDA; "
+                f"device={device.type} would load the base in full precision and measure "
+                "that under the qlora label."
+            )
+        # Imported here rather than at module scope: this is the only path that
+        # needs transformers, and the probe adapters that call `load_kwargs` are
+        # meant to be importable without it.
+        from transformers import BitsAndBytesConfig
+
+        kwargs["quantization_config"] = BitsAndBytesConfig(**QLORA_4BIT)
+    return kwargs
 
 
 def ple_parameters(model: Any) -> list[tuple[str, Any]]:
@@ -225,6 +591,10 @@ def assemble(
     applied += names
     optimizer, names = _optimizer(model.parameters(), config, device)
     applied += names
+    # Before the loss is built, not after: an axis that no batch of this run's data
+    # can turn on is refused here rather than named applied and crashed at step 1.
+    if config.loss.name == "cached_mnrl":
+        _gradcache_needs_splittable_data(dataset)
     loss, names = _loss(config)
     applied += names
     loader, names = _dataloader(dataset, config)
@@ -355,29 +725,89 @@ def _peft(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
     return adapted, ["peft.mode"]
 
 
+# Which operators `gradient_checkpointing=selective` keeps rather than recomputes.
+# The policy *is* the axis: two different save lists measure two different
+# techniques, so this one is transcribed rather than chosen. It is torch's own
+# `compute_intensive_ops` (torch 2.13.0,
+# `torch/_functorch/partitioners.py::get_default_op_list`) — the classification the
+# min-cut partitioner already uses to decide what is too expensive to recompute.
+# Taking it whole leaves no per-operator judgement of ours to defend, and it is the
+# list the published "save the matmuls" policy is made of.
+#
+# Kept verbatim including `convolution_backward`, which cannot appear inside the
+# forward region a checkpoint context wraps: dropping entries would turn a
+# transcription back into a selection.
+#
+# Packets rather than overloads because that is the granularity torch classifies
+# at (`get_aten_target` reduces a node's target to its `overloadpacket`), and
+# because a list of overloads would silently stop covering `aten.mm.out` and
+# friends. `create_selective_checkpoint_contexts` rejects packets in list form, so
+# the comparison goes through a policy function instead.
+SELECTIVE_CHECKPOINT_SAVED_OPS = (
+    torch.ops.aten.mm,
+    torch.ops.aten.convolution,
+    torch.ops.aten.convolution_backward,
+    torch.ops.aten.bmm,
+    torch.ops.aten.addmm,
+    torch.ops.aten._scaled_dot_product_flash_attention,
+    torch.ops.aten._scaled_dot_product_efficient_attention,
+    torch.ops.aten._flash_attention_forward,
+    torch.ops.aten._efficient_attention_forward,
+    torch.ops.aten.upsample_bilinear2d,
+    torch.ops.aten._scaled_mm,
+)
+
+
+def selective_checkpoint_policy(ctx: Any, op: Any, *args: Any, **kwargs: Any) -> Any:
+    """Save the compute-intensive operators, recompute everything else.
+
+    `MUST_SAVE` rather than `PREFER_SAVE`: torch documents `MUST_*` as the form
+    "the policy should not be overridden by other subsystems like torch.compile"
+    (`torch/utils/checkpoint.py`, `CheckpointPolicy`). `compile.mode` is crossed
+    with this axis in the ablation, and under `PREFER_SAVE` the compiled cells
+    would be measuring inductor's partitioner decision under this axis's label.
+    """
+    packet = getattr(op, "overloadpacket", op)
+    if packet in SELECTIVE_CHECKPOINT_SAVED_OPS:
+        return torch.utils.checkpoint.CheckpointPolicy.MUST_SAVE
+    return torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+
+
 def _gradient_checkpointing(model: Any, config: BenchConfig) -> list[str]:
     """Trade compute for activation memory.
 
     `use_reentrant=False` is not a tuning choice here: the reentrant variant skips
     the recomputation entirely when no input to a checkpointed block requires
     grad, which is exactly what a frozen vision tower produces — and `freeze.*`
-    and this axis are crossed in the ablation.
+    and this axis are crossed in the ablation. `selective` additionally has no
+    choice: `context_fn` is only honoured by the non-reentrant implementation.
+
+    `selective` goes through the same hook as `full` rather than walking the module
+    tree, because transformers turns `gradient_checkpointing_kwargs` into
+    `functools.partial(torch.utils.checkpoint.checkpoint, **kwargs)` and hands that
+    partial to every block that checkpoints (`PreTrainedModel._set_gradient_checkpointing`,
+    transformers 5.14.1). So the difference between the two values is entirely the
+    `context_fn` in those kwargs, and that partial is also what
+    `applied._capture_gradient_checkpointing` reads back off the modules.
     """
     mode = config.train.gradient_checkpointing
     if mode == "none":
         return []
-    if mode != "full":
-        raise UnappliedAxis(
-            f"train.gradient_checkpointing={mode} needs a policy for "
-            "torch.utils.checkpoint.create_selective_checkpoint_contexts; not implemented."
-        )
+    if mode not in ("full", "selective"):
+        raise UnappliedAxis(f"train.gradient_checkpointing={mode} has no implementation here.")
     enable = getattr(model, "gradient_checkpointing_enable", None)
     if not callable(enable):
         raise UnappliedAxis(
             f"{type(model).__name__} has no gradient_checkpointing_enable, so nothing here "
-            "can turn train.gradient_checkpointing=full on for it."
+            f"can turn train.gradient_checkpointing={mode} on for it."
         )
-    enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    kwargs: dict[str, Any] = {"use_reentrant": False}
+    if mode == "selective":
+        kwargs["context_fn"] = functools.partial(
+            torch.utils.checkpoint.create_selective_checkpoint_contexts,
+            selective_checkpoint_policy,
+        )
+    enable(gradient_checkpointing_kwargs=kwargs)
     return ["train.gradient_checkpointing"]
 
 
@@ -412,20 +842,104 @@ def _compile(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
 def _optimizer(params: Any, config: BenchConfig, device: torch.device) -> tuple[Any, list[str]]:
     """`fused` follows the device: the fused AdamW kernel is CUDA-only and asking
     for it on CPU raises. The capture probe reports the unfused case as a
-    different applied value, so a CPU run cannot report a fused number."""
-    if config.optim.name != "adamw_fused":
-        raise UnappliedAxis(
-            f"optim={config.optim.name} has no implementation here; adamw_8bit needs "
-            "bitsandbytes and muon needs a Muon implementation, neither of which is in "
-            "any environment yet (audit: axis-packages)."
+    different applied value, so a CPU run cannot report a fused number.
+
+    Muon comes from `pytorch-optimizer` rather than from a copy written here.
+    `envs/native/pyproject.toml` pins that distribution for this axis and
+    `audit_plan.py`'s `AXIS_PACKAGES` maps `optim/muon` onto it, so a local
+    reimplementation would make both of those records false while changing what
+    gets measured: the number this benchmark publishes should be the one a
+    practitioner gets from the library everyone installs, not from our own
+    Newton-Schulz loop.
+
+    **How the parameters are split, and what that qualifies.** Muon orthogonalises
+    a >=2D update and has nothing to do to a 1D one, so the split here is
+    `p.ndim >= 2` into the Muon group and everything below it into the internal
+    AdamW group — two param groups, which is what `applied._capture_optim` records
+    as `param_groups`. The usual further exclusion — embedding tables and the LM
+    head to AdamW as well — is **not** applied, because it cannot be: this function
+    receives `model.parameters()`, an iterable with no names attached, and every
+    way of telling an embedding matrix from a hidden weight matrix needs the names
+    or the modules. `docs/methodology.md` states the consequence as a condition on
+    reading any Muon row, because it is not a code detail: under this split
+    gemma-4's PLE tables go *through* Newton-Schulz rather than around it, which is
+    the opposite of the arrangement PLAN.md's gemma-4 hypothesis is about.
+
+    `adamw_8bit` stays refused on the same grounds as `peft.mode=qlora`:
+    bitsandbytes' 8-bit optimizer state is a CUDA kernel, so implementing it from a
+    machine that cannot run one would mean shipping the path unrun.
+    """
+    if config.optim.name == "adamw_fused":
+        built = torch.optim.AdamW(
+            params,
+            lr=config.optim.lr,
+            weight_decay=config.optim.weight_decay,
+            fused=device.type == "cuda",
         )
-    built = torch.optim.AdamW(
-        params,
-        lr=config.optim.lr,
-        weight_decay=config.optim.weight_decay,
-        fused=device.type == "cuda",
-    )
-    return built, ["optim.name"]
+        return built, ["optim.name"]
+    if config.optim.name != "muon":
+        raise UnappliedAxis(
+            f"optim={config.optim.name} has no implementation here; adamw_8bit is "
+            "bitsandbytes' 8-bit optimizer state, which is a CUDA kernel — the package is "
+            "in envs/native but nothing here can run one, so it stays refused rather than "
+            "measured as plain AdamW under an 8-bit label."
+        )
+
+    # `pytorch-optimizer` is pinned by `envs/native/pyproject.toml` and by the root
+    # `native` extra, not by the `compose` extra the documented setup command
+    # installs — so the import fails on a clean clone and in five of the six
+    # framework images. Refused rather than raised for the same reason
+    # `_patch_liger` wraps its import: an axis the environment cannot provide is an
+    # unapplied axis, and a bare ModuleNotFoundError takes down `assemble` mid-way
+    # instead of being reported as this one axis being unavailable here.
+    try:
+        from pytorch_optimizer import Muon
+    except ImportError as exc:
+        raise UnappliedAxis(
+            f"optim=muon needs pytorch-optimizer, which is not importable here ({exc}). "
+            "It is pinned by envs/native and by the root 'native' extra; the documented "
+            "setup command installs the 'compose' extra, which does not carry it."
+        ) from exc
+
+    held = list(params)
+    orthogonalised = [p for p in held if p.ndim >= 2]
+    elementwise = [p for p in held if p.ndim < 2]
+    # Counted over the *trainable* tensors: a frozen parameter has no gradient, so
+    # Muon skips it at the step and it never enters Newton-Schulz. Counting it here
+    # would let a model whose every matrix is frozen past a guard whose whole
+    # sentence is that the run would then be AdamW under Muon's name — which is
+    # exactly what it would be, since only the 1D tensors would still be stepping.
+    if not any(p.requires_grad for p in orthogonalised):
+        raise UnappliedAxis(
+            "optim=muon orthogonalises the >=2D tensors and hands the rest to an internal "
+            "AdamW; this model has no trainable >=2D parameter, so every tensor that steps "
+            "would take the AdamW path and the run would be AdamW measured under Muon's name."
+        )
+    # `use_muon` is required on every group — `Muon.__init__` raises without it —
+    # and it is what routes a group to Newton-Schulz or to the internal AdamW.
+    # Both groups take the configured lr: `OptimConfig` has one, and giving the
+    # AdamW half a second, invented one would put a number in the measured path
+    # that no config records. Muon rescales it per tensor internally
+    # (`get_adjusted_lr`), which is the library's behaviour and not ours to
+    # restate here.
+    groups: list[dict[str, Any]] = [
+        {
+            "params": orthogonalised,
+            "use_muon": True,
+            "lr": config.optim.lr,
+            "weight_decay": config.optim.weight_decay,
+        }
+    ]
+    if elementwise:
+        groups.append(
+            {
+                "params": elementwise,
+                "use_muon": False,
+                "lr": config.optim.lr,
+                "weight_decay": config.optim.weight_decay,
+            }
+        )
+    return Muon(groups), ["optim.name"]
 
 
 def _dataloader(dataset: Any, config: BenchConfig) -> tuple[Any, list[str]]:
@@ -437,48 +951,688 @@ def _dataloader(dataset: Any, config: BenchConfig) -> tuple[Any, list[str]]:
             f"dataloader.backend={config.dataloader.backend} builds its own iterator; "
             "not implemented."
         )
-    if config.dataloader.packing or config.dataloader.pretokenize:
-        raise UnappliedAxis("dataloader packing/pretokenize are not implemented.")
     if dataset is None:
         return None, []
+    applied = ["dataloader.backend"]
+
+    # packing lives in the collate, which is the only place a batch is assembled —
+    # and the only place `applied._capture_dataloader_packing` looks. Left at None
+    # the loader takes torch's own collate, which pads and cannot pack; that is
+    # positive evidence of `False` rather than the absence of evidence.
+    collate = None
+    if config.dataloader.packing:
+        collate = PackedCollate()
+        applied.append("dataloader.packing")
+
+    if config.dataloader.pretokenize:
+        if not tokenized_columns(dataset):
+            raise UnappliedAxis(
+                f"dataloader.pretokenize=true, but the dataset declares "
+                f"{declared_columns(dataset)} and none of {list(TOKENIZED_COLUMNS)}; "
+                "tokenising needs the model's processor, which this module never sees, so "
+                "the caller pretokenises with axes.pretokenize(dataset, encode) before "
+                "assemble. Building the loader anyway would leave the tokenisation inside "
+                "the timed step under a pretokenized label."
+            )
+        if not tokenized_row(dataset):
+            raise UnappliedAxis(
+                f"dataloader.pretokenize=true and the dataset declares "
+                f"{declared_columns(dataset)}, but its first row carries none of "
+                f"{list(TOKENIZED_COLUMNS)}. Column names are what a dataset says about "
+                "itself; the row is what the timed step is handed, and only the second one "
+                "is evidence. This catches a dataset that advertises token ids it does not "
+                "hand over. It does not catch one that tokenises inside __getitem__ — that "
+                "row carries ids too — which is why axes.pretokenize is what owns the move "
+                "out of the timed window and what the tests attack for it."
+            )
+        applied.append("dataloader.pretokenize")
+
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.train.batch_size,
         num_workers=config.data.num_workers,
+        collate_fn=collate,
     )
     # The backend axis is only applied once a loader exists; without a dataset
-    # nothing was decided, and the capture probe reports it undetermined. packing
-    # and pretokenize are not named: both are false here, and false is the absence
-    # of an application rather than one.
-    return loader, ["dataloader.backend"]
+    # nothing was decided, and the capture probe reports it undetermined. An axis
+    # left at `false` is not named: false is the absence of an application rather
+    # than one, and `applied.capture` reads what the loader actually got either way.
+    #
+    # A `pretokenize=false` request over rows that arrive tokenised anyway is not
+    # refused here. Nothing was applied, so there is nothing for this function to
+    # say — and the capture probe reads `True` off the dataset and blocks the run,
+    # which is the check being in the half that inspects rather than the half that
+    # asks.
+    return loader, applied
 
 
-def _loss(config: BenchConfig) -> tuple[Any, list[str]]:
-    """GradCache is refused rather than approximated: it changes the gradient
-    computation, and measuring plain in-batch negatives under its name would
-    report a speedup for work that was never done."""
-    if config.loss.name == "cached_mnrl":
-        raise UnappliedAxis(
-            "loss=cached_mnrl needs a GradCache implementation and its own numerical "
-            "equivalence test before it can be measured (PLAN.md, Wave 3)."
+def declared_columns(dataset: Any) -> list[str] | None:
+    """The column names a dataset declares, or None if it declares none.
+
+    None and `[]` are different answers and the difference is the whole point:
+    a dataset that says nothing leaves `dataloader.pretokenize` undetermined,
+    while one that lists its columns has answered. Defined here rather than inside
+    the capture probe because `_dataloader` has to ask the same question before it
+    will claim the axis, and two readings of "what columns does this have" would
+    drift the way the two column lists in D1 did.
+    """
+    columns = getattr(dataset, "column_names", None)
+    if columns is None:
+        features = getattr(dataset, "features", None)
+        columns = list(features) if features is not None else None
+    return None if columns is None else sorted(columns)
+
+
+def tokenized_row(dataset: Any) -> bool:
+    """Whether the dataset's first row really hands over token ids.
+
+    One row, because that is the cheapest question that touches the data instead of
+    its description — and the difference between the two is the whole of what this
+    answers. A dataset with no first row answers False: an empty dataset makes every
+    downstream check pass by having nothing to examine. So does one that cannot be
+    indexed at all (an iterable dataset) — nothing here can read what it will yield,
+    and an unreadable dataset that blocks the run is the safe half of the two ways
+    to be wrong about it.
+    """
+    try:
+        row = dataset[0]
+    except (IndexError, KeyError, TypeError, StopIteration):
+        return False
+    keys = row.keys() if hasattr(row, "keys") else ()
+    return any(column in keys for column in TOKENIZED_COLUMNS)
+
+
+def tokenized_columns(dataset: Any) -> list[str] | None:
+    """Which of `TOKENIZED_COLUMNS` a dataset declares; None if it declares none."""
+    columns = declared_columns(dataset)
+    return None if columns is None else sorted(set(columns) & set(TOKENIZED_COLUMNS))
+
+
+def image_columns(dataset: Any) -> list[str] | None:
+    """Which of a dataset's columns put an image in a row; None if it does not say.
+
+    Two readings, and the cheaper one first:
+
+    * a declared `datasets.Image` feature is the Hub's own statement that the
+      column holds images, and reading a row to confirm it would decode the very
+      image the declaration names;
+    * otherwise the `IMAGE_COLUMNS` names are checked against the rows themselves.
+      The name alone is not the answer: a subset can carry the column and no image
+      in it — four of the twenty MMEB configs have no `qry_image` and thirteen no
+      `pos_image`, and `scripts/bench.py::Collate` skips a `None` there — so
+      refusing on the name would refuse a text-only draw stored in the subset's
+      schema, which is a different and false claim. The rows are read only when
+      nothing declares its types, which is the in-memory
+      `scripts/bench.py::PairDataset` case; nothing is decoded that the dataset had
+      not already materialised.
+
+    `None` and `[]` are different answers, and the difference is the point: a
+    dataset that declares no columns, or whose rows are not mappings, has not said
+    there are no images. `_gradcache_needs_splittable_data` turns the two into two
+    different refusals rather than letting silence pass as text-only.
+    """
+    columns = declared_columns(dataset)
+    if columns is None:
+        return None
+    features = getattr(dataset, "features", None)
+    if features:
+        return sorted(
+            column for column in columns if type(features.get(column)).__name__ == "Image"
         )
-    if config.loss.name != "mnrl":
-        raise UnappliedAxis(f"loss={config.loss.name} has no implementation here.")
-    if config.parallel.cross_device_negatives:
+    named = [column for column in columns if column in IMAGE_COLUMNS]
+    if not named:
+        return []
+    try:
+        rows = [dataset[index] for index in range(len(dataset))]
+    except TypeError:
+        return None
+    if not all(hasattr(row, "get") for row in rows):
+        return None
+    return sorted(column for column in named if any(row.get(column) is not None for row in rows))
+
+
+class PretokenizedDataset(torch.utils.data.Dataset):
+    """Rows tokenised before the timed window opened.
+
+    Declares `column_names` because that is the only place the difference shows:
+    `pretokenize` does not change what the loader is, it changes what the loader is
+    handed, so both `_dataloader` and `applied._capture_dataloader_pretokenize`
+    read the answer off the dataset.
+    """
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            raise ValueError(
+                "pretokenizing produced no rows; an empty dataset would make every "
+                "downstream check pass by having nothing to examine"
+            )
+        self.rows = rows
+        self.column_names = sorted({key for row in rows for key in row})
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return self.rows[index]
+
+
+def pretokenize(dataset: Any, encode: Any) -> PretokenizedDataset:
+    """Run `encode` over every row now, so the measured step does not.
+
+    This is the whole of `dataloader.pretokenize=true`: the tokenisation does not
+    change, it moves out of the timed window. `encode` is passed in because
+    tokenising needs the model's processor and this module never sees one — what
+    this module owns is that the move happened and that the result says so.
+
+    An `encode` that returns rows without token ids is refused rather than
+    accepted: the work would still be inside the step while the run reported the
+    axis as applied, which is the substitution `UnappliedAxis` exists for.
+    """
+    rows = [encode(dataset[index]) for index in range(len(dataset))]
+    tokenized = PretokenizedDataset(rows)
+    if not tokenized_columns(tokenized):
         raise UnappliedAxis(
-            "parallel.cross_device_negatives needs an all-gather inside the loss; not implemented."
+            f"encode produced columns {tokenized.column_names}, none of them "
+            f"{list(TOKENIZED_COLUMNS)}; the rows are not tokenised, so the tokenisation is "
+            "still inside the timed step and pretokenize would be a label on unchanged work."
         )
-    temperature = config.loss.temperature
+    return tokenized
+
+
+class PackedCollate:
+    """A batch as one concatenated sequence instead of a padded rectangle.
+
+    Padding is what packing removes: `batch_size` rows of differing length become
+    a single `(1, total)` row, and where each sequence ends travels with the batch
+    as `cu_seqlens` — the cumulative-length vector varlen attention kernels take,
+    and the same vector `embedding.packed_last_token_pool` pools on. The speedup is
+    theirs, not this collate's: without a varlen kernel this produces one long
+    sequence and the attention is quadratic over it. That half is unmeasured here —
+    there is no GPU in this checkout.
+
+    `position_ids` restarts at 0 per sequence. Without it a packed batch is one
+    long sequence to any positional encoding, and the rows would attend across
+    their own boundaries.
+
+    A class rather than a closure for the reasons `scripts/bench.py::Collate`
+    gives: `applied._capture_dataloader_packing` reads `axis_packing` off the
+    collate, and `configs/data/*.yaml` set `num_workers: 8`, which a local closure
+    cannot be pickled into.
+
+    `tokenize` is optional because this module has no processor. With it, it takes
+    the raw rows of one batch and returns one 1-D tensor of token ids per sequence,
+    in the order the loss expects to find them; without it the rows must already
+    carry `input_ids`, which is what `dataloader.pretokenize=true` produces.
+
+    Both paths are checked for padding rather than asked about it, because a padded
+    batch packed here is the one failure this class cannot survive: PAD concatenated
+    into the pack is counted by tokens/s as work the model did, and
+    `packed_last_token_pool` reads some sequences' embedding off a PAD position —
+    while the run still certifies `dataloader.packing=True`, since that answer comes
+    off `axis_packing` below. A padding batch tokenizer (`pad_sequence`, or a
+    tokenizer left at its default `padding=True`) is the natural thing to hand
+    `tokenize`, so `pad_id` is required with it and every sequence is searched for
+    that id; rows that arrive with an `attention_mask` have already recorded where
+    their padding is, and that record is read.
+
+    A checkpoint whose pad id *is* its eos id cannot be checked this way: real
+    sequences would end in it and this refuses them. That refusal is the honest
+    outcome — pretokenize instead, where each row is tokenised alone and no padding
+    is written at all.
+    """
+
+    # Read back by applied._capture_dataloader_packing. Declared rather than
+    # inferred: an unrecognised collate is undetermined there, which is what keeps
+    # a hand-rolled one from being read as either answer.
+    axis_packing = True
+
+    def __init__(self, tokenize: Any = None, pad_id: int | None = None) -> None:
+        if tokenize is not None and pad_id is None:
+            raise ValueError(
+                "PackedCollate(tokenize=...) needs pad_id as well: this path calls a "
+                "tokenizer on the raw batch, every batch tokenizer pads by default, and "
+                "PAD packed as a real token inflates tokens/s and becomes some sequence's "
+                "pooled embedding while the run still reports packing as applied. Tokenise "
+                "with padding=False and pass the id the tokenizer would have padded with."
+            )
+        self.tokenize = tokenize
+        self.pad_id = pad_id
+
+    def _sequences(self, rows: list[Any]) -> list[torch.Tensor]:
+        if self.tokenize is not None:
+            produced = self.tokenize(rows)
+            if isinstance(produced, torch.Tensor):
+                raise ValueError(
+                    f"tokenize returned a single {tuple(produced.shape)} tensor. A rectangle "
+                    "is a padded batch; iterating its rows would pack every PAD in it as a "
+                    "real token. Return one 1-D tensor of ids per sequence instead."
+                )
+            sequences = [torch.as_tensor(sequence) for sequence in produced]
+        else:
+            missing = [i for i, row in enumerate(rows) if "input_ids" not in row]
+            if missing:
+                raise RuntimeError(
+                    f"rows {missing[:8]} carry no 'input_ids' and this collate was built "
+                    "without a tokenize callable, so there is nothing to pack. Either set "
+                    "dataloader.pretokenize=true or hand PackedCollate a tokenizer."
+                )
+            self._refuse_masked_padding(rows)
+            sequences = [torch.as_tensor(row["input_ids"]) for row in rows]
+        flat = []
+        for index, sequence in enumerate(sequences):
+            if sequence.dim() != 1:
+                raise ValueError(
+                    f"sequence {index} has shape {tuple(sequence.shape)}; a pack is built out "
+                    "of 1-D sequences and flattening a rectangle here would pack its padding "
+                    "as content. Give one 1-D tensor per sequence (squeeze a (1, n) row)."
+                )
+            flat.append(sequence)
+        self._refuse_pad_id(flat)
+        empty = [i for i, sequence in enumerate(flat) if sequence.numel() == 0]
+        if empty:
+            raise ValueError(
+                f"sequences {empty[:8]} are empty; a zero-length sequence has no last token "
+                "to pool, and packing it would silently give it the previous sequence's."
+            )
+        return flat
+
+    @staticmethod
+    def _refuse_masked_padding(rows: list[Any]) -> None:
+        """A row that carries an `attention_mask` has already said where its PAD is.
+
+        Tokenising a batch of rows ahead of time with a padding tokenizer produces
+        exactly that: ids padded to the longest row of the batch, and a mask that
+        records it. The mask is the one place the row admits the padding, so it is
+        read rather than trusted — without it the ids alone are indistinguishable
+        from a genuinely uniform batch.
+        """
+        padded = []
+        for index, row in enumerate(rows):
+            mask = row.get("attention_mask") if hasattr(row, "get") else None
+            if mask is None:
+                continue
+            mask = torch.as_tensor(mask).reshape(-1)
+            ids = torch.as_tensor(row["input_ids"]).reshape(-1)
+            if mask.numel() != ids.numel():
+                raise ValueError(
+                    f"row {index} carries {ids.numel()} ids and a {mask.numel()}-long "
+                    "attention_mask; the mask is this row's only record of where its padding "
+                    "is, and one that does not describe the row cannot be read as either answer."
+                )
+            real = int(mask.sum())
+            if real != mask.numel():
+                padded.append(f"{index} ({mask.numel() - real} of {mask.numel()} PAD)")
+        if padded:
+            raise ValueError(
+                f"rows {padded[:8]} arrive padded, by their own attention_mask. Packing them "
+                "would concatenate PAD as real tokens: tokens/s would count work the model "
+                "never did and packed_last_token_pool would read a PAD as some sequence's "
+                "embedding. Tokenise each row on its own, with padding=False."
+            )
+
+    def _refuse_pad_id(self, sequences: list[torch.Tensor]) -> None:
+        """No sequence may contain the id the tokenizer pads with.
+
+        The `attention_mask` check above covers rows that brought their own record;
+        this covers the `tokenize` path, where the callable returns bare id tensors
+        and a padding tokenizer is the default one. `pad_id` is None only on the
+        pretokenized path, where the caller tokenised row by row and had nothing to
+        pad against — stated in the class docstring, and the reason it stays
+        optional there rather than becoming a second declaration to trust.
+        """
+        if self.pad_id is None:
+            return
+        contaminated = [
+            f"{index} ({int((sequence == self.pad_id).sum())} of {sequence.numel()})"
+            for index, sequence in enumerate(sequences)
+            if bool((sequence == self.pad_id).any())
+        ]
+        if contaminated:
+            raise ValueError(
+                f"sequences {contaminated[:8]} contain pad id {self.pad_id}. Every token in a "
+                "packed batch is measured as a real one and can be pooled as a sequence's "
+                "embedding, so a pack holding PAD reports a throughput and an embedding that "
+                "belong to neither the model nor the data. Tokenise with padding=False."
+            )
+
+    def __call__(self, rows: list[Any]) -> dict[str, torch.Tensor]:
+        if not rows:
+            raise ValueError("packing an empty batch; there is nothing to measure in it")
+        sequences = self._sequences(rows)
+        lengths = torch.tensor([sequence.numel() for sequence in sequences], dtype=torch.int32)
+        cu_seqlens = torch.zeros(len(sequences) + 1, dtype=torch.int32)
+        cu_seqlens[1:] = torch.cumsum(lengths, dim=0, dtype=torch.int32)
+        return {
+            "input_ids": torch.cat(sequences).unsqueeze(0),
+            "position_ids": torch.cat(
+                [torch.arange(sequence.numel()) for sequence in sequences]
+            ).unsqueeze(0),
+            "cu_seqlens": cu_seqlens,
+            "seq_lengths": lengths,
+        }
+
+
+def _gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
+    """Every rank's rows, concatenated in rank order, with this rank's slice still
+    attached to its own graph.
+
+    `dist.all_gather` writes into pre-allocated buffers, and those buffers carry
+    no autograd history. A loss built on its raw output therefore produces *no*
+    gradient for the local embeddings at all: the step runs, the timer records it,
+    and the model has learned nothing. Assigning the local tensor back over its own
+    slice before the concatenation is what restores that path, and it is the whole
+    reason this is not two lines of `dist.all_gather`.
+
+    The other ranks' rows stay constants here, so this rank ends up holding
+    d(world loss)/d(its own embeddings) and nothing else. Summing those partial
+    terms across ranks is a gradient all-reduce — which is DDP's job, and
+    `parallel.strategy=ddp` is still refused by `assemble`. Until it is not, a
+    multi-rank run of this axis measures the loss's cost correctly and trains
+    incorrectly; that is stated in the closure below and in the report, rather
+    than hidden by a scale factor chosen to make one line look right.
+    """
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        raise RuntimeError(
+            "parallel.cross_device_negatives=true needs an initialised process group; "
+            "this process has none, so there are no other ranks to draw negatives from. "
+            "The axis is applied — the loss gathers — and this is where a run without a "
+            "world dies, before it has produced a number."
+        )
+    world = dist.get_world_size()
+    if world < 2:
+        raise RuntimeError(
+            "parallel.cross_device_negatives=true with world_size=1 gathers nothing: the "
+            "loss is exactly plain in-batch MNRL, and it would be reported under the "
+            "cross-device label. Run it on more than one rank or turn the axis off."
+        )
+    gathered = [torch.zeros_like(tensor) for _ in range(world)]
+    dist.all_gather(gathered, tensor.contiguous())
+    gathered[dist.get_rank()] = tensor
+    return torch.cat(gathered, dim=0)
+
+
+def _in_batch_scoring(temperature: float, gather: bool) -> tuple[Any, bool]:
+    """The `(queries, documents) -> loss` half of both losses, and a literal saying
+    whether the closure that was built gathers.
+
+    The bool is returned by the branch that built the closure rather than copied
+    from the config, because `applied._capture_cross_device_negatives` reads it off
+    the loss as the evidence of what the loss does. A value copied from the request
+    would make that probe a mirror of the request.
+
+    Both sides are gathered, not the documents alone. `info_nce` labels row i with
+    column i, and `all_gather` returns buffers in rank order, so rank r's local row
+    i lands at global index `r * local_rows + i` on *both* sides: the positive is
+    still the diagonal and `info_nce` is reused exactly as it is. Gathering only
+    the documents would leave a (local, world) matrix needing an explicit
+    `rank * local_rows` label offset — a second, hand-written spelling of which
+    column is the positive, which is the kind of arithmetic that is wrong silently.
+    `tests/test_axes.py` pins the ordering invariant that replaces it.
+
+    The cost is real and is part of what the axis measures: every rank scores the
+    full world-by-world matrix, so the similarity compute is duplicated world-fold
+    while the negatives per row grow by the same factor.
+    """
+    if gather:
+
+        def mnrl_across_ranks(queries: torch.Tensor, documents: torch.Tensor) -> torch.Tensor:
+            return info_nce(_gather_with_grad(queries), _gather_with_grad(documents), temperature)
+
+        return mnrl_across_ranks, True
 
     def mnrl(queries: torch.Tensor, documents: torch.Tensor) -> torch.Tensor:
         return info_nce(queries, documents, temperature)
 
-    # Read back by applied._capture_loss: the function's identity is the only
-    # evidence of which loss a run actually computed.
-    mnrl.axis_value = "mnrl"
-    # A literal set by the branch that built the non-gathering closure, not a copy
-    # of the config. `mnrl` above computes similarities over the local batch only,
-    # so this records what the function does, and a loss built anywhere else
-    # declares nothing and comes back undetermined.
-    mnrl.axis_cross_device_negatives = False
-    return mnrl, ["loss.name"]
+    return mnrl, False
+
+
+def _rng_state(device: torch.device) -> dict[str, Any]:
+    """Enough of the RNG state to replay one forward pass.
+
+    GradCache runs every piece of the batch twice — once under `no_grad` to build
+    the cache and once with a graph to consume it — and the two passes have to be
+    the same function of the same weights. Under `model.train()` they are not:
+    dropout draws a fresh mask each call (`peft.dropout` is an ablation setting in
+    this study, and attention dropout is live in train mode), so the recomputed
+    representations would not be the ones the cached gradient was computed for.
+    The result is a wrong gradient that still looks like a gradient — the exact
+    shape of failure `docs/review-findings.md` asks the equivalence test to rule
+    out.
+
+    The `cuda` branch has no execution evidence: this suite runs on CPU and every
+    measured run is CUDA, so what a real device's generator does across the two
+    passes is 측정 안 함 and needs a GPU pod. `tests/test_axes.py` pins the branch's
+    shape — which device is read and which is written back — against stand-ins for
+    `torch.cuda`'s two calls, and that is all it pins.
+    """
+    state: dict[str, Any] = {"cpu": torch.get_rng_state()}
+    if device.type == "cuda":
+        state["cuda"] = torch.cuda.get_rng_state(device)
+    return state
+
+
+def _restore_rng(state: dict[str, Any], device: torch.device) -> None:
+    """Put the RNG back where `_rng_state` found it, so the recompute replays."""
+    torch.set_rng_state(state["cpu"])
+    if "cuda" in state:
+        torch.cuda.set_rng_state(state["cuda"], device)
+
+
+def _split_rows(batch: dict[str, Any], size: int) -> list[dict[str, Any]]:
+    """The batch cut into `size`-row pieces along the batch dimension.
+
+    Sliced rather than re-collated: the padded width stays whatever the collate
+    produced, so a piece is the same tensor content as the corresponding rows of
+    the whole batch and the recomputed representations are the same numbers.
+
+    A tensor whose leading dimension is not the row count stops the split. This is
+    the multimodal case and it is refused rather than guessed: `pixel_values`
+    counts patches for the Qwen models and images for gemma-4, and which of them
+    belongs to which row is recoverable only from that model's own placeholder
+    accounting. Splitting it by position would hand one row's pixels to another
+    row, and nothing downstream can tell a wrong embedding from a right one.
+    Non-tensor entries are refused on the same grounds — they cannot be shown to be
+    row-aligned, and a value silently copied into every piece is a value shared by
+    rows it does not describe.
+    """
+    mask = batch.get("attention_mask")
+    if not torch.is_tensor(mask):
+        raise RuntimeError(
+            "loss=cached_mnrl splits the batch by rows and pools with attention_mask; "
+            "this batch has none, so neither the split nor the pooling is defined."
+        )
+    rows = int(mask.shape[0])
+    if rows % 2:
+        raise RuntimeError(
+            f"{rows} rows is odd, but queries and documents are the two halves of this "
+            "batch; the pairing that InfoNCE scores would be off by one."
+        )
+    unattributable = sorted(
+        key
+        for key, value in batch.items()
+        if not torch.is_tensor(value) or value.shape[:1] != mask.shape[:1]
+    )
+    if unattributable:
+        raise RuntimeError(
+            f"loss=cached_mnrl cannot split {unattributable} by rows: they do not carry one "
+            f"leading entry per row ({rows}). pixel_values is the case this stops — its "
+            "leading dimension counts patches (Qwen-VL) or images (gemma-4), and mapping "
+            "those back to rows needs that model's own placeholder accounting. Until that "
+            "mapping exists GradCache is refused for multimodal batches rather than run on "
+            "pixels attributed to the wrong row."
+        )
+    return [
+        {key: value[start : start + size] for key, value in batch.items()}
+        for start in range(0, rows, size)
+    ]
+
+
+def _gradcache_needs_splittable_data(dataset: Any) -> None:
+    """Refuse `loss=cached_mnrl` unless the data this run reads can be split by rows.
+
+    `_split_rows` is the per-batch half of this and it is fail-closed, but an axis
+    whose every batch it refuses is not an applicable axis: `assemble` would name
+    `loss.name` applied, `applied.capture` would agree with the request, and the run
+    would die at step 1 — after the axis had been counted. `axis-values` in
+    `scripts/audit_plan.py` counts exactly that report and never reaches a batch, so
+    without this refusal the axis reads as applicable while no measured run can turn
+    it on. That is the "the check passed and there was nothing to check" shape this
+    repository keeps producing, and the honest answer is to refuse here.
+
+    Today that refusal covers every configured run. Both subsets are MMEB draws —
+    `configs/data/speed.yaml` records "0 rows without a query image or positive" —
+    and all three models are VL models whose processor turns those images into
+    `pixel_values`, whose leading dimension counts patches (Qwen-VL) or images
+    (gemma-4) rather than rows. So `loss=cached_mnrl` is *not applicable* to this
+    study as configured. It becomes applicable without a change here the moment a
+    text-only subset is configured; making it applicable to the image subsets needs
+    the row->pixel mapping `_split_rows` describes.
+
+    A dataset that says nothing about itself is refused too, and that is not
+    pedantry: not knowing is not evidence that the batches are splittable, and this
+    function exists precisely so that a run which cannot be split is never first
+    counted as one that can.
+    """
+    carried = image_columns(dataset)
+    if carried is None:
+        raise UnappliedAxis(
+            "loss=cached_mnrl splits the batch by rows, and this run's dataset "
+            f"({type(dataset).__name__}) does not say whether its rows carry images: it "
+            "declares no columns, or no rows this can read as mappings. An image becomes "
+            "pixel_values, which _split_rows cannot attribute to rows, so the axis is "
+            "refused here rather than reported applied and then crashed at the first batch."
+        )
+    if carried:
+        raise UnappliedAxis(
+            f"loss=cached_mnrl cannot run on this dataset: {carried} carry images, and a "
+            "processed batch of them holds pixel_values, whose leading dimension counts "
+            "patches (Qwen-VL) or images (gemma-4) rather than rows. _split_rows refuses "
+            "every such batch, so applying the axis here would report it applied and then "
+            "die at step 1. Both configs/data subsets are MMEB draws with an image on "
+            "nearly every row: until a row->pixel mapping exists, this axis is not "
+            "applicable to them."
+        )
+
+
+def _loss(config: BenchConfig) -> tuple[Any, list[str]]:
+    """The loss a run computes, and where its negatives come from.
+
+    Whether `cached_mnrl` can run against a given run's *data* is decided in
+    `assemble` by `_gradcache_needs_splittable_data`, which is where the dataset
+    is. This function builds the arithmetic; that one decides applicability.
+
+    Two axes are decided here — `loss.name` and
+    `parallel.cross_device_negatives` — because both are properties of the same
+    closure and neither is readable anywhere else. `applied._capture_loss` and
+    `applied._capture_cross_device_negatives` read the attributes this attaches; a
+    loss built anywhere else declares nothing and comes back undetermined, which
+    blocks a reportable run.
+
+    **`cached_mnrl` is not callable as `(queries, documents)`.** GradCache is a
+    backward strategy, not a loss function: it needs the model and the batch so it
+    can encode the batch twice, and pooled embeddings are what it produces rather
+    than what it consumes. The returned callable therefore raises if called that
+    way, which is deliberate — `scripts/bench.py` currently computes `info_nce`
+    inline and never touches `built.loss_fn`, so a harness that reached for the
+    plain signature would measure ordinary in-batch negatives and label the number
+    `cached_mnrl`. Refusing to be called is what turns that into a crash on the
+    first step instead. The real entry point is `gradcache_backward`.
+    """
+    if config.loss.name not in ("mnrl", "cached_mnrl"):
+        raise UnappliedAxis(f"loss={config.loss.name} has no implementation here.")
+
+    scores, gathers = _in_batch_scoring(
+        config.loss.temperature, config.parallel.cross_device_negatives
+    )
+    # `cross_device_negatives=false` is the absence of an application rather than
+    # one, so it is not named — the convention `_apply_to_model` states. `loss.name`
+    # is named either way because a loss is always built.
+    applied = ["loss.name"] + (["parallel.cross_device_negatives"] if gathers else [])
+
+    if config.loss.name == "mnrl":
+        loss_fn = scores
+        loss_fn.axis_value = "mnrl"
+        loss_fn.axis_cross_device_negatives = gathers
+        return loss_fn, applied
+
+    # The schema guarantees both of these for cached_mnrl (`_gradcache_mini_batch_fits`):
+    # non-null, and no larger than the batch it splits.
+    mini_batch = config.loss.mini_batch
+
+    def gradcache_backward(
+        model: Any,
+        batch: dict[str, Any],
+        *,
+        padding_side: str,
+        scale: float = 1.0,
+    ) -> torch.Tensor:
+        """One batch's gradient, accumulated `mini_batch` rows at a time.
+
+        The point of GradCache is that no activation graph for more than
+        `mini_batch` rows exists at once, while the loss is still scored over every
+        row of the batch — which is what makes a contrastive batch larger than
+        memory possible, and what this axis measures.
+
+        Three passes, in order:
+
+        1. encode every piece under `no_grad`, keeping only the representations;
+        2. score all of them at once, with the representations as leaves, and read
+           `d(loss)/d(representations)` off those leaves — the cache;
+        3. encode every piece again *with* a graph and seed its backward with that
+           piece's slice of the cache.
+
+        Step 3 is where the RNG state saved in step 1 is replayed: without it
+        dropout draws different masks in the two passes and the cached gradient
+        belongs to representations that no longer exist.
+
+        `scale` multiplies the gradient, not the returned loss — the caller
+        accumulates micro-batches with `scale=1/grad_accum` and still records the
+        unscaled loss, which is the convention `scripts/bench.py` already uses.
+
+        Returns the detached loss. Nothing here reads a device tensor into Python:
+        the conversion is a synchronisation and belongs outside the timed window.
+        """
+        from trainbench.probe.steps import encode
+
+        pieces = _split_rows(batch, mini_batch)
+        device = pieces[0]["attention_mask"].device
+        states = []
+        representations = []
+        with torch.no_grad():
+            for piece in pieces:
+                states.append(_rng_state(device))
+                representations.append(encode(model, piece, padding_side))
+        cached = torch.cat(representations).detach().requires_grad_(True)
+
+        half = cached.shape[0] // 2
+        loss = scores(cached[:half], cached[half:])
+        (loss * scale).backward()
+        cache = cached.grad
+
+        start = 0
+        for piece, state in zip(pieces, states, strict=True):
+            _restore_rng(state, device)
+            with_graph = encode(model, piece, padding_side)
+            rows = with_graph.shape[0]
+            torch.autograd.backward(with_graph, grad_tensors=cache[start : start + rows])
+            start += rows
+        return loss.detach()
+
+    def cached_mnrl(queries: torch.Tensor, documents: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError(
+            "loss=cached_mnrl cannot be computed from pooled embeddings: GradCache is a "
+            "backward strategy that encodes the batch twice, so it needs the model and the "
+            "batch, not the representations. Call `built.loss_fn.gradcache_backward(model, "
+            "batch, padding_side=..., scale=...)`. Reaching for this signature would have "
+            "measured plain in-batch negatives and labelled the number cached_mnrl."
+        )
+
+    cached_mnrl.axis_value = "cached_mnrl"
+    cached_mnrl.axis_cross_device_negatives = gathers
+    cached_mnrl.gradcache_backward = gradcache_backward
+    # The split size the harness is measuring, exposed so a result can record it
+    # without re-deriving it from the config.
+    cached_mnrl.mini_batch = mini_batch
+    return cached_mnrl, applied

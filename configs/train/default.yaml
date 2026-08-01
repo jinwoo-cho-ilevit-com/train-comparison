@@ -1,3 +1,20 @@
+# The two axis knobs in this group — `gradient_checkpointing` and `offload` — are
+# varied by dotted override (`train.gradient_checkpointing=selective`), not by a
+# file per value the way `compile/` or `freeze/` do it. Hydra selects exactly one
+# file per group, so `train=selective` and `train=offload_optimizer` could never
+# appear in the same run, and the ablation crosses them. A file per value would
+# mean a file per cell of that cross, each one repeating every non-axis knob
+# below.
+#
+# This is still composition rather than a code change (convention 02), and it is
+# how the repository already varies this group in two independent places:
+# `configs/experiment/phase0-*.yaml` carries `train.batch_size=8`, and
+# `audit_plan.py`'s `AXIS_VALUE_COMPANIONS` carries `train.warmup_discard_steps=20`.
+#
+# The cost is that `audit_plan.py`'s `axis-values` cannot see these two knobs:
+# it enumerates variant *files* per group and skips `train` outright
+# (`NON_AXIS_GROUPS`), so its count does not move when a value here becomes
+# applicable. Neither exposure would change that — the check counts files.
 batch_size: 16
 grad_accum: 1
 steps: 120

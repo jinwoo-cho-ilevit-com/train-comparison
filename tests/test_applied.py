@@ -429,15 +429,28 @@ def test_a_loss_that_declares_nothing_is_undetermined(config_mapping):
 
 
 UNIMPLEMENTED_AXES = (
-    {"optim.name": "muon"},
+    # `optim.name: muon` was here. It is applied now (trainbench/axes.py::_optimizer,
+    # pytorch-optimizer's Muon) and its cases moved to tests/test_axes.py, where the
+    # refusal that remains is conditional — a model with no >=2D parameter, for which
+    # every tensor would take the internal AdamW path under Muon's name.
     {"optim.name": "adamw_8bit"},
-    {"loss.name": "cached_mnrl", "loss.mini_batch": 2},
+    # `loss.name: cached_mnrl` was here. It is applied now
+    # (trainbench/axes.py::_loss, `gradcache_backward`) and its cases moved to
+    # tests/test_axes.py, where what remains is conditional — a batch whose
+    # tensors cannot be attributed to rows, and the plain `(queries, documents)`
+    # signature, which GradCache cannot answer at all.
     {"dataloader.backend": "dali"},
-    {"dataloader.packing": True},
-    {"dataloader.pretokenize": True},
+    # `dataloader.packing` and `dataloader.pretokenize` were here. Both are applied
+    # now (trainbench/axes.py::PackedCollate, ::pretokenize) and their refusal cases
+    # moved to tests/test_axes.py, where they are conditional on what the dataset
+    # carries rather than unconditional.
     {"parallel.strategy": "zero3"},
     {"train.offload": "optimizer"},
-    {"parallel.cross_device_negatives": True},
+    # `parallel.cross_device_negatives: True` was here. It is applied now
+    # (trainbench/axes.py::_gather_with_grad) and its cases moved to
+    # tests/test_axes.py. The refusal that remains is not `assemble`'s: building
+    # the gathering closure is what applies the axis, and a process with no world
+    # to gather from raises at the first step instead — before a number.
 )
 
 

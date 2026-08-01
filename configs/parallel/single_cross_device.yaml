@@ -1,0 +1,15 @@
+# Cross-device negatives with no wrapper around the model.
+#
+# The pairing this axis is eventually for is ddp x cross_device_negatives, and it
+# is not spelled here because `axes.assemble` still refuses every strategy but
+# `single`: a `ddp_cross_device` variant would be refused for the wrapper rather
+# than exercised for the loss, and the two settings of the axis would not be
+# comparable. With `single` the only difference from `parallel=single` is where the
+# negatives come from, which is exactly what the axis is.
+#
+# Each rank runs an unsynchronised replica, so this measures the loss's cost and
+# does not train correctly. `axes._gather_with_grad` says so in as many words: the
+# gradient all-reduce that would make the world's partial terms add up is DDP's,
+# and DDP is not implemented. This is a speed setting, not a quality one.
+strategy: single
+cross_device_negatives: true

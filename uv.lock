@@ -1727,6 +1727,21 @@ wheels = [
 ]
 
 [[package]]
+name = "pytorch-optimizer"
+version = "3.10.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
+    { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/15/4e/e12eb9026eb94be8d8c763b4243845e19080c23b150441b20c00d2e45013/pytorch_optimizer-3.10.1.tar.gz", hash = "sha256:c262319cc3ae7be9f591e8728f1883d3096b9d7e15bea358b4ca20dd848c6d2a", size = 21328294, upload-time = "2026-05-23T13:57:07.094Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ee/82/7c715ba010ab8256215a0510494b4a0eedeea24860f652b89345cac594c1/pytorch_optimizer-3.10.1-py3-none-any.whl", hash = "sha256:3719842dee778de50943a6865961f5d3bd6812d28f091822d3a68385dc7481b6", size = 300837, upload-time = "2026-05-23T13:57:09.688Z" },
+]
+
+[[package]]
 name = "pyyaml"
 version = "6.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2252,6 +2267,7 @@ native = [
     { name = "datasets" },
     { name = "peft" },
     { name = "pillow" },
+    { name = "pytorch-optimizer" },
     { name = "transformers" },
 ]
 tracking = [
@@ -2280,6 +2296,7 @@ requires-dist = [
     { name = "pillow", marker = "extra == 'native'", specifier = ">=11.0" },
     { name = "pyarrow", marker = "extra == 'compose'", specifier = ">=21.0" },
     { name = "pydantic", specifier = ">=2.7" },
+    { name = "pytorch-optimizer", marker = "extra == 'native'", specifier = ">=3.10" },
     { name = "pyyaml", marker = "extra == 'compose'", specifier = ">=6.0" },
     { name = "rich", specifier = ">=13.0" },
     { name = "runpod", marker = "extra == 'compose'", specifier = ">=1.11" },

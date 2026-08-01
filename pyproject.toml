@@ -44,6 +44,21 @@ native = [
     "accelerate>=1.14",
     "peft>=0.20",
     "pillow>=11.0",
+    # optim/muon. Pure Python over torch — a py3-none-any wheel whose only
+    # dependencies are numpy and torch, no triton and no CUDA extension — so it
+    # installs and steps on CPU, which is what lets `optim=muon` be exercised by
+    # the test suite instead of only on a pod. `envs/native/pyproject.toml`
+    # already pins it for this axis; this line is what puts it in the root lock so
+    # a checkout resolves the same version.
+    #
+    # It is in `native` and not in `compose`, so `uv sync --extra compose` — the
+    # setup command AGENTS.md and README.md document — does not install it, and
+    # neither do five of the six framework images. `axes._optimizer` therefore
+    # refuses `optim=muon` with `UnappliedAxis` where the import fails rather than
+    # assuming this line reached the environment. `peft` above has the same shape
+    # and no such guard; moving either into `compose` is lane F's call, recorded in
+    # docs/CONTRACTS.md §5.
+    "pytorch-optimizer>=3.10",
 ]
 # Experiment tracking pulls gradio, which constrains pillow. Kept optional so an
 # env that cannot satisfy it still produces results (written as JSON regardless).
