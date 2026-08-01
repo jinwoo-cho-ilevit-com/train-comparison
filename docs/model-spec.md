@@ -201,24 +201,32 @@ Qwen3-VL-Embedding이 학습된 대로 쓰이므로 오히려 정확해진다.
 
 이는 `PLAN.md`의 "모델 간 Pareto frontier"라는 헤드라인을 좁히는 결정이다.
 
-### 4. 구조화 메시지 입력 — 보류 (원칙과 충돌 중)
+### 4. 구조화 메시지 입력 — 채택. 전 모델의 텍스트 입력도 chat template을 탄다
 
-Qwen3-VL-Embedding만 `message` 모달리티(`format: "structured"`)를 공식 입력 형식으로
+Qwen3-VL-Embedding은 `message` 모달리티(`format: "structured"`)를 공식 입력 형식으로
 갖는다(`sentence_bert_config.json`).
 
-당초 "비교 공정성이 떨어진다"를 근거로 미채택했으나, **결정 1이 뒤집히면서 그 근거가
-사라졌다.** 관통 원칙("각 모델을 의도한 방식으로")을 그대로 적용하면 채택하는 것이
-일관된다.
+당초 미채택했던 근거 세 가지가 모두 무너졌다.
 
-채택하지 않을 유일한 남은 근거는 **구현 비용**이다. 모델별로 입력 구성 코드 경로가
-갈라지고, `steps.py`의 공통 배치 생성 함수를 모델별 어댑터로 나눠야 한다.
-
-| 선택지 | 결과 |
+| 당초 근거 | 검토 결과 |
 |---|---|
-| 채택 | 원칙 일관. Qwen3-VL-Embedding을 완전히 공식대로 사용. 코드 경로 분기 발생 |
-| 미채택 | 구현 단순. **원칙에 대한 예외를 하나 남기게 되므로 리포트에 명시 필요** |
+| 비교 공정성이 떨어진다 | 결정 1이 뒤집히며 **소멸**. 관통 원칙이 오히려 채택을 요구한다 |
+| 코드 경로가 모델별로 갈라진다 | **사실이 아니다.** `steps.image_batch`는 이미 `apply_chat_template`에 content 블록을 넘기는 구조화 형식이다. 갈라지는 게 아니라 `text_batch`를 같은 방식으로 맞추면 두 함수가 **일관돼진다** |
+| Qwen3-VL-Embedding만 지원한다 | 근거가 아니다. 공식 규격이 한 모델에만 있다는 것은 그 모델을 규격대로 쓰지 말 이유가 되지 않는다 |
 
-**미결.** Wave 1 코어 정확성 레인 착수 전에 정한다.
+추가로, **결정 2(`add_generation_prompt` 모델별)를 구현하려면 어차피 `text_batch`가
+chat template을 타야 한다.** 평문 `processor(text=...)`에는 그 플래그를 줄 자리가
+없다. 즉 이 채택은 별도 비용이 아니라 이미 확정된 작업에 흡수된다.
+
+**부수 효과와 그 성격**: 생성형 두 모델의 텍스트 입력에도 chat template이 적용되어
+`<|im_start|>user` 같은 토큰이 시퀀스에 붙는다. 임베딩 용도로 생성형 모델에 chat
+template을 적용하는 것은 **널리 쓰이는 관행이지 공식 규격이 아니다.** 이 구분을
+리포트에 유지한다 — Qwen3-VL-Embedding은 공식대로, 생성형 둘은 관행대로 사용한 것이다.
+
+**작업 항목** (Wave 1 코어 정확성 레인):
+- `steps.text_batch`를 `apply_chat_template` 기반으로 전환
+- `add_generation_prompt`를 모델별 값으로 주입(결정 2)
+- Qwen3-VL-Embedding에 instruction prompt 부착(결정 1)
 
 ---
 
