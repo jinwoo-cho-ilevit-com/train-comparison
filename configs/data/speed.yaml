@@ -1,11 +1,9 @@
 repo_id: jinwoo-cho/mmeb-subset
-# WARNING: this revision is the corrupt subset (defect D1, docs/review-findings.md)
-# — pos_image was dropped, 466 rows share one placeholder positive, 644 rows lost
-# their query image. It stays pinned only because unpinning it makes the default
-# composition invalid and breaks tests/test_config.py, which lane A does not own.
-# Replace it with the revision of the regenerated subset before any measured run;
-# scripts/prepare_data.py warns on every invocation until that happens.
-revision: b750b9c3263e9ef5dce225fd50aa25d7c58f1d5f
+# Regenerated 2026-08-01 with the schema-checked pipeline. The previous pin
+# b750b9c3 is the corrupt subset (defect D1) and is now refused by
+# KNOWN_CORRUPT_REVISIONS in scripts/prepare_data.py.
+# 2048 rows, 20/20 configs at quota, 0 rows without a query image or positive.
+revision: 0cfae3fca21a61525166e81e5fa9fcb3dbad55de
 source_repo: MrZilinXiao/MMEB_train_with_image
 # 2048 rows drawn proportionally across all 20 MMEB configs with sample_seed 1234.
 # Speed and memory are measured on a small fixed sample by design (PLAN.md); what
