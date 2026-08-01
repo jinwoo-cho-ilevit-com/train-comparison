@@ -29,8 +29,11 @@ def main(argv: list[str] | None = None) -> int:
     config = load_bench_config(args.config)
     device = get_device(config.device)
     # Probes stay deterministic: they answer "does it run", and reproducing a
-    # failure matters more than kernel selection here.
-    set_seed(config.train.seed, deterministic=True)
+    # failure matters more than kernel selection here. `warn_only` keeps that from
+    # inventing failures — under strict determinism an op with no deterministic
+    # kernel raises, and the probe would record that as the framework refusing the
+    # model rather than as our own seeding refusing the op.
+    set_seed(config.train.seed, deterministic=True, warn_only=True)
 
     report = run_probe(config, device)
     record = build_record(config, device, applied=report.applied, probe=report.to_dict())
