@@ -53,8 +53,9 @@ from omegaconf import DictConfig
 from rich.console import Console
 
 from trainbench.compose import CONFIG_DIR, CONFIG_NAME, output_dir, resolve
+from trainbench.config import git_state
 from trainbench.config_schema import CORRUPT_DATA_REVISIONS, BenchConfig
-from trainbench.record import write_json
+from trainbench.record import package_versions, write_json
 
 console = Console()
 
@@ -1046,7 +1047,25 @@ def main(cfg: DictConfig) -> None:
     blockers = push_blockers(quota, data)
     report(metrics, violations, blockers)
 
+    git = git_state()
     manifest = {
+        # The three fields that make this file evidence rather than a note: which
+        # code drew the subset, whether that code was actually committed, and what
+        # it was asked for. Named as `trainbench/record.py` names them so the two
+        # kinds of record in docs/evidence/ answer "where did this come from" the
+        # same way — and `audit_plan.py`'s `evidence-committed` requires them.
+        #
+        # `config` is the data section alone, not the whole composed config. The
+        # draw depends on nothing else, and recording `attn.name` next to a subset
+        # that never built a model would imply it mattered.
+        "git_commit": git["commit"],
+        "git_dirty": git["dirty"],
+        "git_source": git["source"],
+        "config": data.model_dump(mode="json"),
+        # datasets decides the shuffle and the image encoding, pillow decodes, and
+        # pyarrow writes the shards. A subset is not reproducible across changes in
+        # any of them, so the versions are part of the record.
+        "packages": package_versions(),
         "source_repo": data.source_repo,
         "source_revision": data.source_revision,
         "subset_repo": data.repo_id,
