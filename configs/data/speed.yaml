@@ -1,11 +1,20 @@
 repo_id: jinwoo-cho/mmeb-subset
-# Pinned so every run records the exact data it trained on (convention 07).
-# Produced by scripts/prepare_data.py with sample_seed 1234; 2048 rows drawn
-# proportionally across all 20 MMEB configs.
+# WARNING: this revision is the corrupt subset (defect D1, docs/review-findings.md)
+# — pos_image was dropped, 466 rows share one placeholder positive, 644 rows lost
+# their query image. It stays pinned only because unpinning it makes the default
+# composition invalid and breaks tests/test_config.py, which lane A does not own.
+# Replace it with the revision of the regenerated subset before any measured run;
+# scripts/prepare_data.py warns on every invocation until that happens.
 revision: b750b9c3263e9ef5dce225fd50aa25d7c58f1d5f
 source_repo: MrZilinXiao/MMEB_train_with_image
+# 2048 rows drawn proportionally across all 20 MMEB configs with sample_seed 1234.
+# Speed and memory are measured on a small fixed sample by design (PLAN.md); what
+# has to match the real corpus is the length and image-resolution distribution,
+# which is why the draw is proportional and why prepare_data records p50/p95.
 subset_rows: 2048
 sample_seed: 1234
+# Equal to subset_rows: a timing run reads the whole subset. A smaller value makes
+# this a small-sample run, and prepare_data then refuses to push the draw.
 limit: 2048
 max_seq_len: 2048
 num_workers: 8

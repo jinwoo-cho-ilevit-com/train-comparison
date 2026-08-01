@@ -1,8 +1,20 @@
-repo_id: jinwoo-cho/mmeb-subset
+# The long quality run (loss curve + MMEB-eval Recall@k) needs a corpus 32x the
+# speed subset, so it is its own repo. Sharing one repo_id would mean each
+# regeneration deletes the other subset's files: the pinned commit still resolves,
+# but the two configs would overwrite each other every time either is rebuilt.
+repo_id: jinwoo-cho/mmeb-subset-quality
+# Unpinned, and therefore unusable for purpose=quality: config_schema rejects a
+# null revision for any measured run. It stays null because the subset it would
+# pin does not exist yet — this repo has never been pushed, and inventing a sha is
+# exactly the kind of unmeasured number this project forbids. The audit item
+# `data-pinned` fails on this line by design until that push happens.
 revision: null
 source_repo: MrZilinXiao/MMEB_train_with_image
 subset_rows: 65536
+# Same seed as speed.yaml: the quality subset is a larger draw from the same
+# shuffled stream, so a quality run sees the distribution the timing runs saw.
 sample_seed: 1234
+# null: a quality run reads the whole subset.
 limit: null
 max_seq_len: 2048
 num_workers: 8
