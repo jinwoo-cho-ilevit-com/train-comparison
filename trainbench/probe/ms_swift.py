@@ -3,6 +3,12 @@
 ms-swift advertises infonce embedding training and Qwen3-VL/Gemma4 support, so
 this probe checks its loader accepts each model and that a contrastive step runs
 through the model it returns.
+
+`get_model_processor` owns the `from_pretrained` call, so `axes.load_kwargs`
+(attention implementation, quantisation config) has nowhere to go here. It is
+left unapplied rather than guessed at a keyword: the capture side then reads
+whatever attention the model was really built with and reports the mismatch,
+which is the correct outcome for an axis this path cannot honour.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     import swift
 
     report.add_version(swift)
+    steps.patch_axes(config, report)
 
     loaded: dict[str, Any] = {}
 
@@ -37,6 +44,7 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
 
     model, processor = loaded["model"], loaded["processor"]
     model.to(device)
+    model = steps.verify_axes(model, config, device, "ms_swift", report)
 
     def _template() -> dict[str, Any]:
         from swift import get_template
@@ -49,7 +57,11 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     tokenized: dict[str, torch.Tensor] = {}
     side = config.model.padding_side
 
-    if report.run("text_tokenize", lambda: steps.tokenize_text(processor, device, tokenized))[0]:
+    report.run("padding_side_alignment", lambda: steps.padding_side_alignment(processor, side))
+
+    if report.run("text_tokenize", lambda: steps.tokenize_text(processor, device, tokenized, side))[
+        0
+    ]:
         report.run(
             "infonce_backward",
             lambda: steps.infonce_backward(model, tokenized, config.loss.temperature, side),
@@ -57,4 +69,9 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     else:
         report.skip("infonce_backward", "tokenization failed")
 
-    report.run("visual_tokens", lambda: steps.visual_token_count(processor, model, device))
+    report.run(
+        "visual_tokens",
+        lambda: steps.visual_token_count(
+            processor, model, device, side, config.model.tokens_per_image
+        ),
+    )
