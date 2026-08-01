@@ -20,6 +20,7 @@ reported a pass for exactly the state it was written to catch.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import subprocess
@@ -37,7 +38,16 @@ CODE_ROOTS = (REPO / "trainbench", REPO / "scripts")
 # Reporting a value is not applying it. trainbench/applied.py reads every axis in
 # order to say what was requested, so counting it as a consumer would certify an
 # axis as wired on the strength of the code that only labels it.
-NOT_A_CONSUMER = (REPO / "trainbench" / "applied.py",)
+#
+# This file is excluded for a blunter reason: it lives under `scripts/`, so it
+# scans itself, and its own docstrings spell out the patterns it searches for.
+# `attn.name` passed for exactly that reason and nothing else — the only wired
+# axis was certified by the checker's prose about how it certifies axes.
+NOT_A_CONSUMER = (REPO / "trainbench" / "applied.py", Path(__file__).resolve())
+
+# The measurement entry point. Named here because a check that only asks for
+# "some caller" is satisfied by callers that cannot block anything.
+BENCH_ENTRY_POINT = REPO / "scripts" / "bench.py"
 
 
 @dataclass
@@ -93,10 +103,25 @@ def _reads_dotted(code: str, group: str, key: str) -> bool:
     """
     attribute = rf"\.{re.escape(group)}\s*\.\s*{re.escape(key)}\b"
     subscript = rf"\[\s*[\"']{re.escape(group)}[\"']\s*\]\s*\[\s*[\"']{re.escape(key)}[\"']\s*\]"
-    # `section = config.attn` followed by `section.name` is idiomatic and would
-    # otherwise read as unconsumed, so a getattr-style access counts too.
-    getattr_call = rf"getattr\(\s*[^,]*{re.escape(group)}[^,]*,\s*[\"']{re.escape(key)}[\"']"
+    # Anchored on the config object. An unanchored first argument matched any
+    # variable whose name merely contained the group: `getattr(model, "name")`
+    # counted as reading `model.name`, and `getattr(runner, "purpose")` as
+    # `run.purpose`. `data`, `run`, `train` and `model` are common name fragments.
+    getattr_call = (
+        rf"getattr\(\s*(?:config|cfg)\.{re.escape(group)}\s*,\s*[\"']{re.escape(key)}[\"']"
+    )
     return any(re.search(p, code) for p in (attribute, subscript, getattr_call))
+
+
+# Leaves the schema turns into something else before any code sees them. The
+# scan skips config_schema.py, so the derivation is invisible to it and the
+# source leaf would read as unconsumed. Kept explicit and small: each entry is a
+# claim that reading the derived name is reading the original.
+DERIVED_LEAVES = {
+    # AttnConfig.impl maps the axis value to transformers' name for it. Deriving
+    # rather than configuring both is what stops `name: fa3, impl: sdpa`.
+    "attn.name": "attn.impl",
+}
 
 
 @check("config-consumed")
@@ -108,11 +133,18 @@ def config_fields_are_read_by_code() -> Result:
     twelve ablation axes were in exactly that state.
     """
     code = _code_text(exclude=NOT_A_CONSUMER)
+
+    def consumed(group: str, key: str) -> bool:
+        if _reads_dotted(code, group, key):
+            return True
+        derived = DERIVED_LEAVES.get(f"{group}.{key}")
+        return bool(derived) and _reads_dotted(code, *derived.split("."))
+
     orphans = [
         f"{group}.{key}"
         for group, keys in sorted(_config_leaf_keys().items())
         for key in sorted(keys)
-        if not _reads_dotted(code, group, key)
+        if not consumed(group, key)
     ]
     return Result(
         "config-consumed",
@@ -155,28 +187,117 @@ def axes_are_applied_and_verified() -> Result:
     )
 
 
-@check("assert-called")
-def the_safety_check_has_a_caller() -> Result:
-    """`assert_matches` must be called from code, not only from tests.
+def _calls(path: Path, function: str) -> bool:
+    """Whether the file really calls `function`, rather than mentioning it.
 
-    A guarantee whose only caller is its own test suite guards nothing. This is
-    what makes the measurement harness responsible for calling it rather than
-    free to skip it.
+    Parsed rather than searched: a docstring or a comment satisfies a substring
+    test, and this check exists precisely to catch a guarantee that is talked
+    about but not invoked.
     """
-    callers = [
-        path.relative_to(REPO).as_posix()
-        # This file names the function in order to look for it, which would
-        # otherwise make the check its own evidence.
-        for path in _code_files(exclude=(*NOT_A_CONSUMER, Path(__file__).resolve()))
-        if "assert_matches(" in path.read_text()
-    ]
-    return Result(
-        "assert-called",
-        bool(callers),
-        f"assert_matches is called from {', '.join(callers)}"
-        if callers
-        else "assert_matches has no caller outside tests; the axis check is decorative",
+    try:
+        tree = ast.parse(path.read_text())
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Call)
+        and getattr(node.func, "id", getattr(node.func, "attr", None)) == function
+        for node in ast.walk(tree)
     )
+
+
+# Config groups whose values select an optimisation. Every leaf key in these is
+# either an axis or listed below as deliberately not one.
+AXIS_GROUPS = frozenset(
+    {
+        "attn",
+        "kernel",
+        "precision",
+        "compile",
+        "optim",
+        "loss",
+        "peft",
+        "freeze",
+        "dataloader",
+        "parallel",
+        "framework",
+    }
+)
+# Leaves inside an axis group that parameterise the choice rather than being one.
+# Changing `optim.lr` changes the run, but it is not a thing that can silently
+# fall back to something else, which is what the applied check is for.
+NOT_AN_AXIS = frozenset(
+    {
+        "optim.lr",
+        "optim.weight_decay",
+        "loss.temperature",
+        "loss.mini_batch",
+        "peft.r",
+        "peft.alpha",
+        "peft.dropout",
+    }
+)
+
+
+@check("axis-fields")
+def axis_group_leaves_are_classified() -> Result:
+    """Every leaf in an axis group must be marked `Axis()` or listed as not one.
+
+    The marker is opt-in, and nothing otherwise obliges a new field to carry it.
+    A `precision.recipe` added without one would be read by axes.py (so
+    `config-consumed` passes), absent from `axis_knobs()` (so `axis-wired` never
+    sees it), and outside `assert_matches` — the same shape of hole as the eight
+    unwired axes, one field narrower.
+    """
+    sys.path.insert(0, str(REPO))
+    from trainbench.config_schema import axis_knobs
+
+    marked = set(axis_knobs())
+    problems = []
+    for group, keys in sorted(_config_leaf_keys().items()):
+        if group not in AXIS_GROUPS:
+            continue
+        for key in sorted(keys):
+            leaf = f"{group}.{key}"
+            if leaf not in marked and leaf not in NOT_AN_AXIS:
+                problems.append(leaf)
+    stray = sorted(n for n in NOT_AN_AXIS if n in marked)
+    if stray:
+        problems.append(f"marked as an axis but listed as not one: {', '.join(stray)}")
+    return Result(
+        "axis-fields",
+        not problems,
+        f"every leaf in {len(AXIS_GROUPS)} axis group(s) is classified"
+        if not problems
+        else f"unclassified: {', '.join(problems)}",
+    )
+
+
+@check("assert-called")
+def the_measurement_entry_point_calls_assert_matches() -> Result:
+    """The harness that reports numbers must call `assert_matches`.
+
+    "Some caller exists" is not the property that matters. The probe calls it too,
+    and `purpose=probe` returns immediately from every check — so an entry point
+    written without the call would leave this green while measuring unverified
+    settings. The named entry point is what has to call it.
+    """
+    callers = [p.relative_to(REPO).as_posix() for p in _code_files() if _calls(p, "assert_matches")]
+    if not BENCH_ENTRY_POINT.exists():
+        return Result(
+            "assert-called",
+            False,
+            f"{BENCH_ENTRY_POINT.relative_to(REPO)} does not exist yet, so nothing enforces the "
+            f"axis check for a reportable run (other callers: {', '.join(callers) or 'none'})",
+        )
+    entry = BENCH_ENTRY_POINT.relative_to(REPO).as_posix()
+    if entry not in callers:
+        return Result(
+            "assert-called",
+            False,
+            f"{entry} never calls assert_matches; a reportable run would proceed on "
+            "unverified settings",
+        )
+    return Result("assert-called", True, f"assert_matches is called from {', '.join(callers)}")
 
 
 TREE_PREFIX = " │├└─"

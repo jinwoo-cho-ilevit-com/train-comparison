@@ -6,18 +6,22 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from trainbench import axes
 from trainbench.applied import (
     AppliedMismatch,
     AppliedState,
     AxisState,
+    Built,
     assert_matches,
     capture,
 )
 from trainbench.config import to_bench_config
 from trainbench.config_schema import axis_knobs
 from trainbench.probe.types import Check, ProbeReport
+
+CPU = torch.device("cpu")
 
 
 @pytest.fixture
@@ -58,12 +62,18 @@ def fake_model(attn_impl: str | None, vision_impl: str | None = None, params=())
     )
 
 
+def built(attn_impl="sdpa", vision_impl=None, params=(), **pieces):
+    """What a run constructed. Axes live on more than the model — the optimizer
+    decides optim.name, the loss decides loss.name — so capture takes all of it."""
+    return Built(model=fake_model(attn_impl, vision_impl, params), **pieces)
+
+
 def axis(state, name):
     return next(a for a in state.axes if a.axis == name)
 
 
 def test_attn_is_read_back_from_the_model(config_mapping):
-    state = capture(fake_model("sdpa"), bench(config_mapping))
+    state = capture(built(), bench(config_mapping))
 
     assert axis(state, "attn.name").applied == "sdpa"
     assert axis(state, "attn.name").matches
@@ -74,7 +84,7 @@ def test_silent_fallback_is_caught(config_mapping):
     module exists for: a plausible number under a wrong label."""
     config = bench(config_mapping, **{"attn.name": "fa3"})
 
-    state = capture(fake_model("sdpa"), config)
+    state = capture(built(), config)
 
     assert not axis(state, "attn.name").matches
     with pytest.raises(AppliedMismatch, match="requested 'flash_attention_3', applied 'sdpa'"):
@@ -88,7 +98,7 @@ def test_vision_tower_left_on_sdpa_is_a_mismatch(config_mapping):
     partial application — and reading only the top level calls it a match."""
     config = bench(config_mapping, **{"attn.name": "fa2"})
 
-    state = capture(fake_model("flash_attention_2", vision_impl="sdpa"), config)
+    state = capture(built("flash_attention_2", vision_impl="sdpa"), config)
 
     attn = axis(state, "attn.name")
     assert attn.applied == "mixed(flash_attention_2,sdpa)"
@@ -100,29 +110,52 @@ def test_vision_tower_left_on_sdpa_is_a_mismatch(config_mapping):
 def test_uniform_submodules_still_match(config_mapping):
     config = bench(config_mapping, **{"attn.name": "fa2"})
 
-    state = capture(fake_model("flash_attention_2", vision_impl="flash_attention_2"), config)
+    state = capture(built("flash_attention_2", vision_impl="flash_attention_2"), config)
 
     assert axis(state, "attn.name").matches
 
 
-def test_every_axis_in_the_schema_is_reported(config_mapping):
-    """The axis set is derived, so an axis cannot be dropped by deleting a line.
+# Every knob that selects an optimisation, pinned by name. Comparing the captured
+# set against `axis_knobs()` instead would be a tautology: `capture` iterates that
+# very function and appends in all three of its branches, so the assertion holds
+# however the schema changes. Spelling them out makes adding or dropping a marker
+# show up as a diff in this file.
+AXES = (
+    "attn.name",
+    "compile.mode",
+    "dataloader.backend",
+    "dataloader.packing",
+    "dataloader.pretokenize",
+    "framework.name",
+    "freeze.ple",
+    "freeze.vision_tower",
+    "kernel.name",
+    "loss.name",
+    "optim.name",
+    "parallel.cross_device_negatives",
+    "parallel.strategy",
+    "peft.mode",
+    "precision.name",
+    "train.gradient_checkpointing",
+    "train.offload",
+)
 
-    A hand-written list fails open: a missing entry is not an undetermined axis,
-    it is no axis at all, and nothing notices.
-    """
-    state = capture(fake_model("sdpa"), bench(config_mapping))
 
-    assert {a.axis for a in state.axes} == set(axis_knobs())
-    assert state.missing() == []
-    for name in ("peft.mode", "loss.name", "train.offload", "parallel.cross_device_negatives"):
-        assert name in axis_knobs(), f"{name} is a knob that changes the measurement"
+def test_the_axis_set_is_exactly_this(config_mapping):
+    """A hand-written list in the source fails open: an axis missing from it is
+    not undetermined, it does not exist. The set is derived from the schema, and
+    this is where a change to it has to be argued for."""
+    assert sorted(axis_knobs()) == sorted(AXES)
+
+    state = capture(built(), bench(config_mapping))
+
+    assert sorted(a.axis for a in state.axes) == sorted(AXES)
 
 
 def test_an_axis_without_a_probe_blocks_a_timing_run(config_mapping):
     """Undetermined must not read as fine, or the mechanism is decorative."""
     config = bench(config_mapping)
-    state = capture(fake_model("sdpa"), config)
+    state = capture(built(), config)
 
     unverified = {a.axis for a in state.undetermined()}
     assert "compile.mode" in unverified, "an axis with no capture probe must be undetermined"
@@ -136,7 +169,7 @@ def test_probe_runs_are_not_blocked(config_mapping):
     Paired with the timing case above: on its own this passes even if
     assert_matches were an empty function.
     """
-    state = capture(fake_model("sdpa"), bench(config_mapping))
+    state = capture(built(), bench(config_mapping))
 
     assert_matches(state, bench(config_mapping, **{"run.purpose": "probe"}))
     assert_matches(state, bench(config_mapping, **{"run.purpose": "profile", "run.profiler": True}))
@@ -166,11 +199,11 @@ def test_unknown_purpose_is_an_error_not_a_pass(config_mapping):
     forged = SimpleNamespace(run=SimpleNamespace(purpose="Timing"))
 
     with pytest.raises(ValueError, match="unknown run purpose"):
-        assert_matches(capture(fake_model("sdpa"), config), forged)
+        assert_matches(capture(built(), config), forged)
 
 
 def test_unreadable_model_is_undetermined_not_crash(config_mapping):
-    state = capture(object(), bench(config_mapping))
+    state = capture(Built(model=object()), bench(config_mapping))
 
     attn = axis(state, "attn.name")
     assert attn.applied is None
@@ -184,7 +217,7 @@ def test_a_probe_that_raises_is_undetermined_not_crash(config_mapping, monkeypat
         raise RuntimeError("cuda is on fire")
 
     monkeypatch.setitem(applied._CAPTURES, "attn.name", explode)
-    state = capture(fake_model("sdpa"), bench(config_mapping))
+    state = capture(built(), bench(config_mapping))
 
     assert axis(state, "attn.name").applied is None
     assert "cuda is on fire" in axis(state, "attn.name").detail["reason"]
@@ -193,7 +226,7 @@ def test_a_probe_that_raises_is_undetermined_not_crash(config_mapping, monkeypat
 def test_a_config_of_the_wrong_shape_is_undetermined_not_crash():
     """capture must survive anything: it runs on the failure path, where the
     thing that is wrong may well be the config itself."""
-    state = capture(fake_model("sdpa"), SimpleNamespace())
+    state = capture(built(), SimpleNamespace())
 
     assert state.axes, "axes are still enumerated"
     assert all(a.applied is None for a in state.axes)
@@ -202,7 +235,7 @@ def test_a_config_of_the_wrong_shape_is_undetermined_not_crash():
 def test_applied_state_serialises_for_the_record(config_mapping):
     """This dict is what a result JSON carries; without it the file records the
     request and nothing about what ran."""
-    payload = capture(fake_model("sdpa"), bench(config_mapping)).to_dict()
+    payload = capture(built(), bench(config_mapping)).to_dict()
 
     assert json.loads(json.dumps(payload))["all_matched"] is True
     entry = next(a for a in payload["axes"] if a["axis"] == "attn.name")
@@ -233,7 +266,7 @@ def test_the_attention_detail_does_not_grow_with_the_model():
         ],
     )
 
-    _, detail = _capture_attn(wide, None)
+    _, detail = _capture_attn(Built(model=wide), None)
 
     assert detail == {"implementations": {"sdpa": 501}, "modules_checked": 501}
     assert len(json.dumps(detail)) < 200
@@ -263,9 +296,9 @@ PLE_TRAINING = param("layers.0.per_layer_input_gate", True)
 def test_freezing_nothing_is_not_a_successful_freeze(config_mapping):
     """`_ple_report` reported ok=True on zero matches, so an upstream rename would
     have read as a freeze of 2.39B parameters that were in fact still training."""
-    model = fake_model("sdpa", params=[param("model.layers.0.mlp.weight", True)])
+    state = capture(built(params=[param("model.layers.0.mlp.weight", True)]), gemma(config_mapping))
 
-    ple = axis(capture(model, gemma(config_mapping)), "freeze.ple")
+    ple = axis(state, "freeze.ple")
 
     assert ple.applied is None
     assert ple.detail["matched"] == 0
@@ -274,7 +307,7 @@ def test_freezing_nothing_is_not_a_successful_freeze(config_mapping):
 def test_a_half_applied_freeze_is_a_mismatch(config_mapping):
     config = gemma(config_mapping, **{"freeze.ple": True})
 
-    state = capture(fake_model("sdpa", params=[PLE_FROZEN, PLE_TRAINING]), config)
+    state = capture(built(params=[PLE_FROZEN, PLE_TRAINING]), config)
 
     assert axis(state, "freeze.ple").applied == "partial"
     with pytest.raises(AppliedMismatch, match="freeze.ple"):
@@ -285,7 +318,7 @@ def test_a_freeze_that_took_matches(config_mapping):
     config = gemma(config_mapping, **{"freeze.ple": True})
     frozen = [PLE_FROZEN, param("layers.0.per_layer_input_gate", False)]
 
-    state = capture(fake_model("sdpa", params=frozen), config)
+    state = capture(built(params=frozen), config)
 
     assert axis(state, "freeze.ple").matches
 
@@ -319,3 +352,87 @@ def test_applied_and_verified_sets_agree():
 
     assert set(_CAPTURES) == set(axes.IMPLEMENTED)
     assert set(_CAPTURES) <= set(axis_knobs())
+
+
+def test_an_axis_on_the_optimizer_is_verified_from_the_optimizer(config_mapping):
+    """Half the axes are not properties of the model. A capture that only saw the
+    model would report them undetermined forever, or worse, be widened to guess."""
+    config = bench(config_mapping)
+    params = [torch.nn.Parameter(torch.zeros(2))]
+    fused = torch.optim.AdamW(params, lr=1e-5)
+    fused.param_groups[0]["fused"] = True
+
+    state = capture(built(optimizer=fused), config)
+
+    assert axis(state, "optim.name").applied == "adamw_fused"
+    assert axis(state, "optim.name").matches
+
+
+def test_an_unfused_adamw_is_not_the_fused_axis(config_mapping):
+    """`adamw_fused` names a CUDA-only kernel. A CPU run builds the same class
+    without it, and reporting that under the same name would put an unfused
+    number in the fused row."""
+    config = bench(config_mapping)
+
+    state = capture(
+        built(optimizer=torch.optim.AdamW([torch.nn.Parameter(torch.zeros(2))])), config
+    )
+
+    assert axis(state, "optim.name").applied == "adamw_unfused"
+    assert not axis(state, "optim.name").matches
+
+
+def test_a_run_that_built_no_optimizer_is_undetermined(config_mapping):
+    state = capture(built(), bench(config_mapping))
+
+    assert axis(state, "optim.name").applied is None
+    assert axis(state, "optim.name").detail["reason"] == "no optimizer was built"
+
+
+def test_the_loss_axis_is_read_off_the_loss_that_was_built(config_mapping):
+    """GradCache is the case this exists for: plain in-batch negatives must not be
+    able to report a cached_mnrl speedup for work that was never done."""
+    config = bench(config_mapping)
+    loss, names = axes.loss_fn(config)
+
+    state = capture(built(loss_fn=loss), config)
+
+    assert names == ["loss.name"]
+    assert axis(state, "loss.name").matches
+
+
+def test_a_loss_that_declares_nothing_is_undetermined(config_mapping):
+    state = capture(built(loss_fn=lambda q, d: q), bench(config_mapping))
+
+    assert axis(state, "loss.name").applied is None
+    assert "axis_value" in axis(state, "loss.name").detail["reason"]
+
+
+def test_an_axis_value_with_no_implementation_is_refused_not_substituted(config_mapping):
+    """Returning the default under the requested name is the failure the whole
+    module exists to prevent, and it is not less of one in our own code."""
+    for override, axis_name in (
+        ({"optim.name": "muon"}, "optim"),
+        ({"loss.name": "cached_mnrl", "loss.mini_batch": 2}, "loss"),
+        ({"dataloader.backend": "dali"}, "dataloader"),
+    ):
+        config = bench(config_mapping, **override)
+        build = {
+            "optim": lambda c: axes.optimizer([torch.nn.Parameter(torch.zeros(2))], c, CPU),
+            "loss": axes.loss_fn,
+            "dataloader": axes.dataloader_kwargs,
+        }[axis_name]
+        with pytest.raises(axes.UnappliedAxis):
+            build(config)
+
+
+def test_apply_hands_back_the_model(config_mapping):
+    """peft, torch.compile and FSDP all replace the model rather than mutate it.
+    A hook that only mutated in place could not express them, and the lane that
+    adds those axes would have to change this signature after branching."""
+    model = fake_model("sdpa")
+
+    returned, applied_names = axes.apply(model, bench(config_mapping))
+
+    assert returned is model
+    assert applied_names == []

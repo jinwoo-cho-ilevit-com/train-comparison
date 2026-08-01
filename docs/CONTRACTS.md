@@ -60,12 +60,20 @@ Wave 0을 순차 구간으로 둔 이유가 이것이다.
 "적용했다고 주장하는 것"과 "적용된 것"이 같은 근거를 갖게 된다. 분리해야 대조가 된다.
 
 ```python
-# axes.py — 축을 켜는 유일한 지점
-IMPLEMENTED: frozenset[str]                     # 실제로 적용 가능한 축
-def load_kwargs(config) -> dict                 # from_pretrained에 넘길 것
-def apply(model, config) -> list[str]           # 적재 후 적용, 적용한 축 반환
+# axes.py — 축을 켜는 유일한 지점. 이 5개가 bench.py의 호출 지점 전부다
+IMPLEMENTED: frozenset[str]                            # 실제로 적용 가능한 축
+def load_kwargs(config) -> dict                        # from_pretrained kwargs
+def apply(model, config) -> tuple[Any, list[str]]      # 래핑/교체 허용
+def optimizer(params, config, device) -> tuple[Any, list[str]]
+def dataloader_kwargs(config) -> dict
+def loss_fn(config) -> tuple[Any, list[str]]
+class UnappliedAxis(RuntimeError)                      # 구현 없음 -> 기본값 대체 금지
 
 # applied.py — 켜졌는지 읽는 유일한 지점
+@dataclass(frozen=True)
+class Built:                          # 런이 만든 것. 축은 모델에만 있지 않다
+    model / optimizer / dataloader / loss_fn
+
 @dataclass(frozen=True)
 class AxisState:
     axis: str            # "attn.name" 같은 dotted knob
@@ -80,9 +88,21 @@ class AppliedState:
     def undetermined(self) -> list[AxisState]
     def missing(self) -> list[str]        # 스키마에 있는데 상태에 없는 축
 
-def capture(model, config: BenchConfig) -> AppliedState
+def capture(built: Built, config: BenchConfig) -> AppliedState
 def assert_matches(state: AppliedState, config: BenchConfig) -> None  # AppliedMismatch
 ```
+
+**호출 지점 5개를 Wave 0에서 고정하는 이유**: 이걸 호출할 하네스(`scripts/bench.py`)는
+Wave 3에 다른 레인이 만든다. 형태가 없으면 축을 추가하는 레인과 하네스를 짓는 레인이
+각자 다른 인터페이스를 가정하게 되고, 그게 정확히 이 문서가 막으려는 것이다.
+
+`apply`가 모델을 **반환**하는 이유: 축의 절반은 모델을 변형하지 않고 교체한다.
+`torch.compile`과 `get_peft_model`은 새 객체를 돌려주고 FSDP/DeepSpeed는 감싼다.
+in-place 변형만 표현하는 시그니처로는 이들을 담을 수 없다.
+
+`capture`가 `Built`를 받는 이유: `optim.name`은 옵티마이저가, `dataloader.*`는
+데이터로더가, `loss.name`은 손실이 결정한다. 모델만 보는 capture는 이들을 영원히
+미확인으로 두거나, 더 나쁘게는 추측하도록 넓혀진다.
 
 **불변식**
 
@@ -100,12 +120,35 @@ def assert_matches(state: AppliedState, config: BenchConfig) -> None  # AppliedM
   아예 존재하지 않게 되고, 한 줄 지워도 아무 테스트도 실패하지 않는다
 
 **D 레인의 작업**: `axes.py`에 적용을, `applied.py`의 `_CAPTURES`에 확인을 **쌍으로**
-추가한다. capture 시그니처는 `(model, config) -> tuple[str | None, dict]`. 한쪽만
+추가한다. capture 시그니처는 `(built, config) -> tuple[str | None, dict]`. 한쪽만
 추가하면 `audit_plan.py`의 `axis-wired`가 막는다. `applied.py`의 데이터클래스와
 `capture`/`assert_matches` 본문은 건드리지 않는다.
 
-**Wave 3 G의 의무**: 측정 진입점(`scripts/bench.py`)은 `assert_matches`를 호출한다.
-`audit_plan.py`의 `assert-called`가 호출자 존재를 강제한다.
+새 knob을 추가하면 `Axis()` 마커를 붙이거나 `audit_plan.py`의 `NOT_AN_AXIS`에 올려야
+한다. 둘 다 아니면 `axis-fields`가 막는다 — 마커가 opt-in이라 잊으면 그 필드만 검증
+밖으로 빠지고, 그건 축 전체가 빠지던 것과 같은 모양의 구멍이다.
+
+**Wave 3 G의 의무**: 측정 진입점(`scripts/bench.py`)이 `assert_matches`를 호출한다.
+`audit_plan.py`의 `assert-called`는 **그 파일이 호출하는지**를 본다. "어딘가에 호출자가
+있으면 통과"로는 부족하다 — probe도 호출하지만 `purpose=probe`는 즉시 return하므로,
+호출 없는 하네스가 초록불 아래에서 무검증 측정을 돌릴 수 있다.
+
+### probe가 mismatch를 낼 때 고칠 것은 probe가 아니다
+
+vision tower가 구조적으로 FA를 못 받아 transformers가 개별 강등하면 `attn` 요청은
+항상 `mixed(...)` -> mismatch가 되어 timing이 영구 차단된다. 이때 **probe를 완화하지
+않는다.** 완화는 C2가 고친 결함을 그대로 되돌리는 것이다. config가 기대하는 per-module
+구성을 선언하게 하고, capture는 그 기대와 대조한다. 이질적 적용은 표현되어야 할 상태이지
+숨겨야 할 잡음이 아니다.
+
+### probe 어댑터의 축 중복 (B/D 경계)
+
+`trainbench/probe/native.py`의 `_lora_attach`는 축 적용 지점이 **아니다.** peft는
+`axes.py`에 구현이 없고(LoRA가 모든 base 파라미터를 얼려 `freeze.ple` 판정과 충돌한다 —
+freeze 축이 "얼림"인지 "peft가 얼린 것에 더해 얼림"인지는 축을 구현하는 레인이 정한다),
+`_lora_attach`는 모델을 in-place로 재작성하므로 **마지막에 실행되고 그 뒤에 어떤 체크도
+오지 않는다.** PLE 파라미터 판별은 `axes.ple_parameters` 하나뿐이다 — native.py가 갖고
+있던 두 번째 정의는 제거했다(이미 죽은 `altup` 조건으로 드리프트해 있었다).
 
 ---
 

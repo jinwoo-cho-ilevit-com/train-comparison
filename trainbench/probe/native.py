@@ -53,8 +53,23 @@ def run(config: BenchConfig, device: torch.device) -> ProbeReport:
         return report
     model.to(device)
 
-    report.run("axes_apply", lambda: {"applied": axes.apply(model, config)})
-    report.applied = applied.capture(model, config)
+    built = applied.Built(model=model)
+
+    def _apply_axes() -> dict[str, Any]:
+        # apply() may hand back a different object — peft, compile and FSDP all
+        # replace the model rather than mutating it — so its result is what
+        # everything after this point uses.
+        nonlocal model, built
+        model, names = axes.apply(model, config)
+        optimizer, optim_names = axes.optimizer(model.parameters(), config, device)
+        loss, loss_names = axes.loss_fn(config)
+        built = applied.Built(model=model, optimizer=optimizer, loss_fn=loss)
+        return {"applied": names + optim_names + loss_names}
+
+    # A failure here leaves `built` holding the model alone, so the axes it would
+    # have covered come back undetermined rather than unexamined.
+    report.run("axes_apply", _apply_axes)
+    report.applied = applied.capture(built, config)
     # Records the verdict rather than aborting: a probe answers "does it run", and
     # purpose=probe is not enforced. A reportable purpose raises here, which is the
     # point — the same call in the measurement harness stops the run.
@@ -117,20 +132,23 @@ def _ple_report(model: Any) -> dict[str, Any]:
     Roughly half of gemma-4-E2B's 5.1B parameters live in these tables, so whether
     they are trainable dominates the optimizer-memory picture for this model.
     """
-    matches = [
-        (name, param.numel())
-        for name, param in model.named_parameters()
-        if "per_layer" in name or "altup" in name
-    ]
+    # Which parameters are PLE is defined once, in axes.py. A second definition
+    # here drifted already: it also matched "altup", which the measured weight map
+    # shows matches nothing (docs/model-spec.md), and it would have gone on
+    # disagreeing with the freeze axis that this check is about.
+    matches = [(name, param.numel()) for name, param in axes.ple_parameters(model)]
     total = sum(p.numel() for p in model.parameters())
     ple_total = sum(n for _, n in matches)
-    for name, param in model.named_parameters():
-        if "per_layer" in name or "altup" in name:
-            param.requires_grad_(False)
+
+    before = {name: param.requires_grad for name, param in model.named_parameters()}
+    for _, param in axes.ple_parameters(model):
+        param.requires_grad_(False)
     frozen = sum(1 for _, p in model.named_parameters() if not p.requires_grad)
-    # Restore, so later checks see the model as loaded.
-    for _, param in model.named_parameters():
-        param.requires_grad_(True)
+    # Restore what was there, not everything to True: forcing True would undo the
+    # freeze axis that axes.apply() just set, and the run would measure a model
+    # training 2.39B parameters it was told to freeze.
+    for name, param in model.named_parameters():
+        param.requires_grad_(before[name])
     return {
         "matched_parameter_names": [name for name, _ in matches][:20],
         "matched_count": len(matches),
@@ -142,6 +160,18 @@ def _ple_report(model: Any) -> dict[str, Any]:
 
 
 def _lora_attach(model: Any, config: BenchConfig) -> dict[str, Any]:
+    """Whether peft accepts this architecture. Terminal: no check may follow it.
+
+    `get_peft_model` rewrites the model's modules in place, so this leaves behind
+    a model that is no longer the one the axes were captured from. It runs last
+    and its result is discarded for that reason.
+
+    It is not an axis application site — `peft.mode` has no implementation in
+    axes.py yet, because freezing under LoRA collides with `freeze.ple`: peft
+    freezes every base parameter, so a `freeze.ple=false` run would read back as
+    frozen. Deciding whether freeze axes mean "frozen" or "frozen in addition to
+    what peft does" belongs to the lane that implements the axis, not here.
+    """
     from peft import LoraConfig, get_peft_model
 
     peft_model = get_peft_model(

@@ -1,4 +1,5 @@
 {
+  "assert-called": "Wave 3 (G: harness) - scripts/bench.py must call assert_matches",
   "axis-packages": "Wave 2 (F: envs/images) - install per-axis packages",
   "axis-wired": "Wave 2 (D: axes) - one apply site and one capture probe per axis",
   "config-consumed": "Wave 2 (D: axes) + Wave 3 (G: harness) - wire every knob",

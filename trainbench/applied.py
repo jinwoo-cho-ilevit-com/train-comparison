@@ -92,12 +92,32 @@ class AppliedMismatch(RuntimeError):
     """A reportable run was about to measure something other than what it claims."""
 
 
+@dataclass(frozen=True)
+class Built:
+    """What a run actually constructed.
+
+    Half the axes are not properties of the model: the optimizer decides
+    `optim.name` and `train.offload`, the dataloader decides `dataloader.*`, the
+    loss decides `loss.name` and `parallel.cross_device_negatives`. A capture that
+    only ever sees the model can never verify those, so it would certify a run on
+    the strength of the half it can reach.
+
+    A field left None means the run did not build that piece. Its axes come back
+    undetermined, which blocks a reportable run — never "fine by absence".
+    """
+
+    model: Any = None
+    optimizer: Any = None
+    dataloader: Any = None
+    loss_fn: Any = None
+
+
 # --- per-axis capture probes -------------------------------------------------
 # A probe returns the applied value, or None when it cannot determine it. Adding
 # an axis here is what makes that axis measurable; until then it blocks timing
 # runs by design. Keys are the dotted knob names from the schema.
 
-CaptureFn = Callable[[Any, BenchConfig], tuple[str | None, dict[str, Any]]]
+CaptureFn = Callable[["Built", BenchConfig], tuple[str | None, dict[str, Any]]]
 
 
 def _attn_per_module(model: Any) -> dict[str, str]:
@@ -136,8 +156,8 @@ def _attn_per_module(model: Any) -> dict[str, str]:
     return found
 
 
-def _capture_attn(model: Any, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
-    per_module = _attn_per_module(model)
+def _capture_attn(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
+    per_module = _attn_per_module(built.model)
     if not per_module:
         return None, {"reason": "no _attn_implementation found on the model or its subconfigs"}
     # Counts rather than the whole map: a real VLM records this in one place per
@@ -157,7 +177,7 @@ def _capture_attn(model: Any, config: BenchConfig) -> tuple[str | None, dict[str
     return "mixed(" + ",".join(sorted(counts)) + ")", {**detail, "dissenting": dissenting[:8]}
 
 
-def _capture_freeze_ple(model: Any, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
+def _capture_freeze_ple(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
     """Whether the per-layer embeddings are actually frozen.
 
     Counting matches is half the check. `_ple_report` used to report ok=True on a
@@ -165,7 +185,9 @@ def _capture_freeze_ple(model: Any, config: BenchConfig) -> tuple[str | None, di
     freeze of nothing — 2.39B parameters, 46.8% of gemma-4-E2B, quietly still
     training. Zero matches on gemma4 is undetermined, not False.
     """
-    params = axes.ple_parameters(model)
+    if built.model is None:
+        return None, {"reason": "no model was built"}
+    params = axes.ple_parameters(built.model)
     if not params and config.model.arch == "gemma4":
         return None, {
             "reason": f"no parameter name contains {axes.PLE_PARAM_MARKER!r} on a gemma4 model",
@@ -185,9 +207,48 @@ def _capture_freeze_ple(model: Any, config: BenchConfig) -> tuple[str | None, di
     return "partial", {**detail, "unfrozen_sample": unfrozen[:5]}
 
 
+def _capture_optim(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
+    """Which optimizer a run is actually stepping with.
+
+    The fused AdamW kernel is CUDA-only, so an unfused AdamW is reported as a
+    different applied value: `adamw_fused` is the name of a kernel, and a run that
+    did not use it must not carry that label.
+    """
+    if built.optimizer is None:
+        return None, {"reason": "no optimizer was built"}
+    kind = type(built.optimizer).__name__
+    fused = any(group.get("fused") for group in getattr(built.optimizer, "param_groups", []))
+    detail = {
+        "class": kind,
+        "fused": bool(fused),
+        "param_groups": len(built.optimizer.param_groups),
+    }
+    if kind != "AdamW":
+        return kind.lower(), detail
+    return ("adamw_fused" if fused else "adamw_unfused"), detail
+
+
+def _capture_loss(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
+    """Which loss a run actually computes.
+
+    Read off an attribute the builder sets rather than inferred from the config,
+    which is the request. GradCache is the case that matters: it must not be
+    possible to report its speedup for a run that computed plain in-batch
+    negatives.
+    """
+    if built.loss_fn is None:
+        return None, {"reason": "no loss function was built"}
+    value = getattr(built.loss_fn, "axis_value", None)
+    if value is None:
+        return None, {"reason": f"{type(built.loss_fn).__name__} declares no axis_value"}
+    return str(value), {"callable": getattr(built.loss_fn, "__name__", repr(built.loss_fn))}
+
+
 _CAPTURES: dict[str, CaptureFn] = {
     "attn.name": _capture_attn,
     "freeze.ple": _capture_freeze_ple,
+    "optim.name": _capture_optim,
+    "loss.name": _capture_loss,
 }
 
 # Where the applied value is expressed in different words from the config value.
@@ -198,8 +259,8 @@ _REQUESTED_OVERRIDES: dict[str, Callable[[BenchConfig], Any]] = {
 }
 
 
-def capture(model: Any, config: BenchConfig) -> AppliedState:
-    """Read back the state of every axis after the model is fully constructed.
+def capture(built: Built, config: BenchConfig) -> AppliedState:
+    """Read back the state of every axis from what the run actually constructed.
 
     Never raises: an axis that cannot be read is undetermined, which blocks a
     reportable run just as a mismatch does.
@@ -220,7 +281,7 @@ def capture(model: Any, config: BenchConfig) -> AppliedState:
             )
             continue
         try:
-            applied, detail = probe(model, config)
+            applied, detail = probe(built, config)
         except BaseException as exc:  # noqa: BLE001 - an unreadable axis is undetermined
             applied, detail = None, {"reason": f"{type(exc).__name__}: {exc}"[:300]}
         states.append(AxisState(axis, requested, applied, detail))
