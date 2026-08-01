@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ from rich.console import Console
 from trainbench import pods
 from trainbench.compose import resolve
 from trainbench.config import git_state
+from trainbench.config_schema import axis_knobs
 from trainbench.record import write_json
 
 console = Console()
@@ -74,11 +76,39 @@ PURPOSES_WITHOUT_BASELINE = frozenset({"probe"})
 # (docs/CONTRACTS.md §1).
 RUNNABLE_PURPOSES = frozenset({"probe", "timing", "profile", "quality"})
 
-# Never reachable from an experiment pod. RUNPOD_API_KEY is account-wide and would
-# let a probe delete the sweep that created it; GITHUB_TOKEN carries write:packages
-# and belongs to the image build alone. The universal-auth pair is on the list
-# because an identity that can mint its own tokens makes a short-lived token
-# pointless.
+# Every secret an experiment pod has any use for. `.env.example` names exactly one
+# — "Experiment pods: model/dataset pull, result push, Trackio Space sync" — and
+# everything else the pod needs (TRAINBENCH_*, INFISICAL_*) is handed over in the
+# pod's env dict rather than read out of Infisical.
+#
+# An allowlist rather than a longer FORBIDDEN_ON_POD, and the reason is a
+# measurement, not a preference. The project's `dev` environment injects 27 names
+# (measured 2026-08-02 by diffing `os.environ` under `infisical run --env=dev`
+# against a plain shell). Four of them are the ones below. One is HF_TOKEN. The
+# other **22 pass a deny check and reach the pod with no use for them** — cloud,
+# database and model-provider credentials that nobody thought to enumerate here.
+# A deny list can only ever hold the names someone remembered, and the thing it
+# guards grows without asking it. This one is what the pod is for.
+ALLOWED_ON_POD = frozenset({"HF_TOKEN"})
+
+# The Infisical environment an experiment pod reads. `--infisical-env` names what
+# the *pod* gets, never what the orchestrator itself reads — the orchestrator's
+# secrets come from the `infisical run --env=dev` that wraps this script. So the
+# pod's own environment is the only correct default, and `dev` was a leftover from
+# before that environment existed.
+#
+# Either default fails closed, because the scope check refuses whatever it cannot
+# vouch for. The difference is which mistake is quiet: with `dev` as the default,
+# forgetting the flag stops the campaign; with this one, forgetting it is right.
+POD_INFISICAL_ENV = "pod"
+
+# Account-wide credentials, called out by name when the scope check refuses. These
+# are no longer what the check *tests* — `ALLOWED_ON_POD` is — but naming them
+# separately tells an operator which of the extras are the urgent ones.
+# RUNPOD_API_KEY would let a probe delete the sweep that created it; GITHUB_TOKEN
+# carries write:packages and belongs to the image build alone; the universal-auth
+# pair makes a short-lived token pointless, since an identity that can mint its
+# own tokens is not bounded by the one it was handed.
 FORBIDDEN_ON_POD = (
     "RUNPOD_API_KEY",
     "GITHUB_TOKEN",
@@ -187,7 +217,7 @@ def load_manifest(path: Path) -> Experiment:
             f"hosts, so it must declare 'baseline: {NO_BASELINE}'; naming "
             f"'{baseline}' adds a run of another model and framework to this pod"
         )
-    return Experiment(
+    exp = Experiment(
         name=path.stem,
         phase=str(raw["phase"]),
         model=str(raw["model"]),
@@ -200,6 +230,58 @@ def load_manifest(path: Path) -> Experiment:
         settings={str(k): list(v) for k, v in settings.items()},
         overrides=list(raw.get("overrides") or []),
     )
+    # The label has to match what runs. It is what the split guard reports, and a
+    # pod that sweeps `attn` under the name `loss` files its own violation under a
+    # heading nobody is looking at.
+    moved = axes_touched(exp)
+    if moved and exp.axis and exp.axis not in moved:
+        raise ManifestError(
+            f"{path.name}: declares axis '{exp.axis}' but its overrides move "
+            f"{', '.join(sorted(moved))}"
+        )
+    return exp
+
+
+def axis_moved_by(override: str) -> str | None:
+    """The ablation axis a Hydra override moves, if it moves one.
+
+    `loss=cached_mnrl` selects a config group and every axis knob in that group
+    moves with it; `train.gradient_checkpointing=selective` names a knob outright.
+    Both are how a manifest changes what is measured, so both have to be visible
+    to the guard that keeps one axis on one host.
+
+    Derived from the schema's `Axis()` markers rather than a list kept here: a
+    hand-written list stops covering an axis the moment someone adds one, and this
+    feeds a check whose whole job is to not have gaps.
+
+    It reads override *keys*, which makes it deliberately conservative in one
+    direction — selecting a group counts as moving every axis in it, even for a
+    file that happens to leave them alone — and blind in another: editing what a
+    config group's file contains moves an axis without any manifest changing.
+    """
+    key, sep, _ = override.partition("=")
+    if not sep:
+        return None
+    key = key.lstrip("+~")
+    knobs = axis_knobs()
+    if "." in key:
+        return key if key in knobs else None
+    return key if any(knob.startswith(f"{key}.") for knob in knobs) else None
+
+
+def axes_touched(exp: Experiment) -> dict[str, list[str]]:
+    """Every axis this manifest moves, and the override that shows it.
+
+    Both the overrides fixed for the whole pod and the ones swept per setting: a
+    value pinned on one pod and a different value pinned on another is the same
+    cross-host comparison as a sweep torn in half, and reads as neither.
+    """
+    found: dict[str, list[str]] = {}
+    swept = [override for extra in exp.settings.values() for override in extra]
+    for override in [*exp.overrides, *swept]:
+        if axis := axis_moved_by(override):
+            found.setdefault(axis, []).append(override)
+    return found
 
 
 def load_baselines(path: Path) -> dict[str, list[str]]:
@@ -218,6 +300,7 @@ def load_experiments(directory: Path = MANIFEST_DIR) -> list[Experiment]:
     paths = sorted(p for p in directory.glob("*.yaml") if not p.name.startswith("_"))
     experiments = [load_manifest(p) for p in paths]
     check_axis_not_split(experiments)
+    check_one_baseline_one_gpu(experiments)
     return experiments
 
 
@@ -227,18 +310,67 @@ def check_axis_not_split(experiments: list[Experiment]) -> None:
     Pods are different physical hosts. Comparing FA2 on one host against FA3 on
     another measures the hosts as much as the kernels, so PLAN.md forbids it. The
     rule is enforceable here because a manifest is exactly one pod.
+
+    What counts as touching an axis is read off the overrides, not off the
+    manifest's `axis` field. Keying on the declaration alone left a way through
+    that needed no ill intent: `axis` is required only when a manifest has
+    `settings`, so two pods each pinning one value of the same axis in
+    `overrides` — one `loss=mnrl`, one `loss=cached_mnrl` — declared nothing,
+    collided with nothing, and ran half a comparison each on a different host.
     """
-    seen: dict[tuple[str, str], list[str]] = {}
+    seen: dict[tuple[str, str], dict[str, list[str]]] = {}
     for exp in experiments:
+        touched = axes_touched(exp)
         if exp.axis:
-            seen.setdefault((exp.model, exp.axis), []).append(exp.name)
-    split = {key: names for key, names in seen.items() if len(names) > 1}
+            touched.setdefault(exp.axis, ["declared"])
+        for axis, evidence in touched.items():
+            seen.setdefault((exp.model, axis), {})[exp.name] = evidence
+    split = {key: owners for key, owners in seen.items() if len(owners) > 1}
     if split:
         detail = "; ".join(
-            f"{model} x {axis} split across {', '.join(sorted(names))}"
-            for (model, axis), names in sorted(split.items())
+            f"{model} x {axis} split across "
+            + ", ".join(f"{name} ({', '.join(why)})" for name, why in sorted(owners.items()))
+            for (model, axis), owners in sorted(split.items())
         )
         raise ManifestError(f"an axis is split across pods, which invalidates it: {detail}")
+
+
+def check_one_baseline_one_gpu(experiments: list[Experiment]) -> None:
+    """Pods whose numbers get compared must ask for the same GPU.
+
+    The canonical baseline is the instrument that makes two pods' numbers
+    comparable: every measuring pod runs it and a deviation over 3% throws the pod
+    out. Run that cohort on two different accelerators and the deviation is a fact
+    about the accelerator, after which the gate discards whichever pod was right.
+    PLAN.md bans mixing GPU types outright ("GPU 혼용은 어떤 경우에도 금지") and
+    that sentence was the entire enforcement — `gpu_type_id` is a free string that
+    nothing read back, so eighteen A100 manifests and three B200 manifests sat in
+    one directory with nothing able to tell a campaign from a mistake.
+
+    A measuring pod must name its own GPU rather than inherit `--gpu-type-id`:
+    that default is one value for the whole invocation, so an omission puts the
+    pod on whatever the last caller typed while its cohort runs on what they
+    declared, and the ledger records the difference as if it had been intended.
+    """
+    measuring = [e for e in experiments if e.baseline != NO_BASELINE]
+    if undeclared := sorted(e.name for e in measuring if not e.gpu_type_id):
+        raise ManifestError(
+            "a measuring pod must declare gpu_type_id, or its comparison spans "
+            f"whatever GPU each invocation defaulted to: {', '.join(undeclared)}"
+        )
+    cohorts: dict[str, dict[str, list[str]]] = {}
+    for exp in measuring:
+        cohorts.setdefault(exp.baseline, {}).setdefault(str(exp.gpu_type_id), []).append(exp.name)
+    mixed = {name: gpus for name, gpus in cohorts.items() if len(gpus) > 1}
+    if mixed:
+        detail = "; ".join(
+            f"baseline '{name}' spans "
+            + ", ".join(
+                f"{gpu} ({', '.join(sorted(names))})" for gpu, names in sorted(gpus.items())
+            )
+            for name, gpus in sorted(mixed.items())
+        )
+        raise ManifestError(f"one baseline compared across two GPU types: {detail}")
 
 
 def select(experiments: list[Experiment], patterns: list[str]) -> list[Experiment]:
@@ -344,16 +476,30 @@ def infisical_token() -> str:
     unsupported: with no token the pod runs without HF_TOKEN and every gated
     checkpoint looks like a checkpoint that does not exist.
 
+    **The orchestrator's own `INFISICAL_TOKEN` is not reused**, and that is the
+    whole point of this function. The documented way to run this script is
+    `infisical run --env=dev -- python scripts/orchestrate.py`, which puts a
+    dev-stored `INFISICAL_TOKEN` in the environment. That token is bound to `dev`
+    and ignores `--env` entirely — measured 2026-08-02: it returns the same 26
+    names for `--env=dev`, `--env=pod`, and for an environment that does not
+    exist. Picking it up meant the documented invocation handed every pod a
+    dev-wide token no matter which environment the operator selected, and
+    separating the environments could not fix it.
+
+    A token can still be supplied deliberately, under a name that says whose it
+    is. `INFISICAL_TOKEN` names the caller's; `TRAINBENCH_POD_INFISICAL_TOKEN`
+    names the pod's, and nothing puts it there by accident.
+
     The client secret is not passed on the command line — the Infisical CLI reads
     both halves of the universal-auth identity from the environment it inherits.
     """
-    if token := os.environ.get("INFISICAL_TOKEN"):
+    if token := os.environ.get("TRAINBENCH_POD_INFISICAL_TOKEN"):
         return token
     identity = ("INFISICAL_UNIVERSAL_AUTH_CLIENT_ID", "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET")
     if not all(os.environ.get(name) for name in identity):
         raise RuntimeError(
-            "no INFISICAL_TOKEN and no universal-auth identity in the environment; "
-            "run under `infisical run --env=dev --`"
+            "no TRAINBENCH_POD_INFISICAL_TOKEN and no universal-auth identity in the "
+            "environment; run under `infisical run --env=dev --`"
         )
     out = subprocess.run(
         ["infisical", "login", "--method=universal-auth", "--plain", "--silent"],
@@ -420,7 +566,9 @@ def pod_env(
     return env
 
 
-def pod_reachable_secret_names(token: str, project_id: str) -> set[str]:
+def pod_reachable_secret_names(
+    token: str, project_id: str, env: str = POD_INFISICAL_ENV
+) -> set[str]:
     """Secret NAMES the pod's own token can read. Never values.
 
     The pod does not receive secrets through its env dict; it receives a token,
@@ -428,52 +576,129 @@ def pod_reachable_secret_names(token: str, project_id: str) -> set[str]:
     whole environment that token can see. So the only meaningful question is what
     the token's scope is, and the only way to answer it is to ask with the token.
 
+    `env` is the Infisical environment the pod will be handed (`INFISICAL_ENV`),
+    passed in rather than read from `os.environ` here. Reading it from the
+    orchestrator's own environment made the probe answer for whichever environment
+    the operator happened to be running under while the pod ran in the one they
+    passed on the command line — and separating the pod's secrets into their own
+    environment is precisely the fix this guard recommends, so the guard would
+    have gone blind at the moment it was acted on.
+
     The subprocess gets a sanitised environment so that what the orchestrator
     already holds cannot be mistaken for what the pod can reach.
+
+    **What Infisical injected, not what the child process saw.** The same command
+    is run twice from the same sanitised environment — once under `infisical run`
+    and once without — and the answer is the difference. Subtracting only the
+    names we set was wrong by exactly the variables an operating system adds to
+    any child it spawns: on macOS `LC_CTYPE` and `__CF_USER_TEXT_ENCODING` came
+    back as two secrets the pod supposedly reached, and a correctly scoped `pod`
+    environment holding one secret was refused for holding three. A deny list
+    never noticed, because locale variables were not on it.
     """
     clean = {
         "PATH": os.environ["PATH"],
         "HOME": os.environ.get("HOME", ""),
         "INFISICAL_TOKEN": token,
     }
-    out = subprocess.run(
-        [
-            "infisical",
-            "run",
-            f"--env={os.environ.get('INFISICAL_ENV', 'dev')}",
-            f"--projectId={project_id}",
-            "--",
-            sys.executable,
-            "-c",
-            # chr(10) rather than an escape: this source is passed through argv,
-            # where a literal newline inside the quotes is a syntax error.
-            "import os;print(chr(10).join(sorted(os.environ)))",
-        ],
-        env=clean,
-        capture_output=True,
-        text=True,
-        timeout=120,
+    # chr(10) rather than an escape: this source is passed through argv, where a
+    # literal newline inside the quotes is a syntax error.
+    names = [sys.executable, "-c", "import os;print(chr(10).join(sorted(os.environ)))"]
+    injected = _env_names(
+        ["infisical", "run", f"--env={env}", f"--projectId={project_id}", "--", *names], clean
     )
-    if out.returncode != 0:
-        raise RuntimeError(f"could not read the pod token's scope: {out.stderr.strip()[:300]}")
-    return set(out.stdout.split()) - set(clean)
+    if injected is None:
+        raise RuntimeError(f"could not read the pod token's scope in env '{env}'")
+    ambient = _env_names(names, clean)
+    if ambient is None:
+        raise RuntimeError("could not read the environment a plain subprocess starts with")
+    return injected - ambient
 
 
-def assert_pod_scope_is_safe(token: str, project_id: str) -> set[str]:
-    """Refuse to launch while the pod's token can read secrets it has no business with.
+def _env_names(command: list[str], env: dict[str, str]) -> set[str] | None:
+    """Environment variable names `command` prints, or None if it failed.
+
+    None rather than an exception because one caller expects failure: asking for
+    an environment that does not exist is how `token_is_bound_to_one_environment`
+    tells a scoped token from one that ignores `--env`.
+    """
+    out = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
+    return set(out.stdout.split()) if out.returncode == 0 else None
+
+
+def token_is_bound_to_one_environment(token: str, project_id: str) -> bool:
+    """Whether this token returns the same secrets whatever environment is asked for.
+
+    Measured, not assumed, and the measurement is a name no environment has. A
+    token that honours `--env` makes the CLI fail on it; a token bound to one
+    environment answers with that environment's secrets regardless, so a non-empty
+    answer for an environment that cannot exist is the binding itself.
+
+    Comparing two real environments would not do: they are allowed to hold the
+    same names, and then a scoped token would look bound.
+
+    Why this is checked at all — measured 2026-08-02, names and counts only:
+
+        machine identity   --env=dev  26   --env=pod   1   --env=<nonexistent>  error
+        dev-stored token   --env=dev  26   --env=pod  26   --env=<nonexistent>  26
+
+    The second row is a service token bound to `dev`, and it was the token the
+    documented invocation handed to every pod (see `infisical_token`). Today the
+    scope check would refuse it anyway for the 25 extra secrets — but that is a
+    fact about `dev`'s contents, not about the token, and it stops being true the
+    day `dev` is tidied up.
+    """
+    nowhere = f"trainbench-no-such-env-{uuid.uuid4().hex}"
+    try:
+        return bool(pod_reachable_secret_names(token, project_id, nowhere))
+    except RuntimeError:
+        return False
+
+
+def assert_pod_scope_is_safe(token: str, project_id: str, env: str = POD_INFISICAL_ENV) -> set[str]:
+    """Refuse to launch unless the pod's token reaches exactly `ALLOWED_ON_POD`.
 
     This is the check `pod_env` was supposed to be. It measures the property that
     matters — what the pod can obtain — rather than what we chose to hand it.
+
+    `env` must be the same Infisical environment the pod is handed, or this
+    reports on a scope no pod will ever have.
+
+    Both directions are refusals, and the second is not padding. A token that
+    cannot read HF_TOKEN produces the failure already on this repository's record:
+    every gated checkpoint answers 401, and the combination gets filed as
+    unsupported by a pod that was never equipped to answer. An empty scope is the
+    same refusal — a check whose subject is an empty set passes by having nothing
+    to examine, which is how this repository has been wrong eight times.
     """
-    reachable = pod_reachable_secret_names(token, project_id)
-    leaked = sorted(set(FORBIDDEN_ON_POD) & reachable)
-    if leaked:
+    if token_is_bound_to_one_environment(token, project_id):
         raise RuntimeError(
-            "refusing to launch: the pod's Infisical token can read "
-            f"{', '.join(leaked)}. entrypoint.sh injects everything that token can "
-            "see, so an experiment pod would hold them. Scope the machine identity "
-            "to a pod-only secret set (or a separate Infisical environment) — "
-            "lengthening FORBIDDEN_ON_POD cannot reach this."
+            f"refusing to launch: the pod's token ignores --env, so asking for '{env}' "
+            "changes nothing about what it can read. It is bound to one environment "
+            "(a service token), and separating the pod's secrets cannot reach it. "
+            "Let the orchestrator mint a token from the universal-auth identity, or "
+            "set TRAINBENCH_POD_INFISICAL_TOKEN to one that honours --env."
+        )
+    reachable = pod_reachable_secret_names(token, project_id, env)
+    if extra := sorted(reachable - ALLOWED_ON_POD):
+        urgent = [name for name in FORBIDDEN_ON_POD if name in extra]
+        raise RuntimeError(
+            f"refusing to launch: the pod's Infisical token can read {len(extra)} "
+            f"secret(s) the pod has no use for: {', '.join(extra)}. "
+            + (f"Account-wide among them: {', '.join(urgent)}. " if urgent else "")
+            + "entrypoint.sh runs the workload under `infisical run`, which injects "
+            "everything that token can see, so an experiment pod would hold all of "
+            f"them. Scope the machine identity to {', '.join(sorted(ALLOWED_ON_POD))} "
+            f"or point --infisical-env at an environment holding only that; env "
+            f"'{env}' does not."
+        )
+    if missing := sorted(ALLOWED_ON_POD - reachable):
+        raise RuntimeError(
+            f"refusing to launch: the pod's Infisical token cannot read "
+            f"{', '.join(missing)} in env '{env}'. Without it every gated checkpoint "
+            "answers 401 and the combination is filed as unsupported by a pod that "
+            "was never equipped to load it — a spent pod-hour producing a wrong "
+            "result rather than no result."
         )
     return reachable
 
@@ -523,7 +748,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tag", default="latest")
     parser.add_argument("--gpu-type-id", default="NVIDIA A100-SXM4-80GB")
     parser.add_argument("--result-repo", default="jinwoo-cho/trainbench-results")
-    parser.add_argument("--infisical-env", default="dev")
+    parser.add_argument(
+        "--infisical-env",
+        default=POD_INFISICAL_ENV,
+        help="Infisical environment the pod reads through its token, and what the "
+        "pre-launch scope check asks. Defaults to the pod's own environment; the "
+        "orchestrator's own secrets come from the `infisical run` wrapping it, not "
+        "from here",
+    )
     parser.add_argument("--infisical-project-id", default=default_project_id())
     parser.add_argument("--max-concurrent", type=int, default=6)
     parser.add_argument("--timeout-minutes", type=positive_minutes, default=60)
@@ -605,7 +837,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         token = infisical_token()
         # What the pod can obtain, not what we chose to hand it. Names only.
-        reachable = assert_pod_scope_is_safe(token, args.infisical_project_id)
+        reachable = assert_pod_scope_is_safe(token, args.infisical_project_id, args.infisical_env)
     except (RuntimeError, subprocess.SubprocessError) as exc:
         console.print(f"[red]{exc}[/red]")
         return 2

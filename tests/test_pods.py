@@ -316,6 +316,134 @@ def test_one_axis_split_across_two_pods_is_refused():
         orchestrate.check_axis_not_split([experiment("a"), experiment("b")])
 
 
+def measuring(name, **overrides):
+    """A pod that produces numbers, so both new guards apply to it."""
+    body = {
+        "name": name,
+        "phase": "phase2",
+        "model": "gemma4_e2b",
+        "framework": "native",
+        "purpose": "timing",
+        "baseline": "canonical",
+        "gpu_type_id": "NVIDIA B200",
+    }
+    body.update(overrides)
+    return orchestrate.Experiment(**body)
+
+
+def test_two_pods_pinning_different_values_of_one_axis_are_refused():
+    """The way through the old guard: `axis` is required only alongside
+    `settings`, so a manifest that puts `loss=cached_mnrl` straight in
+    `overrides` declares nothing, and a second pinning `loss=mnrl` collides with
+    nothing. Half a comparison ran on each host and the check said nothing."""
+    split = [
+        measuring("a", overrides=["loss=mnrl"]),
+        measuring("b", overrides=["loss=cached_mnrl"]),
+    ]
+    with pytest.raises(orchestrate.ManifestError, match="loss"):
+        orchestrate.check_axis_not_split(split)
+
+
+def test_a_pinned_value_beside_a_sweep_of_the_same_axis_is_refused():
+    """The sweep is one pod's, the pinned value is another's, and the report puts
+    all three numbers in one column."""
+    pods_ = [
+        measuring("sweep", axis="loss", settings={"a": ["loss=mnrl"], "b": ["loss=cached_mnrl"]}),
+        measuring("pinned", overrides=["loss=cached_mnrl"]),
+    ]
+    with pytest.raises(orchestrate.ManifestError, match="split across pods"):
+        orchestrate.check_axis_not_split(pods_)
+
+
+def test_a_knob_that_is_an_axis_counts_even_written_out_in_full():
+    """`train.gradient_checkpointing` is an axis with no config group of its own,
+    so a guard that only understood `group=value` overrides would miss it."""
+    pods_ = [
+        measuring("a", overrides=["train.gradient_checkpointing=full"]),
+        measuring("b", overrides=["train.gradient_checkpointing=selective"]),
+    ]
+    with pytest.raises(orchestrate.ManifestError, match="train.gradient_checkpointing"):
+        orchestrate.check_axis_not_split(pods_)
+
+
+def test_an_override_that_moves_no_axis_does_not_collide():
+    """Every Phase 0 manifest carries `data.limit` and `train.batch_size`. Neither
+    is an axis, and a guard that refused them would refuse the shipped sweep."""
+    orchestrate.check_axis_not_split(
+        [
+            measuring("a", overrides=["data.limit=8", "train.batch_size=8"]),
+            measuring("b", overrides=["data.limit=8", "train.batch_size=8"]),
+        ]
+    )
+
+
+def test_two_models_may_run_the_same_axis_on_their_own_pods():
+    """The rule is one axis per model per pod, not one axis per campaign — the
+    shipped `loss` sweep is three pods, one per model."""
+    orchestrate.check_axis_not_split(
+        [
+            measuring("a", model="gemma4_e2b", overrides=["loss=mnrl"]),
+            measuring("b", model="qwen3_5_0_8b", overrides=["loss=mnrl"]),
+        ]
+    )
+
+
+def test_a_manifest_whose_declared_axis_is_not_the_one_it_moves_is_refused(tmp_path):
+    path = manifest(
+        tmp_path,
+        "phase2-x",
+        run="timing",
+        baseline="canonical",
+        gpu_type_id="NVIDIA B200",
+        axis="loss",
+        settings={"fa3": ["attn=fa3"], "sdpa": ["attn=sdpa"]},
+    )
+    with pytest.raises(orchestrate.ManifestError, match="declares axis 'loss'"):
+        orchestrate.load_manifest(path)
+
+
+def test_one_baseline_may_not_be_compared_across_two_gpu_types():
+    """The baseline exists so that pods can be compared; run it on two
+    accelerators and the 3% gate discards whichever pod was right."""
+    with pytest.raises(orchestrate.ManifestError, match="two GPU types"):
+        orchestrate.check_one_baseline_one_gpu(
+            [
+                measuring("a", gpu_type_id="NVIDIA B200"),
+                measuring("b", model="qwen3_5_0_8b", gpu_type_id="NVIDIA A100-SXM4-80GB"),
+            ]
+        )
+
+
+def test_two_campaigns_on_two_gpu_types_are_not_a_mix():
+    """Phase 0 probes on A100 and Phase 2 sweeps on B200 is the plan, not a
+    defect. Nothing compares a probe to a timing run, and the probes say so by
+    naming no baseline."""
+    orchestrate.check_one_baseline_one_gpu(
+        [
+            measuring(
+                "probe", purpose="probe", baseline="none", gpu_type_id="NVIDIA A100-SXM4-80GB"
+            ),
+            measuring("sweep", gpu_type_id="NVIDIA B200"),
+        ]
+    )
+
+
+def test_a_measuring_pod_that_names_no_gpu_is_refused():
+    """`--gpu-type-id` is one value for the whole invocation, so an omission puts
+    this pod on whatever the caller typed and its cohort on what they declared."""
+    with pytest.raises(orchestrate.ManifestError, match="must declare gpu_type_id"):
+        orchestrate.check_one_baseline_one_gpu([measuring("a", gpu_type_id=None)])
+
+
+def test_the_shipped_manifests_pass_both_guards():
+    """A guard nothing exercises is a guard nobody has read the output of."""
+    experiments = orchestrate.load_experiments()
+    measured = [e for e in experiments if e.baseline != orchestrate.NO_BASELINE]
+    assert measured, "no manifest produces a number for the GPU cohort rule to hold together"
+    assert {e.gpu_type_id for e in measured} == {"NVIDIA B200"}
+    assert any(orchestrate.axes_touched(e) for e in experiments), "no manifest moves an axis"
+
+
 def test_an_unknown_baseline_name_is_refused():
     exp = orchestrate.Experiment(
         name="x",
@@ -381,6 +509,400 @@ def test_no_deadline_lets_the_pod_outlive_its_watcher(minutes):
 def test_a_deadline_of_zero_minutes_is_refused():
     with pytest.raises(orchestrate.argparse.ArgumentTypeError):
         orchestrate.positive_minutes("0")
+
+
+# --- what the pod's token can reach -------------------------------------------
+#
+# `assert_pod_scope_is_safe` is the only code enforcing the constraint written at
+# the top of trainbench/pods.py — an experiment pod has no business holding an
+# account-wide credential — and it shipped with no test at all. It runs on the
+# path to every launch, so a wrong answer either leaks the account onto a probe
+# pod or blocks the whole campaign.
+#
+# Nothing here handles a secret value. The names are the scope, the names are what
+# the guard compares, and a test that fabricated values would be the first place
+# to write one down.
+
+
+def reaching(*names):
+    """A stand-in for the Infisical answer: the names the pod's token can read."""
+    return lambda token, project_id, env="dev": set(names)
+
+
+# Captured before the fixture below replaces it, so the tests about the binding
+# probe can still reach the real one.
+BINDING_PROBE = orchestrate.token_is_bound_to_one_environment
+
+
+@pytest.fixture(autouse=True)
+def _token_honours_env(monkeypatch):
+    """Most tests here are about scope, and a stub scope reader would otherwise make
+    the binding probe answer for an environment that does not exist. Tests about
+    the binding itself override this."""
+    monkeypatch.setattr(orchestrate, "token_is_bound_to_one_environment", lambda t, p: False)
+
+
+def test_a_refusal_names_every_forbidden_secret_the_token_reaches(monkeypatch):
+    """All of them, not the first one found: the fix is to rescope the identity,
+    and an operator who is told one name at a time rescopes it one round trip at
+    a time."""
+    monkeypatch.setattr(
+        orchestrate,
+        "pod_reachable_secret_names",
+        reaching("HF_TOKEN", *orchestrate.FORBIDDEN_ON_POD),
+    )
+    with pytest.raises(RuntimeError) as raised:
+        orchestrate.assert_pod_scope_is_safe("t", "p")
+    assert all(name in str(raised.value) for name in orchestrate.FORBIDDEN_ON_POD)
+
+
+def test_a_scoped_token_passes_and_reports_what_it_reaches(monkeypatch):
+    monkeypatch.setattr(orchestrate, "pod_reachable_secret_names", reaching("HF_TOKEN"))
+    assert orchestrate.assert_pod_scope_is_safe("t", "p") == {"HF_TOKEN"}
+
+
+@pytest.mark.parametrize("secret", orchestrate.FORBIDDEN_ON_POD)
+def test_every_forbidden_name_is_caught_on_its_own(monkeypatch, secret):
+    """One name per assertion. A guard that only catches the first of a list is
+    indistinguishable from a working one until the day a different one leaks."""
+    monkeypatch.setattr(orchestrate, "pod_reachable_secret_names", reaching("HF_TOKEN", secret))
+    with pytest.raises(RuntimeError, match=secret):
+        orchestrate.assert_pod_scope_is_safe("t", "p")
+
+
+# The reason this check is an allowlist. A deny list holds the names someone
+# remembered; the environment it guards grows without asking it. Measured
+# 2026-08-02: the project's `dev` environment injects 27 names, four of which
+# FORBIDDEN_ON_POD knows and one of which the pod uses — the other 22 passed.
+@pytest.mark.parametrize(
+    "secret",
+    ["AWS_SECRET_ACCESS_KEY", "DATABASE_URL", "OPENAI_API_KEY", "SLACK_WEBHOOK_URL"],
+)
+def test_a_secret_no_deny_list_ever_named_is_still_refused(monkeypatch, secret):
+    monkeypatch.setattr(orchestrate, "pod_reachable_secret_names", reaching("HF_TOKEN", secret))
+    with pytest.raises(RuntimeError, match=secret):
+        orchestrate.assert_pod_scope_is_safe("t", "p")
+    assert secret not in orchestrate.FORBIDDEN_ON_POD, "this name must not be on the deny list"
+
+
+def test_the_refusal_counts_the_extras_so_rescoping_is_one_round_trip(monkeypatch):
+    extras = [f"UNRELATED_{i}" for i in range(22)]
+    monkeypatch.setattr(orchestrate, "pod_reachable_secret_names", reaching("HF_TOKEN", *extras))
+    with pytest.raises(RuntimeError) as raised:
+        orchestrate.assert_pod_scope_is_safe("t", "p")
+    assert "22 secret(s)" in str(raised.value)
+    assert all(name in str(raised.value) for name in extras)
+
+
+def test_a_token_that_cannot_read_hf_token_is_refused(monkeypatch):
+    """The failure already on this repository's record: with no HF_TOKEN every
+    gated checkpoint answers 401 and the combination is filed as unsupported. A
+    pod that cannot answer its question must not be paid for."""
+    monkeypatch.setattr(orchestrate, "pod_reachable_secret_names", reaching())
+    with pytest.raises(RuntimeError, match="cannot read HF_TOKEN"):
+        orchestrate.assert_pod_scope_is_safe("t", "p")
+
+
+def test_an_empty_scope_is_not_a_clean_bill(monkeypatch):
+    """A check whose subject is an empty set passes by having nothing to examine.
+    Under a deny list that is exactly what an unreachable Infisical looked like."""
+    monkeypatch.setattr(orchestrate, "pod_reachable_secret_names", reaching())
+    with pytest.raises(RuntimeError):
+        orchestrate.assert_pod_scope_is_safe("t", "p")
+
+
+# --- the probe must measure what Infisical injected, not what the child saw -----
+#
+# Found by running the guard against the real `pod` environment, which holds one
+# secret. It was refused for holding three: the operating system adds LC_CTYPE and
+# __CF_USER_TEXT_ENCODING to any child process, and subtracting only the names we
+# set counted them as secrets the pod had reached. The deny list never noticed
+# because locale variables were not on it — the allowlist is what exposed it.
+
+OS_ADDED = ["LC_CTYPE", "__CF_USER_TEXT_ENCODING"]
+
+
+def scope_reader(monkeypatch, injected):
+    """Stub the two subprocesses `pod_reachable_secret_names` compares.
+
+    Both answers carry what the OS adds to a child, because that is the condition
+    the defect lived in: identical on both sides and therefore not a secret.
+    """
+    Done = namedtuple("Done", "returncode stdout stderr")
+    clean = ["PATH", "HOME", "INFISICAL_TOKEN"]
+
+    def run(command, env, capture_output, text, timeout):
+        under_infisical = command[0] == "infisical"
+        names = [*clean, *OS_ADDED, *(injected if under_infisical else [])]
+        return Done(0, "\n".join(names), "")
+
+    monkeypatch.setattr(orchestrate.subprocess, "run", run)
+
+
+def test_what_the_operating_system_adds_to_a_child_is_not_a_secret(monkeypatch):
+    scope_reader(monkeypatch, ["HF_TOKEN"])
+    assert orchestrate.pod_reachable_secret_names("t", "p", "pod") == {"HF_TOKEN"}
+
+
+def test_a_correctly_scoped_environment_is_not_refused_for_holding_locale_variables(monkeypatch):
+    """The reported symptom: `--infisical-env pod` refused with 'extra: LC_CTYPE,
+    __CF_USER_TEXT_ENCODING' while Infisical itself reported injecting 1 secret."""
+    scope_reader(monkeypatch, ["HF_TOKEN"])
+    assert orchestrate.assert_pod_scope_is_safe("t", "p", "pod") == {"HF_TOKEN"}
+
+
+def test_a_real_extra_secret_is_still_refused_among_the_locale_variables(monkeypatch):
+    """The other half. A fix that stopped counting anything would pass too."""
+    scope_reader(monkeypatch, ["HF_TOKEN", "AWS_SECRET_ACCESS_KEY"])
+    with pytest.raises(RuntimeError, match="AWS_SECRET_ACCESS_KEY"):
+        orchestrate.assert_pod_scope_is_safe("t", "p", "pod")
+
+
+# --- a token that ignores --env -------------------------------------------------
+#
+# Measured 2026-08-02, counts only: a machine-identity token answers 26 names for
+# `--env=dev`, 1 for `--env=pod`, and errors for an environment that does not
+# exist. A service token stored in `dev` answers 26 to all three. `infisical_token`
+# preferred the ambient INFISICAL_TOKEN, and the documented way to run the
+# orchestrator (`infisical run --env=dev -- python scripts/orchestrate.py`) puts
+# exactly that service token there — so every pod got a dev-wide token whatever
+# --infisical-env said.
+
+
+def bound_to_one_environment(*names):
+    """A token that answers with the same secrets whatever environment is asked."""
+    return lambda token, project_id, env="dev": set(names)
+
+
+def test_a_token_that_answers_for_an_environment_that_cannot_exist_is_bound(monkeypatch):
+    monkeypatch.setattr(orchestrate, "pod_reachable_secret_names", bound_to_one_environment("A"))
+    assert BINDING_PROBE("t", "p") is True
+
+
+def test_a_token_the_cli_rejects_for_a_missing_environment_honours_env(monkeypatch):
+    def refuse(token, project_id, env="dev"):
+        raise RuntimeError(f"environment '{env}' not found")
+
+    monkeypatch.setattr(orchestrate, "pod_reachable_secret_names", refuse)
+    assert BINDING_PROBE("t", "p") is False
+
+
+def test_a_bound_token_is_refused_even_when_its_scope_looks_clean(monkeypatch):
+    """The case that outlives the current mess. Today `dev` holds 27 secrets, so a
+    dev-bound token is refused for the extras — a fact about dev's contents, not
+    about the token. Tidy dev down to HF_TOKEN and the binding would pass
+    silently, and `--infisical-env pod` would go on meaning nothing."""
+    monkeypatch.setattr(orchestrate, "token_is_bound_to_one_environment", lambda t, p: True)
+    monkeypatch.setattr(orchestrate, "pod_reachable_secret_names", reaching("HF_TOKEN"))
+    with pytest.raises(RuntimeError, match="ignores --env"):
+        orchestrate.assert_pod_scope_is_safe("t", "p", "pod")
+
+
+def test_no_pod_is_created_for_a_token_that_ignores_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setattr(orchestrate, "token_is_bound_to_one_environment", lambda t, p: True)
+    code, created = launch(tmp_path, monkeypatch, ["HF_TOKEN"])
+    assert code == 2
+    assert created == []
+
+
+def test_the_orchestrators_own_token_is_not_handed_to_the_pod(monkeypatch):
+    """`INFISICAL_TOKEN` names the caller's token. Reusing it is how a dev-bound
+    service token reached every pod through the documented invocation."""
+    monkeypatch.setenv("INFISICAL_TOKEN", "the-callers-dev-bound-token")
+    monkeypatch.delenv("TRAINBENCH_POD_INFISICAL_TOKEN", raising=False)
+    monkeypatch.delenv("INFISICAL_UNIVERSAL_AUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET", raising=False)
+    with pytest.raises(RuntimeError, match="universal-auth identity"):
+        orchestrate.infisical_token()
+
+
+def test_a_pod_token_supplied_under_its_own_name_is_used(monkeypatch):
+    monkeypatch.setenv("TRAINBENCH_POD_INFISICAL_TOKEN", "the-pods-token")
+    monkeypatch.setenv("INFISICAL_TOKEN", "the-callers-token")
+    assert orchestrate.infisical_token() == "the-pods-token"
+
+
+def test_the_allowlist_is_what_the_pod_is_documented_to_need():
+    """`.env.example` is the repository's own statement of which secret an
+    experiment pod uses. Two places saying it means one can drift."""
+    documented = {
+        line.split("=")[0]
+        for line in (REPO / ".env.example").read_text().splitlines()
+        if "=" in line and not line.startswith("#")
+    }
+    assert orchestrate.ALLOWED_ON_POD < documented
+    assert orchestrate.ALLOWED_ON_POD.isdisjoint(orchestrate.FORBIDDEN_ON_POD)
+
+
+def test_the_refusal_names_the_secret_and_never_the_token(monkeypatch):
+    monkeypatch.setattr(
+        orchestrate, "pod_reachable_secret_names", reaching("HF_TOKEN", "GITHUB_TOKEN")
+    )
+    with pytest.raises(RuntimeError) as raised:
+        orchestrate.assert_pod_scope_is_safe("st.the-actual-token", "p")
+    assert "GITHUB_TOKEN" in str(raised.value)
+    assert "st.the-actual-token" not in str(raised.value)
+
+
+def test_the_scope_is_read_with_the_pod_token_alone(monkeypatch):
+    """The orchestrator runs under `infisical run` itself, so its own environment
+    holds every forbidden name. Inherited by the subprocess, the answer would be
+    the orchestrator's scope wearing the pod's name, and the guard would report
+    a leak on a correctly scoped identity — or hide one."""
+    seen = {}
+
+    def capture(command, env, capture_output, text, timeout):
+        # Both subprocesses must start from the same sanitised environment, or the
+        # difference between them would be the orchestrator's own variables.
+        seen.setdefault("envs", []).append(env)
+        injected = ["HF_TOKEN"] if command[0] == "infisical" else []
+        return namedtuple("Done", "returncode stdout stderr")(
+            0, "\n".join(["PATH", "HOME", "INFISICAL_TOKEN", *injected]), ""
+        )
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-secret")
+    monkeypatch.setattr(orchestrate.subprocess, "run", capture)
+    reachable = orchestrate.pod_reachable_secret_names("pod-token", "project")
+    assert reachable == {"HF_TOKEN"}
+    assert len(seen["envs"]) == 2
+    for env in seen["envs"]:
+        assert set(env) == {"PATH", "HOME", "INFISICAL_TOKEN"}
+        assert env["INFISICAL_TOKEN"] == "pod-token"
+
+
+def test_a_launch_with_no_flag_hands_the_pod_its_own_environment(tmp_path, monkeypatch):
+    """What the pod gets when nobody passes `--infisical-env`.
+
+    The literal `"pod"` is asserted rather than `POD_INFISICAL_ENV`, which would
+    pass just as well after someone set that constant back to `dev`. `dev` is the
+    orchestrator's own environment, and its 27 secrets are not the pod's.
+
+    Both halves are checked together: the environment the pod is handed and the
+    one the pre-launch check asks about have to be the same, or the guard vouches
+    for a scope no pod will ever run in.
+    """
+    asked = []
+    created = []
+
+    def scope(token, project_id, env=orchestrate.POD_INFISICAL_ENV):
+        asked.append(env)
+        return {"HF_TOKEN"}
+
+    monkeypatch.setattr(orchestrate, "infisical_token", lambda: "pod-token")
+    monkeypatch.setattr(orchestrate, "pod_reachable_secret_names", scope)
+    monkeypatch.setattr(orchestrate, "image_digest", lambda image: "sha256:" + "ab" * 32)
+    monkeypatch.setattr(
+        orchestrate.pods, "create", lambda spec: created.append(spec) or {"id": "p"}
+    )
+    monkeypatch.setattr(orchestrate.pods, "terminate", lambda pod_id: None)
+    monkeypatch.setattr(orchestrate.pods, "PodWatch", FakeWatch)
+    code = orchestrate.main(
+        [
+            "--experiment",
+            "phase2-loss-gemma4_e2b",
+            "--allow-dirty",
+            "--infisical-project-id",
+            "project",
+            "--out",
+            str(tmp_path / "orchestrate.json"),
+        ]
+    )
+    assert code == 0
+    assert [spec.env["INFISICAL_ENV"] for spec in created] == ["pod"]
+    assert asked == ["pod"]
+
+
+def test_the_scope_is_read_from_the_environment_the_pod_is_handed(monkeypatch, tmp_path):
+    """Separating the pod's secrets into their own Infisical environment is what
+    the refusal message asks for, and `--infisical-env` is how that reaches the
+    pod. The probe read `INFISICAL_ENV` off the orchestrator's own process, so
+    acting on the advice pointed the pod at one environment and the check at
+    another — the guard would have gone blind at the moment it was obeyed."""
+    asked = {}
+    real_run = subprocess.run
+
+    def capture(command, **kwargs):
+        if command[0] != "infisical":
+            return real_run(command, **kwargs)
+        asked["env_flag"] = next(a for a in command if a.startswith("--env="))
+        return namedtuple("Done", "returncode stdout stderr")(0, "HF_TOKEN\n", "")
+
+    monkeypatch.setenv("INFISICAL_ENV", "dev")
+    monkeypatch.setattr(orchestrate.subprocess, "run", capture)
+    monkeypatch.setattr(orchestrate, "infisical_token", lambda: "pod-token")
+    monkeypatch.setattr(orchestrate, "image_digest", lambda image: "sha256:" + "ab" * 32)
+    monkeypatch.setattr(orchestrate.pods, "create", lambda spec: {"id": "p"})
+    monkeypatch.setattr(orchestrate.pods, "terminate", lambda pod_id: None)
+    monkeypatch.setattr(orchestrate.pods, "PodWatch", FakeWatch)
+    orchestrate.main(
+        [
+            "--experiment",
+            "phase2-loss-gemma4_e2b",
+            "--allow-dirty",
+            "--infisical-env",
+            "pod-only",
+            "--infisical-project-id",
+            "project",
+            "--out",
+            str(tmp_path / "orchestrate.json"),
+        ]
+    )
+    assert asked["env_flag"] == "--env=pod-only"
+
+
+# --- the guard sits on the path to a launch, not beside it ----------------------
+
+
+class FakeWatch:
+    """Every tracked pod finishes on the first wait, so `main`'s loop ends."""
+
+    def __init__(self, timeout_seconds):
+        self.watching = []
+
+    def track(self, pod_id):
+        self.watching.append(pod_id)
+
+    def wait_for_any(self):
+        done, self.watching = self.watching, []
+        return [pods.PodOutcome(p, pods.REASON_EXITED, pods.EXITED, True, 1.0) for p in done]
+
+
+def launch(tmp_path, monkeypatch, reachable):
+    """Run the real `main` over one shipped manifest with nothing real behind it."""
+    created = []
+    monkeypatch.setattr(orchestrate, "infisical_token", lambda: "pod-token")
+    monkeypatch.setattr(orchestrate, "pod_reachable_secret_names", reaching(*reachable))
+    monkeypatch.setattr(orchestrate, "image_digest", lambda image: "sha256:" + "ab" * 32)
+    monkeypatch.setattr(
+        orchestrate.pods, "create", lambda spec: created.append(spec) or {"id": "p"}
+    )
+    monkeypatch.setattr(orchestrate.pods, "terminate", lambda pod_id: None)
+    monkeypatch.setattr(orchestrate.pods, "PodWatch", FakeWatch)
+    code = orchestrate.main(
+        [
+            "--experiment",
+            "phase2-loss-gemma4_e2b",
+            "--allow-dirty",
+            "--infisical-project-id",
+            "project",
+            "--out",
+            str(tmp_path / "orchestrate.json"),
+        ]
+    )
+    return code, created
+
+
+def test_no_pod_is_created_while_the_token_can_read_a_forbidden_secret(tmp_path, monkeypatch):
+    code, created = launch(tmp_path, monkeypatch, ["HF_TOKEN", "RUNPOD_API_KEY"])
+    assert code == 2
+    assert created == []
+
+
+def test_a_scoped_token_reaches_the_launch(tmp_path, monkeypatch):
+    """The other half: a guard that refuses everything also creates no pod."""
+    code, created = launch(tmp_path, monkeypatch, ["HF_TOKEN"])
+    assert code == 0
+    assert [spec.name for spec in created] == ["trainbench-phase2-loss-gemma4_e2b"]
 
 
 # --- publishing ----------------------------------------------------------------
