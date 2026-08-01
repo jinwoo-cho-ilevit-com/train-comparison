@@ -7,11 +7,32 @@ Completion is a *transition*, not a snapshot. A pod that has not started yet and
 pod that has finished look almost identical over the API — both report a null
 runtime — and the only thing separating them is whether a runtime was ever seen.
 Reading one snapshot cannot tell them apart, so this module keeps per-pod state.
+
+Two transports, on purpose. Creation goes over RunPod's REST API; reading and
+terminating stay on the `runpod` SDK's GraphQL calls. Neither half is a preference:
+
+- Creation cannot use the SDK. `runpod.api.mutations.pods` builds its mutation by
+  f-string interpolation — `f'{{ key: "{k}", value: "{v}" }}'` for every env pair —
+  so a value containing a quote closes the string and the rest of it becomes
+  syntax. Our env carries `TRAINBENCH_CONFIG_JSON`, a whole JSON document. The
+  first campaign lost all fifteen launches to `Syntax Error: Expected ":", found
+  String ": {"` and created no pod. REST takes a JSON body, so the encoder escapes
+  what the interpolator could not.
+- Reading cannot use REST. The REST `Pod` object has no `runtime` field, and
+  `runtime` is the whole basis of the pending/running distinction below. Measured
+  against the live account: 50 REST pod objects, not one carried the key, while
+  GraphQL `get_pod` returned a non-null runtime for a RUNNING pod and a null one
+  for an EXITED pod. Moving `get` to REST would make every pod read as pending
+  forever.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -20,6 +41,16 @@ from typing import Any
 # is far too small for that.
 DEFAULT_CONTAINER_DISK_GB = 120
 POLL_SECONDS = 20
+
+# https://rest.runpod.io/v1/openapi.json — `servers[0].url`, `POST /pods` with a
+# `PodCreateInput` body, bearer auth. Field names below come from that document.
+REST_BASE_URL = "https://rest.runpod.io/v1"
+REST_TIMEOUT_SECONDS = 60
+
+# How much of a rejection body to keep in the error. A launch failure is written
+# to the orchestrator's ledger, so the message has to be long enough to name the
+# offending field and short enough not to be a dump.
+ERROR_BODY_CHARS = 500
 
 # How many consecutive readings must agree before an *inferred* terminal state ends
 # a pod's watch. A state the API states outright (`desiredStatus`) needs one. How
@@ -56,42 +87,143 @@ class PodSpec:
     data_center_id: str | None = None
 
 
-def _client() -> Any:
-    import os
+@dataclass(frozen=True)
+class Request:
+    """Exactly what goes on the wire, minus authentication.
 
-    import runpod
+    `body` is bytes rather than a dict because the encoding *is* the fix: a test
+    that inspects a dict proves nothing about how the value gets serialised, and
+    serialisation is what broke the first campaign. The credential is deliberately
+    absent — it is added inside `send` and never enters an object a caller can
+    hold, log, or attach to a ledger entry.
+    """
 
+    method: str
+    url: str
+    headers: dict[str, str]
+    body: bytes | None
+
+
+Transport = Callable[[Request], dict[str, Any]]
+
+
+def _api_key() -> str:
     key = os.environ.get("RUNPOD_API_KEY")
     if not key:
         raise RuntimeError("RUNPOD_API_KEY is not set; run under `infisical run --`")
-    runpod.api_key = key
+    return key
+
+
+def _client() -> Any:
+    import runpod
+
+    runpod.api_key = _api_key()
     return runpod
 
 
-def create(spec: PodSpec) -> dict[str, Any]:
-    runpod = _client()
-    return runpod.create_pod(
-        name=spec.name,
-        image_name=spec.image,
-        gpu_type_id=spec.gpu_type_id,
-        cloud_type="SECURE",
-        # No network volume by design: training data must sit on pod-local NVMe or
-        # the dataloader axis measures the volume instead of the pipeline. Not
-        # attaching one also frees the pod from a single data centre.
-        network_volume_id=None,
-        container_disk_in_gb=spec.container_disk_gb,
-        data_center_id=spec.data_center_id,
-        env=spec.env,
-        start_ssh=False,
-        support_public_ip=False,
+def create_body(spec: PodSpec) -> dict[str, Any]:
+    """The `PodCreateInput` for one pod.
+
+    Every field the previous GraphQL call relied on a default for is written out.
+    The REST defaults are not the same defaults — `volumeInGb` defaults to 20 and
+    `ports` to `8888/http,22/tcp` — and a benchmark that silently grows a disk or
+    an ingress between runs has an uncontrolled variable in it.
+    """
+    body: dict[str, Any] = {
+        "name": spec.name,
+        "imageName": spec.image,
+        "computeType": "GPU",
+        "cloudType": "SECURE",
+        "gpuTypeIds": [spec.gpu_type_id],
+        # One GPU per pod. Pinned rather than defaulted: a multi-GPU pod would
+        # change what every throughput number means, and it must come from a
+        # PodSpec field somebody chose, not from a platform default that moved.
+        "gpuCount": 1,
+        "containerDiskInGb": spec.container_disk_gb,
+        # No persistent volume of any kind, and no `networkVolumeId`: training data
+        # must sit on pod-local NVMe or the dataloader axis measures the volume
+        # instead of the pipeline. Not attaching one also frees the pod from a
+        # single data centre.
+        "volumeInGb": 0,
+        # Nothing needs to reach the pod. The entrypoint runs the workload and
+        # pushes the result out; the old call said the same thing with
+        # `start_ssh=False`, which REST has no equivalent for.
+        "ports": [],
+        "env": dict(spec.env),
+    }
+    if spec.data_center_id is not None:
+        body["dataCenterIds"] = [spec.data_center_id]
+    return body
+
+
+def create_request(spec: PodSpec) -> Request:
+    return Request(
+        method="POST",
+        url=f"{REST_BASE_URL}/pods",
+        headers={"Content-Type": "application/json"},
+        body=json.dumps(create_body(spec)).encode(),
     )
 
 
+def send(request: Request, urlopen: Callable[..., Any] = urllib.request.urlopen) -> dict[str, Any]:
+    """Send one request and return its decoded payload.
+
+    The key is read here, per call, and inlined into the header dict so that no
+    named local holds it.
+    """
+    http = urllib.request.Request(
+        request.url,
+        data=request.body,
+        headers={**request.headers, "Authorization": f"Bearer {_api_key()}"},
+        method=request.method,
+    )
+    try:
+        with urlopen(http, timeout=REST_TIMEOUT_SECONDS) as response:
+            status = response.status
+            payload = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:ERROR_BODY_CHARS].decode("utf-8", "replace")
+        # `from None`: the chained HTTPError adds nothing the message lacks, and a
+        # traceback renderer that prints frame locals would print the header dict.
+        raise RuntimeError(
+            f"RunPod REST {request.method} {request.url} -> {exc.code}: {detail}"
+        ) from None
+    if not payload:
+        # A pod may exist and be billing with nobody holding its id. Say so.
+        raise RuntimeError(
+            f"RunPod REST {request.method} {request.url} -> {status} with an empty body; "
+            "a pod may have been created without returning its id"
+        )
+    return json.loads(payload)
+
+
+def create(spec: PodSpec, transport: Transport = send) -> dict[str, Any]:
+    pod = transport(create_request(spec))
+    if not isinstance(pod, dict) or not pod.get("id"):
+        # The caller indexes `pod["id"]` to record what to terminate. Failing here
+        # names the problem; failing there is a KeyError beside a billing pod.
+        # The payload itself stays out of the message: a created pod echoes its
+        # own env back, and that env carries the pod's Infisical token.
+        raise RuntimeError(
+            f"RunPod accepted the pod request but returned no id "
+            f"(payload keys: {sorted(pod) if isinstance(pod, dict) else type(pod).__name__})"
+        )
+    return pod
+
+
 def get(pod_id: str) -> dict[str, Any] | None:
+    """Read one pod. Stays on GraphQL because REST does not report a runtime.
+
+    The SDK interpolates `pod_id` into its query the same unescaped way it
+    interpolates env values, so the defect is present here too — it is just not
+    reachable: the only value that reaches it is an id RunPod generated and handed
+    back from `create`, never anything this repository composes.
+    """
     return _client().get_pod(pod_id)
 
 
 def terminate(pod_id: str) -> None:
+    """Same transport as `get`, for the same reason and with the same caveat."""
     _client().terminate_pod(pod_id)
 
 

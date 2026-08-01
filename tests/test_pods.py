@@ -7,10 +7,12 @@ launch and filed every combination as producing no result.
 
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import subprocess
 import sys
+import urllib.error
 from collections import namedtuple
 from pathlib import Path
 
@@ -197,6 +199,257 @@ def test_waiting_always_terminates_even_when_nothing_ever_starts():
 
 def test_watching_nothing_returns_immediately():
     assert pods.PodWatch(timeout_seconds=1, get_pod=lambda _: None).wait_for_any() == []
+
+
+# --- what actually goes on the wire when a pod is created ----------------------
+#
+# The first campaign lost all fifteen launches here while 592 tests passed, because
+# every test that touched `create` replaced it with a stub. So these tests inspect
+# the request bytes and nothing else pretends to.
+
+# The env of a real launch, and the reason the old path died. `TRAINBENCH_CONFIG_JSON`
+# is a whole resolved config document; the rest are shapes that break naive string
+# assembly in a different way each.
+HOSTILE_ENV = {
+    "TRAINBENCH_CONFIG_JSON": json.dumps(
+        {"model": {"name": "qwen3_5_0_8b"}, "train": {"lr": 1e-5}, "purpose": "timing"}
+    ),
+    "TRAINBENCH_PLAN_JSON": json.dumps([{"name": "baseline", "axis": "attn.name"}]),
+    "WITH_A_NEWLINE": "first\nsecond",
+    "WITH_A_BACKSLASH": r"C:\models\qwen",
+    "WITH_A_BARE_QUOTE": 'the operator said "run it"',
+}
+
+KEY = "rpa-sentinel-not-a-real-key"
+
+
+def spec(**overrides):
+    fields = {
+        "name": "trainbench-phase0-native-qwen3_5_0_8b",
+        "image": "ghcr.io/org/trainbench-native@sha256:" + "0" * 64,
+        "gpu_type_id": "NVIDIA A100 80GB PCIe",
+        "env": dict(HOSTILE_ENV),
+    }
+    fields.update(overrides)
+    return pods.PodSpec(**fields)
+
+
+def sent(pod_spec=None, reply=None):
+    """Create a pod against a transport that records the request instead of sending."""
+    captured = []
+
+    def transport(request):
+        captured.append(request)
+        return reply if reply is not None else {"id": "abc123"}
+
+    pod = pods.create(pod_spec or spec(), transport=transport)
+    assert len(captured) == 1
+    return captured[0], pod
+
+
+class FakeResponse:
+    def __init__(self, status=201, payload=b'{"id": "abc123"}'):
+        self.status = status
+        self._payload = payload
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def http_error(code, body):
+    return urllib.error.HTTPError(
+        f"{pods.REST_BASE_URL}/pods", code, "rejected", {}, io.BytesIO(body)
+    )
+
+
+def test_a_resolved_config_document_survives_the_trip_into_a_pod_env():
+    """The assertion this whole change exists for.
+
+    Not "the dict we built has the right keys" — the bytes on the wire parse, and
+    every value comes back the way it went in. The previous transport could not
+    make this claim for any value containing a quote, and `TRAINBENCH_CONFIG_JSON`
+    is nothing but quotes.
+    """
+    request, _ = sent()
+    body = json.loads(request.body)
+    assert body["env"] == HOSTILE_ENV
+    # And the document is still a document, not a string that merely looks like one.
+    assert json.loads(body["env"]["TRAINBENCH_CONFIG_JSON"])["model"]["name"] == "qwen3_5_0_8b"
+
+
+@pytest.mark.parametrize("value", sorted(HOSTILE_ENV.values()))
+def test_every_hostile_env_value_arrives_unaltered(value):
+    request, _ = sent(spec(env={"TRAINBENCH_CONFIG_JSON": value}))
+    assert json.loads(request.body)["env"]["TRAINBENCH_CONFIG_JSON"] == value
+
+
+def test_the_sdk_path_this_replaced_still_puts_the_document_in_raw():
+    """Why the transport changed, pinned so the claim is checkable rather than told.
+
+    `runpod` builds its mutation with `f'{{ key: "{k}", value: "{v}" }}'`. The
+    value's own quotes close the GraphQL string and the remainder becomes syntax —
+    the fifteen launches all returned `Syntax Error: Expected ":", found String
+    ": {"`, which is a fragment of this very document.
+
+    If this test fails because the SDK started escaping, that removes one of the
+    two reasons `create` has its own transport. The other one is `get`: REST
+    reports no runtime, so the module would still need both.
+    """
+    mutations = pytest.importorskip("runpod.api.mutations.pods")
+    mutation = mutations.generate_pod_deployment_mutation(
+        name="trainbench-phase0-native-qwen3_5_0_8b",
+        image_name="ghcr.io/org/trainbench-native",
+        gpu_type_id="NVIDIA A100 80GB PCIe",
+        env=dict(HOSTILE_ENV),
+    )
+    document = HOSTILE_ENV["TRAINBENCH_CONFIG_JSON"]
+    assert f'value: "{document}"' in mutation
+    assert '\\"' not in mutation, "the SDK escaped nothing; the values go in raw"
+    # The literal fragment RunPod's parser reported: Expected ":", found String ": {".
+    assert '": {"' in mutation
+
+
+def test_the_request_is_the_documented_create_endpoint():
+    request, _ = sent()
+    assert request.method == "POST"
+    assert request.url == "https://rest.runpod.io/v1/pods"
+    assert request.headers["Content-Type"] == "application/json"
+
+
+def test_the_spec_lands_in_the_documented_field_names():
+    request, _ = sent(spec(container_disk_gb=200, data_center_id="EU-RO-1"))
+    body = json.loads(request.body)
+    assert body["name"] == "trainbench-phase0-native-qwen3_5_0_8b"
+    assert body["imageName"].startswith("ghcr.io/org/trainbench-native@sha256:")
+    # Plural and a list, unlike the GraphQL `gpuTypeId`/`dataCenterId` they replace.
+    assert body["gpuTypeIds"] == ["NVIDIA A100 80GB PCIe"]
+    assert body["dataCenterIds"] == ["EU-RO-1"]
+    assert body["cloudType"] == "SECURE"
+    assert body["computeType"] == "GPU"
+    assert body["containerDiskInGb"] == 200
+    assert body["gpuCount"] == 1
+
+
+def test_a_pod_without_a_data_centre_is_not_pinned_to_one():
+    assert "dataCenterIds" not in json.loads(sent()[0].body)
+
+
+def test_no_pod_ever_asks_for_a_volume():
+    """The NVMe rule, enforced on the bytes rather than in a comment.
+
+    REST defaults `volumeInGb` to 20, so omitting the field would quietly attach a
+    disk that training data could land on — and a dataloader axis measured off a
+    network-backed volume measures the volume.
+    """
+    body = json.loads(sent()[0].body)
+    assert body["volumeInGb"] == 0
+    assert "networkVolumeId" not in body
+
+
+def test_nothing_is_exposed_on_a_measuring_pod():
+    # REST defaults to `8888/http,22/tcp`; the old call said `start_ssh=False`.
+    assert json.loads(sent()[0].body)["ports"] == []
+
+
+def test_the_account_key_never_enters_the_request_object(monkeypatch):
+    """A Request is held by the caller and can end up in a log or a ledger entry."""
+    monkeypatch.setenv("RUNPOD_API_KEY", KEY)
+    request, _ = sent()
+    assert KEY not in repr(request)
+    assert KEY not in request.body.decode()
+    assert not any(KEY in value for value in request.headers.values())
+
+
+def test_the_key_reaches_the_wire_as_a_bearer_header(monkeypatch):
+    monkeypatch.setenv("RUNPOD_API_KEY", KEY)
+    seen = []
+
+    def urlopen(http, timeout=None):
+        seen.append(http)
+        return FakeResponse()
+
+    pods.send(pods.create_request(spec()), urlopen=urlopen)
+    (http,) = seen
+    assert http.get_header("Authorization") == f"Bearer {KEY}"
+    assert http.get_method() == "POST"
+
+
+def test_a_missing_key_is_named_before_anything_is_sent(monkeypatch):
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+
+    def urlopen(http, timeout=None):
+        raise AssertionError("a request was sent without a credential")
+
+    with pytest.raises(RuntimeError, match="RUNPOD_API_KEY is not set"):
+        pods.send(pods.create_request(spec()), urlopen=urlopen)
+
+
+def test_a_rejected_launch_reports_the_status_and_the_reason(monkeypatch):
+    monkeypatch.setenv("RUNPOD_API_KEY", KEY)
+
+    def urlopen(http, timeout=None):
+        raise http_error(400, b'{"error": "gpuTypeIds is required"}')
+
+    with pytest.raises(RuntimeError) as caught:
+        pods.send(pods.create_request(spec()), urlopen=urlopen)
+    assert "400" in str(caught.value)
+    assert "gpuTypeIds is required" in str(caught.value)
+
+
+def test_a_rejection_never_carries_the_key_into_the_ledger(monkeypatch):
+    """`launch_error` is `str(exc)`, and the orchestrator writes it to disk."""
+    monkeypatch.setenv("RUNPOD_API_KEY", KEY)
+
+    def urlopen(http, timeout=None):
+        raise http_error(401, b"unauthorized")
+
+    with pytest.raises(RuntimeError) as caught:
+        pods.send(pods.create_request(spec()), urlopen=urlopen)
+    assert KEY not in str(caught.value)
+
+
+def test_an_oversized_rejection_body_is_cut_rather_than_dumped(monkeypatch):
+    monkeypatch.setenv("RUNPOD_API_KEY", KEY)
+
+    def urlopen(http, timeout=None):
+        raise http_error(400, b"x" * 10_000)
+
+    with pytest.raises(RuntimeError) as caught:
+        pods.send(pods.create_request(spec()), urlopen=urlopen)
+    assert str(caught.value).count("x") == pods.ERROR_BODY_CHARS
+
+
+def test_an_empty_reply_is_reported_as_a_pod_that_may_be_billing(monkeypatch):
+    monkeypatch.setenv("RUNPOD_API_KEY", KEY)
+    empty = lambda http, timeout=None: FakeResponse(payload=b"")  # noqa: E731
+    with pytest.raises(RuntimeError, match="may have been created"):
+        pods.send(pods.create_request(spec()), urlopen=empty)
+
+
+def test_a_reply_without_an_id_is_a_launch_failure_not_a_ledger_entry():
+    # The orchestrator indexes `pod["id"]`; a KeyError there happens beside a pod
+    # that is already billing.
+    with pytest.raises(RuntimeError, match="returned no id"):
+        sent(reply={"desiredStatus": "RUNNING"})
+
+
+def test_a_failed_launch_does_not_echo_the_pod_token_back_into_the_message():
+    """A created pod echoes its own env, and that env holds an Infisical token."""
+    token = "st.sentinel.pod.token"
+    with pytest.raises(RuntimeError) as caught:
+        sent(spec(env={"INFISICAL_TOKEN": token}), reply={"env": {"INFISICAL_TOKEN": token}})
+    assert token not in str(caught.value)
+
+
+def test_a_created_pod_is_returned_whole():
+    _, pod = sent(reply={"id": "abc123", "desiredStatus": "RUNNING"})
+    assert pod["id"] == "abc123"
 
 
 # --- experiment manifests ------------------------------------------------------
