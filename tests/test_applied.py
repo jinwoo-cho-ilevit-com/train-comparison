@@ -11,6 +11,7 @@ import torch
 
 from trainbench import axes
 from trainbench.applied import (
+    ADAPTER_PARAM_MARKER,
     AppliedMismatch,
     AppliedState,
     AxisState,
@@ -491,3 +492,347 @@ def test_an_adapter_that_declares_nothing_is_undetermined(config_mapping):
     state = capture(built(), bench(config_mapping))
 
     assert axis(state, "framework.name").applied is None
+
+
+# --- precision.name -----------------------------------------------------------
+# The load dtype is chosen by `probe/steps.py::dtype_for`, so unlike every other
+# axis the request is not applied by `axes.py` at all. That is what makes reading
+# it back off the weights the whole of the check.
+
+
+def bf16_model(dtype=torch.bfloat16, vision_dtype=None):
+    """A model whose parameters are in a dtype, with a tower to disagree with."""
+    model = torch.nn.Module()
+    model.language_model = torch.nn.Linear(2, 2).to(dtype)
+    model.visual = torch.nn.Linear(2, 2).to(vision_dtype or dtype)
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+    return model
+
+
+def test_precision_is_read_off_the_weights_not_off_the_request(config_mapping):
+    config = bench(config_mapping)
+
+    state = capture(Built(model=bf16_model()), config)
+
+    assert axis(state, "precision.name").applied == "bf16"
+    assert axis(state, "precision.name").matches
+    assert axis(state, "precision.name").detail["base"] == {"bf16": 4}
+
+
+def test_a_model_loaded_in_fp32_does_not_pass_as_bf16(config_mapping):
+    """`dtype_for` returns fp32 on anything that is not CUDA, so a bf16 request
+    measured on the wrong machine is the ordinary way this goes wrong — and the
+    config says bf16 either way."""
+    config = bench(config_mapping)
+
+    state = capture(Built(model=bf16_model(torch.float32)), config)
+
+    assert axis(state, "precision.name").applied == "fp32"
+    with pytest.raises(AppliedMismatch, match="precision.name: requested 'bf16', applied 'fp32'"):
+        assert_matches(state, config)
+
+
+def test_a_half_converted_model_is_neither_precision(config_mapping):
+    """A tower left in fp32 under a bf16 language model is the same partial
+    application the attention probe exists for, and it must not match the dtype
+    that happens to be commonest."""
+    config = bench(config_mapping)
+
+    state = capture(Built(model=bf16_model(vision_dtype=torch.float32)), config)
+
+    assert axis(state, "precision.name").applied == "mixed(bf16,fp32)"
+    with pytest.raises(AppliedMismatch, match="precision.name"):
+        assert_matches(state, config)
+
+
+def test_lora_adapter_weights_do_not_make_a_bf16_run_mixed(config_mapping):
+    """peft holds adapters in fp32 over a bf16 base, so counting every parameter
+    together would report `mixed(bf16,fp32)` for every LoRA run and block the half
+    of this study that LoRA is — the freeze x peft collision again, one axis over.
+
+    A real `get_peft_model` rather than a stand-in: what peft does to the dtype of
+    the weights it adds is the fact under test, and a fake would do whatever this
+    test told it to.
+    """
+    from peft import LoraConfig, get_peft_model
+
+    config = bench(config_mapping, **{"peft.mode": "lora", "peft.r": 4})
+    adapted = get_peft_model(bf16_model(), LoraConfig(r=4, target_modules="all-linear"))
+
+    precision = axis(capture(Built(model=adapted), config), "precision.name")
+
+    assert precision.detail["adapter"] == {"fp32": 4}, "peft no longer keeps adapters in fp32"
+    assert precision.applied == "bf16"
+    assert precision.matches
+
+
+def test_an_adapter_whose_parameters_stop_matching_is_undetermined(config_mapping):
+    """The marker is a string, and a string drifts. `_ple_report` shipped with one
+    that matched nothing and reported success; zero matches under a declared
+    adapter has to be undetermined rather than a base dtype that quietly includes
+    the adapter's."""
+    model = bf16_model()
+    model.peft_config = {"default": SimpleNamespace(peft_type="LORA")}
+
+    precision = axis(capture(Built(model=model), bench(config_mapping)), "precision.name")
+
+    assert precision.applied is None
+    assert ADAPTER_PARAM_MARKER in precision.detail["reason"]
+
+
+class _RecipeLinear(torch.nn.Linear):
+    """A module a recipe library defined, which is how one announces itself.
+
+    Subclassed rather than restamped onto `torch.nn.Linear`: writing `__module__`
+    onto torch's own class renames it for the whole session, and the tests that
+    then read `transformer_engine` off an ordinary model fail somewhere else.
+    """
+
+
+_RecipeLinear.__module__ = "transformer_engine.pytorch.module.linear"
+
+
+def test_an_fp8_recipe_is_not_read_off_bf16_weights(config_mapping):
+    """transformer-engine keeps bf16 parameters and casts inside the recipe that
+    wraps the step. Reading the weights of an mxfp8 run would report bf16, and a
+    bf16 request over that model would then be certified as a match."""
+    model = bf16_model()
+    model.language_model = _RecipeLinear(2, 2).to(torch.bfloat16)
+
+    precision = axis(capture(Built(model=model), bench(config_mapping)), "precision.name")
+
+    assert precision.applied is None
+    assert "transformer_engine" in precision.detail["reason"]
+
+
+def test_a_model_with_no_floating_point_weights_is_undetermined(config_mapping):
+    model = torch.nn.Module()
+    model.counter = torch.nn.Parameter(torch.zeros(2, dtype=torch.int64), requires_grad=False)
+
+    precision = axis(capture(Built(model=model), bench(config_mapping)), "precision.name")
+
+    assert precision.applied is None
+    assert precision.detail["base"] == {}
+
+
+# --- train.offload ------------------------------------------------------------
+# `axes.assemble` refuses every value but `none`, so `none` is the only one that
+# can reach a run and the only one this can prove. The rest are deepspeed's, and
+# a probe that cannot tell them apart says so.
+
+
+def optimizer_over(model):
+    return torch.optim.AdamW(model.parameters(), lr=1e-5)
+
+
+def test_nothing_offloaded_is_read_off_where_the_tensors_are(config_mapping):
+    model = bf16_model()
+    config = bench(config_mapping)
+
+    state = capture(Built(model=model, optimizer=optimizer_over(model)), config)
+
+    assert axis(state, "train.offload").applied == "none"
+    assert axis(state, "train.offload").matches
+    assert axis(state, "train.offload").detail["compute"] == ["cpu"]
+
+
+def test_parameters_held_off_the_compute_device_are_not_none(config_mapping):
+    """Parameters somewhere the model does not compute is what `offload=param`
+    produces. Nothing here can request it, so the run that shows up in this state
+    got there by some route no one declared, and it must not report `none`."""
+    config = bench(config_mapping)
+    elsewhere = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(2, device="meta"))], lr=1e-5)
+
+    state = capture(Built(model=bf16_model(), optimizer=elsewhere), config)
+
+    assert axis(state, "train.offload").applied == "offloaded(meta)"
+    with pytest.raises(AppliedMismatch, match="train.offload"):
+        assert_matches(state, config)
+
+
+def test_optimizer_state_held_off_the_compute_device_is_not_none(config_mapping):
+    """The state is what `offload=optimizer` moves, and it is empty until the
+    first step — so a probe reading only the parameters would report `none` for an
+    offloaded run and would have nothing to examine besides."""
+    model = bf16_model()
+    optimizer = optimizer_over(model)
+    held = optimizer.param_groups[0]["params"][0]
+    optimizer.state[held] = {"exp_avg": torch.zeros(2, device="meta")}
+    config = bench(config_mapping)
+
+    state = capture(Built(model=model, optimizer=optimizer), config)
+
+    assert axis(state, "train.offload").applied == "offloaded(meta)"
+    assert axis(state, "train.offload").detail["state_tensors"] == 1
+    with pytest.raises(AppliedMismatch, match="train.offload"):
+        assert_matches(state, config)
+
+
+def deepspeed_optimizer():
+    class DeepSpeedZeroOptimizer:
+        param_groups = ()
+        state: dict = {}
+
+    DeepSpeedZeroOptimizer.__module__ = "deepspeed.runtime.zero.stage_1_and_2"
+    return DeepSpeedZeroOptimizer()
+
+
+def test_deepspeed_is_undetermined_rather_than_none(config_mapping):
+    """Offload lives in deepspeed's own config, not on any object reachable from
+    here. `none` would then be a claim about a setting nothing read."""
+    model = bf16_model()
+    config = bench(config_mapping)
+
+    state = capture(Built(model=model, optimizer=deepspeed_optimizer()), config)
+    offload = axis(state, "train.offload")
+
+    assert offload.applied is None
+    assert "deepspeed" in offload.detail["reason"]
+
+
+class DeepSpeedEngine(torch.nn.Module):
+    """Named, not renamed: `PARALLEL_WRAPPERS` matches on the class name because
+    the packages that define these are not installed in every environment."""
+
+
+def test_a_deepspeed_engine_around_the_model_is_undetermined_too(config_mapping):
+    """The engine is where the optimizer would be built, so a run can reach this
+    probe with a torch optimizer and still be a deepspeed run."""
+    model = bf16_model()
+    model.wrapped = DeepSpeedEngine()
+
+    offload = axis(
+        capture(Built(model=model, optimizer=optimizer_over(model)), bench(config_mapping)),
+        "train.offload",
+    )
+
+    assert offload.applied is None
+    assert offload.detail["engine"] == "DeepSpeedEngine"
+
+
+def test_an_optimizer_holding_nothing_is_undetermined(config_mapping):
+    """Where a run keeps no parameters says nothing about offload, and `none` from
+    an empty scan is the shape of check this repository keeps shipping."""
+    empty = torch.optim.AdamW([{"params": []}], lr=1e-5)
+
+    offload = axis(
+        capture(Built(model=bf16_model(), optimizer=empty), bench(config_mapping)), "train.offload"
+    )
+
+    assert offload.applied is None
+    assert "no parameters" in offload.detail["reason"]
+
+
+def test_offload_without_a_model_is_undetermined(config_mapping):
+    """Nothing to be off: without the model there is no compute device to compare
+    the optimizer's tensors against."""
+    offload = axis(
+        capture(Built(optimizer=optimizer_over(bf16_model())), bench(config_mapping)),
+        "train.offload",
+    )
+
+    assert offload.applied is None
+    assert "device" in offload.detail["reason"]
+
+
+# --- the run these two axes were blocking -------------------------------------
+
+
+class _Block(torch.nn.Module):
+    """A submodule carrying the flag `train.gradient_checkpointing` is read off."""
+
+    def __init__(self, dtype=torch.bfloat16):
+        super().__init__()
+        self.proj = torch.nn.Linear(2, 2).to(dtype)
+        self.gradient_checkpointing = False
+
+
+class _Rows(torch.utils.data.Dataset):
+    """A dataset that declares its columns, which is where `pretokenize` is read."""
+
+    column_names = ("query", "document")
+
+    def __len__(self) -> int:
+        return 2
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        return torch.zeros(2)
+
+
+def whole_run(config) -> Built:
+    """Everything a bf16 run on an accelerator constructs, in the state it leaves.
+
+    Assembled here rather than through `axes.assemble` because the optimizer has
+    to come back fused, and the fused AdamW kernel is CUDA-only — the one axis
+    docs/CONTRACTS.md §6 says a CPU cannot satisfy. Everything else is the real
+    object each probe reads.
+    """
+    model = torch.nn.Module()
+    model.language_model = _Block()
+    model.visual = _Block()
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+    optimizer.param_groups[0]["fused"] = True
+    loss, _ = axes._loss(config)
+    return Built(
+        model=model,
+        optimizer=optimizer,
+        dataloader=torch.utils.data.DataLoader(_Rows()),
+        loss_fn=loss,
+        framework="native",
+    )
+
+
+def test_a_timing_run_is_no_longer_refused_for_want_of_a_probe(config_mapping):
+    """The state this whole file is about. Before `precision.name` and
+    `train.offload` had probes, every axis of every timing run could be verified
+    and the run was still refused — `assert_matches` requires all of them, and two
+    were undetermined by construction on any device. Nothing recorded that; the
+    audit reported it as two unwired axes, which reads as work outstanding rather
+    than as a measurement path that cannot run.
+    """
+    config = bench(config_mapping, **{"run.purpose": "timing"})
+
+    state = capture(whole_run(config), config)
+
+    assert [a.axis for a in state.undetermined()] == []
+    assert [a.axis for a in state.mismatched()] == []
+    assert_matches(state, config)
+
+
+def test_a_timing_run_is_still_refused_when_one_axis_disagrees(config_mapping):
+    """Paired with the test above, which on its own would also pass if
+    `assert_matches` had been loosened to make the two new axes fit."""
+    config = bench(config_mapping, **{"run.purpose": "timing"})
+    run = whole_run(config)
+    run.optimizer.param_groups[0]["fused"] = False
+
+    with pytest.raises(AppliedMismatch, match="optim.name"):
+        assert_matches(capture(run, config), config)
+
+
+def test_capture_reports_an_axis_with_no_probe_as_undetermined(config_mapping, monkeypatch):
+    """The producing half of the no-probe guarantee.
+
+    It used to be driven by whichever axis happened to be unwired, and it was
+    written to be deleted once none were — which would have taken the coverage
+    with it. It is worth keeping: mutating `capture`'s no-probe branch to
+    `AxisState(axis, requested, requested, ...)` is one word, and it left 325
+    tests green while certifying two axes nothing had looked at.
+
+    A synthetic knob keeps the branch reachable without waiting for someone to add
+    an axis and forget the probe, which is the case it is there to catch.
+    """
+    from trainbench import applied
+
+    knobs = {**axis_knobs(), "synthetic.unwired": lambda config: "x"}
+    monkeypatch.setattr(applied, "axis_knobs", lambda: knobs)
+    config = bench(config_mapping)
+
+    state = capture(built(), config)
+
+    unwired = axis(state, "synthetic.unwired")
+    assert unwired.applied is None
+    assert unwired.detail["reason"] == "no capture probe implemented"
+    with pytest.raises(AppliedMismatch, match="synthetic.unwired"):
+        assert_matches(state, config)

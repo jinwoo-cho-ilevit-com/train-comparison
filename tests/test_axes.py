@@ -7,16 +7,20 @@ same capture refusing it. A probe that only ever sees the working case certifies
 the request rather than the result, which is the failure `trainbench/applied.py`
 exists to prevent.
 
-Two axes stay unapplied and are asserted to stay that way:
+Two axes reach their inert value here and nowhere else, and both are now read
+back by a probe in `trainbench/applied.py` rather than assumed:
 
 * `precision.name` — bf16 is not chosen here. The load dtype is decided by
-  `trainbench/probe/steps.py::dtype_for` from the device, so `axes.py` has no
-  site at which it turns bf16 on, and a capture without one would certify a
-  choice this module never made. mxfp8/nvfp4 additionally need
-  transformer-engine, absent from every environment.
+  `trainbench/probe/steps.py::dtype_for` from the device, so `axes.py` only
+  refuses the values it cannot put into effect: mxfp8/nvfp4 need
+  transformer-engine, absent from every environment. What makes bf16 a claim
+  rather than a hope is `applied._capture_precision`, which reads the dtype off
+  the weights — a run loaded in fp32 is refused however the config reads.
 * `train.offload` — inseparable from ZeRO: `deepspeed.initialize` returns the
   engine, optimizer and dataloader from one call, and deepspeed is absent from
-  every environment.
+  every environment. `assemble` therefore refuses everything but `none`, and
+  `applied._capture_offload` proves `none` by finding every parameter and
+  optimizer state tensor on the device the model computes on.
 
 Nothing here imports transformers, liger or deepspeed. None of them is installed
 in the environment the test suite runs in, and an axis whose only proof is a
@@ -39,7 +43,6 @@ import torch
 
 from trainbench import axes
 from trainbench.applied import (
-    _CAPTURES,
     AppliedMismatch,
     Built,
     assert_matches,
@@ -737,13 +740,19 @@ def test_packing_and_pretokenize_are_refused(composed):
             )
 
 
-# --- the two that stay unapplied ---------------------------------------------
+# --- the last two to be wired ------------------------------------------------
 
 
-def test_precision_and_offload_are_still_unapplied():
-    """Named rather than left implicit. `axis-wired` reports them as the remaining
-    gap, and this is the assertion that has to be deleted to close it."""
-    unwired = set(axes.IMPLEMENTED) ^ {
+def test_every_axis_the_schema_declares_is_wired():
+    """Spelled out rather than compared against `axis_knobs()`, which would make
+    it a tautology: adding a knob would extend both sides at once. This is where
+    an axis leaving the wired set has to be argued for.
+
+    It replaces `test_precision_and_offload_are_still_unapplied`, which pinned the
+    complement — the fifteen that were wired, plus an assertion that these two
+    were not. Its own docstring named itself as the thing to delete when they were.
+    """
+    assert set(axes.IMPLEMENTED) == {
         "attn.name",
         "compile.mode",
         "dataloader.backend",
@@ -758,12 +767,11 @@ def test_precision_and_offload_are_still_unapplied():
         "parallel.cross_device_negatives",
         "parallel.strategy",
         "peft.mode",
+        "precision.name",
         "train.gradient_checkpointing",
+        "train.offload",
     }
-
-    assert unwired == set()
-    assert "precision.name" not in axes.IMPLEMENTED
-    assert "train.offload" not in axes.IMPLEMENTED
+    assert set(axes.IMPLEMENTED) == set(axis_knobs())
 
 
 def test_an_inert_configuration_claims_to_have_applied_nothing(composed):
@@ -773,34 +781,6 @@ def test_an_inert_configuration_claims_to_have_applied_nothing(composed):
 
     assert set(names) == {"optim.name", "loss.name", "framework.name"}
     assert built.model is not None
-
-
-def test_capture_reports_an_axis_with_no_probe_as_undetermined(composed):
-    """The half of the no-probe guarantee that produces `assert_matches`' input.
-
-    `tests/test_applied.py` covers the consuming half with a synthetic axis. That
-    left this one uncovered: mutating `capture`'s no-probe branch to
-    `AxisState(axis, requested, requested, ...)` — one word — certified
-    `precision.name` and `train.offload` as applied and left all 325 tests green.
-
-    Derived from `_CAPTURES` rather than naming an axis, so wiring one does not
-    break it. The empty-set guard is the point of the derivation: when the last
-    axis is wired this fails loudly instead of passing on nothing to examine, and
-    it gets deleted then, together with the `axis-wired` line in
-    docs/audit-baseline.json.
-    """
-    unwired = set(axis_knobs()) - set(_CAPTURES)
-    assert unwired, (
-        "every axis now has a capture probe; delete this test and the axis-wired "
-        "baseline entry together rather than leaving a check with nothing to examine"
-    )
-
-    state = capture(Built(model=plain_model()), bench(composed))
-
-    for name in unwired:
-        recorded = axis(state, name)
-        assert recorded.applied is None, name
-        assert recorded.detail["reason"] == "no capture probe implemented", name
 
 
 def test_a_quality_run_is_enforced_exactly_like_a_timing_run(composed):

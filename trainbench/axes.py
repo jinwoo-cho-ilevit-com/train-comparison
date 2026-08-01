@@ -99,11 +99,16 @@ TOKENIZED_COLUMNS = ("input_ids",)
 # `applied._CAPTURES`: `audit_plan.py`'s `axis-wired` check enforces it, and
 # `tests/test_applied.py::test_applied_and_verified_sets_agree` pins it.
 #
-# `precision.name` and `train.offload` are absent on purpose. Neither has a site
-# here: the load dtype is chosen by `probe/steps.py::dtype_for` from the device,
-# and offload is inseparable from `deepspeed.initialize`, which builds the model,
-# optimizer and dataloader together. The module docstring of tests/test_axes.py
-# carries the long form.
+# `precision.name` and `train.offload` sit here on the same terms as
+# `dataloader.packing`: this module decides them by refusing every value it cannot
+# put into effect, and the inert value it does accept needs nothing done to it.
+# `step_context` refuses every precision but bf16, and bf16 needs no autocast
+# region only because the weights are already in it; `assemble` refuses every
+# offload but none, and none is an optimizer built where the model is. Both of
+# those are premises rather than actions, which is why they were left out until
+# `applied._capture_precision` and `_capture_offload` began reading them back off
+# the model and the optimizer. An axis is wired when something applies it and
+# something checks it, and for these two the checking half was the missing one.
 IMPLEMENTED = frozenset(
     {
         "attn.name",
@@ -120,7 +125,9 @@ IMPLEMENTED = frozenset(
         "parallel.cross_device_negatives",
         "parallel.strategy",
         "peft.mode",
+        "precision.name",
         "train.gradient_checkpointing",
+        "train.offload",
     }
 )
 

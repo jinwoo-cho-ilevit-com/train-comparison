@@ -484,6 +484,167 @@ def _capture_parallel_strategy(
     return "single", detail
 
 
+# How torch spells a floating-point dtype, in this study's vocabulary. A dtype
+# that is not here is reported under torch's own name, which is equal to no
+# configured value — an unexpected precision has to be a mismatch rather than the
+# nearest bucket.
+DTYPE_NAMES = {
+    "torch.bfloat16": "bf16",
+    "torch.float16": "fp16",
+    "torch.float32": "fp32",
+    "torch.float64": "fp64",
+}
+
+# Packages that implement a low-precision recipe by replacing modules rather than
+# by changing the weights. transformer-engine keeps bf16 parameters and casts
+# inside the recipe that wraps the forward pass, so with one of these in the tree
+# the parameter dtype is no longer the whole answer and this probe says so instead
+# of reading bf16 off the weights of an fp8 run.
+PRECISION_MODULE_ROOTS = ("transformer_engine", "torchao")
+
+# peft holds its adapter weights in fp32 over a bf16 base. Measured on peft
+# 0.20.0: `get_peft_model` over a bfloat16 model returns `lora_A`/`lora_B` in
+# float32 while every base tensor stays bfloat16. A probe demanding one dtype
+# across the whole model would therefore report `mixed(bf16,fp32)` for every LoRA
+# run and block half of this study — the same shape as the freeze x peft
+# collision docs/CONTRACTS.md §2 records. The marker is
+# `peft.tuners.lora.LoraModel.prefix`; zero matches under an adapter is
+# undetermined, for the reason the freeze probes give.
+ADAPTER_PARAM_MARKER = "lora_"
+
+
+def _capture_precision(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
+    """What dtype the model's weights are actually in.
+
+    Read off the parameters because nothing in `axes.py` sets them: the load dtype
+    comes from `probe/steps.py::dtype_for`, which returns fp32 on anything that is
+    not CUDA. `axes.step_context` is written on the premise that a bf16 run is
+    already loaded in bf16 and so needs no autocast region; until this probe
+    existed, nothing checked that premise. A run that asked for bf16 and got fp32
+    is the ordinary result of measuring on the wrong machine, and it has to be a
+    mismatch rather than a match on the config's own word.
+
+    Adapter weights are counted apart from the base rather than folded in: peft
+    keeps them in fp32 over a bf16 base, so one dtype across the whole model is
+    not what a correct LoRA run looks like.
+
+    What it cannot see is which fp8 recipe is in effect. Those cast inside the
+    step rather than on the weights, so a model carrying their modules is reported
+    undetermined — the alternative is to read bf16 off an mxfp8 run's parameters
+    and certify it as bf16.
+    """
+    if built.model is None:
+        return None, {"reason": "no model was built"}
+    swapped = sorted(set(_module_roots(built.model)) & set(PRECISION_MODULE_ROOTS))
+    base: dict[str, int] = {}
+    adapter: dict[str, int] = {}
+    for name, param in built.model.named_parameters():
+        if not param.is_floating_point():
+            continue
+        spelling = str(param.dtype)
+        spelling = DTYPE_NAMES.get(spelling, spelling.rsplit(".", 1)[-1])
+        bucket = adapter if ADAPTER_PARAM_MARKER in name else base
+        bucket[spelling] = bucket.get(spelling, 0) + 1
+    detail: dict[str, Any] = {"base": base, "adapter": adapter}
+    if swapped:
+        return None, {
+            **detail,
+            "reason": f"{', '.join(swapped)} defines modules in this model, and those cast "
+            "inside the step rather than on the weights, so which recipe is in effect cannot "
+            "be read off the parameters",
+        }
+    if not base:
+        return None, {
+            **detail,
+            "reason": "no non-adapter floating-point parameter, so the compute dtype cannot "
+            "be read back",
+        }
+    if getattr(built.model, "peft_config", None) and not adapter:
+        return None, {
+            **detail,
+            "reason": f"this model carries an adapter but no parameter name contains "
+            f"{ADAPTER_PARAM_MARKER!r}, so adapter weights cannot be told apart from base "
+            "weights and either could be the dtype reported here",
+        }
+    if len(base) == 1:
+        return next(iter(base)), detail
+    # Deliberately not equal to any configured value: a model half-converted is
+    # neither precision, and must not match the one that happens to be commonest.
+    return "mixed(" + ",".join(sorted(base)) + ")", detail
+
+
+def _capture_offload(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
+    """Whether anything the optimizer holds lives off the compute device.
+
+    Only `none` can reach a run: `axes.assemble` raises `UnappliedAxis` for every
+    other value, because offload is inseparable from `deepspeed.initialize` and
+    deepspeed is in no environment here. So this probe proves the one value it can
+    and refuses to speak for the rest — under deepspeed the setting lives in its
+    own config rather than on any object reachable from here, and reporting `none`
+    because nothing looked would be worse than reporting nothing.
+
+    `none` is positive evidence, not an absence: every parameter and every
+    optimizer state tensor is on a device the model computes on. Optimizer state
+    is empty until the first step, which is why the parameters are read too — a
+    check whose only subject is an empty dict passes by having nothing to examine.
+    """
+    if built.optimizer is None:
+        return None, {"reason": "no optimizer was built"}
+    package = type(built.optimizer).__module__.split(".")[0]
+    engine = None
+    if built.model is not None:
+        engine = next(
+            (
+                type(module).__name__
+                for _, module in built.model.named_modules()
+                if PARALLEL_WRAPPERS.get(type(module).__name__) == "deepspeed"
+            ),
+            None,
+        )
+    detail: dict[str, Any] = {"optimizer": type(built.optimizer).__name__, "engine": engine}
+    if package == "deepspeed" or engine is not None:
+        return None, {
+            **detail,
+            "reason": "deepspeed decides offload inside its own config, which is not readable "
+            "from the optimizer or the engine here",
+        }
+
+    compute = sorted(
+        {
+            str(param.device)
+            for _, param in built.model.named_parameters()
+            if getattr(param, "device", None) is not None
+        }
+        if built.model is not None
+        else ()
+    )
+    if not compute:
+        return None, {
+            **detail,
+            "reason": "no model parameter reports a device, so there is nothing for the "
+            "optimizer's tensors to be off",
+        }
+    held = [param for group in built.optimizer.param_groups for param in group.get("params", ())]
+    state = [
+        value
+        for entry in built.optimizer.state.values()
+        for value in entry.values()
+        if getattr(value, "device", None) is not None
+    ]
+    if not held:
+        return None, {
+            **detail,
+            "reason": "the optimizer holds no parameters, so where it keeps them says nothing",
+        }
+    elsewhere = sorted({str(tensor.device) for tensor in [*held, *state]} - set(compute))
+    detail = {**detail, "compute": compute, "state_tensors": len(state)}
+    if elsewhere:
+        # Not equal to any configured value: which of optimizer/param/both is off
+        # the device is deepspeed's distinction, and nothing here made it.
+        return "offloaded(" + ",".join(elsewhere) + ")", {**detail, "elsewhere": elsewhere}
+    return "none", detail
+
+
 def _capture_dataloader_backend(
     built: Built, config: BenchConfig
 ) -> tuple[str | None, dict[str, Any]]:
@@ -598,7 +759,9 @@ _CAPTURES: dict[str, CaptureFn] = {
     "parallel.cross_device_negatives": _capture_cross_device_negatives,
     "parallel.strategy": _capture_parallel_strategy,
     "peft.mode": _capture_peft,
+    "precision.name": _capture_precision,
     "train.gradient_checkpointing": _capture_gradient_checkpointing,
+    "train.offload": _capture_offload,
 }
 
 # Where the applied value is expressed in different words from the config value.
