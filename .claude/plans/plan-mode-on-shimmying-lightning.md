@@ -1,327 +1,199 @@
-# 리뷰 후속 수정 — 워크트리 병렬 개발 계획
+# Wave 1 레인 A 게이트 마감 — 3레인 리뷰 findings 수정
 
 ## Context
 
-3레인 병렬 리뷰(module / architecture / critic)에서 치명 결함 5건이 나왔고, 전부
-코드를 직접 실행해 확정했다. 상세는 `docs/review-findings.md`.
+D1(서브셋 손상) 수정 도중 D6(전 행을 디코딩된 픽셀로 누적 → SIGKILL)을 실행으로
+발견해 고쳤고, 두 서브셋을 재생성·재핀했다. 그 변경에 대해 module / architecture /
+critic 3레인 병렬 리뷰를 돌렸다.
 
-핵심은 **측정을 시작할 수 있는 상태가 아니라는 것**이다. 이미지는 빌드되고 config는
-통과하고 리포트는 숫자를 뱉지만, (a) 학습 데이터의 positive 54.6%가 중복이고 쿼리
-이미지 31.4%가 결측이며, (b) 12개 ablation 축 중 8개를 코드가 한 줄도 읽지 않는다.
-지금 Phase 2를 돌리면 이름만 다른 동일 실험이 나오고, 그 표는 이 프로젝트의 가설을
-구조적으로 확증한다.
+**리뷰가 찾아낸 것 중 가장 중요한 사실: 오늘 만든 speed 핀 `f4363029`는 읽을 수
+없다.** `load_dataset(...)`이 CastError로 실패한다. 저장소 README의
+`dataset_info`가 여전히 **D1 시절의 4컬럼 스키마**(`pos_image` 없음)를 선언하고
+있고, `Dataset.push_to_hub`는 기존 `dataset_info`가 있는 저장소에 덮어쓸 때 새
+features를 쓰지 않는다(`datasets/arrow_dataset.py:6953`, `info_to_dump = repo_info`).
+D1의 컬럼 손실이 parquet에서는 두 번 고쳐졌는데 저장소 메타데이터에서는 살아남았다.
 
-이 계획의 목표는 **유효한 측정이 가능한 상태**에 도달하는 것이다. 작업량이 커서
-워크트리로 파일을 격리해 병렬 진행하되, 공유 계약을 먼저 얼리고 매 단계마다 전체
-계획과의 정합을 기계적으로 점검한다.
+이 결함이 통과한 경로가 이 수정의 핵심이다: **push가 성공하고 revision이 나온 것을
+완료로 취급했고, push된 산출물을 다시 읽어보지 않았다.** 이 저장소가 반복해서 겪은
+패턴(검사가 자기 부재를 통과로 보고하는 것)의 또 다른 사례다.
 
-확정된 설계 결정 두 가지 (2026-08-01, 사용자):
-- **SFT 대조군을 두지 않는다.** 주장 범위를 "임베딩 학습 내부의 축별 효과 + 모델별
-  병목"으로 좁히고 `PLAN.md`에서 SFT 비교 주장을 철회한다.
-- **8개 축을 전부 구현한 뒤** Phase 2를 시작한다.
+목표는 findings를 닫고, **재-push 후 산출물을 실제로 읽어 게이트를 재계산하는
+검증 단계**를 절차에 넣는 것이다.
+
+여기 적힌 결함은 전부 실행으로 재현됐다. 재현하지 못한 것은 "이번에 하지 않는 것"에
+있다.
 
 ---
 
-## 파동 구조 — 왜 이렇게 나누는가
+## 1. 재-push 전에 반드시 고칠 것
 
-컨벤션 09: 워크트리는 **파일 격리 수단**이므로 파일 편집이 겹칠 때만 도입하고,
-**공유 계약은 실행 전에 얼린다**. 따라서 병렬화 이전에 순차 구간이 하나 필요하다.
+이걸 고치지 않고 다시 올리면 같은 결함을 다시 담는다.
+
+### F1. `push_to_hub`가 features 메타데이터를 갱신하도록 (`scripts/prepare_data.py`)
+
+`build_dataset(...).push_to_hub(...)` → `DatasetDict({"train": ds}).push_to_hub(...)`.
+`DatasetDict.push_to_hub`는 `remove_other_splits=True`를 넘기고(`dataset_dict.py`
+소스 확인), 그러면 else 분기를 타 features를 새로 쓴다.
+
+### F2. 캐시 히트에서도 업스트림 스키마를 대조 (`scripts/prepare_data.py`)
+
+현재 `check_columns`는 `stream_rows` 안에만 있고 `sample_config`의 캐시 경로는
+그것을 건너뛴다. **재현 완료**: 업스트림이 `pos_image`를 떨어뜨린 상황을 만들면
+스트리밍 경로는 RuntimeError를 내지만 캐시 경로는 1602행을 조용히 반환한다.
+manifest에는 검사한 적 없는 스키마가 검사한 것처럼 기록된다 — D1과 같은 모양이다.
+
+`sample_config`가 캐시 히트 여부와 무관하게 매 실행 `stream.features`를 읽어
+`check_columns`를 돌린다. 행을 받지 않으므로 비용은 config당 HTTP 한 번이다.
+
+### F3. `_image_size`가 픽셀까지 검증 (`scripts/prepare_data.py`)
+
+`PIL.Image.open`은 lazy라서 IHDR만 멀쩡하면 IDAT이 깨져도 크기를 돌려준다. D6
+이전에는 `datasets`가 매 행 `load()`를 호출해 상류에서 터졌으므로,
+`MAX_ROWS_WITH_UNREADABLE_IMAGE = 0`은 **"픽셀이 디코딩된다"**를 뜻했다. 지금은
+"헤더가 파싱된다"를 뜻한다. D6이 만든 회귀다.
+
+`with` 블록 안에서 `load()`를 호출한다. 이미지를 보유하지 않으므로 메모리는
+한 장 단위로 유지되고 D6이 없앤 누적은 돌아오지 않는다.
+
+**비용 실측**: speed draw 2320장 디코딩에 2.2초, 실패 0건. quality는 약 65초로
+추정되며 캐시된 shard에서 돌므로 네트워크가 필요 없다. 게이트 판정은 바뀌지 않는다.
+
+### F4. `DecompressionBombError`를 판독 불가로 계산 (`scripts/prepare_data.py`)
+
+`Exception` 파생이라 `except (OSError, ValueError)`를 빠져나가 런을 죽인다. 그리고
+캐시가 있으므로 **재시도마다 같은 자리에서 반복**한다 — kill을 견디려고 만든 캐시가
+실패를 영구화한다. 예외 목록에 추가해 이상 이미지로 계산한다.
+
+### F5. push 후 산출물을 다시 읽어 게이트를 재계산 (`scripts/prepare_data.py`)
+
+이 계획에서 가장 중요한 항목이다. 깨진 핀을 완료로 보고한 원인을 닫는다.
+
+push 직후 `load_dataset(repo_id, revision=<새 revision>)`으로 되읽어:
+
+- 컬럼 집합이 `SUBSET_COLUMN_NAMES`와 일치하는가 (F1의 회귀 방지)
+- 행 수가 quota 합과 일치하는가
+- `rows_without_positive_content` / `rows_without_query_image` /
+  `rows_with_unreadable_image`를 **아티팩트에서** 재계산해 manifest와 일치하는가
+- 이미지 positive config의 `max_single_positive_share`를 재계산해 일치하는가
+
+`pos_image_path`는 push되지 않으므로 아티팩트에서는 **`pos_image` 바이트 해시**를
+identity로 쓴다. critic 레인이 speed draw 7개 config 전부에서 경로↔해시가 1:1이고
+manifest 수치가 자릿수까지 재현됨을 실측했다. manifest에 대리 키를 썼다는 사실을
+명시적으로 기록한다 — 1:1은 이 draw에서 측정된 것이지 보장이 아니다.
+
+불일치하면 non-zero 종료하고, config에 핀하지 말라고 출력한다.
+
+### F6. 업스트림 커밋 고정 (`trainbench/config_schema.py`, `configs/data/*.yaml`)
+
+`load_dataset(...)`에 `revision=`이 없어 미러의 HEAD를 스트리밍하는데,
+`prepare_data.py` docstring과 `PLAN.md`는 "커밋을 고정하고 기록한다"고 주장한다.
+코드가 하지 않는 일을 문서가 주장하는 상태다. 캐시가 얹히면서 업스트림 드리프트가
+재실행으로도 드러나지 않게 됐다.
+
+`DataConfig.source_revision`을 추가하고(계약 변경 — `docs/CONTRACTS.md` §5에 기록),
+`load_dataset`에 넘기고, shard 캐시 키에 포함한다.
+
+**재추출은 불필요하다.** 미러 HEAD는 `9d0fd31789c12a007442de52fe22509e46e49e7d`
+(2025-06-17, 21개 커밋 중 최신)이고, 두 draw의 다운로드 URL이 전부 그 sha를
+가리킨다(로그 확인). 지금 뽑아둔 행은 그 커밋의 산출물임이 증명된다.
+
+---
+
+## 2. 재-push와 재핀
+
+**두 서브셋 모두 다시 올린다.** quality의 README는 정상이고 행도 동일하지만, 두 핀이
+같은 최종 코드 경로에서 나오고 둘 다 F5 검증을 통과해야 설명이 필요 없는 상태가
+된다. 캐시된 shard가 있으므로 재추출은 없고 조립·업로드만 든다(speed 약 1분,
+quality 약 8분).
+
+핀한 뒤 `configs/data/*.yaml` 주석의 **거짓 서술 두 가지를 정정**한다.
+
+- **"두 서브셋은 같은 스트림을 다른 깊이로 읽은 것"은 20개 중 12개 config에서
+  거짓이다.** `shuffle_buffer(want) = min(2000, max(64, want*20))`이라 speed의 작은
+  `want`가 2000을 채우지 못해 셔플 자체가 달라진다. 직접 확인: 버퍼가 같은 8개는
+  prefix가 성립하고 다른 12개는 성립하지 않는다(HatefulMemes 320, VOC2007 300,
+  OK-VQA 340 …). 두 draw는 각각 유효하지만, quality.yaml이 그 대응관계를 **공동
+  재핀의 근거로 내세운 것**은 틀렸다.
+- **speed.yaml의 "최대 단일 image positive 3.3%"는 게이트가 평가하지 않은 값이다.**
+  그 3.3%는 NIGHTS(30행)이고, WebQA(33행)와 함께 `MIN_ROWS_FOR_SHARE_GATE = 50`
+  미달로 붕괴 게이트가 아예 돌지 않는다. speed draw의 image-positive 7개 중 5개만
+  게이트를 받고, 인용된 최댓값은 안 받은 쪽에서 나왔다.
+
+---
+
+## 3. 독립적으로 고칠 것 (재-push와 무관)
+
+| # | 결함 | 수정 |
+|---|---|---|
+| F7 | 원자성 테스트가 `write_shard`를 호출조차 안 함 — 원자성을 제거해도 4개 shard 테스트 전부 통과(변이 실험으로 증명) | `write_shard`를 실제로 호출하고 중간에 실패시켜 최종 경로가 생기지 않음을 검사 |
+| F8 | `read_shard`가 파일에 없는 컬럼을 null로 backfill — `take_row`가 막던 것을 재개 경로가 되살림 | 읽은 파일의 컬럼 집합이 스키마와 다르면 예외 |
+| F9 | 동시 `write_shard`가 고정 `.partial` 이름에서 충돌해 `FileNotFoundError` | staging 이름에 pid 포함 |
+| F10 | 손상된 shard를 `read_shard`가 그대로 터뜨려 재시도가 영구 실패 | `sample_config`에서 읽기 실패 시 shard 삭제 후 재추출 |
+| F11 | 붕괴 게이트가 건너뛴 config가 어디에도 기록되지 않음 | manifest와 `report()`에 "게이트 미평가 config" 명시 |
+| F12 | 메모리 증거가 120초 간격 `ps` 샘플링뿐 — 진짜 피크는 미측정 | `resource.getrusage(RUSAGE_SELF).ru_maxrss`를 manifest에 기록 |
+| F13 | 계약 위반 4건 중 1건만 기록 (`pyproject.toml`·`uv.lock`은 레인 F, `tests/test_config.py`는 공유) | `docs/CONTRACTS.md`에 나머지 기록 |
+| F14 | `docs/review-findings.md`에 이번 findings 미기재 | D7(읽을 수 없는 핀) 이하 추가, D6 항목에 회귀(F3) 명시 |
+
+F12 관련: "재생성 런이 수정을 증명한다"는 주장은 과했다. 방어 가능한 형태는
+**"120초 해상도 샘플링에서 14.2 GB를 넘지 않았고 런이 완주했다"**이다. 누적은 단조인데
+RSS가 40377행 14.2 GB에서 65536행 8.6 GB로 **떨어졌다**는 것 자체가 두 샘플이
+누적이 아니라 할당 노이즈를 쟀다는 증거다. 반면 17배 비율(독립 재측정 17.6배)과
+그로부터 나오는 예측 — 40377행 × 1.18 MiB/행 ≈ 49.8 GB, 실제 SIGKILL 지점 —
+은 성립한다. 메커니즘 증거는 살아 있고 결과 증거가 약했다.
+
+---
+
+## 4. 이번에 하지 않는 것
+
+- **`MIN_ROWS_FOR_SHARE_GATE = 50` 자체의 재설계.** 소표본에서 점유율이 draw
+  크기에 좌우된다는 원래 논거는 여전히 옳다. 지금 필요한 것은 임계값 변경이 아니라
+  **건너뛴 사실의 기록**(F11)이다. 임계값을 바꾸려면 근거 측정이 선행해야 하고,
+  그건 이 수정의 범위가 아니다.
+- **`fsync` 추가.** `trainbench/record.py`의 `write_json`과 맞추는 것이 일관되지만,
+  shard는 재생성 가능한 캐시이고 손상 시 F10이 재추출한다.
+- **`build_dataset`의 조립 단계 피크 메모리 최적화.** 실측 12.7 GB로 48 GB 대비
+  여유가 크다. F12가 정확한 피크를 기록하기 시작하면 그때 판단한다.
+
+---
+
+## 5. 실행 순서
+
+의존 관계가 있어 순서를 지킨다. 어기면 재-push를 두 번 하게 된다.
+
+1. F1~F4, F6 코드 수정 + 테스트
+2. F5 검증기 구현 + 테스트
+3. F7~F10 수정 + 테스트
+4. `ruff` / `pytest` / `audit_plan.py` 통과 확인
+5. speed 재생성·push (캐시 사용, 재추출 없음) → **F5 검증 통과 확인** → 재핀
+6. quality 재생성·push → **F5 검증 통과 확인** → 재핀
+7. F11~F14 문서·기록
+8. 전체 게이트 재실행 후 논리 단위로 커밋 분할
+
+---
+
+## 6. 검증
 
 ```
-Wave 0 (순차, 병렬 금지)  공유 계약 확정
-        │
-        ├─ Wave 1 (워크트리 4개 병렬)  A 데이터 / B 코어정확성 / C 오케스트레이션 / E 문서
-        │
-        ├─ Wave 2 (워크트리 2개 병렬)  D 축구현 / F 이미지·env
-        │
-        └─ Wave 3 (순차)  G 하네스 + baseline 게이트 + 품질 가드레일
-```
-
-Wave 0을 병렬화하면 안 되는 이유: `config_schema.py`와 신설 `applied.py`가 이후 모든
-레인의 입력이다. 이걸 각자 고치면 4개 워크트리가 서로 다른 스키마 위에서 개발하게
-되고 병합이 불가능해진다.
-
-Wave 3을 병렬화하지 않는 이유: 하네스는 B(pooling)와 D(축 적용)의 결과물을 모두
-소비하고, baseline 게이트는 이후 모든 결과가 통과하는 지점이라 마지막에 한 번에
-확정해야 한다.
-
----
-
-## Wave 0 — 공유 계약 확정 (순차, 메인 워크트리)
-
-**이 구간이 끝나기 전에는 어떤 워크트리도 만들지 않는다.**
-
-| 산출물 | 내용 |
-|---|---|
-| `trainbench/config_schema.py` | 8개 축의 누락 필드 추가: `TrainConfig.offload`, `DataloaderConfig.pretokenize`, `ParallelConfig.cross_device_negatives`. 검증기 추가: `warmup_discard_steps < steps`, `purpose=profile`인데 `profiler=false` 금지, `batch_size <= data.limit`, `quality.yaml`의 `revision: null` 금지 |
-| `trainbench/applied.py` (신설) | **요청값 vs 실제 적용값** 계약. `AppliedState` 데이터클래스 + `capture(model, config) -> AppliedState` + `assert_matches(requested, applied)` 시그니처만 확정. 구현은 Wave 2(D) |
-| `trainbench/probe/types.py` | `Check.expected_failure: bool` 추가. unsloth의 `fast_sentence_transformer_accepts_vlm`처럼 실패가 예상 결과인 체크가 셀 전체를 FAIL로 만드는 문제 해소 |
-| `trainbench/record.py` | 레코드 스키마 확정: `applied`, `image_digest`, `git_commit`(env 우선), 호스트 스펙(`os.process_cpu_count()` + cgroup, `/proc/meminfo`, `torch.version.cuda`), `_TRACKED_PACKAGES`에 `flash-attn`/`causal-conv1d`/`bitsandbytes`/`deepspeed`/`torchvision` 추가 |
-| `docs/CONTRACTS.md` (신설) | 위 인터페이스를 문서로 고정. Wave 1~2의 모든 레인이 이 파일을 계약으로 삼는다 |
-| `docs/model-spec.md` (신설) | 아래 "모델별 규격 검증"의 산출물. B와 D의 입력 |
-
-### 모델별 규격 검증 (Wave 0에 포함, HuggingFace MCP 사용)
-
-현재 probe는 세 모델에 **동일한 generic 경로**를 쓴다 — `AutoModel` + 자체
-`last_token_pool` + 자체 `info_nce`. 모델이 의도한 사용법과 다르면 측정 대상이
-"모델"이 아니라 "잘못 쓴 모델"이 된다. Wave 0에 넣는 이유는 B(pooling)와 D(freeze
-대상)가 이 결과를 입력으로 받기 때문이다.
-
-HF MCP(`hub_repo_details`, `hf_fs`)로 저장소 파일을 직접 읽어 확인하고, **추측으로
-채우지 않는다**(컨벤션 16). 확인하지 못한 항목은 "미확인"으로 남긴다.
-
-| 질문 | 읽을 아티팩트 |
-|---|---|
-| 공식 pooling이 last-token인가 | `modules.json`, `1_Pooling/config.json`, `config_sentence_transformers.json`, 모델 카드 |
-| 쿼리/문서에 붙는 instruction·prompt 포맷 | 모델 카드 사용 예시, `chat_template`, `config_sentence_transformers.json`의 prompts |
-| 정규화·유사도 함수·temperature | 모델 카드, ST config |
-| MRL(Matryoshka) 지원 차원 | 모델 카드, ST config. 지원하면 임베딩 차원이 축이 될 수 있다 |
-| gemma-4 PLE 파라미터 **실제 이름** | `model.safetensors.index.json`의 weight map. 현재 `per_layer`/`altup` 문자열 매칭은 추측이며, 틀리면 `matched_count: 0`인데 `ok: True`로 통과한다 |
-| 이미지 placeholder 확장 위치(processor vs 모델 내부) | `preprocessor_config.json`, `processor_config.json`. 후자면 visual token 카운트가 1 같은 값으로 나와 모델 간 정규화 상수가 오염된다 |
-| 동적 해상도 범위 | `preprocessor_config.json`의 `min_pixels`/`max_pixels`(Qwen) vs `vision_soft_tokens_per_image`(gemma) |
-| `padding_side` | `tokenizer_config.json`. gemma-4는 `left`로 확인됨 — `last_token_pool` 결함이 노출되는 유일한 모델 |
-| LoRA target module 관례 | 모델 카드/공식 레시피. 현재 `all-linear`는 "모델별 target module 인식" 질문을 회피한다 |
-
-**산출물**: `docs/model-spec.md` — 항목마다 근거 파일 경로와 revision을 남긴다.
-generic 경로와 공식 규격이 다른 항목은 **차이를 명시**하고, 차이를 수용할지
-(단순성·비교 공정성) 모델별로 맞출지(현실성)를 결정해 기록한다. 이 결정 자체가
-리포트의 한정 조건이 된다.
-
-**완료 조건**: `uv run pytest` 통과 + 스키마 변경으로 기존 config 53개가 전부 해석됨
-+ `docs/model-spec.md`의 모든 행이 근거 또는 "미확인"으로 채워짐.
-
----
-
-## Wave 1 — 병렬 워크트리 4개
-
-각 레인은 자기 파일만 만진다. 겹침 없음을 아래 표로 보장한다.
-
-### A. 데이터 재생성 (`wt/data`)
-
-가장 심각한 결함이고 다른 모든 것의 선행 조건.
-
-| 파일 | 변경 |
-|---|---|
-| `scripts/prepare_data.py` | `SUBSET_COLUMNS`를 config별 기대 스키마로 대체. `pos_image` 보존. 기대 컬럼이 없으면 **예외**(현재는 `row.get()`이 조용히 None) |
-| `configs/data/speed.yaml`, `quality.yaml` | 손상된 revision 고정 해제, 재생성 후 새 revision 고정. `quality.yaml`도 서브셋 생성 |
-| `tests/test_data.py` (신설) | `proportional_quota(total < len(counts))` 경계, 컬럼 스키마 검증 |
-
-manifest에 추가할 품질 지표 — **이게 없어서 손상을 놓쳤다**:
-`rows_without_query_image`, `rows_without_positive_content`, `distinct_pos_text_count`,
-`duplicate_pos_text_ratio`, config별 시퀀스 길이·이미지 해상도 분포(p50/p95).
-**임계값 초과 시 push 거부.**
-
-`pos_text`가 `<|image_1|>` 같은 MMEB placeholder를 담고 있으므로 모델별
-`apply_chat_template` 변환이 필요하다는 점도 여기서 문서화(구현은 Wave 3).
-
-### B. 코어 정확성 (`wt/core`)
-
-| 파일 | 변경 |
-|---|---|
-| `trainbench/embedding.py` | `last_token_pool` left padding 수정. Qwen 공식 구현처럼 `attention_mask[:, -1].sum() == batch`로 left를 감지해 분기. **거짓 주석 제거** |
-| `trainbench/probe/steps.py` | `visual_token_count`에 `image_token_id` -> `image_token_index` -> `get_text_config()` fallback. 반환값 타당 범위(10~2000) 검사. `_tokenize` 클로저 5중 복제를 헬퍼로 흡수 |
-| `trainbench/probe/native.py` | `_ple_report`가 `matched_count == 0`이면 **실패**로 기록(현재는 아무것도 못 찾아도 `ok: True`). `requires_grad` 스냅샷 후 복원 |
-| `trainbench/probe/registry.py` | report를 registry가 만들어 `module.run(config, device, report)`로 전달 → 부분 결과 보존 |
-| `trainbench/seed.py`, `scripts/verify_env.py` | `set_seed(warn_only=)` 추가. probe는 `warn_only=True` — 결정적 구현이 없는 연산이 "프레임워크 미지원"으로 오기록되는 것 방지 |
-| `tests/test_embedding.py` | **left padding 테스트**(현재 right만 검증해 결함을 통과시켰다), `is_finished`, registry 부분 실패 보존 |
-
-### C. 오케스트레이션 견고화 (`wt/orch`)
-
-| 파일 | 변경 |
-|---|---|
-| `trainbench/pods.py` | `is_finished`를 "runtime이 non-null -> null로 **전이**" 또는 `desiredStatus == EXITED`로 수정. `get()` 예외를 `unknown` 센티널로. pod별 개별 deadline |
-| `scripts/orchestrate.py` | `pod_env`에 `INFISICAL_TOKEN`·`TRAINBENCH_GIT_COMMIT`·이미지 digest 추가. `run=probe` 하드코딩 제거 → `configs/experiment/` 소비. launch 직후 ledger 증분 기록 |
-| `configs/experiment/*.yaml` (신설) | 파일 1개 = pod 1개 작업(모델 + 축그룹 + override + **필수 `baseline:`**). 컨벤션 02 §3 "재실행 가능해야 실험이다" |
-| `docker/entrypoint.sh` | 결과 파일 없으면 fallback 레코드 기록 후 publish. `cd ... \|\| exit`. 빈 `--projectId` 플래그 제거. `timeout Nm` 자살 장치 |
-| `scripts/publish_result.py` | `create_repo(exist_ok=True)`, 백오프 재시도, probe 시작 전 `started.json` |
-| `scripts/report.py` | 타임스탬프 최신 우선 병합 + 중복 경고, 파싱 실패 파일 스킵, `expected_failure` 제외, "기동했으나 결과 없음"을 미확인과 구분 |
-
-### E. 문서 정정 (`wt/docs`)
-
-코드와 겹치지 않아 안전하게 병렬 가능.
-
-- `PLAN.md`: **SFT 비교 주장 철회**, 핵심 가설을 "임베딩 학습 내부 축별 효과 + 모델별
-  병목"으로 재작성. Liger를 "무력화"가 아니라 "FLCE 경로만 정의상 비활성"으로 정정.
-  저장소 구조의 미존재 파일 정리. 데이터 출처 표기 수정
-- `README.md`: `uv sync --group dev` → `--extra compose` (**현재 문서대로 하면 pytest가
-  hydra 부재로 실패**)
-- `AGENTS.md`: `env_report.py`를 "smoke"로 지칭한 부분 정정(모델 적재도 step도 없음)
-- `docs/methodology.md` **신설**: `config_schema.py`와 `AGENTS.md`가 참조하는데 부재.
-  "torch.profiler 20~44%"의 출처 명기 또는 미측정 표기 (현재 4곳에 출처 없이 사실로
-  반복 — 컨벤션 16 위반)
-- `docs/support-matrix.md`: "env 5/5 성공"에 "`uv lock` 성공이며 설치·빌드·실행 아님"
-  한정 추가. native 셀에 "macOS CPU fp32, 텍스트 위주, 3모델 중 2모델" 조건 명시
-
----
-
-## Wave 2 — 병렬 워크트리 2개 (Wave 1 병합 후)
-
-### D. 8개 축 구현 (`wt/axes`)
-
-Wave 0의 `applied.py` 계약을 구현하고 축을 실제로 배선한다.
-
-축별로 **적용 지점 + 검증 방법 + 검증 가능 GPU**를 함께 정의한다. FA4/NVFP4는 B200
-전용이라 A100에서는 검증조차 불가능하므로, config 검증기가 GPU와 축의 조합을 거부해야
-한다.
-
-| 축 | 적용 | 검증(applied) | 필요 패키지 |
-|---|---|---|---|
-| attn | `attn_implementation=` | `model.config._attn_implementation` | `flash-attn` (fa2/3/4) |
-| kernel liger | Liger 패치 | 패치된 심볼 목록 | `liger-kernel` |
-| kernel fla | 설치 여부 | GDN fast path 실사용 | `flash-linear-attention` + `causal-conv1d` |
-| precision | TE / torchao | 활성 recipe | `transformer-engine` |
-| compile | `torch.compile` | `torch._dynamo.utils.counters` graph break 수 | - |
-| optim | 옵티마이저 생성 | 클래스명 + param group | `bitsandbytes`, Muon 구현체 |
-| freeze | `requires_grad` | 실제 학습 파라미터 수 | - |
-| dataloader | packing/DALI/pretokenize | 실제 경로 | `nvidia-dali` |
-| parallel | FSDP2/ZeRO/all-gather | world size + 전략 | `deepspeed` |
-
-**`purpose=timing`에서 요청값 ≠ 적용값이면 런 실패.** 이것이 이 프로젝트에서 가장
-중요한 단일 안전장치다 — 없으면 sdpa로 폴백된 런이 "FA3 1.4배"로 리포트에 실린다.
-
-### F. 이미지·env 갱신 (`wt/images`)
-
-- `envs/*/pyproject.toml`에 축별 패키지 추가 후 재-lock. **패키지 간 충돌은 Phase 0
-  결과로 기록**(예: unsloth의 torch<2.12가 특정 flash-attn과 양립 불가)
-- `Dockerfile.framework`: `COPY trainbench`를 `uv sync` **뒤로** 이동 — 현재는 소스
-  한 줄 수정이 axolotl 237패키지 sync를 매번 재실행시킨다
-- `build-images.yml`: 이미지에 digest 태그 부여(현재 `latest`만이라 어떤 이미지가
-  그 숫자를 냈는지 사후 특정 불가). GHA 캐시 10GB 상한 대응
-- **axolotl 빌드 실패 원인 규명** (미확인 상태)
-- `USE_HF=1` (ms-swift가 기본 ModelScope hub라 gemma-4를 못 찾을 위험)
-
----
-
-## Wave 3 — 하네스 (순차, 메인 워크트리)
-
-### G. 측정 하네스 + 게이트
-
-- `scripts/bench.py` + pod 내부 **sweep 러너**: 모델 1회 적재 후 축 sweep. 현재 진입점은
-  프로세스당 모델 1회 적재라 5B 모델에서 오버헤드가 측정을 지배한다. PLAN의 "35h"는
-  이 러너를 전제해야 성립하는데 요구사항으로 적혀 있지도 않았다
-- `trainbench/metrics/`: throughput, peak VRAM, step p50/p95. **MFU는 tokens/s를 1차
-  지표로 격하** — GDN linear attention / PLE lookup / sliding window에서 표준 FLOP
-  공식이 세 모델 모두 깨진다. 모델별 공식을 유닛 테스트로 검증한 뒤에만 제시
-- **baseline 게이트**: 3% 임계값을 **동일 pod 동일 설정 5회 반복 편차를 실측한 뒤**
-  그 2~3배로 교정. 현재 값은 멀티테넌트 클라우드 편차보다 타이트할 수 있고, 그러면
-  재실행이 비용의 지배 항이 된다
-- **데이터로딩 병목 선판정**: 이것이 병목이면 Phase 2 전체가 무의미
-- **품질 가드레일**: Recall@k 이전에 **축별 수치 등가성 검사**(같은 seed로 N step 후
-  baseline 대비 loss/grad norm tolerance). GradCache는 전용 등가성 테스트 필수 —
-  검증 없이 재면 GradCache 버그가 GradCache 속도 향상으로 리포트된다
-- **모델별 visual token 분포 실측**: 합성 이미지 1장 기반 196:196:280 보정은 448 정사각
-  1장에서만 성립. Qwen은 동적 해상도(픽셀 비례), gemma-4는 280 고정이라 모델 간
-  토큰 예산 고정이 원리적으로 불가능. 실제 서브셋에서 분포를 재고, 불가능하면 리포트
-  범위를 "모델 내 축 효과만 비교"로 명시적으로 좁힌다
-
----
-
-## 매 단계 정합 점검 — 기계화
-
-사용자 요구: "개발이 마칠 때마다 전체 계획에서 누락/오류가 없는지 항상 점검".
-사람이 체크리스트를 읽는 방식은 이번에 이미 실패했다(서브셋 손상을 검증 지표가
-완벽 통과로 보고했다). **가능한 만큼 기계로 만든다.**
-
-### `scripts/audit_plan.py` (신설, Wave 0에서 만들고 매 wave 끝에 실행)
-
-기계적으로 검증 가능한 불변식만 담는다. 실패하면 non-zero.
-
-1. **config 손잡이가 전부 소비되는가** — 모든 config leaf 필드가 코드 어딘가에서
-   읽히는지. 안 읽히면 실패. (D4를 잡았을 검사)
-2. **PLAN.md에 적힌 파일이 실제로 존재하는가** — 저장소 구조 절의 경로 전수 확인
-3. **support-matrix의 수치가 커밋된 아티팩트를 참조하는가** — 현재 `.gitignore`가
-   `outputs/`를 제외해 실측 로그가 저장소에 하나도 없다. `docs/evidence/`를 만들고
-   결과 JSON을 커밋 대상으로
-4. **축 ↔ 패키지 정합** — config group에 있는 축의 필요 패키지가 해당 env lock에
-   존재하는지
-5. **문서 명령이 실제로 도는가** — README/AGENTS의 명령을 dry-run
-6. **데이터 revision이 null이 아닌가**, manifest 품질 지표가 임계 내인가
-7. **모델별 규격 정합** — `docs/model-spec.md`에 기록된 각 모델의 공식 규격(pooling,
-   prompt 포맷, PLE 파라미터 이름, placeholder 확장 위치, `padding_side`)이 HF에
-   호스팅된 현재 파일과 여전히 일치하는가. HF MCP로 재조회해 대조하고, 업스트림이
-   바뀌었으면 실패시킨다 — 모델 저장소는 갱신되며 우리 구현은 그 시점 스냅샷 위에
-   서 있다
-
-### 각 wave 종료 게이트 (사람 + 에이전트)
-
-1. `uv run pytest` + `ruff` + `scripts/audit_plan.py` 전부 통과
-2. **작성자와 분리된 리뷰 레인 1개** (컨벤션 09). 변경이 2+ 모듈이거나 인터페이스를
-   건드리면 3레인
-3. `docs/review-findings.md`의 해당 항목을 해소 표시하고, **새로 발견된 것을 추가**
-4. 통합 검증: 워크트리 병합 후 전체 테스트 1회
-
----
-
-## 워크트리와 team mode의 역할 분담
-
-둘은 대안이 아니라 직교한다. **워크트리는 파일 격리**, **team mode는 공유 task list
-기반 조율**이다. 병용한다.
-
-| Wave | 워크트리 | team mode | 근거 |
-|---|---|---|---|
-| 0 계약 확정 | 미사용 | 미사용 | 병렬화 자체가 금지 구간 |
-| 1 (A/B/C/E) | 사용 | 사용 | 파일 겹침 방지 + 진행 상태를 오케스트레이터 컨텍스트 밖에 유지 |
-| 2 (D/F) | 사용 | 사용 | 위와 동일 |
-| 3 하네스 | 미사용 | 미사용 | baseline 게이트가 이후 모든 결과의 통과 지점이라 한 번에 확정 |
-
-**team mode를 쓰는 진짜 이유는 처리량이 아니라 상태 외부화다.** Wave가 4개, 레인이
-6개이므로 진행 상태를 오케스트레이터의 컨텍스트에 두면 중간에 유실된다. task list가
-그것을 대신한다.
-
-**team mode가 풀지 못하는 것**: 이번에 발견된 결함 5건은 전부 정확성·판단 실패였고
-처리량 부족이 아니었다. 손이 더 많아도 잡히지 않았을 것이고, 실제로 잡은 것은
-독립적인 검증 관점이었다. 따라서 병렬 인원보다 **매 wave 게이트의 분리된 리뷰
-레인**이 우선한다. 이 우선순위를 뒤집지 않는다.
-
-## 워크트리 운용
-
-```
-.claude/worktrees/wt-data     A
-.claude/worktrees/wt-core     B
-.claude/worktrees/wt-orch     C
-.claude/worktrees/wt-docs     E
-.claude/worktrees/wt-axes     D   (Wave 2)
-.claude/worktrees/wt-images   F   (Wave 2)
-```
-
-- 각 워크트리는 Wave 0 병합 커밋에서 분기
-- **파일 소유권은 위 표가 유일한 기준.** 다른 레인의 파일을 고쳐야 하면 직접 고치지
-  말고 계약 변경으로 올린다
-- 병합 순서: A → B → C → E (충돌 최소 순). 각 병합 후 전체 테스트
-- `configs/`는 A(data), C(experiment), D(axes)가 서로 다른 하위 디렉터리만 만진다
-
----
-
-## 이번 범위에서 제외
-
-- 실제 Phase 2 측정 실행 — Wave 3 완료 후 별도
-- 프레임워크 probe 4종의 API 수정(tevatron forward 시그니처, axolotl `normalize_config`,
-  unsloth `for_training`) — 이미지가 빌드돼야 검증 가능하므로 Wave 2(F) 이후 별도 wave
-- B200 pod 기동 — Wave 3 완료 및 audit 통과 전까지 금지
-
----
-
-## 검증
-
-각 wave 종료 시:
-```
-infisical run --env=dev -- uv run ruff check
+uv run ruff check && uv run ruff format --check
 infisical run --env=dev -- uv run pytest
 infisical run --env=dev -- uv run python scripts/audit_plan.py
+infisical run --env=dev -- uv run python scripts/env_report.py \
+  device=cpu model=qwen3_5_0_8b framework=native data.limit=4 train.batch_size=4
 ```
 
-Wave 3 종료 시 추가:
+재-push 후 반드시 (F5가 자동으로 하지만 독립적으로도 확인):
+
 ```
-# 데이터 무결성
-infisical run --env=dev -- uv run python scripts/audit_plan.py --check data-quality
-
-# 축 적용 검증이 실제로 막는가 (패키지 없는 축을 요청하면 실패해야 함)
-infisical run --env=dev -- uv run python scripts/bench.py device=cpu attn=fa4 run=timing
-# -> 실패해야 정상. 성공하면 축 검증 계층이 동작하지 않는 것
-
-# CPU 소수 샘플 E2E
-infisical run --env=dev -- uv run python scripts/bench.py device=cpu data.limit=4 train.steps=2
+infisical run --env=dev -- uv run python -c "
+from datasets import load_dataset
+ds = load_dataset(<repo>, revision=<new sha>, split='train', streaming=True)
+print(sorted(next(iter(ds))))
+"
 ```
 
-**완료 주장 금지**: TODO/stub/skip 잔존, 실행 로그 없는 통과 주장, `audit_plan.py`
-실패 상태에서의 다음 wave 착수.
+`pos_image`가 컬럼 목록에 있어야 한다. 이것이 오늘 통과했다고 보고했으나 실제로는
+실패했던 검사다.
+
+**완료 주장 금지**: F5 검증을 통과하지 않은 revision을 핀하지 않는다. push 성공과
+revision 출력은 완료의 증거가 아니다 — 오늘 그렇게 취급해서 읽을 수 없는 핀을
+완료로 보고했다.

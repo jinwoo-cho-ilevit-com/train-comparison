@@ -272,6 +272,27 @@ class ProbeReport:
 
 **수정 금지.** 필드 추가가 필요하면 계약 변경으로 올린다.
 
+계약 변경 이력:
+
+- 2026-08-01 `CORRUPT_DATA_REVISIONS` + `_no_run_reads_a_corrupt_subset` 추가.
+  손상 서브셋 revision을 핀한 config는 **purpose와 무관하게** 구성 자체가 실패한다.
+  `scripts/prepare_data.py`는 이 목록을 import하며 자체 정의를 두지 않는다 —
+  "손상"의 정의가 두 곳에 있으면 그게 D1(컬럼 목록 2개)의 재현이다. 필드 추가가
+  아니라 검증기 추가이므로 config 스키마 자체는 그대로다.
+- 2026-08-01 **`DataConfig.source_revision` 추가**(필드 추가, 기본값 없음).
+  샘플러가 미러의 HEAD를 스트리밍하는 동안 `prepare_data.py` docstring과 `PLAN.md`는
+  커밋을 고정한다고 서술하고 있었다 — 코드가 하지 않는 일을 문서가 주장하는 상태였고,
+  shard 캐시가 얹히면서 업스트림 변경이 재실행으로도 드러나지 않게 됐다. 이 값은
+  shard 캐시 키의 일부이기도 하다. `configs/data/*.yaml` 양쪽에 기입 필요.
+- 2026-08-01 **레인 경계 침범 기록**. 아래 파일들을 레인 A 작업이 수정했다. 기술적
+  위험은 낮지만(아래 근거) 소유 레인이 모르는 채로 남지 않도록 여기 남긴다.
+  - `pyproject.toml`, `uv.lock` (레인 F 소유) — `compose` extra에 `pyarrow>=21.0`
+    추가. `scripts/prepare_data.py`의 shard 캐시가 필요로 하는데 지금까지는
+    `native` extra의 `datasets`를 통해서만 딸려왔다. `envs/*/pyproject.toml`에는
+    `pyarrow` 고정이 하나도 없어 이미지 해석에 영향이 없고, `uv.lock` 변화는 2줄이다.
+  - `tests/test_config.py` (공유) — 위 두 검증기의 테스트 추가. 스키마 변경과 같은
+    커밋에 들어가지 않으면 검증기가 테스트 없이 랜딩한다.
+
 모델별 사용 규격은 코드가 아니라 config에 있다. 기계 판독 가능한 형태는
 `docs/model-spec.yaml`이고, `audit_plan.py`의 `model-spec`이 **값 대 값으로** 대조한다
 (문자열 존재 확인은 true를 false로 뒤집어도 통과한다).
