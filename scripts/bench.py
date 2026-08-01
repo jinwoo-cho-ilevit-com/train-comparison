@@ -37,7 +37,7 @@ from trainbench.applied import assert_matches, capture
 from trainbench.config import load_bench_config
 from trainbench.config_schema import BenchConfig
 from trainbench.device import get_device
-from trainbench.embedding import align_padding_side, info_nce
+from trainbench.embedding import align_padding_side, packed_last_token_pool
 from trainbench.probe import steps
 from trainbench.record import build_record, write_json
 from trainbench.seed import set_seed
@@ -68,6 +68,19 @@ class MicroBatch(NamedTuple):
     rows: int
     samples: int
     images: int
+    images_dropped: int
+    # Sequence boundaries, present only when `dataloader.packing=true`. They are
+    # kept out of `tensors` because `model(**tensors)` would reject them: they
+    # belong to pooling, not to the forward pass (axes.PACKED_BOUNDARY_KEYS).
+    # None is what tells the step to pool the padded way.
+    cu_seqlens: torch.Tensor | None = None
+
+
+class PairTexts(NamedTuple):
+    """One batch's 2N templated strings, queries first, and the images for them."""
+
+    texts: list[str]
+    images: list[Any]
     images_dropped: int
 
 
@@ -187,12 +200,24 @@ class Collate:
             add_generation_prompt=self.config.model.add_generation_prompt,
         )
 
-    def __call__(self, rows: list[dict[str, Any]]) -> MicroBatch:
+    def pair_texts(self, rows: list[dict[str, Any]], *, with_images: bool = True) -> PairTexts:
+        """The 2N templated strings and the images that go with them.
+
+        Split out of `__call__` because the packing and pretokenize paths need the
+        same strings from the same rows and must not grow a second spelling of how
+        a pair becomes text — which model's placeholder, which side carries the
+        instruction prompt, where the MMEB marker went.
+
+        `with_images=False` is the packed path: `axes.PackedCollate` returns token
+        ids alone, so pixels cannot ride along and every image in the rows is
+        counted as dropped rather than quietly forgotten.
+        """
         queries: list[str] = []
         positives: list[str] = []
         query_images: list[Any] = []
         positive_images: list[Any] = []
         dropped = 0
+        take_images = with_images and self.accepts_images
 
         for row in rows:
             side_images = []
@@ -200,7 +225,7 @@ class Collate:
                 image = row.get(column)
                 if image is None:
                     side_images.append(False)
-                elif self.accepts_images:
+                elif take_images:
                     bucket.append(image)
                     side_images.append(True)
                 else:
@@ -215,9 +240,18 @@ class Collate:
             queries.append(self.prompt + self._text(row.get("qry"), side_images[0]))
             positives.append(self._text(row.get("pos_text"), side_images[1]))
 
-        images = query_images + positive_images
+        return PairTexts(
+            texts=queries + positives,
+            images=query_images + positive_images,
+            images_dropped=dropped + sum(int(row.get("images_dropped", 0) or 0) for row in rows),
+        )
+
+    def __call__(self, rows: list[dict[str, Any]]) -> MicroBatch:
+        built = self.pair_texts(rows)
+        images = built.images
+        dropped = built.images_dropped
         kwargs: dict[str, Any] = {
-            "text": queries + positives,
+            "text": built.texts,
             "return_tensors": "pt",
             "padding": True,
         }
@@ -253,6 +287,209 @@ class Collate:
             images=len(images),
             images_dropped=dropped,
         )
+
+
+class Encode:
+    """One row, tokenised before the timed window opens.
+
+    Handed to `axes.pretokenize`, which is what `dataloader.pretokenize=true`
+    means: the tokenisation does not change, it moves out of the measured step.
+    Each side is tokenised **alone and unpadded**, which is also the only form
+    `axes.PackedCollate` will accept — a row tokenised as part of a padded batch
+    carries PAD that packing would count as real tokens.
+
+    Images cannot survive this: the row that comes back is token ids, and pixels
+    tokenised now would have to be carried as tensors through the dataset. How many
+    were left behind travels in the row so the result can report it rather than
+    quietly measuring a text-only run on an image corpus.
+    """
+
+    def __init__(self, processor: Any, config: BenchConfig) -> None:
+        self.collate = Collate(processor, config)
+        self.tokenizer = getattr(processor, "tokenizer", processor)
+        self.max_length = config.data.max_seq_len
+
+    def __call__(self, row: dict[str, Any]) -> dict[str, Any]:
+        built = self.collate.pair_texts([row], with_images=False)
+        # One call for the pair, `padding=False`: the two sides of a row differ in
+        # length and padding them against each other here would write PAD into the
+        # dataset, where nothing downstream could tell it from content.
+        query, positive = self.tokenizer(
+            built.texts, padding=False, truncation=True, max_length=self.max_length
+        )["input_ids"]
+        return {
+            "input_ids": list(query),
+            "positive_input_ids": list(positive),
+            "images_dropped": built.images_dropped,
+        }
+
+
+class PackedPairs:
+    """`axes.PackedCollate`'s `tokenize` hook: one 1-D id tensor per sequence.
+
+    Queries first, then positives, because `info_nce` splits the pooled embeddings
+    at the midpoint — `PackedCollate` pools in packing order, so the order this
+    returns *is* the pairing.
+
+    Rows that already carry `input_ids` (`dataloader.pretokenize=true`) are read
+    rather than tokenised again; the rest are tokenised here with `padding=False`,
+    which is what `PackedCollate` requires and checks. It is the same hook either
+    way because what `PackedCollate` asks for is the sequences in loss order, and
+    only the source of the ids differs.
+    """
+
+    def __init__(self, processor: Any, config: BenchConfig) -> None:
+        self.collate = Collate(processor, config)
+        self.tokenizer = getattr(processor, "tokenizer", processor)
+        self.max_length = config.data.max_seq_len
+
+    def __call__(self, rows: list[dict[str, Any]]) -> list[torch.Tensor]:
+        if all("input_ids" in row for row in rows):
+            queries = [torch.as_tensor(row["input_ids"]) for row in rows]
+            positives = [torch.as_tensor(row["positive_input_ids"]) for row in rows]
+            return queries + positives
+        built = self.collate.pair_texts(rows, with_images=False)
+        encoded = self.tokenizer(
+            built.texts, padding=False, truncation=True, max_length=self.max_length
+        )
+        return [torch.as_tensor(ids) for ids in encoded["input_ids"]]
+
+
+class PackedBatches:
+    """`axes.PackedCollate`, wrapped so the step gets the same `MicroBatch` shape.
+
+    The wrapper exists for the accounting, not for the packing: `PackedCollate`
+    returns bare tensors, and the measured loop needs to know how many samples,
+    tokens and images that batch stood for. The boundary vectors are lifted out of
+    the batch here rather than in the step, so what stays in `tensors` is exactly
+    what `model(**tensors)` takes.
+
+    `axis_packing` is **read off the wrapped collate**, never declared again. A
+    second declaration is a second answer to the question
+    `applied._capture_dataloader_packing` asks, and two answers is how one of them
+    drifts into a label the run did not earn.
+
+    A packed batch has no padding by construction, so `tokens` and
+    `padded_tokens` are the same number — which is the whole of what packing
+    claims to save.
+    """
+
+    def __init__(self, packed: Any) -> None:
+        self.packed = packed
+        self.axis_packing = packed.axis_packing
+
+    def __call__(self, rows: list[dict[str, Any]]) -> MicroBatch:
+        # Counted before delegating: `PackedCollate` returns ids alone, so this is
+        # the last point at which the rows still say what was left behind.
+        dropped = sum(
+            int(row.get("images_dropped", 0) or 0)
+            if "images_dropped" in row
+            else sum(1 for column in axes.IMAGE_COLUMNS if row.get(column) is not None)
+            for row in rows
+        )
+        batch = self.packed(rows)
+        boundaries = {key: batch.pop(key) for key in axes.PACKED_BOUNDARY_KEYS}
+        total = int(batch["input_ids"].numel())
+        return MicroBatch(
+            tensors=batch,
+            tokens=total,
+            padded_tokens=total,
+            rows=int(boundaries["seq_lengths"].numel()),
+            samples=len(rows),
+            images=0,
+            images_dropped=dropped,
+            cu_seqlens=boundaries["cu_seqlens"],
+        )
+
+
+class PretokenizedCollate:
+    """Pre-tokenised rows padded back into a rectangle, queries first.
+
+    `dataloader.pretokenize=true` without packing still needs a padded batch, and
+    torch's default collate cannot build one out of variable-length id lists. The
+    padding goes on `config.model.padding_side` because `last_token_pool` checks
+    the mask against that side and refuses to pool a PAD.
+    """
+
+    # Read back by applied._capture_dataloader_packing. This pads; it does not
+    # concatenate sequences.
+    axis_packing = False
+
+    def __init__(self, processor: Any, config: BenchConfig) -> None:
+        self.pad_id = steps.pad_token_id(processor) or 0
+        self.padding_side = config.model.padding_side
+
+    def __call__(self, rows: list[dict[str, Any]]) -> MicroBatch:
+        sequences = [torch.as_tensor(row["input_ids"]) for row in rows]
+        sequences += [torch.as_tensor(row["positive_input_ids"]) for row in rows]
+        width = max(int(sequence.numel()) for sequence in sequences)
+        input_ids = torch.full((len(sequences), width), self.pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(sequences), width), dtype=torch.long)
+        for index, sequence in enumerate(sequences):
+            length = int(sequence.numel())
+            span = (
+                slice(0, length) if self.padding_side == "right" else slice(width - length, width)
+            )
+            input_ids[index, span] = sequence.to(torch.long)
+            attention_mask[index, span] = 1
+        return MicroBatch(
+            tensors={"input_ids": input_ids, "attention_mask": attention_mask},
+            tokens=int(attention_mask.sum()),
+            padded_tokens=int(input_ids.numel()),
+            rows=len(sequences),
+            samples=len(rows),
+            images=0,
+            images_dropped=sum(int(row.get("images_dropped", 0) or 0) for row in rows),
+        )
+
+
+def build_collate(processor: Any, config: BenchConfig) -> Any:
+    """The collate this run's `dataloader.*` axes call for.
+
+    Assigned over whatever `axes.assemble` built, which is the only way in — that
+    function takes no collate argument. The packed branch wraps `axes.PackedCollate`
+    rather than replacing it, so `dataloader.packing` is still applied and read back
+    from the class that owns it; overwriting it outright is what left `torch_packed`
+    certified False against a True request and refused at `assert_matches`.
+    """
+    if not config.dataloader.packing:
+        return (
+            PretokenizedCollate(processor, config)
+            if config.dataloader.pretokenize
+            else Collate(processor, config)
+        )
+    pad_id = steps.pad_token_id(processor)
+    if pad_id is None:
+        raise RuntimeError(
+            "dataloader.packing=true needs the processor's pad token id: PackedCollate "
+            "searches every sequence for it, because a PAD packed as a real token inflates "
+            "tokens/s and becomes some sequence's pooled embedding while the run still "
+            "certifies packing as applied. This processor declares no pad token."
+        )
+    return PackedBatches(axes.PackedCollate(tokenize=PackedPairs(processor, config), pad_id=pad_id))
+
+
+def pooled_embeddings(
+    model: Any, tensors: dict[str, Any], padding_side: str, cu_seqlens: Any = None
+) -> torch.Tensor:
+    """The batch's embeddings, pooled the way this batch is shaped.
+
+    The padded case is `steps.encode` unchanged. The packed case cannot use it:
+    a packed batch has no `attention_mask` and one row holds every sequence end to
+    end, which is precisely the contract `last_token_pool` refuses to weaken. The
+    hidden-state lookup is the one thing duplicated from `steps.encode`; that
+    function pools unconditionally, so there is nothing there to reuse that stops
+    short of pooling. It belongs in `trainbench/probe/steps.py` next to its twin
+    the moment that lane wants it.
+    """
+    if cu_seqlens is None:
+        return steps.encode(model, tensors, padding_side)
+    output = model(**tensors, output_hidden_states=False)
+    hidden = getattr(output, "last_hidden_state", None)
+    if hidden is None:
+        hidden = getattr(output, "hidden_states", None)
+        hidden = hidden[-1] if hidden else output[0]
+    return packed_last_token_pool(hidden, cu_seqlens)
 
 
 def micro_batches(loader: Iterable[Any]) -> Iterator[Any]:
@@ -327,6 +564,30 @@ def train(built: Any, loader: Any, config: BenchConfig, device: torch.device) ->
     losses and the counts are gathered post-discard for the same reason — the
     reported `loss_first` used to be the first *warmup* step while every other
     figure in the summary was post-discard.
+
+    **The loss comes from `built.loss_fn`, never from `info_nce` directly.** The
+    previous version called `info_nce` inline, which was correct for `loss=mnrl`
+    and silently wrong for everything else: once `axes._loss` learned to build
+    `cached_mnrl`, `assemble` and `assert_matches` both passed while the loop went
+    on measuring ordinary in-batch negatives and the result carried the label
+    `cached_mnrl`. A crash had become a mislabelled number, which is worse — and
+    `capture` reads `built.loss_fn` to certify `loss.name`, so the object that was
+    certified was the one object the loop did not use.
+
+    Two shapes of loss are supported, and which one a run takes is read off the
+    callable rather than branched on `config.loss.name` — the config is the request
+    and this loop runs what was built (docs/CONTRACTS.md §2):
+
+    * a plain `(queries, documents) -> loss`, whose backward this loop issues;
+    * one carrying `gradcache_backward`, which encodes the batch twice and issues
+      its own backward, returning the loss already detached.
+
+    Both stay entirely inside the timer. GradCache's second forward pass is a real
+    cost of that setting and has to land in the step time it is compared on.
+    `grad_accum` scales both the same way — `loss / grad_accum` on one path and
+    `scale=1 / grad_accum` on the other, which multiplies the gradient and not the
+    returned loss — so the two paths accumulate to one batch's gradient rather than
+    to different effective learning rates.
     """
     if config.model.pooling != "lasttoken":
         raise RuntimeError(
@@ -342,6 +603,16 @@ def train(built: Any, loader: Any, config: BenchConfig, device: torch.device) ->
     side = config.model.padding_side
     dtype = steps.dtype_for(device)
     stream = micro_batches(loader)
+    # Read once, outside the loop: a getattr per micro-batch would be a dictionary
+    # lookup inside the timed window on every step of every run.
+    gradcache_backward = getattr(built.loss_fn, "gradcache_backward", None)
+    if gradcache_backward is not None and config.dataloader.packing:
+        raise RuntimeError(
+            "loss=cached_mnrl with dataloader.packing=true: GradCache splits the batch into "
+            "row-wise pieces and pools each with the padded convention, and a packed batch is "
+            "one row whose boundaries live in cu_seqlens. It would pool the wrong positions "
+            "and still report both axes as applied. Measure the two axes separately."
+        )
     counted = dict.fromkeys(
         ("tokens", "padded_tokens", "rows", "samples", "images", "images_dropped"), 0
     )
@@ -366,15 +637,33 @@ def train(built: Any, loader: Any, config: BenchConfig, device: torch.device) ->
                 # would step on gradients that had just been wiped, and the loop
                 # would time a forward and a backward while calling it training.
                 # Caught by tests/test_smoke_cpu.py, which asserts the gradients
-                # are non-zero at the moment of the step. `encode` and `info_nce`
-                # are reused unchanged.
-                pooled = steps.encode(built.model, tensors, side)
-                half = pooled.shape[0] // 2
-                loss = info_nce(pooled[:half], pooled[half:], config.loss.temperature)
-                # Scaled so N micro-batches accumulate to one batch's gradient
-                # rather than N times it. The recorded loss is the unscaled one, so
-                # it stays comparable across grad_accum settings.
-                (loss / grad_accum).backward()
+                # are non-zero at the moment of the step. `encode` is reused
+                # unchanged.
+                if gradcache_backward is not None:
+                    # GradCache owns the whole forward/backward: it encodes the
+                    # batch in pieces under no_grad, scores every row at once, then
+                    # re-encodes each piece with a graph and seeds its backward
+                    # from the cache. `scale` multiplies the gradient rather than
+                    # the returned loss, so the loss recorded below is the unscaled
+                    # one on this path too.
+                    loss = gradcache_backward(
+                        built.model, tensors, padding_side=side, scale=1.0 / grad_accum
+                    )
+                else:
+                    # `micro.cu_seqlens` is None unless `dataloader.packing=true`,
+                    # and it is what selects the pooling: a packed batch is one row
+                    # with no attention_mask, which `last_token_pool` refuses.
+                    pooled = pooled_embeddings(built.model, tensors, side, micro.cu_seqlens)
+                    half = pooled.shape[0] // 2
+                    # `built.loss_fn`, not `info_nce`: the temperature and any
+                    # cross-rank gather are already closed over by the callable
+                    # `axes.assemble` built, and that callable is the one
+                    # `applied.capture` reads to certify `loss.name`.
+                    loss = built.loss_fn(pooled[:half], pooled[half:])
+                    # Scaled so N micro-batches accumulate to one batch's gradient
+                    # rather than N times it. The recorded loss is the unscaled one,
+                    # so it stays comparable across grad_accum settings.
+                    (loss / grad_accum).backward()
                 if measured:
                     detached = loss.detach()
                     first_loss = detached if first_loss is None else first_loss
@@ -409,9 +698,10 @@ def train(built: Any, loader: Any, config: BenchConfig, device: torch.device) ->
     summary["loss_first"] = float(first_loss) if first_loss is not None else None
     summary["loss_last"] = float(last_loss) if last_loss is not None else None
     summary["loss_definition"] = (
-        "unscaled InfoNCE of one micro-batch. loss_first is the first micro-batch of the "
-        "first measured step, loss_last the last micro-batch of the final step; warmup steps "
-        "are excluded, as they are from every other figure here"
+        f"unscaled {config.loss.name} over one micro-batch, as computed by the loss "
+        "built.loss_fn holds — not a separately recomputed InfoNCE. loss_first is the first "
+        "micro-batch of the first measured step, loss_last the last micro-batch of the final "
+        "step; warmup steps are excluded, as they are from every other figure here"
     )
     return summary
 
@@ -444,13 +734,20 @@ def main(argv: list[str] | None = None) -> int:
     model.to(device)
 
     dataset = load_pairs(config)
+    if config.dataloader.pretokenize:
+        # Before `assemble`, which is the whole of the axis: `_dataloader` refuses
+        # `pretokenize=true` over rows that do not already carry token ids, because
+        # building the loader anyway would leave the tokenisation inside the timed
+        # step under a pretokenized label.
+        dataset = axes.pretokenize(dataset, Encode(processor, config))
     built, applied = axes.assemble(model, config, device, framework="native", dataset=dataset)
-    # `assemble` has no collate argument, so the loader it builds carries torch's
-    # default one and this is the only place to replace it. The replacement declares
-    # `axis_packing`, which is what `applied._capture_dataloader_packing` reads —
-    # without it this assignment would turn a determined axis into an undetermined
-    # one and `assert_matches` below would refuse the run.
-    built.dataloader.collate_fn = Collate(processor, config)
+    # `assemble` has no collate argument, so the loader it builds carries either
+    # torch's default one or `axes.PackedCollate`, and this is the only place to
+    # replace it. What goes in declares `axis_packing`, which is what
+    # `applied._capture_dataloader_packing` reads — an assignment that did not would
+    # turn a determined axis into an undetermined one and `assert_matches` below
+    # would refuse the run.
+    built.dataloader.collate_fn = build_collate(processor, config)
 
     state = capture(built, config)
     # Directly, and before a single step runs. Not inside a try, and not through

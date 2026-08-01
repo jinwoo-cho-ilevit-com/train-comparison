@@ -23,6 +23,7 @@ import pickle
 import sys
 import time
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -53,7 +54,10 @@ class TinyEmbedder(torch.nn.Module):
         # `axes.assemble` and the capture probes read a transformers-shaped config.
         self.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
 
-    def forward(self, input_ids, attention_mask, **_):
+    # `attention_mask` defaults to None the way a transformers model's does: a
+    # packed batch carries no mask, and a stub that required one would make the
+    # packed path untestable for a reason no real model has.
+    def forward(self, input_ids, attention_mask=None, **_):
         hidden = self.proj(self.embed(input_ids))
         return type("Output", (), {"last_hidden_state": hidden})()
 
@@ -68,8 +72,17 @@ class FakeProcessor:
     it None rather than by naming an architecture.
     """
 
+    # `steps.pad_token_id` reads this, and `build_collate` refuses packing without
+    # it: PackedCollate searches every sequence for the pad id. Never produced by
+    # the character tokeniser below (`1 + ord(c) % 60` starts at 1), so a pad id
+    # found in a packed sequence really did come from padding.
+    pad_token_id = 0
+
     def __init__(self, *, accepts_images: bool = True) -> None:
         self.image_processor = SimpleNamespace() if accepts_images else None
+        # Every tokenising call, so a test can assert the pretokenize axis moved
+        # the work out of the step rather than only relabelling it.
+        self.tokenize_calls = 0
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
         content = messages[0]["content"]
@@ -86,9 +99,16 @@ class FakeProcessor:
         truncation=False,
         max_length=None,
     ):
-        rows = [[1 + (ord(c) % 60) for c in one] for one in text]
+        self.tokenize_calls += 1
+        texts = [text] if isinstance(text, str) else list(text)
+        rows = [[1 + (ord(c) % 60) for c in one] for one in texts]
         if truncation and max_length is not None:
             rows = [row[:max_length] for row in rows]
+        if not padding:
+            # A real tokenizer with padding=False returns ragged python lists, which
+            # is the one shape `axes.PackedCollate` accepts — it refuses a rectangle
+            # because a rectangle is a padded batch.
+            return {"input_ids": rows[0] if isinstance(text, str) else rows}
         width = max(len(row) for row in rows)
         encoded = {
             "input_ids": torch.tensor([row + [0] * (width - len(row)) for row in rows]),
@@ -125,6 +145,25 @@ def batches(samples: int, length: int = 6, count: int = 8):
         yield micro_batch(samples, length)
 
 
+def padded_batches(samples: int, count: int, length: int = 6):
+    """Batches whose mask actually contains padding, with rows of unequal length.
+
+    `micro_batch` attends every position, and with nothing padded `last_token_pool`
+    returns the same row whichever side it is told to expect — so a batch built
+    from it cannot tell a harness that threaded `config.model.padding_side` through
+    from one that passed a literal. These pad on the right, which is the declared
+    side for the configs here; `last_token_pool` refuses a mask that disagrees.
+    """
+    for _ in range(count):
+        base = micro_batch(samples, length)
+        mask = base.tensors["attention_mask"].clone()
+        mask[:, -1] = 0
+        mask[0, -2] = 0
+        yield base._replace(
+            tensors={**base.tensors, "attention_mask": mask}, tokens=int(mask.sum())
+        )
+
+
 def micro_batch(samples: int, length: int = 6, offset: int = 0) -> bench_entry.MicroBatch:
     ids = torch.randint(1, 60, (samples * 2, length)) + offset % 3
     return bench_entry.MicroBatch(
@@ -153,21 +192,70 @@ def probe_config(config_mapping):  # noqa: F811 - the imported fixture, requeste
     )
 
 
-def built_with(model, lr: float = 1e-3, optimizer=None) -> Built:
+def text_only_rows(count: int, text: str = "ab") -> list[dict[str, Any]]:
+    """Rows that declare no image column at all.
+
+    Not `rows()` with its image columns set to None: `axes.image_columns` reads
+    what the dataset *declares*, so a row carrying `qry_image=None` still declares
+    an image column and `axes._gradcache_needs_splittable_data` refuses
+    `loss=cached_mnrl` for it. Dropping the keys is what makes a dataset text-only,
+    and text-only data is the only kind GradCache is applicable to here.
+    """
+    return [{"qry": f"{text}{index}", "pos_text": f"{text * 2}{index}"} for index in range(count)]
+
+
+def assembled_loss(config, dataset=None) -> Any:
+    """The callable `axes.assemble` puts in `Built.loss_fn`, for this config.
+
+    Taken from `assemble` rather than rebuilt here. `axes._loss` is D's internal
+    structure (docs/CONTRACTS.md §2 fixes the four call sites, not what is inside
+    them), and a test that rebuilt the loss its own way would keep passing while
+    the loss the harness actually runs changed underneath it.
+
+    `dataset` is threaded through because `loss.name` is decided partly by it:
+    `cached_mnrl` is refused outright for a dataset that declares image columns.
+    """
+    built, _ = axes.assemble(
+        TinyEmbedder(),
+        config,
+        CPU,
+        framework="native",
+        dataset=bench_entry.PairDataset(rows(4)) if dataset is None else dataset,
+    )
+    return built.loss_fn
+
+
+def built_with(
+    model, config, lr: float = 1e-3, optimizer=None, loss_fn=None, dataset=None
+) -> Built:
+    """What `main()` hands `train`, minus the dataloader the caller supplies.
+
+    `loss_fn` defaults to the assembled one instead of to None. It was None, which
+    made every test here pass against a loop that computed `info_nce` inline — the
+    field `capture` reads to certify `loss.name` was the one field no test could
+    have noticed was unused.
+    """
     return Built(
         model=model,
         optimizer=optimizer or torch.optim.AdamW(model.parameters(), lr=lr),
-        loss_fn=None,
+        loss_fn=assembled_loss(config, dataset) if loss_fn is None else loss_fn,
         dataloader=None,
         framework="native",
     )
+
+
+def text_only(count: int = 4):
+    """The dataset `loss=cached_mnrl` is applicable to."""
+    return bench_entry.PairDataset(text_only_rows(count))
 
 
 # --- the measured loop -------------------------------------------------------
 
 
 def test_the_measured_loop_runs_and_reports_what_it_measured(probe_config):
-    summary = bench_entry.train(built_with(TinyEmbedder()), list(batches(2)), probe_config, CPU)
+    summary = bench_entry.train(
+        built_with(TinyEmbedder(), probe_config), list(batches(2)), probe_config, CPU
+    )
 
     assert summary["steps_timed"] == 6
     assert summary["steps_discarded"] == 2
@@ -202,7 +290,7 @@ def test_the_data_pipeline_is_inside_the_timed_window(probe_config):
 
     config = bench_config_of(probe_config, steps=4, discard=0)
 
-    summary = bench_entry.train(built_with(TinyEmbedder()), SlowLoader(), config, CPU)
+    summary = bench_entry.train(built_with(TinyEmbedder(), config), SlowLoader(), config, CPU)
 
     assert summary["step_seconds_p50"] >= delay
     assert summary["samples_per_second"] <= summary["samples_per_step"] / delay
@@ -233,7 +321,7 @@ def test_grad_accum_consumes_distinct_micro_batches(config_mapping):  # noqa: F8
                 served.append(index)
                 yield batch
 
-    bench_entry.train(built_with(TinyEmbedder()), CountingLoader(), config, CPU)
+    bench_entry.train(built_with(TinyEmbedder(), config), CountingLoader(), config, CPU)
 
     assert served == [0, 1, 2, 3, 4, 5]
 
@@ -243,7 +331,7 @@ def test_the_loop_does_not_spin_on_a_loader_that_yields_nothing(probe_config):
     loader yielding zero batches spun with no output and no exception until the pod
     deadline killed it."""
     with pytest.raises(RuntimeError, match="yielded no batches"):
-        bench_entry.train(built_with(TinyEmbedder()), [], probe_config, CPU)
+        bench_entry.train(built_with(TinyEmbedder(), probe_config), [], probe_config, CPU)
 
 
 def test_the_optimizer_actually_steps_on_gradients_that_exist(probe_config):
@@ -275,27 +363,32 @@ def test_the_optimizer_actually_steps_on_gradients_that_exist(probe_config):
     before = model.proj.weight.detach().clone()
     optimizer = GradSpyAdamW(model.parameters(), lr=0.1)
 
-    bench_entry.train(built_with(model, optimizer=optimizer), list(batches(2)), probe_config, CPU)
+    bench_entry.train(
+        built_with(model, probe_config, optimizer=optimizer), list(batches(2)), probe_config, CPU
+    )
 
     assert len(optimizer.grad_max_at_step) == probe_config.train.steps
     assert all(seen > 0 for seen in optimizer.grad_max_at_step)
     assert not torch.equal(before, model.proj.weight.detach())
 
 
-def test_the_reported_losses_exclude_the_warmup_steps(probe_config, monkeypatch):
+def test_the_reported_losses_exclude_the_warmup_steps(probe_config):
     """`loss_first` used to be the first *warmup* step while every other figure in
     the summary was post-discard, so the two could not be read together."""
     seen: list[torch.Tensor] = []
-    real = bench_entry.info_nce
+    real = assembled_loss(probe_config)
 
-    def spy(queries, documents, temperature):
-        loss = real(queries, documents, temperature)
+    def spy(queries, documents):
+        loss = real(queries, documents)
         seen.append(loss.detach().clone())
         return loss
 
-    monkeypatch.setattr(bench_entry, "info_nce", spy)
-
-    summary = bench_entry.train(built_with(TinyEmbedder()), list(batches(2)), probe_config, CPU)
+    summary = bench_entry.train(
+        built_with(TinyEmbedder(), probe_config, loss_fn=spy),
+        list(batches(2)),
+        probe_config,
+        CPU,
+    )
 
     discard = probe_config.train.warmup_discard_steps
     assert len(seen) == probe_config.train.steps
@@ -322,7 +415,254 @@ def test_a_declared_pooling_the_loop_does_not_implement_is_refused(probe_config,
     object.__setattr__(probe_config.model, "pooling", "mean")
 
     with pytest.raises(RuntimeError, match="pools the last token"):
-        bench_entry.train(built_with(TinyEmbedder()), list(batches(2)), probe_config, CPU)
+        bench_entry.train(
+            built_with(TinyEmbedder(), probe_config), list(batches(2)), probe_config, CPU
+        )
+
+
+# --- the loss the loop actually runs -----------------------------------------
+
+
+def gradcache_config(config_mapping, **overrides):  # noqa: F811
+    """A `loss=cached_mnrl` config. `mini_batch` may not exceed `train.batch_size`
+    (`config_schema._gradcache_mini_batch_fits`), so both move together."""
+    settings = {
+        "run.purpose": "probe",
+        "train.steps": 2,
+        "train.warmup_discard_steps": 0,
+        "train.grad_accum": 1,
+        "train.batch_size": 2,
+        "data.limit": 8,
+        "loss.name": "cached_mnrl",
+        "loss.mini_batch": 2,
+    }
+    settings.update(overrides)
+    return bench(config_mapping, **settings)
+
+
+class ForwardCountingSGD(torch.optim.SGD):
+    """Forward calls per optimizer step, counted on the model the loop was handed.
+
+    Wrapping the real object's `forward` is what makes the count an observation of
+    what ran rather than of what a fixture arranged. `lr=0.0` because these tests
+    read gradients and counts, not weights — and SGD rather than AdamW because
+    AdamW's decoupled decay moves weights with the gradients at zero, the same
+    confusion `test_the_optimizer_actually_steps` exists to keep out.
+    """
+
+    def __init__(self, model) -> None:
+        super().__init__(model.parameters(), lr=0.0)
+        self.per_step: list[int] = []
+        self._seen = 0
+        inner = model.forward
+
+        def forward(*args: Any, **kwargs: Any):
+            self._seen += 1
+            return inner(*args, **kwargs)
+
+        model.forward = forward
+
+    def step(self, *args: Any, **kwargs: Any):
+        self.per_step.append(self._seen)
+        self._seen = 0
+        return super().step(*args, **kwargs)
+
+
+def test_the_loop_computes_the_loss_the_run_assembled(probe_config):
+    """The loop called `info_nce` inline and never touched `built.loss_fn`.
+
+    For `loss=mnrl` the two are the same arithmetic, so no number moved and nothing
+    here could see it — and that is precisely why it survived: `capture` reads
+    `built.loss_fn` to certify `loss.name`, so the certified object was the one
+    object the measured loop did not run. The moment `axes._loss` learned a second
+    loss, the label and the number came apart.
+
+    The spy returns a number no InfoNCE would, so a loop that recomputed the loss
+    its own way cannot report this one by coincidence.
+    """
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+    scored = assembled_loss(probe_config)
+
+    def spy(queries: torch.Tensor, documents: torch.Tensor) -> torch.Tensor:
+        calls.append((queries.detach().clone(), documents.detach().clone()))
+        return scored(queries, documents) + 5.0
+
+    summary = bench_entry.train(
+        built_with(TinyEmbedder(), probe_config, loss_fn=spy),
+        list(batches(2)),
+        probe_config,
+        CPU,
+    )
+
+    assert len(calls) == probe_config.train.steps * probe_config.train.grad_accum
+    # Halves, not the whole pooled tensor: the loop is what splits queries from
+    # positives, and handing the loss all four rows would score every row against
+    # itself.
+    assert [tuple(side.shape[0] for side in call) for call in calls] == [(2, 2)] * len(calls)
+    discard = probe_config.train.warmup_discard_steps
+    plain = float(scored(*calls[discard]))
+    assert summary["loss_first"] == pytest.approx(plain + 5.0)
+    # Stated against the same batch rather than against a magnitude: at
+    # `loss.temperature=0.02` a fresh model already separates two pairs, so plain
+    # InfoNCE here is ~0 and an absolute threshold would prove nothing.
+    assert summary["loss_first"] != pytest.approx(plain)
+
+
+def test_cached_mnrl_runs_gradcache_rather_than_plain_in_batch_negatives(config_mapping):  # noqa: F811
+    """The failure this closes was strictly worse than a crash.
+
+    Before `axes._loss` could build `cached_mnrl`, such a run died in `assemble` and
+    produced no number. After, `assemble` and `assert_matches` both passed while the
+    loop went on scoring ordinary in-batch negatives — and the result JSON carried
+    `loss.name=cached_mnrl`. The repository's only three timing manifests
+    (`configs/experiment/phase2-loss-*.yaml`) are on this axis.
+
+    GradCache is visible in the forward count, which is what makes this an
+    observation rather than an assertion about the code: every piece of the batch is
+    encoded twice, once under `no_grad` for the cache and once with a graph to
+    consume it. The plain path encodes once.
+    """
+    config = gradcache_config(config_mapping)
+    model = TinyEmbedder()
+    counter = ForwardCountingSGD(model)
+
+    summary = bench_entry.train(
+        built_with(model, config, optimizer=counter, dataset=text_only()),
+        list(batches(2)),
+        config,
+        CPU,
+    )
+
+    # Every piece encoded twice: once under `no_grad` to build the cache, once with
+    # a graph to consume it. The plain path encodes once, whatever the split.
+    pieces = (2 * config.train.batch_size) // config.loss.mini_batch
+    assert counter.per_step == [2 * pieces] * config.train.steps
+    assert summary["loss_first"] is not None
+    assert config.loss.name in summary["loss_definition"]
+
+
+def test_the_plain_path_encodes_the_batch_once(probe_config):
+    """The other half of the count above: without it, `2 * pieces` is a number with
+    nothing to be larger than, and a loop that double-encoded every run would
+    satisfy both tests."""
+    model = TinyEmbedder()
+    counter = ForwardCountingSGD(model)
+
+    bench_entry.train(
+        built_with(model, probe_config, optimizer=counter), list(batches(2)), probe_config, CPU
+    )
+
+    assert counter.per_step == [probe_config.train.grad_accum] * probe_config.train.steps
+
+
+def test_gradcache_and_plain_backward_accumulate_the_same_gradient(config_mapping):  # noqa: F811
+    """`scale` is the wiring that is wrong silently.
+
+    `gradcache_backward` takes `scale=1/grad_accum` and multiplies the *gradient*;
+    the plain path divides the *loss*. Drop the argument and GradCache accumulates
+    `grad_accum` times the gradient the other path does — same config, same label,
+    a different effective learning rate, and every number still printed. Nothing in
+    the result JSON would say so.
+
+    GradCache computes the exact gradient, so with the same weights and the same
+    batches the two paths must agree to floating-point error. That also pins the
+    rest of the call: a batch handed over unsplit lands here as a mismatch. The
+    batches are padded, and unequally, so that `padding_side` is pinned too — with
+    nothing padded, `last_token_pool` returns the same row for either side and a
+    literal passed in place of `config.model.padding_side` goes unnoticed.
+    """
+    cached = gradcache_config(config_mapping, **{"train.grad_accum": 2, "train.steps": 1})
+    plain = gradcache_config(
+        config_mapping,
+        **{"train.grad_accum": 2, "train.steps": 1, "loss.name": "mnrl", "loss.mini_batch": None},
+    )
+
+    def gradients(config):
+        torch.manual_seed(0)
+        model = TinyEmbedder()
+        torch.manual_seed(1)
+        data = list(padded_batches(2, count=config.train.grad_accum))
+        spy = GradSpySGD(model.parameters(), lr=0.0)
+        bench_entry.train(
+            built_with(model, config, optimizer=spy, dataset=text_only()), data, config, CPU
+        )
+        return spy.seen
+
+    from_cache, from_plain = gradients(cached), gradients(plain)
+
+    assert len(from_cache) == len(from_plain) == 1
+    assert from_plain[0], "no gradients reached the step; the comparison would be vacuous"
+    for name, grad in from_plain[0].items():
+        assert grad.abs().max() > 0, f"{name} arrived at the step as zeros"
+        assert torch.allclose(from_cache[0][name], grad, atol=1e-6), name
+
+
+class GradSpySGD(torch.optim.SGD):
+    """The gradients as the step saw them, before `zero_grad` erases the evidence."""
+
+    def __init__(self, params, **kwargs):
+        super().__init__(list(params), **kwargs)
+        self.seen: list[dict[str, torch.Tensor]] = []
+
+    def step(self, *args, **kwargs):
+        self.seen.append(
+            {
+                f"{group}.{index}": p.grad.detach().clone()
+                for group, params in enumerate(self.param_groups)
+                for index, p in enumerate(params["params"])
+                if p.grad is not None
+            }
+        )
+        return super().step(*args, **kwargs)
+
+
+def test_gradcache_stops_the_run_on_a_batch_it_cannot_split_by_rows(config_mapping):  # noqa: F811
+    """GradCache is text-only here: `pixel_values` counts patches (Qwen-VL) or
+    images (gemma-4), and mapping those back to rows needs that model's own
+    placeholder accounting, so `axes._split_rows` refuses rather than guess.
+
+    `axes._gradcache_needs_splittable_data` refuses an image-carrying *dataset*
+    before a batch exists, which is the layer that covers every configured run.
+    This is the layer under it: the dataset here declares text only and a batch
+    turns up with pixels anyway. The refusal has to reach the caller. Swallowed
+    inside the timed window — by a `try` here, or by a context manager returning
+    True from `__exit__` — the run would go on to report a step time for a step
+    that computed nothing.
+    """
+    config = gradcache_config(config_mapping)
+    with_pixels = micro_batch(2)
+    with_pixels.tensors["pixel_values"] = torch.zeros(3, 3, 4, 4)
+
+    with pytest.raises(RuntimeError, match="cannot split"):
+        bench_entry.train(
+            built_with(TinyEmbedder(), config, dataset=text_only()), [with_pixels], config, CPU
+        )
+
+
+def test_a_loss_that_refuses_the_pooled_signature_dies_on_the_first_step(probe_config):
+    """The fail-closed half of the wiring, independent of GradCache existing.
+
+    `axes._loss` returns a `cached_mnrl` whose `(queries, documents)` signature
+    raises, precisely so that a harness reaching for the plain shape crashes instead
+    of measuring in-batch negatives under the wrong label. That only works if the
+    loop lets the exception out — and it has to be out of the *first* step, before
+    `summarise` can turn timings into a throughput figure.
+    """
+    steps_entered = []
+
+    def refuses(queries: torch.Tensor, documents: torch.Tensor) -> torch.Tensor:
+        steps_entered.append(len(steps_entered))
+        raise RuntimeError("cannot be computed from pooled embeddings")
+
+    with pytest.raises(RuntimeError, match="pooled embeddings"):
+        bench_entry.train(
+            built_with(TinyEmbedder(), probe_config, loss_fn=refuses),
+            list(batches(2)),
+            probe_config,
+            CPU,
+        )
+
+    assert steps_entered == [0]
 
 
 # --- the collate -------------------------------------------------------------
@@ -474,3 +814,192 @@ def bench_config_of(config, *, steps: int, discard: int):
     would make this test depend on the config directory as well as on the loop."""
     train = config.train.model_copy(update={"steps": steps, "warmup_discard_steps": discard})
     return config.model_copy(update={"train": train})
+
+
+# --- dataloader.packing and dataloader.pretokenize ---------------------------
+# Both axes were unreachable from this harness until now: the collate assignment in
+# `main()` overwrote `axes.PackedCollate` unconditionally, so `torch_packed` was
+# certified False against a True request and refused at `assert_matches`; and
+# nothing called `axes.pretokenize`, so `torch_pretokenized` died in `assemble`.
+
+
+def axis_config(config_mapping, **dataloader):  # noqa: F811
+    """A probe config with the dataloader axis set and workers off.
+
+    `num_workers: 0` because these tests count tokenising calls on the processor,
+    and a forked worker's copy of that counter never comes back.
+    """
+    return bench(
+        config_mapping,
+        **{
+            "run.purpose": "probe",
+            "train.steps": 4,
+            "train.warmup_discard_steps": 0,
+            "train.grad_accum": 1,
+            "train.batch_size": 2,
+            "data.limit": 8,
+            "data.num_workers": 0,
+            **{f"dataloader.{key}": value for key, value in dataloader.items()},
+        },
+    )
+
+
+def harness_loader(config, processor, source=None):
+    """`main()`'s construction for whatever this config's dataloader axes say."""
+    dataset = bench_entry.PairDataset(rows(8, qry_image=True)) if source is None else source
+    if config.dataloader.pretokenize:
+        dataset = axes.pretokenize(dataset, bench_entry.Encode(processor, config))
+    built, _ = axes.assemble(TinyEmbedder(), config, CPU, framework="native", dataset=dataset)
+    built.dataloader.collate_fn = bench_entry.build_collate(processor, config)
+    return built
+
+
+def test_a_packed_run_certifies_packing_from_the_class_that_owns_it(config_mapping):  # noqa: F811
+    """The wrapper carries the accounting the step needs; it must not carry a
+    second opinion about whether the batch is packed. `axis_packing` is forwarded
+    from `axes.PackedCollate`, and the capture probe reads the forwarded value."""
+    config = axis_config(config_mapping, packing=True)
+    built = harness_loader(config, FakeProcessor())
+
+    collate = built.dataloader.collate_fn
+    assert isinstance(collate.packed, axes.PackedCollate)
+    # Not a class attribute of the wrapper: two declarations is how one of them
+    # drifts into a label the run did not earn.
+    assert "axis_packing" not in vars(bench_entry.PackedBatches)
+    assert collate.axis_packing is axes.PackedCollate.axis_packing
+
+    axis = {a.axis: a for a in capture(built, config).axes}["dataloader.packing"]
+    assert axis.determined, axis.detail
+    assert (axis.requested, axis.applied) == ("True", "True")
+
+
+def test_a_packed_batch_keeps_queries_first_so_the_pairing_survives(config_mapping):  # noqa: F811
+    """`info_nce` splits the pooled embeddings at the midpoint and
+    `packed_last_token_pool` returns them in packing order, so the order the
+    sequences are packed in *is* the pairing."""
+    config = axis_config(config_mapping, packing=True)
+    processor = FakeProcessor()
+    pairs = rows(2, qry_image=True)
+
+    micro = bench_entry.build_collate(processor, config)(pairs)
+
+    texts = bench_entry.Collate(processor, config).pair_texts(pairs, with_images=False).texts
+    expected = [len(text) for text in texts]
+    lengths = (micro.cu_seqlens[1:] - micro.cu_seqlens[:-1]).tolist()
+    assert lengths == expected
+    assert micro.samples == 2
+    assert micro.rows == 4
+    # No padding at all is the whole of what packing claims to save.
+    assert micro.tokens == micro.padded_tokens == sum(expected)
+    assert tuple(micro.tensors["input_ids"].shape) == (1, sum(expected))
+    # The pixels cannot ride along in a pack, so they are counted, not forgotten.
+    assert micro.images == 0
+    assert micro.images_dropped == 2
+
+
+def test_a_packed_batch_pools_each_sequence_at_its_own_last_token(config_mapping):  # noqa: F811
+    """A packed batch is one row with no attention_mask, which is exactly the
+    contract `last_token_pool` refuses to weaken — so it gets its own pooling and
+    the boundaries have to be carried. Hand calculation: hidden state = position,
+    so sequence i must pool to `cu_seqlens[i + 1] - 1`."""
+
+    class Positions(torch.nn.Module):
+        def forward(self, input_ids, **_):
+            total = int(input_ids.shape[1])
+            hidden = torch.arange(total, dtype=torch.float32).reshape(1, total, 1)
+            return type("Output", (), {"last_hidden_state": hidden})()
+
+    cu_seqlens = torch.tensor([0, 3, 7, 9], dtype=torch.int32)
+    tensors = {"input_ids": torch.ones(1, 9, dtype=torch.long)}
+
+    pooled = bench_entry.pooled_embeddings(Positions(), tensors, "right", cu_seqlens)
+
+    assert pooled.flatten().tolist() == [2.0, 6.0, 8.0]
+
+
+def test_pretokenize_moves_the_tokenisation_out_of_the_measured_step(config_mapping):  # noqa: F811
+    """The axis is not a label on unchanged work: after `axes.pretokenize` the
+    measured loop must tokenise nothing at all. The control is the same loop on the
+    same rows with the axis off, which tokenises on every batch it draws."""
+    processor = FakeProcessor()
+    config = axis_config(config_mapping, pretokenize=True)
+    built = harness_loader(config, processor)
+    processor.tokenize_calls = 0
+
+    bench_entry.train(built, built.dataloader, config, CPU)
+
+    assert processor.tokenize_calls == 0
+
+    plain = axis_config(config_mapping)
+    other = FakeProcessor()
+    plain_built = harness_loader(plain, other)
+    other.tokenize_calls = 0
+    bench_entry.train(plain_built, plain_built.dataloader, plain, CPU)
+    assert other.tokenize_calls > 0
+
+
+def test_packing_and_pretokenize_together_need_no_tokenizer_in_the_step(config_mapping):  # noqa: F811
+    """The one combination `axes.PackedCollate` was written to serve. The rows
+    already carry unpadded ids, so the pack is assembled out of them and nothing is
+    tokenised inside the timed window."""
+    processor = FakeProcessor()
+    config = axis_config(config_mapping, packing=True, pretokenize=True)
+    built = harness_loader(config, processor)
+    processor.tokenize_calls = 0
+
+    summary = bench_entry.train(built, built.dataloader, config, CPU)
+
+    assert processor.tokenize_calls == 0
+    assert summary["steps_measured"] == 4
+    assert summary["tokens_per_step"] == summary["padded_tokens_per_step"]
+    state = capture(built, config)
+    determined = {a.axis: (a.requested, a.applied) for a in state.axes}
+    assert determined["dataloader.packing"] == ("True", "True")
+    assert determined["dataloader.pretokenize"] == ("True", "True")
+
+
+def test_packing_with_gradcache_is_refused_rather_than_mispooled(config_mapping):  # noqa: F811
+    """GradCache pools row-wise pieces the padded way; a packed batch is one row
+    whose boundaries live in `cu_seqlens`. Together they would pool the wrong
+    positions and still report both axes as applied."""
+    config = axis_config(config_mapping, packing=True)
+
+    def loss_fn(queries, documents):
+        raise AssertionError("the run should have stopped before any loss was computed")
+
+    loss_fn.gradcache_backward = lambda *args, **kwargs: None
+
+    with pytest.raises(RuntimeError, match="Measure the two axes separately"):
+        bench_entry.train(built_with(TinyEmbedder(), config, loss_fn=loss_fn), [], config, CPU)
+
+
+def test_a_cross_device_loss_without_a_world_stops_the_run_on_the_first_step(config_mapping):  # noqa: F811
+    """`parallel.cross_device_negatives=true` builds a loss that all-gathers, and
+    that gather refuses to run without a process group. The refusal is fail-closed
+    only if something calls the loss: a harness that computed its own InfoNCE would
+    measure ordinary local negatives on a single-process pod and report them under
+    the cross-device label, and nothing in the result JSON would say so.
+
+    The real assembled loss, not a stand-in. A synthetic raiser proves the loop
+    propagates an exception; it would go on passing if `axes._loss` stopped
+    attaching the gather, which is the half this pins.
+    """
+    config = bench(
+        config_mapping,
+        **{
+            "run.purpose": "probe",
+            "train.steps": 4,
+            "train.warmup_discard_steps": 0,
+            "train.batch_size": 2,
+            "parallel.strategy": "single",
+            "parallel.cross_device_negatives": True,
+        },
+    )
+    built = built_with(TinyEmbedder(), config)
+    # The axis is applied and read back, so what stops the run below is the missing
+    # world and not an unverified axis.
+    axis = {a.axis: a for a in capture(built, config).axes}["parallel.cross_device_negatives"]
+    assert (axis.requested, axis.applied) == ("True", "True")
+
+    with pytest.raises(RuntimeError, match="needs an initialised process group"):
+        bench_entry.train(built, list(batches(2)), config, CPU)
