@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import json
 import pickle
+import subprocess
 import sys
 import time
 from types import SimpleNamespace
@@ -77,6 +79,10 @@ class FakeProcessor:
     # the character tokeniser below (`1 + ord(c) % 60` starts at 1), so a pad id
     # found in a packed sequence really did come from padding.
     pad_token_id = 0
+    # A real processor declares one, and `embedding.align_padding_side` refuses a
+    # processor that does not — it cannot establish which side would be pooled.
+    # `main()` calls it, so a stub without this could not stand in for a checkpoint.
+    padding_side = "right"
 
     def __init__(self, *, accepts_images: bool = True) -> None:
         self.image_processor = SimpleNamespace() if accepts_images else None
@@ -1003,3 +1009,270 @@ def test_a_cross_device_loss_without_a_world_stops_the_run_on_the_first_step(con
 
     with pytest.raises(RuntimeError, match="needs an initialised process group"):
         bench_entry.train(built, list(batches(2)), config, CPU)
+
+
+# --- a refused setting is a result ------------------------------------------
+# `main()` end to end, with the checkpoint stubbed. The refusals below are the real
+# ones raised by `trainbench/axes.py` and `trainbench/applied.py` for these configs,
+# not stand-ins: what is under test is that the reason reaches `--out` instead of
+# only the exit code reaching the pod log.
+
+
+@pytest.fixture
+def stub_checkpoint(monkeypatch):
+    """A checkpoint `main()` can load without a network or a 2B download.
+
+    Patched on the auto classes' `from_pretrained` rather than by rebinding
+    `transformers.AutoModel` on the module: transformers is a lazy module, and a
+    rebind there does not survive `from transformers import AutoModel` inside
+    `build_run` — the suite then quietly pulled the real checkpoint out of whatever
+    HF cache the machine happened to have, which is exactly the "the check ran and
+    examined something else" shape this repository keeps producing. Run the tests
+    below with an empty `HF_HOME` and they still pass; with the rebind they did not.
+    """
+    import transformers
+
+    processor = FakeProcessor()
+    monkeypatch.setattr(
+        transformers.AutoProcessor, "from_pretrained", staticmethod(lambda *a, **k: processor)
+    )
+    monkeypatch.setattr(
+        transformers.AutoModel, "from_pretrained", staticmethod(lambda *a, **k: TinyEmbedder())
+    )
+    return processor
+
+
+@pytest.fixture
+def pod_setting(tmp_path, monkeypatch, stub_checkpoint):
+    """Run `main()` the way docker/entrypoint.sh does: a config file and an `--out`.
+
+    Returns `(exit code, parsed record or None)`. The subset is stubbed at
+    `load_pairs` because the pinned corpus is a Hub download; every axis under test
+    here is decided before a row is read.
+    """
+
+    out = tmp_path / "result.json"
+
+    def run(config, rows_for_run):
+        monkeypatch.setattr(
+            bench_entry, "load_pairs", lambda _: bench_entry.PairDataset(rows_for_run)
+        )
+        config_path = tmp_path / "resolved_config.json"
+        config_path.write_text(json.dumps(config.model_dump(mode="json")))
+        code = bench_entry.main(["--config", str(config_path), "--out", str(out)])
+        return code, (json.loads(out.read_text()) if out.exists() else None)
+
+    # So a test that expects the run to raise can still ask whether anything was
+    # filed. "Nothing was written" is the assertion, and it needs the path.
+    run.out = out
+    return run
+
+
+def timing_config(config_mapping, **overrides):  # noqa: F811
+    settings = {
+        "run.purpose": "timing",
+        "train.steps": 2,
+        "train.warmup_discard_steps": 0,
+        "train.grad_accum": 1,
+        "train.batch_size": 2,
+        "data.limit": 8,
+        "data.num_workers": 0,
+    }
+    settings.update(overrides)
+    return bench(config_mapping, **settings)
+
+
+def test_an_axis_this_data_cannot_apply_is_written_to_the_result_file(pod_setting, config_mapping):  # noqa: F811
+    """`loss=cached_mnrl` over image-carrying rows, which is a configured pod run.
+
+    `axes._gradcache_needs_splittable_data` refuses it in `assemble`. Before this,
+    the process died with no `--out`, docker/entrypoint.sh filed a fallback record
+    saying `exit 1`, and the reason — the sentence naming `pixel_values` and why a
+    row cannot be recovered from it — stayed in the pod log. The report then said
+    only that a pod-hour had been spent.
+    """
+    config = timing_config(config_mapping, **{"loss.name": "cached_mnrl", "loss.mini_batch": 2})
+
+    code, record = pod_setting(config, rows(8, qry_image=True))
+
+    assert code != 0, "a refusal is not a success; the sweep counts this setting as failed"
+    assert record is not None
+    # The body, not a category. This sentence is what the report has to be able to
+    # say, and nothing here paraphrases it.
+    assert "pixel_values" in record["refusal"]["reason"]
+    assert "_split_rows refuses every such batch" in record["refusal"]["reason"]
+    assert record["refusal"]["kind"] == "UnappliedAxis"
+    assert record["refusal"]["stage"] == "assemble"
+    # The setting, so the row is attributable without decoding the whole config.
+    assert record["refusal"]["requested_axes"]["loss.name"] == "cached_mnrl"
+    # Never. report.py renders a record carrying this as a measurement.
+    assert "metrics" not in record
+
+
+def test_an_axis_this_environment_cannot_apply_is_written_before_the_timer(
+    pod_setting,
+    config_mapping,  # noqa: F811
+):
+    """`precision=mxfp8` has no recipe, and `axes.step_context` is what says so.
+
+    That call site is inside the measured loop, after `timer.__enter__`. `build_run`
+    calls it once up front so the refusal lands here rather than on step 0 inside
+    the timed window, where the only choices are catching inside the loop or
+    crashing on something that was knowable before it started.
+    """
+    config = timing_config(config_mapping, **{"precision.name": "mxfp8"})
+
+    code, record = pod_setting(config, rows(8))
+
+    assert code != 0
+    assert record["refusal"]["stage"] == "step_context"
+    assert "Transformer Engine recipe" in record["refusal"]["reason"]
+    assert "metrics" not in record
+
+
+def test_a_mismatched_axis_is_recorded_with_the_axes_that_disagreed(pod_setting, config_mapping):  # noqa: F811
+    """`AppliedMismatch` is not the same finding as `UnappliedAxis` and the record
+    says so.
+
+    A CPU timing run is refused because `adamw_fused` resolves to `adamw_unfused`
+    without CUDA (docs/CONTRACTS.md §6) — a fact about the machine. But the same
+    exception is raised when this harness's own construction leaves an axis
+    undetermined, which has happened here twice. Which axes disagreed is the only
+    thing that tells them apart, so the record keeps the whole `AppliedState`.
+    """
+    code, record = pod_setting(timing_config(config_mapping), text_only_rows(8))
+
+    assert code != 0
+    assert record["refusal"]["kind"] == "AppliedMismatch"
+    assert record["refusal"]["stage"] == "assert_matches"
+    assert "optim.name" in record["refusal"]["reason"]
+    disagreed = {a["axis"] for a in record["applied"]["axes"] if not a["matches"]}
+    assert "optim.name" in disagreed
+    assert "metrics" not in record
+
+
+def test_a_failure_inside_the_measured_loop_is_not_recorded_as_a_refusal(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """The boundary. Catching a refusal and swallowing one differ only in where the
+    `try` ends, and a loop whose failures were recorded as refusals would file a
+    half-run measurement as a setting that was declined.
+
+    `axes.step_context` is called per step, so the loop really can raise this type;
+    the assertion is that `main` does not catch it and writes nothing.
+    """
+    config = timing_config(config_mapping, **{"run.purpose": "probe"})
+
+    def raise_mid_loop(*_args, **_kwargs):
+        raise axes.UnappliedAxis("raised after the loop had started")
+
+    monkeypatch.setattr(bench_entry, "train", raise_mid_loop)
+
+    with pytest.raises(axes.UnappliedAxis, match="after the loop had started"):
+        pod_setting(config, text_only_rows(8))
+    assert not pod_setting.out.exists()
+
+
+def test_a_crash_that_is_not_a_refusal_still_leaves_no_result(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """Only the two refusal types are caught, and the catch sits around the same
+    region an OOM comes out of.
+
+    A checkpoint that will not download, a CUDA OOM, a corpus that came back short:
+    those leave no `--out`, which is what makes docker/entrypoint.sh publish a
+    fallback record instead of a result. A `try` widened to `Exception` would turn
+    every one of them into a tidy record claiming an axis could not be applied —
+    a run that died would be filed as a run that was declined.
+    """
+    config = timing_config(config_mapping)
+
+    def out_of_memory(*_args, **_kwargs):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(axes, "assemble", out_of_memory)
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        pod_setting(config, text_only_rows(8))
+    assert not pod_setting.out.exists()
+
+
+# --- what scripts/report.py makes of a refusal record ------------------------
+
+
+def merged_document(tmp_path, artifacts: dict[str, dict[str, Any]]) -> str:
+    """`scripts/report.py` run for real over the given `path -> record` artifacts.
+
+    A subprocess rather than an import: report.py imports its sibling
+    `publish_result` off `scripts/`, and the question here is what the tool a human
+    runs produces, not what a re-wired copy of it would.
+    """
+    results = tmp_path / "downloaded"
+    for relative, payload in artifacts.items():
+        path = results / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, default=str))
+    matrix = tmp_path / "matrix.md"
+    matrix.write_text("# hand-written head\n")
+    done = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "report.py"),
+            "--results",
+            str(results),
+            "--matrix",
+            str(matrix),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    return matrix.read_text()
+
+
+def test_report_renders_the_refusal_as_a_reason_and_not_as_a_measurement(
+    tmp_path,
+    pod_setting,
+    config_mapping,  # noqa: F811
+):
+    """Passed through the real report.py, not asserted about in the abstract.
+
+    The control is the same record with a `metrics` block added: it is the one key
+    that decides the lane, so without the control this test would also pass against
+    a report that renders no measurement table at all.
+    """
+    config = timing_config(config_mapping, **{"loss.name": "cached_mnrl", "loss.mini_batch": 2})
+    _, refused = pod_setting(config, rows(8, qry_image=True))
+
+    pod = "results/native/qwen3_vl_emb_2b/pod-a"
+    measured = {
+        key: value for key, value in refused.items() if key not in ("status", "refusal")
+    } | {
+        "metrics": {
+            "step_seconds_p50": 0.5,
+            "step_seconds_p95": 0.6,
+            "steps_measured": 4,
+            "samples_per_second": 8.0,
+        }
+    }
+    document = merged_document(
+        tmp_path,
+        {
+            f"{pod}/loss-cached_mnrl/result.json": refused,
+            f"{pod}/loss-mnrl/result.json": measured,
+        },
+    )
+
+    rows_in_tables = [line for line in document.splitlines() if line.startswith("| loss-")]
+    # The control landed in a table, so "not in a table" below is a distinction the
+    # document can actually draw.
+    assert any(line.startswith("| loss-mnrl |") for line in rows_in_tables)
+    assert not any(line.startswith("| loss-cached_mnrl |") for line in rows_in_tables)
+    # And the reason is in the document, in full.
+    assert "pixel_values" in document
+    assert "_split_rows refuses every such batch" in document
+    assert "지표 없음" in document

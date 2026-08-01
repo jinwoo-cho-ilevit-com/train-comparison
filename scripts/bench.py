@@ -19,6 +19,11 @@ all five. `assert_matches` is called here directly rather than through
 `trainbench/probe/steps.py::verify_axes`, which wraps it in `report.run(...)` and
 therefore *swallows* the raise — a harness built on that would satisfy the audit
 while a mismatched axis went on to produce a number.
+
+A setting those calls refuse still writes `--out` (`refusal_record`) and still
+exits non-zero. "Ran, and this data or this image cannot do it" is a result of
+this study and has to reach the report; before, only the exit code survived the
+pod and the reason stayed in a log nobody reads afterwards.
 """
 
 from __future__ import annotations
@@ -27,20 +32,33 @@ import argparse
 import re
 import sys
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
 
 from trainbench import axes, metrics
-from trainbench.applied import assert_matches, capture
+from trainbench.applied import AppliedMismatch, AppliedState, assert_matches, capture
 from trainbench.config import load_bench_config
-from trainbench.config_schema import BenchConfig
+from trainbench.config_schema import BenchConfig, axis_knobs
 from trainbench.device import get_device
 from trainbench.embedding import align_padding_side, packed_last_token_pool
 from trainbench.probe import steps
 from trainbench.record import build_record, write_json
 from trainbench.seed import set_seed
+
+# Exit code for a setting refused before it measured anything. Distinct from 1,
+# which is what an unhandled exception exits with and which leaves no result file
+# at all; distinct from `timeout`'s 124 and from docker/entrypoint.sh's 125 and
+# 127. The pod log is the only place an exit code is read, and "refused" and
+# "crashed" are different findings there.
+REFUSED_EXIT = 3
+
+# `status` prefix on a refusal record. Not `no_result`: that value belongs to
+# `publish_result.fallback_record` and means no result file existed, which is the
+# case this exists to stop producing.
+REFUSED_STATUS = "axis-refused"
 
 # MMEB stores its own placeholder markup inside `qry` / `pos_text` verbatim
 # (`scripts/prepare_data.py`): `"<|image_1|>\nRepresent the given image.\n"`. It is
@@ -706,6 +724,159 @@ def train(built: Any, loader: Any, config: BenchConfig, device: torch.device) ->
     return summary
 
 
+class RefusedSetting(RuntimeError):
+    """A setting this pod cannot measure, tagged with where the refusal fired.
+
+    Wraps the two refusals construction can end on. They are not the same finding,
+    and the record says which:
+
+    * `axes.UnappliedAxis` — nothing here can put the requested value into effect,
+      because of what the image ships or what the data looks like. That is a
+      property of the setting: the same pod re-running it gets the same answer, so
+      it is a result and belongs in the report.
+    * `applied.AppliedMismatch` — request and reality disagree, or an axis could
+      not be read back at all. Sometimes that is the same kind of fact
+      (`adamw_fused` resolves to `adamw_unfused` without CUDA, docs/CONTRACTS.md
+      §6) and sometimes it is a defect in this harness — assigning a closure over
+      `collate_fn` once made the harness refuse every one of its own runs. The two
+      are told apart by *which* axes disagreed, so a mismatch record carries the
+      whole `AppliedState` and a reader who cannot tell must not read it as a
+      property of the hardware.
+
+    The stage matters for the same reason: `patch` fires before the model exists,
+    `assemble` during construction, `assert_matches` after. Only the last had a
+    model to read back, so the stage is what says whether `applied` in the record
+    means anything.
+    """
+
+    def __init__(self, stage: str, cause: Exception, state: AppliedState | None = None) -> None:
+        super().__init__(str(cause))
+        self.stage = stage
+        self.cause = cause
+        self.state = state
+
+
+@contextmanager
+def refusing(stage: str, state: AppliedState | None = None) -> Iterator[None]:
+    """Tag whichever refusal comes out of this region with the call site it fired at.
+
+    Only the two refusal types are caught. Everything else — a checkpoint that will
+    not download, an OOM, a collate that cannot find a pad id — passes through
+    untouched and leaves no result file, which is what makes docker/entrypoint.sh
+    publish a fallback record rather than a result for it. Widening this to
+    `Exception` would turn every crash into a tidy record saying the axis could not
+    be applied, which is a different and false claim.
+    """
+    try:
+        yield
+    except (axes.UnappliedAxis, AppliedMismatch) as exc:
+        raise RefusedSetting(stage, exc, state) from exc
+
+
+def refusal_record(
+    config: BenchConfig, device: torch.device, refused: RefusedSetting
+) -> dict[str, Any]:
+    """The result file for a setting refused before it measured anything.
+
+    **No `metrics` key, ever.** `scripts/report.py` renders any record carrying one
+    as a measurement, so a refusal with a `metrics` block — even zeroed, even empty
+    — would be a fabricated figure in the results table. Without it the record
+    lands in that file's `지표 없음` list, whose whole subject is a pod-hour spent
+    for no number.
+
+    `status` is where the reason travels, because that is the one field report.py
+    prints verbatim for such a record. Collapsed to a single line for that reason;
+    the message is also in `refusal.reason` unwrapped, next to the structured
+    fields.
+
+    Every axis knob's requested value is recorded, not the one axis refused. Which
+    axis an `UnappliedAxis` is about lives only in its prose, and recovering it by
+    matching knob names against that prose is the regex-over-prose guess this
+    repository has already had to take out of `config-consumed`. The reason
+    sentence names the axis; the map says what the whole setting asked for.
+
+    No `probe` block, though `publish_result.fallback_record` builds one for the
+    same shape of event. It would make the artifact `report.Artifact.graded_here`,
+    and a refused timing setting would then outrank the probe that graded the same
+    (framework, model) cell and take the cell over.
+    """
+    reason = " ".join(str(refused.cause).split())
+    return build_record(
+        config,
+        device,
+        applied=refused.state,
+        status=f"{REFUSED_STATUS} ({refused.stage}, {type(refused.cause).__name__}) — {reason}",
+        refusal={
+            "kind": type(refused.cause).__name__,
+            "stage": refused.stage,
+            "reason": str(refused.cause),
+            "requested_axes": {knob: str(read(config)) for knob, read in axis_knobs().items()},
+        },
+    )
+
+
+def build_run(config: BenchConfig, device: torch.device) -> tuple[Any, list[str], AppliedState]:
+    """Everything between the resolved config and the first measured step.
+
+    Split out of `main` so that the refusals can be caught around a region that
+    *stops* at `assert_matches`. The measured loop is deliberately outside it: an
+    exception raised in there is a failure partway through a measurement, and
+    filing it as a clean refusal would say a setting was declined when a loop had
+    already run. `tests/test_smoke_cpu.py` pins that boundary.
+    """
+    from transformers import AutoModel, AutoProcessor
+
+    with refusing("patch"):
+        axes.patch(config)
+    processor = AutoProcessor.from_pretrained(config.model.hf_id, revision=config.model.revision)
+    align_padding_side(processor, config.model.padding_side)
+    with refusing("load_kwargs"):
+        load_kwargs = axes.load_kwargs(config)
+    model = AutoModel.from_pretrained(
+        config.model.hf_id,
+        revision=config.model.revision,
+        dtype=steps.dtype_for(device),
+        **load_kwargs,
+    )
+    model.to(device)
+
+    dataset = load_pairs(config)
+    with refusing("assemble"):
+        if config.dataloader.pretokenize:
+            # Before `assemble`, which is the whole of the axis: `_dataloader`
+            # refuses `pretokenize=true` over rows that do not already carry token
+            # ids, because building the loader anyway would leave the tokenisation
+            # inside the timed step under a pretokenized label.
+            dataset = axes.pretokenize(dataset, Encode(processor, config))
+        built, applied = axes.assemble(model, config, device, framework="native", dataset=dataset)
+    with refusing("step_context"):
+        # The fifth call site, and the only one the measured loop enters. Called
+        # once here and the result dropped, so a precision value with no recipe is
+        # refused before the timer starts. Left to the loop it would raise on step
+        # 0 *after* `timer.__enter__`, where the choice is between catching inside
+        # the timed window and crashing on something that was knowable here. Safe
+        # to call twice because it is a factory: it either raises or returns a
+        # fresh context manager. A future recipe that made construction expensive
+        # or stateful would have to move this to a cheaper precondition check.
+        axes.step_context(config)
+    # `assemble` has no collate argument, so the loader it builds carries either
+    # torch's default one or `axes.PackedCollate`, and this is the only place to
+    # replace it. What goes in declares `axis_packing`, which is what
+    # `applied._capture_dataloader_packing` reads — an assignment that did not would
+    # turn a determined axis into an undetermined one and `assert_matches` below
+    # would refuse the run.
+    built.dataloader.collate_fn = build_collate(processor, config)
+
+    state = capture(built, config)
+    # Directly, and before a single step runs. Not through `steps.verify_axes`,
+    # which wraps it in `report.run(...)` and swallows the raise. The `refusing`
+    # block does not swallow it either: it re-raises a tagged exception that
+    # `main` writes to the result file and then exits non-zero on.
+    with refusing("assert_matches", state):
+        assert_matches(state, config)
+    return built, applied, state
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path, help="resolved config JSON")
@@ -720,39 +891,18 @@ def main(argv: list[str] | None = None) -> int:
     # `purpose=timing` — hardcoding it here would override that silently.
     set_seed(config.train.seed, deterministic=config.train.deterministic, warn_only=True)
 
-    from transformers import AutoModel, AutoProcessor
-
-    axes.patch(config)
-    processor = AutoProcessor.from_pretrained(config.model.hf_id, revision=config.model.revision)
-    align_padding_side(processor, config.model.padding_side)
-    model = AutoModel.from_pretrained(
-        config.model.hf_id,
-        revision=config.model.revision,
-        dtype=steps.dtype_for(device),
-        **axes.load_kwargs(config),
-    )
-    model.to(device)
-
-    dataset = load_pairs(config)
-    if config.dataloader.pretokenize:
-        # Before `assemble`, which is the whole of the axis: `_dataloader` refuses
-        # `pretokenize=true` over rows that do not already carry token ids, because
-        # building the loader anyway would leave the tokenisation inside the timed
-        # step under a pretokenized label.
-        dataset = axes.pretokenize(dataset, Encode(processor, config))
-    built, applied = axes.assemble(model, config, device, framework="native", dataset=dataset)
-    # `assemble` has no collate argument, so the loader it builds carries either
-    # torch's default one or `axes.PackedCollate`, and this is the only place to
-    # replace it. What goes in declares `axis_packing`, which is what
-    # `applied._capture_dataloader_packing` reads — an assignment that did not would
-    # turn a determined axis into an undetermined one and `assert_matches` below
-    # would refuse the run.
-    built.dataloader.collate_fn = build_collate(processor, config)
-
-    state = capture(built, config)
-    # Directly, and before a single step runs. Not inside a try, and not through
-    # `steps.verify_axes`: the whole value of this call is that it stops the run.
-    assert_matches(state, config)
+    try:
+        built, applied, state = build_run(config, device)
+    except RefusedSetting as refused:
+        # A result file, and a non-zero exit. The sweep in docker/entrypoint.sh
+        # publishes whatever `--out` holds with `--mode result` and counts this
+        # setting as failed, so the axis keeps running and the reason reaches the
+        # report instead of dying in the pod log with the exit code.
+        record = refusal_record(config, device, refused)
+        write_json(args.out, record)
+        print(record["status"], file=sys.stderr)
+        print(f"wrote {args.out}")
+        return REFUSED_EXIT
 
     # Timing and profiling are separate runs (AGENTS.md). The schema already
     # refuses `run.profiler=true` for `purpose=timing`; this is where the other
