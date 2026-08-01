@@ -1,0 +1,19 @@
+# Phase 0 pod: can Axolotl load Qwen3.5-0.8B and run one embedding step?
+#
+# A combination that does not work is a result, not an accident — Phase 3 reports
+# it as unsupported. That verdict is only trustworthy when the pod had everything
+# it needed, so this pod carries a real Infisical token and a digest-pinned image.
+phase: phase0
+description: axolotl x qwen3_5_0_8b load and forward-pass probe
+model: qwen3_5_0_8b
+framework: axolotl
+run: probe
+gpu_type_id: NVIDIA A100-SXM4-80GB
+# A probe answers "does it load", not "how fast". There is no number to compare
+# across hosts, so there is no canonical baseline run to compare it against.
+baseline: none
+# Few rows and a batch no wider than the sample: a probe pays for the model load,
+# not for the data.
+overrides:
+  - data.limit=8
+  - train.batch_size=8
