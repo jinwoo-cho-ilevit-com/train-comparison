@@ -1,0 +1,113 @@
+{
+  "applied": null,
+  "config": {
+    "attn": {
+      "name": "sdpa"
+    },
+    "compile": {
+      "mode": "none"
+    },
+    "data": {
+      "limit": 4,
+      "max_seq_len": 2048,
+      "num_workers": 8,
+      "push_subset": false,
+      "repo_id": "jinwoo-cho/mmeb-subset",
+      "revision": "b750b9c3263e9ef5dce225fd50aa25d7c58f1d5f",
+      "sample_seed": 1234,
+      "source_repo": "MrZilinXiao/MMEB_train_with_image",
+      "subset_rows": 2048
+    },
+    "dataloader": {
+      "backend": "torch",
+      "packing": false,
+      "pretokenize": false
+    },
+    "device": "cpu",
+    "framework": {
+      "name": "native"
+    },
+    "freeze": {
+      "ple": false,
+      "vision_tower": false
+    },
+    "kernel": {
+      "name": "none"
+    },
+    "loss": {
+      "mini_batch": null,
+      "name": "mnrl",
+      "temperature": 0.02
+    },
+    "model": {
+      "add_generation_prompt": false,
+      "arch": "qwen3_5",
+      "hf_id": "Qwen/Qwen3.5-0.8B",
+      "instruction_prompt": null,
+      "name": "qwen3_5_0_8b",
+      "padding_side": "right",
+      "pooling": "lasttoken",
+      "revision": null,
+      "tokens_per_image": null
+    },
+    "optim": {
+      "lr": 1e-05,
+      "name": "adamw_fused",
+      "weight_decay": 0.01
+    },
+    "parallel": {
+      "cross_device_negatives": false,
+      "strategy": "single"
+    },
+    "peft": {
+      "alpha": 0,
+      "dropout": 0.0,
+      "mode": "full",
+      "r": 0
+    },
+    "precision": {
+      "name": "bf16"
+    },
+    "run": {
+      "profiler": false,
+      "purpose": "probe",
+      "trackio_project": "train-comparison-probe",
+      "trackio_space_id": null
+    },
+    "train": {
+      "batch_size": 4,
+      "deterministic": false,
+      "grad_accum": 1,
+      "gradient_checkpointing": "none",
+      "offload": "none",
+      "seed": 1234,
+      "steps": 120,
+      "warmup_discard_steps": 10
+    }
+  },
+  "device": "cpu",
+  "git_commit": "28875a22e9807c674583b9be50b24efe6df1e186",
+  "git_dirty": false,
+  "git_source": "git",
+  "host": {
+    "cpu_count_host": 18,
+    "cpu_count_process": 18,
+    "cpu_model": null,
+    "cpu_quota": null,
+    "cuda_runtime": null,
+    "gpu": null,
+    "hostname": "Jinwoo-Work.local",
+    "memory_total_gb": null,
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "python": "3.13.13",
+    "runpod_datacenter": null,
+    "runpod_pod_id": null,
+    "torch_device_count": 1
+  },
+  "image": null,
+  "image_digest": null,
+  "packages": {
+    "torch": "2.13.0",
+    "torchvision": "0.28.0"
+  }
+}
