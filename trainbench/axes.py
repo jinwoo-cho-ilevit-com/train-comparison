@@ -309,22 +309,43 @@ def _freeze(model: Any, config: BenchConfig) -> list[str]:
 def _peft(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
     """Adapter attachment. `full` attaches nothing, which is the whole of it.
 
-    LoRA is refused rather than attached because `get_peft_model` freezes every
-    base parameter, so a `freeze.ple=false` LoRA run would read back as frozen and
-    every LoRA timing run would be blocked the moment this axis starts reporting
-    (docs/CONTRACTS.md §2). What `freeze.*` should mean under an adapter — frozen,
-    or frozen on top of what peft froze — is a decision that has to be made and
-    tested against a real peft model, and this lane has no environment with peft
-    in it to test either answer against.
+    The freeze collision `docs/CONTRACTS.md` §2 left open is settled, by measurement
+    rather than by choosing: `get_peft_model` sets `requires_grad=False` on every
+    base parameter, and the result is byte-identical whether or not a freeze axis
+    ran first. So there is no combined meaning to define — under an adapter the
+    freeze axes have no state to be in, and `config_schema.py` refuses the
+    combination outright instead of letting two identical models occupy two rows of
+    the ablation table.
+
+    `qlora` stays refused. It is LoRA over a 4-bit base, so the adapter half is this
+    same call and the quantisation half is a `BitsAndBytesConfig` that belongs in
+    `load_kwargs` — and bitsandbytes only quantises on CUDA. Implementing it here
+    from a machine that cannot build one would mean shipping the path unrun.
     """
-    if config.peft.mode != "full":
+    if config.peft.mode == "full":
+        return model, []
+    if config.peft.mode == "qlora":
         raise UnappliedAxis(
-            f"peft.mode={config.peft.mode} needs get_peft_model, which rewrites the model "
-            "in place and freezes every base parameter; how that combines with the freeze "
-            "axes is undecided (docs/CONTRACTS.md §2), so it is refused rather than run as "
-            "full finetuning under a LoRA label."
+            "peft.mode=qlora needs a 4-bit base, which is a BitsAndBytesConfig passed to "
+            "from_pretrained and a CUDA device; neither is exercised here, so it is "
+            "refused rather than run as plain LoRA under a QLoRA label."
         )
-    return model, []
+
+    from peft import LoraConfig, get_peft_model
+
+    # all-linear rather than a per-architecture list. Naming target modules per
+    # model would make the axis mean something different for each of the three,
+    # and this benchmark compares the same request across them.
+    adapted = get_peft_model(
+        model,
+        LoraConfig(
+            r=config.peft.r,
+            lora_alpha=config.peft.alpha,
+            lora_dropout=config.peft.dropout,
+            target_modules="all-linear",
+        ),
+    )
+    return adapted, ["peft.mode"]
 
 
 def _gradient_checkpointing(model: Any, config: BenchConfig) -> list[str]:

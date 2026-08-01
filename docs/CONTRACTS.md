@@ -295,6 +295,14 @@ class ProbeReport:
   미확인 축은 undetermined이고 timing을 차단한다. `axis_knobs() - _CAPTURES`에서
   동적으로 유도하지 않는 이유는 그 형태가 전 축이 배선된 순간 검사 대상 0개로
   조용히 통과하기 때문이다(§6의 "빈 입력은 통과가 아니라 실패다").
+- 2026-08-01 **§2가 열어둔 freeze x peft 충돌을 닫는다** — `config_schema.py`에
+  검증기 2건 + `tests/test_config.py` 테스트 3건.
+  결정이 아니라 측정으로 닫았다(peft 0.20.0): `get_peft_model`은 base 파라미터를 전부
+  얼리고, **freeze 축이 먼저 돌았든 아니든 결과가 같다.** 즉 어댑터 아래에서
+  `freeze.ple=true`와 `false`는 같은 모델을 만든다 — 정의할 합성 의미가 없다.
+  그래서 "얼린 것에 더해"인지 "얼린 것"인지를 고르는 대신 **조합 자체를 config 단계에서
+  거부**한다. 허용하면 ablation 표에 라벨만 다른 동일 모델 두 행이 생긴다.
+  `peft.r=0`도 거부한다 — 학습 가능한 어댑터 파라미터가 0개인 LoRA 런이다.
 - 2026-08-01 **`audit_plan.py` 감사 계층 수리 3건 + `tests/test_audit.py`.**
   Wave 2 게이트 리뷰가 찾은 것: 병합 트리에서 D의 capture 계층을 통째로 되돌려도
   `7/11 passing, 0 new failure(s), 0 newly fixed`가 바이트 단위로 동일했다. 게이트가

@@ -402,6 +402,37 @@ class BenchConfig(Strict):
         return self
 
     @model_validator(mode="after")
+    def _freeze_axes_mean_nothing_under_an_adapter(self) -> BenchConfig:
+        """An adapter run cannot also be a freeze-axis run.
+
+        Measured (peft 0.20.0): `get_peft_model` sets `requires_grad=False` on every
+        base parameter, and the result is identical whether or not a freeze axis ran
+        first. `freeze.ple=true` and `freeze.ple=false` therefore build the same
+        model under LoRA — the axis has no state to be in.
+
+        Refused here rather than at the axis, because the two settings are not a
+        mismatch to be caught at capture time; they are a request for a comparison
+        that does not exist. Leaving it legal would put two rows in the ablation
+        table whose only difference is their labels.
+        """
+        frozen = [name for name in ("vision_tower", "ple") if getattr(self.freeze, name)]
+        if self.peft.mode != "full" and frozen:
+            raise ValueError(
+                f"peft.mode={self.peft.mode} freezes every base parameter, so "
+                f"freeze.{'/freeze.'.join(frozen)}=true selects nothing; use freeze=none "
+                "with an adapter, or peft=full to measure the freeze axes."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _adapter_rank_is_set_when_an_adapter_is_used(self) -> BenchConfig:
+        """`r=0` builds a LoRA with no trainable adapter parameters, which trains
+        nothing at all while reporting itself as a LoRA run."""
+        if self.peft.mode != "full" and self.peft.r <= 0:
+            raise ValueError(f"peft.mode={self.peft.mode} requires peft.r > 0, got {self.peft.r}")
+        return self
+
+    @model_validator(mode="after")
     def _instruction_prompt_is_official_only(self) -> BenchConfig:
         """Only qwen3_vl ships an official embedding prompt. Inventing one for the
         generative models would add an unvalidated confound (docs/model-spec.md)."""

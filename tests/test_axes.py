@@ -18,9 +18,15 @@ Two axes stay unapplied and are asserted to stay that way:
   engine, optimizer and dataloader from one call, and deepspeed is absent from
   every environment.
 
-Nothing here imports transformers, peft, liger or deepspeed. None of them is
-installed in the environment the test suite runs in, and an axis whose only proof
-is a package this suite cannot import is an axis with no proof.
+Nothing here imports transformers, liger or deepspeed. None of them is installed
+in the environment the test suite runs in, and an axis whose only proof is a
+package this suite cannot import is an axis with no proof.
+
+peft is the exception, and it is imported on purpose: it *is* installed here
+(0.20.0), and `peft.mode` was refused on the stated grounds that it was not. The
+adapter tests below build a real `get_peft_model` model, because the question the
+axis turns on — what `get_peft_model` does to base parameters — cannot be answered
+by a stand-in that does whatever the test sets it to do.
 """
 
 from __future__ import annotations
@@ -482,13 +488,61 @@ def test_qlora_is_told_apart_by_the_quantised_base(composed):
     assert axis(capture(Built(model=model), config), "peft.mode").applied == "qlora"
 
 
-def test_lora_is_refused_rather_than_run_as_a_full_finetune(composed):
-    """Silently training every parameter under a LoRA label is the headline
-    comparison of this study reported backwards."""
-    for mode in ("lora", "qlora"):
-        config = bench(composed, **{"peft.mode": mode, "peft.r": 32})
-        with pytest.raises(axes.UnappliedAxis, match="peft.mode"):
-            axes.assemble(plain_model(), config, CPU, framework="native")
+def test_lora_attaches_a_real_adapter_and_reads_back_as_lora(composed):
+    """The pair for this axis, against real peft rather than a stand-in.
+
+    Silently training every parameter under a LoRA label is the headline comparison
+    of this study reported backwards, so what is asserted is not that `assemble`
+    returned something, but that the thing it returned has adapter parameters and
+    a frozen base."""
+    config = bench(composed, **{"peft.mode": "lora", "peft.r": 8, "peft.alpha": 16})
+
+    built, applied = axes.assemble(plain_model(), config, CPU, framework="native")
+
+    assert "peft.mode" in applied
+    assert axis(capture(built, config), "peft.mode").applied == "lora"
+    trainable = [n for n, p in built.model.named_parameters() if p.requires_grad]
+    assert trainable, "an adapter with no trainable parameter trains nothing"
+    assert all("lora_" in name for name in trainable), trainable
+    # The wrapper, not the base that `get_peft_model` mutated on its way past.
+    # It injects lora layers into the base *and* sets `peft_config` on it, so every
+    # assertion above holds for the base too — discarding the returned wrapper left
+    # the whole suite green until this line existed. `assemble` returns a model for
+    # exactly this reason (docs/CONTRACTS.md §2).
+    assert type(built.model).__module__.startswith("peft"), type(built.model)
+
+
+def test_qlora_is_refused_because_its_quantised_half_is_not_built_here(composed):
+    """Running plain LoRA under a QLoRA label would report the memory of one and
+    the name of the other."""
+    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32})
+
+    with pytest.raises(axes.UnappliedAxis, match="4-bit"):
+        axes.assemble(plain_model(), config, CPU, framework="native")
+
+
+def test_an_adapter_freezes_the_base_whatever_the_freeze_axes_did(composed):
+    """The measurement the schema validator rests on.
+
+    `get_peft_model` sets `requires_grad=False` on every base parameter, and the
+    result is the same whether or not a freeze axis ran first — so `freeze.ple=true`
+    and `freeze.ple=false` build the same model under an adapter. That is why the
+    combination is refused at config time rather than defined: there are not two
+    states to tell apart. If a future peft stops doing this, this test fails and
+    the validator is what has to be revisited."""
+    config = bench(composed, **{"peft.mode": "lora", "peft.r": 8})
+    pre_frozen = plain_model()
+    for param in pre_frozen.parameters():
+        param.requires_grad_(False)
+
+    a, _ = axes.assemble(plain_model(), config, CPU, framework="native")
+    b, _ = axes.assemble(pre_frozen, config, CPU, framework="native")
+
+    def grads(built):
+        return {n: p.requires_grad for n, p in built.model.named_parameters()}
+
+    assert grads(a) == grads(b)
+    assert not any(g for n, g in grads(a).items() if "lora_" not in n)
 
 
 # --- parallel.strategy -------------------------------------------------------

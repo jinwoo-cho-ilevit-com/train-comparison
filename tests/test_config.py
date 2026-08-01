@@ -201,3 +201,26 @@ def test_the_pinned_subsets_are_not_on_the_denylist():
     landed before the regeneration it depends on."""
     for name in ("speed", "quality"):
         assert compose_cfg(f"data={name}").data.revision not in CORRUPT_DATA_REVISIONS
+
+
+def test_an_adapter_run_cannot_also_request_a_freeze_axis():
+    """Measured, not assumed (tests/test_axes.py): `get_peft_model` freezes every
+    base parameter regardless of what a freeze axis did first, so the two freeze
+    settings build the same model under an adapter. Two identical models must not
+    occupy two rows of the ablation table under different labels."""
+    for axis in ("freeze.ple=true", "freeze.vision_tower=true"):
+        with pytest.raises(ValidationError, match="freezes every base parameter"):
+            compose_cfg("peft=lora", "model=gemma4_e2b", axis)
+
+
+def test_the_freeze_axes_stay_available_to_a_full_finetune():
+    """The refusal above is about adapters, not about freezing. A check that
+    refused both would have removed the axis this study measures."""
+    assert compose_cfg("peft=full", "model=gemma4_e2b", "freeze=ple").freeze.ple is True
+
+
+def test_an_adapter_with_no_rank_is_refused():
+    """`r=0` builds an adapter with no trainable parameter: a LoRA run that trains
+    nothing while reporting itself as one."""
+    with pytest.raises(ValidationError, match="requires peft.r"):
+        compose_cfg("peft=lora", "peft.r=0")

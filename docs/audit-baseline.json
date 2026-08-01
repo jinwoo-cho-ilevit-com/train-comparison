@@ -4,8 +4,8 @@
     "note": "Wave 3 (G: harness) - scripts/bench.py must call assert_matches"
   },
   "axis-values": {
-    "count": 7,
-    "note": "Wave 2.5 (peft) + Wave 3 (F: build images so kernel/parallel/dataloader/precision values can be applied) - 7 groups still take only their inert value"
+    "count": 6,
+    "note": "Wave 3 (F: build images so kernel/parallel/dataloader/precision values can be applied) - 6 groups still take only their inert value; peft resolved in Wave 2.5"
   },
   "axis-wired": {
     "count": 2,
