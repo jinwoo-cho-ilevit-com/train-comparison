@@ -9,6 +9,7 @@ placeholder.
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -22,9 +23,9 @@ sys.path.insert(0, str(REPO / "scripts"))
 import audit_plan  # noqa: E402
 from audit_plan import (  # noqa: E402
     Result,
+    _demanded_imports,
     _normalise,
     _reads_dotted,
-    _test_imports,
     anchor_holds,
     classify,
     merge_baseline,
@@ -152,17 +153,19 @@ def test_selecting_no_checks_is_an_error_not_a_pass():
 
 
 def test_a_new_failure_blocks_and_a_known_one_does_not():
-    regressions, fixed, grew, shrank = classify(failing("a", "b"), accepted(a=("Wave 1", None)))
+    regressions, fixed, grew, shrank, unreadable = classify(
+        failing("a", "b"), accepted(a=("Wave 1", None))
+    )
 
     assert regressions == ["b"]
-    assert (fixed, grew, shrank) == ([], [], [])
+    assert (fixed, grew, shrank, unreadable) == ([], [], [], [])
 
 
 def test_a_baseline_entry_that_starts_passing_blocks():
     """A stale baseline grants amnesty to whatever breaks there next."""
-    regressions, fixed, grew, shrank = classify(passing("a"), accepted(a=("Wave 1", 3)))
+    regressions, fixed, grew, shrank, unreadable = classify(passing("a"), accepted(a=("Wave 1", 3)))
 
-    assert (regressions, fixed, grew, shrank) == ([], ["a"], [], [])
+    assert (regressions, fixed, grew, shrank, unreadable) == ([], ["a"], [], [], [])
 
 
 def test_an_accepted_failure_that_got_worse_blocks():
@@ -170,29 +173,59 @@ def test_an_accepted_failure_that_got_worse_blocks():
     that was already failing: deleting Wave 2's entire capture layer left
     `7/11 passing, 0 new failure(s), 0 newly fixed` identical to the byte, because
     `axis-wired` failed before and after."""
-    regressions, fixed, grew, shrank = classify(
+    regressions, fixed, grew, shrank, unreadable = classify(
         failing("a", count=22), accepted(a=("Wave 2 (D)", 2))
     )
 
     assert grew == ["a 2->22"]
-    assert (regressions, fixed, shrank) == ([], [], [])
+    assert (regressions, fixed, shrank, unreadable) == ([], [], [], [])
 
 
 def test_an_accepted_failure_that_shrank_blocks_as_a_stale_baseline():
     """Same reason a newly passing check blocks: an entry accepting 12 problems
     when 2 remain grants amnesty for 10 that no longer exist."""
-    regressions, fixed, grew, shrank = classify(
+    regressions, fixed, grew, shrank, unreadable = classify(
         failing("a", count=2), accepted(a=("Wave 2 (D)", 12))
     )
 
     assert shrank == ["a 12->2"]
-    assert (regressions, fixed, grew) == ([], [], [])
+    assert (regressions, fixed, grew, unreadable) == ([], [], [], [])
 
 
 def test_a_check_that_does_not_count_is_not_compared_by_size():
     """`assert-called` either finds the entry point or does not; inventing a count
     for it would make the comparison fire on nothing."""
-    assert classify(failing("a"), accepted(a=("Wave 3 (G)", None)))[2:] == ([], [])
+    assert classify(failing("a"), accepted(a=("Wave 3 (G)", None)))[2:] == ([], [], [])
+
+
+def test_a_baseline_count_that_is_not_a_number_is_reported_not_raised(
+    tmp_path, monkeypatch, capsys
+):
+    """`docs/audit-baseline.json` is hand-edited between waves, and a quoted count
+    there used to take the gate down: `classify` compares with `>`, so
+    `"count": "3"` raised `TypeError: '>' not supported between instances of 'int'
+    and 'str'` and the run printed no result for any check — including the twelve
+    that had nothing to do with the malformed entry. A gate that dies on its own
+    input is the failure mode this ledger exists for.
+
+    Both halves are asserted, because the pure function returning a list is worth
+    nothing if `main` still cannot get to the end: `True` is caught as well as
+    `"3"`, since `bool` is an `int` and `True == 1` would have silently accepted a
+    count of one.
+    """
+    assert classify(failing("a", count=2), accepted(a=("Wave 2 (D)", "3")))[4] == ["a count='3'"]
+    assert classify(failing("a", count=1), accepted(a=("Wave 2 (D)", True)))[4] == ["a count=True"]
+
+    baseline = tmp_path / "audit-baseline.json"
+    baseline.write_text(json.dumps({"fake": {"note": "Wave 2 (D)", "count": "3"}}))
+    monkeypatch.setattr(audit_plan, "BASELINE", baseline)
+    monkeypatch.setattr(
+        audit_plan, "CHECKS", {"fake": lambda: Result("fake", False, "two problems", count=2)}
+    )
+
+    assert audit_plan.main([]) == 1
+    printed = capsys.readouterr().out
+    assert "BLOCKED: baseline entries with an uncomparable count: fake count='3'" in printed
 
 
 def test_an_old_string_baseline_still_loads(tmp_path, monkeypatch):
@@ -443,17 +476,53 @@ def test_axis_values_draws_a_batch_so_the_collate_actually_runs(monkeypatch):
 def test_the_test_imports_are_collected_from_the_tests_not_a_list():
     """A hand-written list of what the tests need is a list of what to forget.
     All three gaps were function-level imports, which is why they are collected."""
-    modules = _test_imports()
+    modules = _demanded_imports()
 
-    # `datasets` was in this set and is not any more: the one import of it under
-    # `tests/` was in `test_axes.py`, and the loss lane removed it when this check
-    # first reported it — the documented setup does not install it, so a test that
-    # needed it was a test a clean clone could not run. Left here as a name would
-    # have made this assertion demand an import nothing makes.
     assert {"torch", "pytest", "hydra", "peft", "transformers"} <= set(modules)
-    assert "test_applied.py" in modules["peft"]
+    assert "tests/test_applied.py" in modules["peft"]
     # First-party and stdlib are not distributions and must not be demanded of a lock.
     assert not {"trainbench", "audit_plan", "json", "pathlib", "__future__"} & set(modules)
+
+
+def test_a_lazy_third_party_import_in_the_package_is_demanded_of_the_documented_setup(monkeypatch):
+    """The scan read `tests/` alone, and the question it answered was used as the
+    answer to a wider one.
+
+    `optim=muon` imports `pytorch-optimizer` in exactly one place — inside
+    `axes._optimizer`, at call time — and no test imports it. So it appeared in no
+    scan, no documented `uv sync` was ever asked for it, and `doc-commands` kept
+    reporting that the documented command installs everything while a clean clone
+    got the optim axis refusing itself and an ablation one row short.
+
+    Three properties, because the middle one is where a narrower scan slips
+    through: the import is found, it is found although it is lazy, and the check
+    demands what the scan returns rather than a second list of its own.
+    """
+    modules = _demanded_imports()
+
+    assert "trainbench/axes.py" in modules["pytorch_optimizer"]
+    # Lazy: a scan that read only the import block at the top of each file — which
+    # is what "collect the imports" usually means — would find nothing here.
+    tree = ast.parse((REPO / "trainbench" / "axes.py").read_text())
+    top_level = {
+        alias.name.split(".")[0]
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {node.module.split(".")[0] for node in tree.body if isinstance(node, ast.ImportFrom)}
+    assert "pytorch_optimizer" not in top_level
+    # The per-image adapters are not demanded of the root lock: unsloth is pinned
+    # by `envs/unsloth` and installed in that image only.
+    assert "unsloth" not in modules
+
+    monkeypatch.setattr(audit_plan, "_locked_distributions", lambda flags: ({"hydra-core"}, None))
+    monkeypatch.setattr(
+        audit_plan, "_demanded_imports", lambda: {"pytorch_optimizer": {"trainbench/axes.py"}}
+    )
+    result = audit_plan.CHECKS["doc-commands"]()
+
+    assert not result.ok
+    assert "pytorch_optimizer" in result.detail
 
 
 def test_distribution_names_are_normalised_before_comparison():

@@ -809,6 +809,40 @@ class ProbeReport:
     그렇다면 성공한 파드도 `restarted`로 감시가 끝나며, 어느 쪽이든 데드라인까지
     기다리는 것보다 낫다. 첫 캠페인의 `uptime_seconds`가 바로 답한다.
 
+- 2026-08-02 **`doc-commands`의 import 수집이 `tests/`에서 패키지와 엔트리포인트까지
+  넓어진다** (`audit_plan.py`, `tests/test_audit.py`. optim 레인, 판정서
+  `optim-muon-silently-absent-from-the-documented-setup`).
+  위 2026-08-02 항목이 세운 새 방식은 `tests/`만 훑었고, 그 답이 더 넓은 질문의
+  답으로 쓰였다. `optim=muon`의 `pytorch-optimizer` import는 `trainbench/axes.py`
+  안 함수 레벨에 단 하나 있고 어떤 테스트도 그것을 import하지 않는다 — 그래서 어떤
+  스캔에도 안 잡혔고, clean clone은 optim 축이 스스로 거부하는 ablation을 받는
+  동안 이 체크는 계속 "문서화된 명령이 필요한 것을 전부 설치한다"고 보고했다.
+  - `_test_imports` -> `_demanded_imports`. 수집 대상이 `tests/` + `trainbench/` +
+    `scripts/`이고, 보고에 붙는 출처가 파일명이 아니라 저장소 상대 경로가 된다.
+  - **프레임워크 프로브 어댑터는 제외한다.** `_per_image_adapters()`가 `envs/`의
+    디렉터리 이름에서 `trainbench/probe/<framework>.py`를 유도한다. 각 어댑터는
+    자기 이미지 안에서만 import되고(`probe/registry.py`) `envs/<framework>/uv.lock`이
+    핀하므로, 루트 lock에 `unsloth`를 요구하면 결함이 아닌 것을 결함으로 만든다.
+    대가는 어댑터 안에 새로 생기는 지연 import를 이 체크가 못 본다는 것이고,
+    결과 문자열이 몇 개를 건너뛰었는지 그대로 말한다.
+  - 문서 쪽(`README.md:22` / `AGENTS.md:15`)은 이미 `--extra compose --extra native`로
+    고쳐져 있었다. 이 변경은 그 사실을 되돌릴 수 없게 만드는 쪽이다 — 셋업 명령을
+    `--extra compose`로 되돌리면 체크가 `pytorch_optimizer (imported by
+    trainbench/axes.py)`를 이름으로 지목하며 red가 된다(실측).
+
+- 2026-08-02 **`classify`가 잘못된 baseline `count`에 죽지 않고 보고한다**
+  (`audit_plan.py`, `tests/test_audit.py`. optim 레인이 등재하고 닫았다).
+  `docs/audit-baseline.json`은 웨이브 사이에 손으로 편집되는데, 따옴표 붙은 숫자
+  하나(`"count": "3"`)가 `TypeError: '>' not supported between instances of 'int'
+  and 'str'`를 내고 게이트 전체를 세웠다 — 그 항목과 무관한 12개 체크까지 아무
+  결과도 못 냈다.
+  - **반환 개수가 4에서 5로 는다**: `classify(...) -> (regressions, fixed, grew,
+    shrank, unreadable)`. 정수가 아닌 `count`가 다섯 번째에 이름으로 들어가고,
+    `main`이 `BLOCKED: baseline entries with an uncomparable count: ...`로 호명하며
+    1로 끝난다. 요약 줄에도 `N unreadable`이 붙는다.
+  - `None`은 그대로 '기록된 count 없음'이라 크기 비교만 꺼진다(옛 문자열 전용 항목).
+    `bool`은 `int`의 하위 클래스이고 `True == 1`이라 명시적으로 걸러낸다.
+
 **새 레인 의무 — 파일을 추가하면 `PLAN.md` 구조 블록에 한 줄 추가한다.**
 위 반대 방향 때문에 생긴다. 열거되는 디렉터리(저장소 루트, `configs/`,
 `trainbench/`, `scripts/`, `tests/`, `docs/`)에 추적되는 파일이나 디렉터리를 새로

@@ -262,7 +262,11 @@
           "test_the_muon_update_is_orthogonalised_on_a_non_square_matrix_too"
         ]
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "D (axes)",
+        "evidence": "고친 것 — 행동 단언을 정사각 16x16 한 형상에서 떼어내 `tests/test_axes.py`에 비정사각 파라메트라이즈 테스트 `test_the_muon_update_is_orthogonalised_on_a_non_square_matrix_too`(shape=(24,8), (8,24))를 세웠다. 두 방향을 모두 넣은 이유는 Newton-Schulz가 짧은 쪽에서 돌고 되돌려 transpose하는 분기를 tall과 wide가 서로 반대편으로 타기 때문이고, 정사각은 그 분기를 영원히 안 탄다. 스텝도 1회가 아니라 2회를 같은 단언으로 잰다.\n단언은 셋으로 나뉜다(`assert_orthogonalised`). 스펙트럼 평탄도(update의 최소/최대 특이값 > 0.4), 방향(gradient의 `-(U@Vt)`와 코사인 > 0.9), 그리고 업데이트 노름. 노름 창은 `lr * sqrt(min(m,n))` 대비 0.2~3.0이다 — 직교화된 업데이트는 특이값이 전부 1 근처라 Frobenius 노름이 랭크와 스텝 크기로 고정되고, 이 빌드에서 실측 0.72~0.89가 나온다(측정: (16,16) 0.723 / (24,8) 0.890 / (8,24) 0.885). 이 창이 lr x100 변이를 닫는 부분이다.\n부수기 증거 — 판정서가 적어둔 플러그인(`$CLAUDE_JOB_DIR/tmp/reverify-optim/falsify3.py`)을 그대로 재실행했다. `uv run pytest tests/test_axes.py -k muon -p falsify3`:\n    MUON3=onlysquare  3 failed, 11 passed\n      FAILED test_the_muon_update_is_orthogonalised_on_a_non_square_matrix_too[shape0] - AssertionError: (24, 8) step 1\n      FAILED test_the_muon_update_is_orthogonalised_on_a_non_square_matrix_too[shape1] - AssertionError: (8, 24) step 1\n    MUON3=firststep   3 failed, 11 passed\n      FAILED test_the_muon_update_is_orthogonalised_on_a_non_square_matrix_too[shape1] - AssertionError: (8, 24) step 2\n    MUON3=onlysmall   3 failed, 11 passed\n      FAILED test_the_muon_update_is_orthogonalised_on_a_non_square_matrix_too[shape1] - AssertionError: (8, 24) step 1\n    MUON3=bigstep     4 failed, 10 passed\n      FAILED test_the_muon_update_is_orthogonalised_on_a_non_square_matrix_too[shape0] - AssertionError: ('(24, 8) step 1', 89.01592083216418)\n      FAILED test_the_muon_update_is_orthogonalised_on_a_non_square_matrix_too[shape1] - AssertionError: ('(8, 24) step 1', 88.48308755955755)\n고치기 전 관측은 세 변이 모두 11 passed였다. bigstep의 4번째 실패는 `test_muon_is_refused_rather_than_crashing_where_pytorch_optimizer_is_absent`인데 이건 플러그인 인공물이다 — ns2/half/bigstep 분기가 `_optimizer` 자체를 갈아치우면서 `pytorch_optimizer` import를 try 밖으로 내보내기 때문이고, 변이가 잡은 결함이 아니다.\n살아남은 변이 — `MUON3=ns2`(라이브러리 Muon, ns_steps=2)는 13 passed로 여전히 통과한다. 강화하지 않고 남긴다: 실측한 평탄도가 ns_steps=5에서 0.599/0.604/0.603, ns_steps=2에서 0.486/0.581/0.575로 비정사각에서 4% 차이밖에 안 난다(코사인은 0.978~0.983으로 사실상 동일). 이 둘을 가르는 임계값은 시드와 형상에 붙은 취약한 숫자가 되고, 애초에 ns_steps는 '틀린 옵티마이저'가 아니라 라이브러리 기본값(5)을 안 건드리는 이 저장소가 설정하지 않는 값이다 — 축이 아니라 config 질문이라 여기 단언의 대상이 아니다.\nGPU만 답할 수 있는 것 — 없음. `pytorch-optimizer`의 Muon은 py3-none-any이고 의존성이 numpy/torch뿐이라 Newton-Schulz가 CPU에서 실제로 돈다. 이 테스트들은 진짜 스텝을 밟는다. 다만 Muon의 처리량/옵티마이저 상태 메모리 주장은 여전히 측정 안 함."
+      }
     },
     {
       "id": "optim-only-the-tensor-the-test-watches-is-checked",
@@ -284,7 +288,11 @@
           "test_muon_orthogonalises_every_trainable_matrix_not_only_the_one_the_test_watches"
         ]
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "D (axes)",
+        "evidence": "고친 것 — `test_muon_orthogonalises_every_trainable_matrix_not_only_the_one_the_test_watches`. 학습 가능한 행렬 3개를 서로 다른 형상 (24,8)/(8,24)/(8,8)으로 한 모델에 넣고(사이에 LayerNorm을 둬 1D 그룹도 존재한다) 셋을 한 번에 스텝시킨 뒤 셋 전부에 같은 단언(`assert_orthogonalised`)을 건다. 스텝은 2회. 형상 목록 자체를 `assert [tuple(w.shape) for w in weights] == [(24, 8), (8, 24), (8, 8)]`로 못 박아, 나중에 모델을 한 행렬짜리로 줄이면 조용히 커버리지가 좁아지는 대신 여기서 실패한다.\n부수기 증거 — 같은 플러그인, `uv run pytest tests/test_axes.py -k muon -p falsify3`:\n    MUON3=half        4 failed, 10 passed\n      FAILED test_muon_orthogonalises_every_trainable_matrix_not_only_the_one_the_test_watches - AssertionError: (8, 24) step 1\n    MUON3=onlysquare  3 failed, 11 passed\n      FAILED test_muon_orthogonalises_every_trainable_matrix_not_only_the_one_the_test_watches - AssertionError: (24, 8) step 1\n    MUON3=onlysmall   3 failed, 11 passed\n      FAILED test_muon_orthogonalises_every_trainable_matrix_not_only_the_one_the_test_watches - AssertionError: (24, 8) step 1\n    MUON3=firststep   3 failed, 11 passed\n      FAILED test_muon_orthogonalises_every_trainable_matrix_not_only_the_one_the_test_watches - AssertionError: (24, 8) step 2\n    MUON3=bigstep     4 failed, 10 passed\n      FAILED test_muon_orthogonalises_every_trainable_matrix_not_only_the_one_the_test_watches - AssertionError: ('(24, 8) step 1', 88.8292034828707)\n`half`는 첫 번째 행렬만 Newton-Schulz로 보내고 나머지를 라이브러리 Muon의 내부 AdamW로 보내는 변이다 — 이 항목이 말한 바로 그 대체이고, 고치기 전에는 통과했다. 지금은 두 번째 행렬 (8,24)에서 죽는다.\nGPU만 답할 수 있는 것 — 없음(위 항목과 같은 이유)."
+      }
     },
     {
       "id": "optim-muon-silently-absent-from-the-documented-setup",
@@ -306,7 +314,11 @@
           "test_a_lazy_third_party_import_in_the_package_is_demanded_of_the_documented_setup"
         ]
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "D (axes)",
+        "evidence": "고친 것 — (a) 경로를 택했다. `scripts/audit_plan.py`의 import 스캔을 `_test_imports`(tests/ 전용)에서 `_demanded_imports`(tests/ + trainbench/ + scripts/)로 넓혔다. 프레임워크 프로브 어댑터는 제외한다 — `_per_image_adapters()`가 `envs/` 디렉터리 이름에서 파일 경로를 유도하며, 각 어댑터는 자기 이미지 안에서만 import되고 `envs/<framework>/uv.lock`이 핀한다(`trainbench/probe/registry.py`가 그 이유를 적고 있다). 루트 lock에 unsloth를 요구하면 결함이 아닌 것을 결함으로 보고한다. 대신 어댑터 안에 새로 생긴 지연 import는 여기서 안 잡힌다는 사실을 체크의 scope 문자열이 그대로 말한다.\n문서 쪽은 이미 (E) 레인이 `README.md:22` / `AGENTS.md:15`를 `uv sync --extra compose --extra native`로 고쳐둔 상태였다. 이 항목이 남긴 진짜 구멍은 '그 사실을 지키는 체크가 없다'였고, 그게 지금 닫혔다.\ndoc-commands가 이걸 잡는다는 증거(오늘의 PASS가 의미 있으려면 부숴봐야 한다) — `README.md`/`AGENTS.md`의 셋업 명령을 `uv sync --extra compose`로 되돌리고 `uv run python scripts/audit_plan.py --only doc-commands`:\n    NEW   doc-commands  README.md: `uv sync --extra compose` installs 136 distribution(s) but the\n    repo imports 4 it does not provide: datasets (datasets, imported by scripts/bench.py,\n    scripts/prepare_data.py, tests/test_axes.py); peft (peft, imported by tests/test_applied.py,\n    trainbench/axes.py); pytorch_optimizer (pytorch_optimizer, imported by trainbench/axes.py);\n    transformers (...); AGENTS.md: (동일)\n    0/1 passing, 1 new failure(s), 0 newly fixed, 0 grew, 0 shrank, 0 unreadable\n    BLOCKED: new failures not in baseline: doc-commands\n즉 `pytorch_optimizer`가 `trainbench/axes.py`에 귀속된 채 이름으로 호명된다. 문서를 원복하면 다시 PASS(`5 documented command(s); 16 third-party module(s) imported under tests/, trainbench/ or scripts/ (6 per-image probe adapter(s) skipped)`).\n앵커 테스트 쪽 부수기 증거 — `_demanded_imports`의 스캔 루트를 `(\"tests\",)`로 되돌리면:\n    FAILED tests/test_audit.py::test_a_lazy_third_party_import_in_the_package_is_demanded_of_the_documented_setup\n      - KeyError: 'pytorch_optimizer'\n      tests/test_audit.py:471 in assert \"trainbench/axes.py\" in modules[\"pytorch_optimizer\"]\n테스트는 세 가지를 잰다. import가 발견될 것, 그것이 *지연* import임에도 발견될 것(`trainbench/axes.py`의 최상위 import 집합에 `pytorch_optimizer`가 없음을 AST로 확인한다 — 파일 머리의 import 블록만 읽는 스캔은 여기서 아무것도 못 찾는다), 그리고 체크가 자기 목록이 아니라 이 스캐너가 돌려준 것을 lock에 요구할 것(`_demanded_imports`/`_locked_distributions`를 monkeypatch해 `doc-commands`를 실제로 돌리고 결과가 red인지 본다).\nuv export 실측 — `uv export --frozen --no-hashes --extra compose --extra native`가 `peft==0.20.0`과 `pytorch-optimizer==3.9.3`을 둘 다 낸다(체크가 이 lock을 읽어 PASS한다).\nGPU만 답할 수 있는 것 — 이미지 안에서 `optim=muon`이 실제로 도는지. 여기서 닫힌 것은 '문서화된 명령이 배포판을 설치한다'이고, 프레임워크 이미지 6개 각각이 그 축을 제공하는지는 `axis-packages`가 문자열 검색으로만 답하는 상태 그대로다. 측정 안 함."
+      }
     },
     {
       "id": "qlora-load-kwargs-mapping-is-pinned-by-one-key",
@@ -328,7 +340,11 @@
           "test_the_load_axes_reach_from_pretrained_as_the_whole_mapping"
         ]
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "B (probe)",
+        "evidence": "고친 것 — `tests/test_probe.py::test_the_load_axes_reach_from_pretrained_as_the_whole_mapping`. `steps.load_kwargs(config, report)`가 돌려준 매핑을 `axes.load_kwargs(config)`와 통째로 비교한다. 키가 둘 이상인 매핑이어야 의미가 있으므로 `peft.mode=qlora`를 켜고 `axes.get_device`만 CUDA로 monkeypatch한다 — 양자화는 아무것도 일어나지 않고, 비교 대상은 '요청'이다(그게 이 헬퍼가 책임지는 전부다). `BitsAndBytesConfig`에 `__eq__`가 없어 같은 레시피 두 개가 서로 다른 객체이므로 `to_dict()`로 정규화해 비교한다. 그리고 `assert set(wanted) == {\"attn_implementation\", \"quantization_config\"}`을 먼저 걸어, 축이 다시 거부되기 시작하면 '비교할 게 없어서 통과'하는 대신 여기서 실패하게 했다.\n부수기 증거 — 판정서가 적어둔 변이를 현재 트리에서 먼저 재현했다. `MUTANT2=drop_quant_kwarg uv run pytest tests/ -p qlora_recheck_mutants` -> `713 passed`(당시 584 passed와 같은 생존; 숫자 차이는 그 사이 늘어난 테스트 수다). 새 테스트를 넣은 뒤 같은 변이:\n    FAILED tests/test_probe.py::test_the_load_axes_reach_from_pretrained_as_the_whole_mapping\n      > assert comparable(reached) == comparable(wanted)\n      E AssertionError: assert {'attn_implem...ex_attention'} == {'attn_implem...d': 6.0, ...}}\n    1 failed, 29 deselected\n같은 플러그인의 `MUTANT2=ok_swallow`는 이 테스트를 통과한다 — 거부를 삼키는 변이라 거부가 없는 이 경로에서는 출하된 헬퍼와 동일하기 때문이고, 그 변이는 다른 항목의 몫이다.\nGPU만 답할 수 있는 것 — 4비트 가중치가 실제로 적재되는지. bitsandbytes는 CUDA에서만 양자화하므로 CPU에서는 요청까지만 잴 수 있다. 측정 안 함. 파드가 보여야 하는 것: `peft.mode=qlora`로 실제 체크포인트를 적재한 런의 레코드에서 `applied.peft.mode == \"qlora\"`와 `base_quantisation`이 `QLORA_4BIT`와 일치하는 것, 그리고 `_peft`의 무조건 거부가 풀린 뒤에도 `axes_verified`가 통과하는 것."
+      }
     },
     {
       "id": "checkpointing-policy-does-not-honour-its-own-save-list",
@@ -613,6 +629,32 @@
         "pattern": "A stale lock fails the build instead"
       },
       "closed": null
+    },
+    {
+      "id": "audit-a-malformed-baseline-count-takes-the-whole-gate-down",
+      "axis": "audit",
+      "finding": "레인 발견 (r2-rv-optim.md 최소 조치 작업 중, 앞선 레인이 자기 항목이 아니라 남겨둔 것)",
+      "owner": "D (axes)",
+      "verdict": "없음 — 판정서가 아니라 레인이 찾았다",
+      "summary": "`scripts/audit_plan.py::classify`가 baseline 항목의 `count`를 `>`로 비교하는데, `docs/audit-baseline.json`은 웨이브 사이에 손으로 편집된다. 따옴표 붙은 숫자 하나(`\"count\": \"3\"`)가 `TypeError: '>' not supported between instances of 'int' and 'str'`를 내고 게이트 전체를 죽인다 — 그 항목과 무관한 12개 체크까지 아무 결과도 못 낸다. 잘못된 입력에 대해 보고하는 대신 죽는 것은 이 저장소가 반복해서 만들어내는 실패 양식 그 자체다.",
+      "closes_when": {
+        "criterion": "`classify`가 비교 불가능한 count를 예외 대신 다섯 번째 목록으로 돌려주고, `main`이 그 항목을 이름으로 호명하며 1로 끝날 것. 그것을 단언하는 테스트가 있을 것.",
+        "command": "uv run python -c \"import sys; sys.path.insert(0,'scripts'); from audit_plan import classify, Result; print(classify([Result('a', False, '', count=2)], {'a': {'note':'n','count':'3'}}))\"",
+        "expected": "다섯 번째 원소가 [\"a count='3'\"], 예외 없음",
+        "observed": "TypeError: '>' not supported between instances of 'int' and 'str' (2026-08-02, 고치기 전)"
+      },
+      "anchor": {
+        "kind": "test",
+        "file": "tests/test_audit.py",
+        "names": [
+          "test_a_baseline_count_that_is_not_a_number_is_reported_not_raised"
+        ]
+      },
+      "closed": {
+        "date": "2026-08-02",
+        "by": "D (axes)",
+        "evidence": "등재하고 닫았다. 앞선 레인이 발견했지만 자기 항목이 아니라 손대지 않고 남긴 결함이다.\n재현 — 고치기 전, `classify([Result('a', False, '', count=2)], {'a': {'note':'n','count':'3'}})`:\n    TypeError: '>' not supported between instances of 'int' and 'str'\n고친 것 — `classify`가 네 개가 아니라 다섯 개의 목록을 돌려준다. 다섯 번째가 `unreadable`이고, `count`가 정수가 아닌(그리고 `None`이 아닌) baseline 항목이 여기 이름으로 들어간다. `None`은 그대로 '기록된 count 없음'(옛 문자열 전용 항목을 `load_baseline`이 정규화한 모양)이라 크기 비교만 꺼진다. `bool`은 `int`의 하위 클래스이고 `True == 1`이라 명시적으로 걸러낸다 — 안 그러면 count 1로 조용히 받아들여진다. `main`은 `BLOCKED: baseline entries with an uncomparable count: <name> count=<repr>`를 찍고 1로 끝난다. 요약 줄에도 `N unreadable`이 붙어 카운트 줄만 봐도 보인다.\n부수기 증거 — `classify`에서 그 타입 검사 세 줄만 지우고 `uv run pytest tests/test_audit.py -k not_a_number`:\n    FAILED tests/test_audit.py::test_a_baseline_count_that_is_not_a_number_is_reported_not_raised\n      - TypeError: '>' not supported between instances of 'int' and 'str'\n      scripts/audit_plan.py:1748\n원복 후 1 passed. 테스트는 순수 함수 쪽(`\"3\"`과 `True` 둘 다)과 `main`의 끝까지 도달하는 쪽을 모두 단언한다 — 목록을 돌려주기만 하고 `main`이 여전히 못 끝내면 아무 소용이 없기 때문에, 가짜 `CHECKS`와 tmp baseline으로 `main([])`을 실제로 돌려 종료 코드 1과 BLOCKED 줄을 확인한다.\nGPU 관련 없음.\n부수 효과 — `classify`의 반환 개수가 4에서 5로 늘어 `tests/test_audit.py`의 기존 호출부 5곳을 함께 고쳤다. 값 자체는 바뀌지 않는다."
+      }
     }
   ]
 }

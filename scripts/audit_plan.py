@@ -854,18 +854,47 @@ def _repo_module_names() -> set[str]:
     )
 
 
-def _test_imports() -> dict[str, set[str]]:
-    """Third-party top-level modules imported under `tests/`, and who imports them.
+def _per_image_adapters() -> set[Path]:
+    """The probe adapters that live in one framework image each.
 
-    Function-level imports count. They do not break collection the way a
-    module-level one does, but the test still fails when the module is absent, and
-    the question this check asks is whether the documented setup runs the suite —
-    not whether it survives collection. All three gaps found here were
-    function-level.
+    `trainbench/probe/registry.py` imports them lazily and says why: unsloth is
+    absent from the axolotl image and importing it there would fail for reasons
+    unrelated to the question. `envs/` has one directory per such image, and each
+    directory's own lock pins that framework — so the root lock is the wrong place
+    to demand them, and `_demanded_imports` skips these files.
+    """
+    envs = REPO / "envs"
+    if not envs.is_dir():
+        return set()
+    return {
+        REPO / "trainbench" / "probe" / f"{path.name.replace('-', '_')}.py"
+        for path in envs.iterdir()
+        if path.is_dir()
+    }
+
+
+def _demanded_imports() -> dict[str, set[str]]:
+    """Third-party top-level modules the documented setup has to provide, and who
+    imports them.
+
+    Collected from `tests/`, `trainbench/` and `scripts/` — the suite, the package
+    and the entry points are all things the documented command claims to make
+    runnable. Function-level imports count. They do not break collection the way a
+    module-level one does, but the run still fails when the module is absent, and
+    the import this widening was written for is one of them: `optim=muon`'s
+    `from pytorch_optimizer import Muon`, inside `trainbench/axes.py`, reached a
+    clean clone as an axis that refused itself and an ablation missing a row.
+
+    The framework adapters are skipped (`_per_image_adapters`), so a lazy import
+    added inside one of those files is not covered here.
     """
     modules: dict[str, set[str]] = {}
     local = _repo_module_names()
-    for path in sorted((REPO / "tests").rglob("*.py")):
+    skipped = _per_image_adapters()
+    roots = [REPO / name for name in ("tests", "trainbench", "scripts")]
+    for path in sorted(p for root in roots for p in root.rglob("*.py")):
+        if path in skipped:
+            continue
         try:
             tree = ast.parse(path.read_text())
         except SyntaxError:
@@ -880,7 +909,7 @@ def _test_imports() -> dict[str, set[str]]:
             for name in names:
                 root = name.split(".")[0]
                 if root not in sys.stdlib_module_names and root not in local:
-                    modules.setdefault(root, set()).add(path.name)
+                    modules.setdefault(root, set()).add(str(path.relative_to(REPO)))
     return modules
 
 
@@ -916,7 +945,7 @@ def _locked_distributions(flags: str) -> tuple[set[str], str | None]:
 
 @check("doc-commands")
 def documented_commands_are_runnable() -> Result:
-    """README/AGENTS commands must work as written, and install what the tests import.
+    """README/AGENTS commands must work as written, and install what this repo imports.
 
     The documented bootstrap once installed no extras, so `uv run pytest` failed
     on a missing hydra while local development used a different flag set. And the
@@ -930,13 +959,20 @@ def documented_commands_are_runnable() -> Result:
     and `transformers` are all in the `native` extra, no documented command asks
     for it, and this reported `5 documented command(s) install what the tests need`
     throughout. A rule naming one package cannot answer a question about all of
-    them, so the imports are collected from `tests/` and each one is looked for in
-    the lock the documented command actually resolves to.
+    them, so the imports are collected from the source and each one is looked for
+    in the lock the documented command actually resolves to.
+
+    Collected from the package and the entry points as well as from `tests/`. The
+    suite-only scan asked a narrower question than the one the answer was used
+    for: `optim=muon`'s only import of `pytorch-optimizer` is lazy and inside
+    `trainbench/axes.py`, so it appeared in no test, and a clean clone got an
+    ablation with the optim axis quietly refusing itself while this check reported
+    that the documented command installs everything.
     """
     problems = []
     found = 0
-    modules = _test_imports()
-    if empty := _nothing_to_check(modules, "third-party imports under tests/"):
+    modules = _demanded_imports()
+    if empty := _nothing_to_check(modules, "third-party imports under tests/ or the package"):
         return Result("doc-commands", False, empty)
     distributions = _distributions_for(modules)
     checked_locks: dict[str, set[str]] = {}
@@ -963,7 +999,7 @@ def documented_commands_are_runnable() -> Result:
             if missing:
                 problems.append(
                     f"{name}: `uv sync{flags}` installs {len(locked)} distribution(s) but the "
-                    f"tests import {len(missing)} it does not provide: {'; '.join(missing)}"
+                    f"repo imports {len(missing)} it does not provide: {'; '.join(missing)}"
                 )
         for match in re.finditer(r"python (scripts/env_report\.py[^\n`]*)", text):
             command = match.group(1).split()
@@ -980,14 +1016,15 @@ def documented_commands_are_runnable() -> Result:
     if empty := _nothing_to_check(found, "documented commands in README.md or AGENTS.md"):
         return Result("doc-commands", False, empty)
     scope = (
-        f"{found} documented command(s); {len(modules)} third-party module(s) imported "
-        "under tests/, resolved to distributions by this environment's metadata and "
+        f"{found} documented command(s); {len(modules)} third-party module(s) imported under "
+        f"tests/, trainbench/ or scripts/ ({len(_per_image_adapters())} per-image probe "
+        "adapter(s) skipped), resolved to distributions by this environment's metadata and "
         "looked for in the lock each documented `uv sync` produces"
     )
     return Result(
         "doc-commands",
         not problems,
-        f"every documented command runs as written and installs what the tests import ({scope})"
+        f"every documented command runs as written and installs what this repo imports ({scope})"
         if not problems
         else f"{'; '.join(problems)} ({scope})",
         count=len(problems),
@@ -1679,24 +1716,40 @@ def merge_baseline(
 
 def classify(
     results: list[Result], baseline: dict[str, dict[str, Any]]
-) -> tuple[list[str], list[str], list[str], list[str]]:
-    """New failures, newly passing, and failures that changed size in either direction.
+) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
+    """New failures, newly passing, failures that changed size in either direction,
+    and baseline entries whose recorded size cannot be compared to one.
 
     A shrunk count blocks for the same reason a newly passing check blocks: the
     baseline now grants amnesty for problems that no longer exist, and carrying
     that forward is how a stale entry stops meaning anything.
+
+    The fourth answer is the one that used to be an exception. `count` is compared
+    with `>`, `docs/audit-baseline.json` is hand-edited between waves, and a
+    quoted number there — `"count": "3"` — raised TypeError out of this function
+    and took the whole run with it: no check reported its result, including the
+    twelve that had nothing to do with the malformed entry. Naming the entry is
+    strictly more than the gate said before, and it still blocks.
     """
     regressions = [r.name for r in results if not r.ok and r.name not in baseline]
     fixed = [r.name for r in results if r.ok and r.name in baseline]
-    grew, shrank = [], []
+    grew, shrank, unreadable = [], [], []
     for r in results:
         if r.ok or r.count is None or r.name not in baseline:
             continue
         was = baseline[r.name].get("count")
-        if was is None or was == r.count:
+        # `None` is an entry with no recorded count — the older string-only shape,
+        # which `load_baseline` normalises to that and which disables only this
+        # comparison. Anything else that is not a whole number is a malformed entry.
+        if was is None:
+            continue
+        if not isinstance(was, int) or isinstance(was, bool):
+            unreadable.append(f"{r.name} count={was!r}")
+            continue
+        if was == r.count:
             continue
         (grew if r.count > was else shrank).append(f"{r.name} {was}->{r.count}")
-    return regressions, fixed, grew, shrank
+    return regressions, fixed, grew, shrank, unreadable
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1732,7 +1785,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     width = max(len(r.name) for r in results)
-    regressions, fixed, grew, shrank = classify(results, baseline)
+    regressions, fixed, grew, shrank, unreadable = classify(results, baseline)
     for r in results:
         if r.ok and r.name in baseline:
             status = "FIXED"
@@ -1748,7 +1801,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"\n{sum(1 for r in results if r.ok)}/{len(results)} passing, "
         f"{len(regressions)} new failure(s), {len(fixed)} newly fixed, "
-        f"{len(grew)} grew, {len(shrank)} shrank"
+        f"{len(grew)} grew, {len(shrank)} shrank, {len(unreadable)} unreadable"
     )
     if partial:
         print(f"PARTIAL RUN: {len(CHECKS) - len(selected)} check(s) not run; not a wave gate")
@@ -1762,7 +1815,10 @@ def main(argv: list[str] | None = None) -> int:
     if shrank:
         print(f"BLOCKED: baseline is stale, these shrank: {', '.join(shrank)}")
         print("  run --update-baseline after confirming, so amnesty is not carried forward")
-    return 1 if (regressions or fixed or grew or shrank) else 0
+    if unreadable:
+        print(f"BLOCKED: baseline entries with an uncomparable count: {', '.join(unreadable)}")
+        print("  a count is the whole number of problems the entry was accepted at")
+    return 1 if (regressions or fixed or grew or shrank or unreadable) else 0
 
 
 if __name__ == "__main__":

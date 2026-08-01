@@ -3678,6 +3678,123 @@ def test_the_muon_update_is_the_orthogonalised_gradient_not_an_elementwise_one(c
     assert cosine > 0.9
 
 
+def spread_gradient(shape: tuple[int, int]) -> torch.Tensor:
+    """A gradient of known spectrum: smallest singular value exactly a tenth of the
+    largest, at any shape. Newton-Schulz drives that ratio toward one and an
+    elementwise optimizer leaves it as it found it, so the ratio is what separates
+    the two paths."""
+    rows, cols = shape
+    rank = min(shape)
+    left, _ = torch.linalg.qr(torch.randn(rows, rank))
+    right, _ = torch.linalg.qr(torch.randn(cols, rank))
+    return (left @ torch.diag(torch.logspace(0, -1, rank)) @ right.T).double()
+
+
+def muon_step(built, weights, gradients) -> list[torch.Tensor]:
+    """One step with the given gradients on every weight at once, returning what
+    landed on each. Stepping the whole model rather than one tensor is the point:
+    a build that orthogonalises only the tensor a test happens to watch is the
+    substitution these assertions have to see."""
+    before = [w.detach().clone() for w in weights]
+    for weight, gradient in zip(weights, gradients, strict=True):
+        weight.grad = gradient.float().clone()
+    built.optimizer.step()
+    return [(w.detach() - was).double() for w, was in zip(weights, before, strict=True)]
+
+
+def assert_orthogonalised(update, gradient, *, lr, where):
+    """The update that reached the weight is the gradient's orthogonalisation.
+
+    Three independent readings, because each one alone has a way through. The
+    spectrum admits any elementwise rescaling that happens to come out flat; the
+    direction admits an update of the right shape and the wrong size — `bigstep`,
+    lr x100, keeps both. The norm closes that: an orthogonalised update has every
+    singular value near one, so its Frobenius norm is fixed by the rank and the
+    step size at `lr * sqrt(k)` times a constant Muon sets internally (measured
+    0.72-0.89 across the shapes asserted here). The window admits that and refuses
+    both a step two orders too large and an update that never happened.
+    """
+    spectrum = torch.linalg.svdvals(gradient)
+    assert float(spectrum.min() / spectrum.max()) == pytest.approx(0.1, abs=1e-6), where
+
+    update_spectrum = torch.linalg.svdvals(update)
+    assert float(update_spectrum.min() / update_spectrum.max()) > 0.4, where
+
+    u, _, vt = torch.linalg.svd(gradient, full_matrices=False)
+    orthogonalised = -(u @ vt)
+    cosine = float(
+        (update.flatten() @ orthogonalised.flatten()) / (update.norm() * orthogonalised.norm())
+    )
+    assert cosine > 0.9, where
+
+    scale = float(update.norm()) / (lr * min(update.shape) ** 0.5)
+    assert 0.2 < scale < 3.0, (where, scale)
+
+
+@pytest.mark.parametrize("shape", [(24, 8), (8, 24)])
+def test_the_muon_update_is_orthogonalised_on_a_non_square_matrix_too(composed, shape):
+    """The same assertion off the square, and past the first step.
+
+    The square 16x16 above is the shape a real checkpoint almost never has, and it
+    is the one shape where Newton-Schulz's transpose branch — the iteration runs on
+    the smaller side and transposes back — is never taken. Three Muons that
+    orthogonalise only the square case, only the small case, or only step 1, and
+    hand everything else to sign-SGD, kept the run record honest and the square
+    test green. Both non-square orientations are asserted because tall and wide
+    take opposite sides of that branch, and step 2 because a first-step-only
+    orthogonalisation is otherwise indistinguishable from the real thing.
+    """
+    config = muon(composed)
+    rows, cols = shape
+    torch.manual_seed(0)
+    layer = torch.nn.Linear(cols, rows, bias=False)
+    assert tuple(layer.weight.shape) == shape
+    model = torch.nn.Sequential(layer)
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+
+    built, _ = axes.assemble(model, config, CPU, framework="native")
+    gradient = spread_gradient(shape)
+
+    for step in (1, 2):
+        (update,) = muon_step(built, [layer.weight], [gradient])
+        assert_orthogonalised(update, gradient, lr=config.optim.lr, where=f"{shape} step {step}")
+
+
+def test_muon_orthogonalises_every_trainable_matrix_not_only_the_one_the_test_watches(composed):
+    """The tensor coverage the assertion above cannot give.
+
+    Every behavioural test here used to build a model with one trainable matrix,
+    so a Muon that routed the first matrix to Newton-Schulz and every other one to
+    the internal AdamW passed all of them — and `_capture_optim` cannot see it
+    either, because `use_muon` is set per group and that build sets it honestly.
+    Three matrices of three different shapes are stepped together and all three are
+    asserted, twice.
+    """
+    config = muon(composed)
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(8, 24, bias=False),
+        torch.nn.LayerNorm(24),
+        torch.nn.Linear(24, 8, bias=False),
+        torch.nn.Linear(8, 8, bias=False),
+    )
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+    weights = [p for p in model.parameters() if p.ndim >= 2 and p.requires_grad]
+    # Named, so shrinking the model back to one matrix fails here rather than
+    # quietly narrowing what the loop below covers.
+    assert [tuple(w.shape) for w in weights] == [(24, 8), (8, 24), (8, 8)]
+
+    built, _ = axes.assemble(model, config, CPU, framework="native")
+    gradients = [spread_gradient(tuple(w.shape)) for w in weights]
+
+    for step in (1, 2):
+        updates = muon_step(built, weights, gradients)
+        for weight, update, gradient in zip(weights, updates, gradients, strict=True):
+            assert_orthogonalised(
+                update, gradient, lr=config.optim.lr, where=f"{tuple(weight.shape)} step {step}"
+            )
+
+
 def test_a_muon_that_orthogonalises_nothing_does_not_read_back_as_muon(composed):
     """The record side of the same substitution.
 
@@ -3734,13 +3851,14 @@ def test_a_frozen_matrix_is_not_counted_as_a_tensor_muon_will_orthogonalise(comp
 
 
 def test_muon_is_refused_rather_than_crashing_where_pytorch_optimizer_is_absent(composed):
-    """`from pytorch_optimizer import Muon` was a bare import. The documented setup
-    command is `uv sync --extra compose`, which does not install that distribution
-    — only the `native` extra and `envs/native` pin it — so on a clean clone and in
+    """`from pytorch_optimizer import Muon` was a bare import, and the documented
+    setup command did not install that distribution — so on a clean clone and in
     five of the six framework images this axis did not refuse, it took `assemble`
-    down partway through with ModuleNotFoundError. `_patch_liger` wraps its import
-    for the same reason: "this environment cannot provide the axis" is an unapplied
-    axis, not a crash.
+    down partway through with ModuleNotFoundError. The documented command carries
+    it now (`doc-commands` demands this very import of the lock it produces), but
+    the five images still do not, and `_patch_liger` wraps its import for the same
+    reason: "this environment cannot provide the axis" is an unapplied axis, not a
+    crash.
     """
     with pytest.MonkeyPatch.context() as patched:
         patched.setitem(sys.modules, "pytorch_optimizer", None)

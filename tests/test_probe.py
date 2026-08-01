@@ -541,6 +541,50 @@ def test_the_load_axes_reach_from_pretrained_when_they_are_not_refused(config_ma
     assert (check.ok, check.detail) == (True, {"requested": ["attn_implementation"]})
 
 
+def test_the_load_axes_reach_from_pretrained_as_the_whole_mapping(config_mapping, monkeypatch):
+    """One key is not the mapping.
+
+    The test above watches `attn_implementation` arrive, and `attn.name` is the
+    only load-time axis that is never refused — so it is the only key any config
+    this suite can compose puts in that mapping, and a helper that forwarded attn
+    while dropping everything else passed the whole suite. `peft.mode=qlora` is
+    the key that would be dropped: the base's 4-bit recipe is produced while the
+    checkpoint is read, so a probe that lost it would load a full-precision base
+    and file the support-matrix cell as qlora.
+
+    Nothing here quantises. The device is the one thing forced, because
+    `axes.load_kwargs` refuses off CUDA and the mapping under test only has a
+    second key when it is not refused; what is compared is the request, which is
+    all this helper is responsible for. Whether 4-bit weights actually arrive is a
+    GPU question and `applied._capture_peft`'s — 측정 안 함 here.
+    """
+    from trainbench import axes
+    from trainbench.probe import steps
+
+    monkeypatch.setattr(axes, "get_device", lambda name: torch.device("cuda"))
+    mapping = json.loads(json.dumps(config_mapping))
+    mapping["attn"]["name"] = "flex"
+    mapping["peft"]["mode"] = "qlora"
+    mapping["peft"]["r"] = 32
+    config = to_bench_config(mapping)
+
+    def comparable(kwargs):
+        # `BitsAndBytesConfig` has no `__eq__`, so two equal recipes are two
+        # unequal objects; the dict it exports is what "the same mapping" means.
+        return {k: (v.to_dict() if hasattr(v, "to_dict") else v) for k, v in kwargs.items()}
+
+    wanted = axes.load_kwargs(config)
+    report = ProbeReport(framework="native", model=config.model.name)
+    reached = steps.load_kwargs(config, report)
+
+    # Asserted rather than assumed: if the axis started refusing again this would
+    # be one key and the comparison below would pass by having nothing to compare.
+    assert set(wanted) == {"attn_implementation", "quantization_config"}
+    assert comparable(reached) == comparable(wanted)
+    check = next(c for c in report.checks if c.name == "axes_load_kwargs")
+    assert (check.ok, check.detail) == (True, {"requested": sorted(wanted)})
+
+
 def test_proportional_quota_preserves_composition_and_total():
     from scripts.prepare_data import proportional_quota
 

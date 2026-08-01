@@ -960,19 +960,19 @@ def _optimizer(params: Any, config: BenchConfig, device: torch.device) -> tuple[
         )
 
     # `pytorch-optimizer` is pinned by `envs/native/pyproject.toml` and by the root
-    # `native` extra, not by the `compose` extra the documented setup command
-    # installs — so the import fails on a clean clone and in five of the six
-    # framework images. Refused rather than raised for the same reason
-    # `_patch_liger` wraps its import: an axis the environment cannot provide is an
-    # unapplied axis, and a bare ModuleNotFoundError takes down `assemble` mid-way
-    # instead of being reported as this one axis being unavailable here.
+    # `native` extra, which the documented setup command installs — `doc-commands`
+    # collects this lazy import and demands it of that lock. Five of the six
+    # framework images still lack it. Refused rather than raised for the same
+    # reason `_patch_liger` wraps its import: an axis the environment cannot
+    # provide is an unapplied axis, and a bare ModuleNotFoundError takes down
+    # `assemble` mid-way instead of naming the one axis unavailable here.
     try:
         from pytorch_optimizer import Muon
     except ImportError as exc:
         raise UnappliedAxis(
             f"optim=muon needs pytorch-optimizer, which is not importable here ({exc}). "
-            "It is pinned by envs/native and by the root 'native' extra; the documented "
-            "setup command installs the 'compose' extra, which does not carry it."
+            "It is pinned by envs/native and by the root 'native' extra, which the "
+            "documented setup command installs; five of the six framework images do not."
         ) from exc
 
     held = list(params)

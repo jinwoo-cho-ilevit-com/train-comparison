@@ -270,8 +270,10 @@ embedding 행렬과 hidden weight 행렬을 이름 없이 구별할 방법이 �
 멈춘다. 어느 것도 AdamW 수치에 Muon 라벨을 붙이지 않는다.
 
 - **`pytorch-optimizer`가 없는 환경.** 이 배포판은 root `native` extra와
-  `envs/native`에만 있고 문서화된 셋업 명령(`uv sync --extra compose`)에는 없다.
-  6개 프레임워크 이미지 중 5개도 마찬가지다. 그 환경에서 `optim=muon`은
+  `envs/native`에 있다. 문서화된 셋업 명령은 `uv sync --extra compose --extra native`
+  이므로 문서대로 설치한 환경에는 있고, 그 사실을 `audit_plan.py`의 `doc-commands`가
+  지킨다 — 이 지연 import까지 수집해 문서화된 명령이 만드는 lock에서 찾는다. 6개
+  프레임워크 이미지 중 5개에는 여전히 없고, 그 환경에서 `optim=muon`은
   `UnappliedAxis`로 거부된다(예전에는 `assemble` 중간에 `ModuleNotFoundError`로
   죽었다).
 - **직교화할 학습 가능한 행렬이 없는 모델.** 가드는 `p.ndim >= 2`가 아니라
