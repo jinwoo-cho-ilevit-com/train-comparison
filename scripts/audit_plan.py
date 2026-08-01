@@ -81,16 +81,44 @@ def _code_text(exclude: tuple[Path, ...] = ()) -> str:
     return "\n".join(p.read_text() for p in _code_files(exclude))
 
 
+# Directories under configs/ that are not Hydra config groups. Each entry is a
+# claim that nothing composes the directory, so its keys are not run settings and
+# holding code to "reads every one of them" would be meaningless.
+NOT_A_CONFIG_GROUP = {
+    "experiment": (
+        "orchestrator manifests read by scripts/orchestrate.py; absent from "
+        "configs/config.yaml defaults, so Hydra never composes them into a run"
+    ),
+}
+
+
+def _composed_groups() -> set[str]:
+    """Config groups the root config actually composes.
+
+    A Hydra config group is defined by being in `defaults`; a directory that is
+    not there never reaches a run. Deriving the set rather than listing exceptions
+    is what keeps `configs/experiment/` out without a special case.
+    """
+    root_config = CONFIGS / "config.yaml"
+    if not root_config.exists():
+        # Empty rather than an exception, and safe in both directions: the callers
+        # then find no leaves and no composed groups, which their own empty-input
+        # guards turn into failures instead of a silent pass.
+        return set()
+    root = yaml.safe_load(root_config.read_text()) or {}
+    return {key for entry in root.get("defaults", []) if isinstance(entry, dict) for key in entry}
+
+
 def _config_leaf_keys() -> dict[str, set[str]]:
-    """Leaf keys per config group, e.g. {"attn": {"name"}}."""
+    """Leaf keys per composed config group, e.g. {"attn": {"name"}}."""
+    composed = _composed_groups()
     groups: dict[str, set[str]] = {}
     for path in CONFIGS.rglob("*.yaml"):
-        if path.parent == CONFIGS:
+        if path.parent == CONFIGS or path.parent.name not in composed:
             continue
-        group = path.parent.name
         data = yaml.safe_load(path.read_text()) or {}
         if isinstance(data, dict):
-            groups.setdefault(group, set()).update(k for k in data if isinstance(k, str))
+            groups.setdefault(path.parent.name, set()).update(k for k in data if isinstance(k, str))
     return groups
 
 
@@ -125,6 +153,44 @@ def _nothing_to_check(items, what: str) -> str | None:
     if items:
         return None
     return f"found no {what}; a check with nothing to examine passes for the wrong reason"
+
+
+@check("config-groups")
+def every_config_directory_is_composed_or_declared() -> Result:
+    """Every directory under configs/ is either composed or declared not to be.
+
+    `config-consumed` only looks at composed groups, which is what keeps
+    orchestrator manifests out of it. That narrowing would otherwise fail open: a
+    real axis group added to configs/ but forgotten in `defaults` would vanish
+    from every check at once while also never reaching a run.
+    """
+    composed = _composed_groups()
+    directories = {p.name for p in CONFIGS.iterdir() if p.is_dir()}
+    if empty := _nothing_to_check(directories, "directories under configs/"):
+        return Result("config-groups", False, empty)
+    problems = [
+        f"{name} is neither in configs/config.yaml defaults nor declared as not a group"
+        for name in sorted(directories - composed - set(NOT_A_CONFIG_GROUP))
+    ]
+    problems += [
+        f"{name} is declared as not a config group but the root config composes it"
+        for name in sorted(composed & set(NOT_A_CONFIG_GROUP))
+    ]
+    # A declaration for a directory that does not exist yet excludes nothing, so
+    # it is reported rather than failed: the risk this check guards is an
+    # unclassified directory, and a lane may land its declaration before its files.
+    pending = sorted(set(NOT_A_CONFIG_GROUP) - directories)
+    note = (
+        f", {len(pending)} declared but not yet present ({', '.join(pending)})" if pending else ""
+    )
+    return Result(
+        "config-groups",
+        not problems,
+        f"{len(composed)} composed group(s), "
+        f"{len(NOT_A_CONFIG_GROUP) - len(pending)} declared non-group(s){note}"
+        if not problems
+        else "; ".join(problems),
+    )
 
 
 # Leaves the schema turns into something else before any code sees them. The
