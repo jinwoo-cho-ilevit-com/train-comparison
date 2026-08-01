@@ -18,16 +18,33 @@ Wave 0을 순차 구간으로 둔 이유가 이것이다.
 | A 데이터 | `wt-data` | `scripts/prepare_data.py`, `configs/data/`, `tests/test_data.py` |
 | B 코어정확성 | `wt-core` | `trainbench/embedding.py`, `trainbench/device.py`, `trainbench/seed.py`, `trainbench/probe/` 전체(`types.py` 제외), `scripts/verify_env.py`, `scripts/env_report.py`, `configs/model/`, `tests/test_embedding.py`, `tests/test_device_seed.py`, `tests/test_probe.py` |
 | C 오케스트레이션 | `wt-orch` | `trainbench/pods.py`, `scripts/{orchestrate,publish_result,report}.py`, `configs/experiment/`, `configs/run/`, `docker/entrypoint.sh`, `docs/evidence/`, `tests/test_pods.py` |
-| D 축구현 | `wt-axes` | `trainbench/axes.py`, `trainbench/applied.py`의 `_CAPTURES`·`_REQUESTED_OVERRIDES`·capture 함수들, `configs/{attn,kernel,precision,compile,optim,freeze,dataloader,parallel,peft,loss}/`, `configs/train/`, `tests/test_axes.py` |
+| D 축구현 | `wt-axes` | `trainbench/axes.py`, `trainbench/applied.py`의 `_CAPTURES`·`_REQUESTED_OVERRIDES`·capture 함수들, `configs/{attn,kernel,precision,compile,optim,freeze,dataloader,parallel,peft,loss,framework}/`, `configs/train/`, `tests/test_axes.py` |
 | E 문서 | `wt-docs` | `PLAN.md`, `README.md`, `AGENTS.md`, `CLAUDE.md`, `docs/methodology.md`, `docs/support-matrix.md`, `docs/model-spec.md` |
-| F 이미지 | `wt-images` | `envs/*/`(pyproject + lock), `docker/Dockerfile.*`, `.github/workflows/`, `pyproject.toml`, 루트 `uv.lock`, `.pre-commit-config.yaml`, `.gitignore` |
+| F 이미지 | `wt-images` | `envs/*/`(pyproject + lock), `docker/Dockerfile.*`, `.github/workflows/`, `pyproject.toml`, 루트 `uv.lock`, `.pre-commit-config.yaml`, `.gitignore`, `.python-version` |
+| G 하네스 (Wave 3) | 순차 | `scripts/bench.py`, `trainbench/metrics/`, `tests/{test_metrics,test_smoke_cpu}.py` |
 
 **공유(수정 금지)**: `trainbench/config_schema.py`, `trainbench/config.py`,
 `trainbench/compose.py`, `trainbench/record.py`, `trainbench/probe/types.py`,
 `trainbench/applied.py`의 인터페이스(데이터클래스·`capture`·`assert_matches`),
 `scripts/audit_plan.py`, `scripts/compose_config.py`, `docs/CONTRACTS.md`,
 `docs/model-spec.yaml`, `tests/{conftest,test_config,test_applied,test_audit}.py`,
-`.env.example`, `.infisical.json`.
+`.env.example`, `.infisical.json`, `configs/config.yaml`,
+`trainbench/__init__.py`, `tests/__init__.py`.
+
+`configs/config.yaml`이 공유인 이유: `audit_plan.py`의 `_composed_groups()`가 이
+파일의 `defaults`에서 config group 집합을 유도하므로, 이 한 파일이 `config-groups` ·
+`config-consumed` · `axis-fields` 세 체크의 **검사 범위를 결정한다.** 축 그룹을 추가하는
+것은 D의 작업이지만 `defaults`에 한 줄을 추가하는 것은 계약 변경이다.
+
+**기록 문서(수정 금지, 추가만)**: `docs/review-findings.md`, `.claude/plans/`.
+무엇이 왜 틀렸는지의 기록이므로 고쳐서 맞게 만들지 않는다. 해소는 항목에 표시로 남긴다.
+
+### Wave 3 시작 시 이관
+
+G는 `docker/entrypoint.sh`(C 소유)를 반드시 고쳐야 한다 — pod 진입점이 `bench.py`를
+호출해야 하고, 지금은 `probe` 외 purpose에 분기가 없다. **Wave 3 착수 시점에
+`docker/entrypoint.sh`와 `scripts/orchestrate.py`의 `RUNNABLE_PURPOSES`가 C에서 G로
+이관된다.** 이관 없이 G가 손대면 병합된 레인의 파일을 되돌리는 일이 된다.
 
 ### `docs/audit-baseline.json` — 공유하되 한 줄씩만
 
