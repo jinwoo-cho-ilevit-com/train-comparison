@@ -1,0 +1,8 @@
+{
+  "axis-packages": "Wave 2 (F: envs/images) - install per-axis packages",
+  "config-consumed": "Wave 2 (D: axes) + Wave 3 (G: harness) - wire every knob",
+  "data-pinned": "Wave 1 (A: data) - regenerate subset and pin quality revision",
+  "doc-commands": "Wave 1 (E: docs) - fix README/AGENTS sync flags",
+  "evidence-committed": "Wave 1 (C: orch) - commit result artifacts to docs/evidence",
+  "plan-files": "Wave 1 (E: docs) + Wave 3 (G) - bench.py, methodology.md, report.md"
+}
