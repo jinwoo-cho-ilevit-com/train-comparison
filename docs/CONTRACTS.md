@@ -17,11 +17,11 @@ Wave 0을 순차 구간으로 둔 이유가 이것이다.
 |---|---|---|
 | A 데이터 | `wt-data` | `scripts/prepare_data.py`, `configs/data/`, `tests/test_data.py` |
 | B 코어정확성 | `wt-core` | `trainbench/embedding.py`, `trainbench/device.py`, `trainbench/seed.py`, `trainbench/probe/` 전체(`types.py` 제외), `scripts/verify_env.py`, `scripts/env_report.py`, `configs/model/`, `tests/test_embedding.py`, `tests/test_device_seed.py`, `tests/test_probe.py` |
-| C 오케스트레이션 | `wt-orch` | `trainbench/pods.py`, `scripts/{orchestrate,publish_result,report}.py`, `configs/experiment/`, `configs/run/`, `docker/entrypoint.sh`, `docs/evidence/`, `tests/test_pods.py` |
+| C 오케스트레이션 | `wt-orch` | `trainbench/pods.py`, `scripts/{orchestrate,publish_result,report}.py`(`RUNNABLE_PURPOSES` 제외), `configs/experiment/`, `configs/run/`, `docs/evidence/`, `tests/test_pods.py` |
 | D 축구현 | `wt-axes` | `trainbench/axes.py`, `trainbench/applied.py`의 `_CAPTURES`·`_REQUESTED_OVERRIDES`·capture 함수들, `configs/{attn,kernel,precision,compile,optim,freeze,dataloader,parallel,peft,loss,framework}/`, `configs/train/`, `tests/test_axes.py` |
 | E 문서 | `wt-docs` | `PLAN.md`, `README.md`, `AGENTS.md`, `CLAUDE.md`, `docs/methodology.md`, `docs/support-matrix.md`, `docs/model-spec.md` |
 | F 이미지 | `wt-images` | `envs/*/`(pyproject + lock), `docker/Dockerfile.*`, `.github/workflows/`, `pyproject.toml`, 루트 `uv.lock`, `.pre-commit-config.yaml`, `.gitignore`, `.python-version` |
-| G 하네스 (Wave 3) | 순차 | `scripts/bench.py`, `trainbench/metrics/`, `tests/{test_metrics,test_smoke_cpu}.py` |
+| G 하네스 (Wave 3) | 순차 | `scripts/bench.py`, `trainbench/metrics/`, `tests/{test_metrics,test_smoke_cpu}.py`, `docker/entrypoint.sh`, `scripts/orchestrate.py`의 `RUNNABLE_PURPOSES` |
 
 **공유(수정 금지)**: `trainbench/config_schema.py`, `trainbench/config.py`,
 `trainbench/compose.py`, `trainbench/record.py`, `trainbench/probe/types.py`,
@@ -45,6 +45,10 @@ G는 `docker/entrypoint.sh`(C 소유)를 반드시 고쳐야 한다 — pod 진�
 호출해야 하고, 지금은 `probe` 외 purpose에 분기가 없다. **Wave 3 착수 시점에
 `docker/entrypoint.sh`와 `scripts/orchestrate.py`의 `RUNNABLE_PURPOSES`가 C에서 G로
 이관된다.** 이관 없이 G가 손대면 병합된 레인의 파일을 되돌리는 일이 된다.
+
+**이관 완료 (2026-08-01, Wave 3 착수).** 위 §1 표를 갱신했다. 이관 대상은
+`docker/entrypoint.sh` 전체와 `RUNNABLE_PURPOSES` 하나뿐이며, `scripts/orchestrate.py`의
+나머지는 C 소유로 남는다.
 
 ### `docs/audit-baseline.json` — 공유하되 한 줄씩만
 
@@ -295,6 +299,12 @@ class ProbeReport:
   미확인 축은 undetermined이고 timing을 차단한다. `axis_knobs() - _CAPTURES`에서
   동적으로 유도하지 않는 이유는 그 형태가 전 축이 배선된 순간 검사 대상 0개로
   조용히 통과하기 때문이다(§6의 "빈 입력은 통과가 아니라 실패다").
+- 2026-08-01 **`config-consumed`가 산문에 만족하던 것을 고친다** — `audit_plan.py`에
+  `_strip_prose()` 추가. 이 체크는 정규식이라 knob을 **언급만** 해도 통과했다.
+  `scripts/bench.py` docstring이 `config.data.subset_rows`를 적었을 뿐인데 소비된 것으로
+  보고됐다 — 이 파일 헤더가 경고하는 실패이고 `assert-called`가 AST 파싱인 이유인데,
+  이 체크는 그 결함을 그대로 갖고 있었다. 주석과 docstring만 제거한다: 부분식
+  `config["data"]["key"]`도 문자열이라 문자열 전체를 지우면 그 형태를 못 잡는다.
 - 2026-08-01 **§2가 열어둔 freeze x peft 충돌을 닫는다** — `config_schema.py`에
   검증기 2건 + `tests/test_config.py` 테스트 3건.
   결정이 아니라 측정으로 닫았다(peft 0.20.0): `get_peft_model`은 base 파라미터를 전부

@@ -112,6 +112,35 @@ if [[ "${purpose}" == "probe" ]]; then
         --config "${CONFIG_PATH}" \
         --out "${RESULT_PATH}"
     run_status=$?
+elif [[ "${purpose}" == "timing" || "${purpose}" == "profile" || "${purpose}" == "quality" ]]; then
+    # One process per setting, not a loop inside bench.py. A process that already
+    # ran a setting carries its autotune cache, compiled graphs and allocator
+    # fragmentation into the next one, and `kernel`/`attn` cannot change after the
+    # model exists at all. The plan is the ordered list of settings this pod owns;
+    # an axis is never split across pods, so this loop is the whole axis.
+    settings=$("${PYTHON[@]}" -c \
+        'import json,sys; print(len(json.load(open(sys.argv[1]))))' "${PLAN_PATH}")
+    if [[ "${settings}" -eq 0 ]]; then
+        echo "purpose '${purpose}' with an empty plan: nothing to measure" >&2
+        run_status=2
+    else
+        run_status=0
+        for i in $(seq 0 $((settings - 1))); do
+            setting_out="${RESULT_DIR}/result-${i}.json"
+            echo "-- setting ${i}/${settings}"
+            "${PYTHON[@]}" -c \
+                'import json,sys; json.dump(json.load(open(sys.argv[1]))[int(sys.argv[2])], open(sys.argv[3],"w"))' \
+                "${PLAN_PATH}" "${i}" "${RESULT_DIR}/setting-${i}.json"
+            run_with_secrets timeout --signal=TERM --kill-after=60 "${DEADLINE_SECONDS}" \
+                "${PYTHON[@]}" "${REPO_DIR}/scripts/bench.py" \
+                --config "${RESULT_DIR}/setting-${i}.json" \
+                --out "${setting_out}"
+            status=$?
+            # Keep going: one setting failing is a recorded gap in the axis, and
+            # abandoning the rest wastes the pod that was booted for all of them.
+            [[ ${status} -ne 0 ]] && run_status=${status}
+        done
+    fi
 else
     # No dangling reference to an entry point this image does not have: the
     # missing capability is recorded as the pod's result.

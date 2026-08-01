@@ -55,6 +55,7 @@ from rich.console import Console
 from trainbench.compose import CONFIG_DIR, CONFIG_NAME, output_dir, resolve
 from trainbench.config import git_state
 from trainbench.config_schema import CORRUPT_DATA_REVISIONS, BenchConfig
+from trainbench.metrics import percentile
 from trainbench.record import package_versions, write_json
 
 console = Console()
@@ -519,21 +520,14 @@ def build_dataset(rows_by_config: dict[str, list[dict[str, Any]]]) -> Any:
     return concatenate_datasets(parts)
 
 
-def _percentile(ordered: Sequence[float], q: float) -> float:
-    """Nearest-rank percentile. No interpolation: these are token and pixel counts
-    read by a human comparing two regenerations, not statistics to be smoothed."""
-    index = max(0, math.ceil(q * len(ordered)) - 1)
-    return ordered[min(index, len(ordered) - 1)]
-
-
 def distribution(values: Sequence[float]) -> dict[str, float | int] | None:
     if not values:
         return None
     ordered = sorted(values)
     return {
         "count": len(ordered),
-        "p50": _percentile(ordered, 0.50),
-        "p95": _percentile(ordered, 0.95),
+        "p50": percentile(ordered, 0.50),
+        "p95": percentile(ordered, 0.95),
         "max": ordered[-1],
     }
 

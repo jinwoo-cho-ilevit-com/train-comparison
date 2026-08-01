@@ -1,8 +1,4 @@
 {
-  "assert-called": {
-    "count": null,
-    "note": "Wave 3 (G: harness) - scripts/bench.py must call assert_matches"
-  },
   "axis-values": {
     "count": 6,
     "note": "Wave 3 (F: build images so kernel/parallel/dataloader/precision values can be applied) - 6 groups still take only their inert value; peft resolved in Wave 2.5"
@@ -12,7 +8,7 @@
     "note": "Wave 2 (D: axes) - one apply site and one capture probe per axis"
   },
   "config-consumed": {
-    "count": 13,
-    "note": "Wave 2 (D: axes) + Wave 3 (G: harness) - wire every knob"
+    "count": 5,
+    "note": "Wave 3 \uc794\uc5ec - data.push_subset/data.subset_rows\ub294 prepare_data.py\uc758 `data = config.data` \ubcc4\uce6d \ub54c\ubb38\uc5d0 \uc548 \ubcf4\uc774\ub294 \uac83(\ub808\uc778 A, \ud638\ucd9c\ubd80 4\uc904), model.add_generation_prompt\ub294 chat template \uacbd\ub85c\uac00 \uc0dd\uaca8\uc57c \ud558\uace0, run.trackio_*\ub294 \uc2e4\ud589 \ub85c\uac70\ub97c \ubd99\uc77c \ub54c \uc18c\ube44\ub41c\ub2e4"
   }
 }

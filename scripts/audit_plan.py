@@ -85,8 +85,36 @@ def _code_files(exclude: tuple[Path, ...] = ()) -> list[Path]:
     ]
 
 
+def _strip_prose(source: str) -> str:
+    """Source with its comments and docstrings removed.
+
+    `config-consumed` matches a regex, and a regex over raw source is satisfied by
+    a file that merely *talks about* the knob. Found the hard way: `bench.py`'s
+    docstring named `config.data.subset_rows` while no statement read it, and the
+    check reported the knob as consumed. `assert-called` is AST-parsed for exactly
+    this reason and said so; this one had the flaw it was written to avoid.
+
+    String literals in general are kept — the subscript form the check also accepts
+    (`config["data"]["subset_rows"]`) is made of them. Only whole-statement strings
+    go, which is what a docstring is.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    lines = source.splitlines()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Constant):
+            continue
+        if not isinstance(node.value.value, str) or node.end_lineno is None:
+            continue
+        for line in range(node.lineno - 1, node.end_lineno):
+            lines[line] = ""
+    return "\n".join(line.split("#", 1)[0] if "#" in line else line for line in lines)
+
+
 def _code_text(exclude: tuple[Path, ...] = ()) -> str:
-    return "\n".join(p.read_text() for p in _code_files(exclude))
+    return "\n".join(_strip_prose(p.read_text()) for p in _code_files(exclude))
 
 
 # Directories under configs/ that are not Hydra config groups. Each entry is a

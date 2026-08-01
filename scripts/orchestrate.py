@@ -69,7 +69,10 @@ PURPOSES_WITHOUT_BASELINE = frozenset({"probe"})
 # What the pod images can execute today. `scripts/bench.py` (Wave 3) is what makes
 # a timing purpose runnable; until then, launching one buys an hour of GPU to
 # learn that the entry point is missing.
-RUNNABLE_PURPOSES = frozenset({"probe"})
+# Widened once `scripts/bench.py` existed and `docker/entrypoint.sh` grew an arm
+# that calls it. Ownership of both moved from lane C to lane G at Wave 3 start
+# (docs/CONTRACTS.md §1).
+RUNNABLE_PURPOSES = frozenset({"probe", "timing", "profile", "quality"})
 
 # Never reachable from an experiment pod. RUNPOD_API_KEY is account-wide and would
 # let a probe delete the sweep that created it; GITHUB_TOKEN carries write:packages
