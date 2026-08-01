@@ -84,8 +84,15 @@ FORBIDDEN_ON_POD = (
 )
 
 # The pod kills itself this long before the orchestrator's own deadline, so a hung
-# run stops billing on its own even if the orchestrator dies first.
+# run stops billing on its own even if the orchestrator dies first. It is a ceiling,
+# not a fixed subtraction: see pod_timeout_seconds.
 SELF_KILL_MARGIN_SECONDS = 120
+
+# Why a run is in a pod's plan. The baseline is a fixed reference workload that
+# every measuring pod repeats so host-to-host variance is measured rather than
+# assumed; it is not what the pod was created to answer.
+ROLE_BASELINE = "baseline"
+ROLE_EXPERIMENT = "experiment"
 
 
 class ManifestError(ValueError):
@@ -97,11 +104,24 @@ class Run:
     """One resolved setting a pod executes."""
 
     name: str
+    role: str
     overrides: tuple[str, ...]
     config: dict[str, Any]
 
     def summary(self) -> dict[str, Any]:
-        return {"name": self.name, "overrides": list(self.overrides)}
+        """Everything the pod needs to execute this run, resolved.
+
+        The config travels, not just the Hydra override strings. No pod image has
+        Hydra — the antlr4 pin is incompatible with axolotl, which is why
+        composition happens here — so a pod handed only overrides cannot resolve
+        the settings it owns, and a sweep pod owns more than one.
+        """
+        return {
+            "name": self.name,
+            "role": self.role,
+            "overrides": list(self.overrides),
+            "config": self.config,
+        }
 
 
 @dataclass(frozen=True)
@@ -153,6 +173,16 @@ def load_manifest(path: Path) -> Experiment:
         raise ManifestError(
             f"{path.name}: purpose '{purpose}' produces numbers, so it must name a "
             "canonical baseline; results from different hosts are otherwise not comparable"
+        )
+    # The converse, and it is not symmetry for its own sake. The baseline names its
+    # own model and framework, so adding one to a probe pod puts a run of a
+    # different combination on a pod built to answer a question about this one —
+    # in this pod's image, filed under this pod's directory.
+    if baseline != NO_BASELINE and purpose in PURPOSES_WITHOUT_BASELINE:
+        raise ManifestError(
+            f"{path.name}: purpose '{purpose}' produces no number to compare across "
+            f"hosts, so it must declare 'baseline: {NO_BASELINE}'; naming "
+            f"'{baseline}' adds a run of another model and framework to this pod"
         )
     return Experiment(
         name=path.stem,
@@ -240,6 +270,7 @@ def plan_runs(exp: Experiment, baselines: dict[str, list[str]]) -> list[Run]:
         runs.append(
             Run(
                 name=f"baseline:{exp.baseline}",
+                role=ROLE_BASELINE,
                 overrides=tuple(overrides),
                 config=resolved_config(list(overrides)),
             )
@@ -247,13 +278,31 @@ def plan_runs(exp: Experiment, baselines: dict[str, list[str]]) -> list[Run]:
     base = [f"framework={exp.framework}", f"model={exp.model}", f"run={exp.purpose}"]
     base += exp.overrides
     if not exp.settings:
-        return [*runs, Run(name=exp.name, overrides=tuple(base), config=resolved_config(base))]
+        own = [
+            Run(
+                name=exp.name,
+                role=ROLE_EXPERIMENT,
+                overrides=tuple(base),
+                config=resolved_config(base),
+            )
+        ]
+        return [*runs, *own]
     for setting, extra in exp.settings.items():
         overrides = [*base, *extra]
         runs.append(
-            Run(name=setting, overrides=tuple(overrides), config=resolved_config(overrides))
+            Run(
+                name=setting,
+                role=ROLE_EXPERIMENT,
+                overrides=tuple(overrides),
+                config=resolved_config(overrides),
+            )
         )
     return runs
+
+
+def own_runs(runs: list[Run]) -> list[Run]:
+    """The runs a pod was created to perform, in order, baseline excluded."""
+    return [r for r in runs if r.role == ROLE_EXPERIMENT]
 
 
 def image_for(exp: Experiment, registry: str, tag: str) -> str:
@@ -331,11 +380,17 @@ def pod_env(
     which commit, which image digest, and a token that lets it read the secrets
     it needs. What does not travel is anything that can act on the account.
     """
+    own = own_runs(runs)
+    if not own:
+        raise ManifestError(f"{exp.name}: a pod plan with no run of the pod's own")
     env = {
         "TRAINBENCH_EXPERIMENT": exp.name,
-        # The first run, for the single-config entry point. The full ordered plan
-        # travels beside it so a sweep pod knows every setting it owns.
-        "TRAINBENCH_CONFIG_JSON": json.dumps(runs[0].config),
+        # The pod's OWN first run, never the baseline. The baseline names its own
+        # model and framework, so handing it to the single-config entry point makes
+        # the pod measure a different combination than the one it is filed under.
+        # The full ordered plan travels beside it, each entry carrying a resolved
+        # config, so a sweep pod can execute every setting it owns without Hydra.
+        "TRAINBENCH_CONFIG_JSON": json.dumps(own[0].config),
         "TRAINBENCH_PLAN_JSON": json.dumps([r.summary() for r in runs]),
         "TRAINBENCH_PURPOSE": exp.purpose,
         "TRAINBENCH_RESULT_REPO": args.result_repo,
@@ -421,7 +476,25 @@ def assert_pod_scope_is_safe(token: str, project_id: str) -> set[str]:
 
 
 def pod_timeout_seconds(args: argparse.Namespace) -> int:
-    return max(SELF_KILL_MARGIN_SECONDS, args.timeout_minutes * 60 - SELF_KILL_MARGIN_SECONDS)
+    """The pod's own deadline, always strictly inside the orchestrator's.
+
+    The margin is a ceiling, not a fixed subtraction. Subtracting a constant and
+    then flooring it inverted the relationship on short deadlines —
+    `--timeout-minutes 1` gave the pod 120s against the orchestrator's 60s, so the
+    watcher gave up first and the pod it was meant to outlive kept billing. On a
+    short deadline the margin shrinks with it instead.
+    """
+    total = args.timeout_minutes * 60
+    margin = min(SELF_KILL_MARGIN_SECONDS, total // 2)
+    return max(1, total - margin)
+
+
+def positive_minutes(raw: str) -> int:
+    """A deadline of zero or less is a pod with no deadline, which bills until noticed."""
+    minutes = int(raw)
+    if minutes < 1:
+        raise argparse.ArgumentTypeError("must be at least 1 minute")
+    return minutes
 
 
 def default_project_id() -> str:
@@ -450,7 +523,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--infisical-env", default="dev")
     parser.add_argument("--infisical-project-id", default=default_project_id())
     parser.add_argument("--max-concurrent", type=int, default=6)
-    parser.add_argument("--timeout-minutes", type=int, default=60)
+    parser.add_argument("--timeout-minutes", type=positive_minutes, default=60)
     parser.add_argument("--dry-run", action="store_true", help="print the plan, launch nothing")
     parser.add_argument(
         "--allow-dirty",
