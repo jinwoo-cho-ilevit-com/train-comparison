@@ -1,0 +1,18 @@
+# Phase 2 pod: the GradCache axis on Qwen3.5-0.8B.
+#
+# Both settings run here, on one host. Public claims about GradCache overhead
+# disagree by an order of magnitude (20% against 2~2.4x), and splitting the two
+# settings across pods would fold host differences into exactly that gap.
+phase: phase2
+description: MNRL against cached MNRL (GradCache) on Qwen3.5-0.8B
+model: qwen3_5_0_8b
+framework: native
+run: timing
+gpu_type_id: NVIDIA B200
+baseline: canonical
+axis: loss
+settings:
+  mnrl:
+    - loss=mnrl
+  cached_mnrl:
+    - loss=cached_mnrl

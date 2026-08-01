@@ -1,0 +1,34 @@
+# The canonical baseline runs, defined once for the whole campaign.
+#
+# PLAN.md's multi-pod rule 3: every measuring pod runs one identical setting so
+# that host-to-host variance is measured instead of assumed, and a pod deviating
+# by more than 3% is thrown out rather than averaged in.
+#
+# It lives in one file because a baseline copied into every manifest drifts, and a
+# baseline that differs per pod says nothing about the pods. Every axis is pinned
+# explicitly rather than inherited from `configs/config.yaml`: a baseline that
+# moves when a default moves is not a baseline.
+#
+# Nothing here mentions the pod's own model or framework. The baseline is a fixed
+# reference workload, so the same one runs on the gemma-4 pod and the Qwen3-VL pod.
+
+canonical:
+  description: >
+    Smallest model, no optimisation on any axis. Cheap enough to repeat on every
+    pod and sensitive to host CPU and memory bandwidth, which is what it is for.
+  overrides:
+    - run=timing
+    - model=qwen3_5_0_8b
+    - framework=native
+    - data=speed
+    - attn=sdpa
+    - kernel=none
+    - precision=bf16
+    - compile=none
+    - optim=adamw_fused
+    - loss=mnrl
+    - peft=full
+    - freeze=none
+    - dataloader=torch
+    - parallel=single
+    - train=default
