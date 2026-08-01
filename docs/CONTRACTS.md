@@ -20,7 +20,7 @@ Wave 0을 순차 구간으로 둔 이유가 이것이다.
 | C 오케스트레이션 | `wt-orch` | `trainbench/pods.py`, `scripts/{orchestrate,publish_result,report}.py`, `configs/experiment/`, `configs/run/`, `docker/entrypoint.sh`, `docs/evidence/`, `tests/test_pods.py` |
 | D 축구현 | `wt-axes` | `trainbench/axes.py`, `trainbench/applied.py`의 `_CAPTURES`·`_REQUESTED_OVERRIDES`·capture 함수들, `configs/{attn,kernel,precision,compile,optim,freeze,dataloader,parallel,peft,loss}/`, `configs/train/`, `tests/test_axes.py` |
 | E 문서 | `wt-docs` | `PLAN.md`, `README.md`, `AGENTS.md`, `CLAUDE.md`, `docs/methodology.md`, `docs/support-matrix.md`, `docs/model-spec.md` |
-| F 이미지 | `wt-images` | `envs/*/`(pyproject + lock), `docker/Dockerfile.*`, `.github/workflows/`, `pyproject.toml`, 루트 `uv.lock`, `.pre-commit-config.yaml` |
+| F 이미지 | `wt-images` | `envs/*/`(pyproject + lock), `docker/Dockerfile.*`, `.github/workflows/`, `pyproject.toml`, 루트 `uv.lock`, `.pre-commit-config.yaml`, `.gitignore` |
 
 **공유(수정 금지)**: `trainbench/config_schema.py`, `trainbench/config.py`,
 `trainbench/compose.py`, `trainbench/record.py`, `trainbench/probe/types.py`,
@@ -287,6 +287,14 @@ infisical run --env=dev -- uv run python scripts/audit_plan.py
 ```
 
 `audit_plan.py`는 **회귀 추적기**다. 완료 기준이 아니다.
+
+**빈 입력은 통과가 아니라 실패다.** 집합을 순회하는 체크는 그 집합이 비면 실패한다.
+Wave 1 착수 직후 세 레인이 동시에 발견한 것이 이 형태였다 — `.gitignore`의 앵커 없는
+`data/`가 `configs/data/`를 삼켜 한 번도 커밋된 적이 없었고, `data-pinned`가
+"every data config pins a commit sha"로 통과했다. config가 0개라서 참이었다. 동시에
+깨끗한 clone에서는 Hydra 합성이 불가능해 Wave 0 게이트가 재현되지 않았다.
+`tests/test_audit.py::test_a_check_with_nothing_to_examine_fails`가 5개 체크 전부를
+고정한다.
 
 - `docs/audit-baseline.json`의 알려진 실패는 `KNOWN`으로 통과시킨다. 각 항목에 해소
   wave가 적혀 있어 baseline이 변명이 아니라 일정표가 된다

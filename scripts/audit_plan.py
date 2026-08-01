@@ -113,6 +113,20 @@ def _reads_dotted(code: str, group: str, key: str) -> bool:
     return any(re.search(p, code) for p in (attribute, subscript, getattr_call))
 
 
+def _nothing_to_check(items, what: str) -> str | None:
+    """Why an empty input set is a failure rather than a pass.
+
+    `data-pinned` reported "every data config pins a commit sha" when
+    `configs/data/` was absent, because zero configs all pin one. The item was in
+    the baseline, so passing marked it FIXED and blocked the gate — which is the
+    only reason anyone noticed. Every check that iterates a set has this shape,
+    so each one says what it expected to find.
+    """
+    if items:
+        return None
+    return f"found no {what}; a check with nothing to examine passes for the wrong reason"
+
+
 # Leaves the schema turns into something else before any code sees them. The
 # scan skips config_schema.py, so the derivation is invisible to it and the
 # source leaf would read as unconsumed. Kept explicit and small: each entry is a
@@ -132,6 +146,9 @@ def config_fields_are_read_by_code() -> Result:
     prints, and is recorded in the result JSON while changing nothing. Eight of
     twelve ablation axes were in exactly that state.
     """
+    leaves = _config_leaf_keys()
+    if empty := _nothing_to_check(leaves, "config groups under configs/"):
+        return Result("config-consumed", False, empty)
     code = _code_text(exclude=NOT_A_CONSUMER)
 
     def consumed(group: str, key: str) -> bool:
@@ -142,7 +159,7 @@ def config_fields_are_read_by_code() -> Result:
 
     orphans = [
         f"{group}.{key}"
-        for group, keys in sorted(_config_leaf_keys().items())
+        for group, keys in sorted(leaves.items())
         for key in sorted(keys)
         if not consumed(group, key)
     ]
@@ -252,10 +269,11 @@ def axis_group_leaves_are_classified() -> Result:
     from trainbench.config_schema import axis_knobs
 
     marked = set(axis_knobs())
+    leaves = {g: k for g, k in _config_leaf_keys().items() if g in AXIS_GROUPS}
+    if empty := _nothing_to_check(leaves, f"config files in any of {sorted(AXIS_GROUPS)}"):
+        return Result("axis-fields", False, empty)
     problems = []
-    for group, keys in sorted(_config_leaf_keys().items()):
-        if group not in AXIS_GROUPS:
-            continue
+    for group, keys in sorted(leaves.items()):
         for key in sorted(keys):
             leaf = f"{group}.{key}"
             if leaf not in marked and leaf not in NOT_AN_AXIS:
@@ -467,7 +485,10 @@ def axes_have_their_packages() -> Result:
     a pass: silence is how `optim/muon` sat here needing an implementation that
     no environment had.
     """
-    locks = {p: p.read_text() for p in [REPO / "uv.lock", *(REPO / "envs").glob("*/uv.lock")]}
+    found = [p for p in [REPO / "uv.lock", *(REPO / "envs").glob("*/uv.lock")] if p.exists()]
+    if empty := _nothing_to_check(found, "uv.lock files"):
+        return Result("axis-packages", False, empty)
+    locks = {p: p.read_text() for p in found}
     problems = []
     for path in sorted(CONFIGS.rglob("*.yaml")):
         group = path.parent.name
@@ -544,8 +565,11 @@ def measured_data_is_pinned() -> Result:
     """
     from trainbench.config_schema import COMMIT_SHA
 
+    configs = sorted((CONFIGS / "data").glob("*.yaml"))
+    if empty := _nothing_to_check(configs, "config files in configs/data/"):
+        return Result("data-pinned", False, empty)
     problems = []
-    for path in sorted((CONFIGS / "data").glob("*.yaml")):
+    for path in configs:
         revision = (yaml.safe_load(path.read_text()) or {}).get("revision")
         if revision in (None, "null", ""):
             problems.append(f"{path.name} has no pinned revision")
@@ -593,6 +617,8 @@ def model_spec_matches_config() -> Result:
     configs = {
         p.stem: yaml.safe_load(p.read_text()) or {} for p in (CONFIGS / "model").glob("*.yaml")
     }
+    if empty := _nothing_to_check(spec and configs, "models in both the spec and configs/model/"):
+        return Result("model-spec", False, empty)
     problems = model_spec_problems(spec, configs)
     return Result(
         "model-spec",

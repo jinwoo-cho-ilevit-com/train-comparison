@@ -10,6 +10,7 @@ placeholder.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -170,6 +171,38 @@ def test_model_spec_notices_a_missing_field():
     assert model_spec_problems(spec, {"m": {}}) == [
         "m.padding_side is specified but absent from the config"
     ]
+
+
+# Checks that answer a question about a set of files. Each one reported success
+# when its set was empty: `configs/data/` was matched by an unanchored `data/` in
+# .gitignore and had never been committed, so `data-pinned` announced that every
+# data config pins a commit sha — of which there were none.
+SET_CHECKS = ("config-consumed", "axis-fields", "axis-packages", "data-pinned", "model-spec")
+
+
+@pytest.mark.parametrize("name", SET_CHECKS)
+def test_a_check_with_nothing_to_examine_fails(name, monkeypatch, tmp_path):
+    """Vacuous truth is not evidence. A check that goes green when the thing it
+    inspects disappears is worse than no check: it certifies the absence."""
+    monkeypatch.setattr(audit_plan, "CONFIGS", tmp_path / "configs")
+    monkeypatch.setattr(audit_plan, "REPO", tmp_path)
+
+    result = audit_plan.CHECKS[name]()
+
+    # The property is the verdict, not the wording: `model-spec` reports its
+    # missing spec file first, which is the same refusal for a nearer reason.
+    assert not result.ok, f"{name} certified an empty repository"
+
+
+def test_the_data_config_group_is_committed():
+    """It was ignored and untracked for the whole of Wave 0, so the gate only
+    passed on the one checkout that happened to have the files locally. A clean
+    clone could not compose a run at all."""
+    tracked = subprocess.run(
+        ["git", "ls-files", "configs/data"], cwd=REPO, capture_output=True, text=True
+    ).stdout.split()
+
+    assert [Path(p).name for p in tracked] == ["quality.yaml", "speed.yaml"]
 
 
 @pytest.mark.parametrize("name", sorted(audit_plan.CHECKS))

@@ -1,0 +1,9 @@
+repo_id: jinwoo-cho/mmeb-subset
+revision: null
+source_repo: MrZilinXiao/MMEB_train_with_image
+subset_rows: 65536
+sample_seed: 1234
+limit: null
+max_seq_len: 2048
+num_workers: 8
+push_subset: false

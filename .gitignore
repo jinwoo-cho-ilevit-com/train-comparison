@@ -14,9 +14,15 @@ multirun/
 runs/
 trackio_data/
 
-# Model weights and datasets are pulled to pod-local disk at runtime, never committed
-data/
-models/
+# Model weights and datasets are pulled to pod-local disk at runtime, never committed.
+# Anchored to the repository root: an unanchored `data/` matches at any depth and
+# swallowed configs/data/, which meant the data config group was never committed
+# and no clean clone could compose a run.
+/data/
+/models/
 
 # Agent session state, not project content
 .omc/
+# Parallel lane working copies. Ephemeral, and without this every lane's lint and
+# test run walks into the other lanes' in-progress code.
+.claude/worktrees/
