@@ -2132,13 +2132,8 @@ def test_an_image_column_under_another_name_is_still_refused(composed):
     The row's `picture` is `None`, so a reading that fell through to the rows would
     find no image and let the run start.
 
-    `Image` here stands in for `datasets.Image`, the feature type a Hub dataset
-    declares for an image column, because the documented test environment (`uv sync
-    --extra compose`, which `audit_plan.py::doc-commands` checks) does not install
-    `datasets` — and a test that runs only where an undocumented extra happens to be
-    present is a test a clean clone skips. What that costs is stated rather than
-    hidden: this pins the reading, not the fact that `datasets` names that type
-    `Image`. That fact is recorded where the reading is, in `axes.image_columns`.
+    `Image` here stands in for `datasets.Image`, so this pins the reading and not
+    the name it reads for. The test below pins the name against the real type.
     """
 
     class Image:
@@ -2149,6 +2144,26 @@ def test_an_image_column_under_another_name_is_still_refused(composed):
 
     with pytest.raises(axes.UnappliedAxis, match="picture"):
         axes.assemble(plain_model(), cached(composed), CPU, framework="native", dataset=declared)
+
+
+def test_the_feature_type_that_reading_depends_on_is_still_called_image():
+    """`axes.image_columns` decides by comparing a type name to the literal
+    "Image", so the reading above is correct only while `datasets` keeps calling
+    it that. Nothing else holds that name down — the test above defines its own
+    class named `Image` and asserts the string against itself.
+
+    What a rename would cost: both pinned subsets are MMEB draws that carry
+    images, so they would read as text-only, `_gradcache_needs_splittable_data`
+    would stop refusing, and `loss=cached_mnrl` would reach batches it cannot
+    split by rows. `datasets` is imported here rather than stood in for because
+    the documented setup installs it (`uv sync --extra compose --extra native`).
+    """
+    from datasets import Image, Value
+
+    declared = SubsetRows([{"qry": "a", "qry_image": None}])
+    declared.features = {"qry": Value("string"), "qry_image": Image()}
+
+    assert axes.image_columns(declared) == ["qry_image"]
 
 
 def test_gradcache_is_refused_when_nothing_says_the_rows_can_be_split(composed):

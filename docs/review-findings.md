@@ -322,3 +322,34 @@ dataloader 축의 의미가 함께 바뀐다(제보가 지적한 그대로). 대
 교훈은 D8과 같은 것의 재발이다: **숫자가 좋아졌을 때 왜 좋아졌는지를 그 축의 코드에서
 확인하지 않으면, 체크의 결함과 코드의 개선을 구분할 수 없다.** 이번에는 감사 레인이
 그 실수를 했다.
+
+### D12 후속 — `datasets` import 제거는 이제 불필요하고, 대가가 있다 (2026-08-02)
+
+새 `doc-commands`가 지목한 3건에 **두 레인이 독립적으로 각각 대응했고, 하나면 충분했다.**
+
+- 레인 E: `README.md:22` / `AGENTS.md:15`를 `uv sync --extra compose --extra native`로 고침.
+  실측하면 이 명령이 `datasets==5.0.1`, `peft==0.20.0`, `transformers==5.14.1`을 전부 설치한다.
+- loss 레인: `tests/test_axes.py`에서 `from datasets import Image, Value`를 지우고 로컬
+  stand-in 클래스로 대체.
+
+E의 수정이 들어간 뒤에는 두 번째가 필요 없다. loss 레인이 남긴 근거("문서화된 설정이
+설치하지 않으므로 clean clone이 수집조차 못 한다")는 **현재 거짓**이다.
+
+**대가가 구체적이다.** `axes.image_columns`는 선언된 피처를 볼 때
+`type(features.get(column)).__name__ == "Image"` — 서드파티 클래스 이름과의 문자열 비교 — 로
+판정한다. 실측:
+
+```
+audit fixture (name path):    ['qry_image']     # IMAGE_COLUMNS 이름 경로
+real dataset (feature path):  ['qry_image']     # type(...).__name__ == "Image"
+if upstream renamed Image:    []                # <-- 텍스트 전용으로 읽힌다
+```
+
+upstream이 그 클래스를 renaming하면 실제 서브셋이 **텍스트 전용으로 읽히고**,
+`_gradcache_needs_splittable_data`가 거부를 멈추며, `loss/cached_mnrl`이 applicable로
+보고된 뒤 런이 스텝 1에서 죽는다 — D13이 방금 닫은 바로 그 구멍이 다시 열린다.
+그 문자열을 고정하던 유일한 테스트가 자기 자신을 상대로 단언하는 stand-in으로 바뀌었다.
+
+`axis-values`는 영향이 없다. 감사 fixture는 `features`를 선언하지 않아 이름 경로를 타므로
+이 문자열에 의존하지 않는다. 실제 런의 경로만 무방비다. 복원 여부는 그 파일의 소유
+레인(loss/D)이 정한다 — 이제 문서화된 명령이 `datasets`를 설치하므로 복원에 걸림돌이 없다.
