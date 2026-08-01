@@ -341,13 +341,23 @@ flash-attn은 `code=sm_XX`만 내보내고 PTX를 넣지 않으므로 JIT으로 
 목록 밖 GPU는 `no kernel image is available for execution on the device`로 죽는다.
 느린 fallback으로 떨어져 잘못된 숫자를 내는 부류의 위험이 아니다.
 
-**그래도 시작 시점 차단은 만들지 못했다.** 이미지에 `TRAINBENCH_CUDA_ARCHS`를
-넣어 컨테이너 안에서 목록을 읽을 수 있게 해뒀지만, **읽는 쪽이 없다.** pod 진입점인
-`docker/entrypoint.sh`는 F 레인 소유가 아니다(`docs/CONTRACTS.md` §1에서 G 소유).
-필요한 검사는 "`nvidia-smi`의 compute capability가 `TRAINBENCH_CUDA_ARCHS`에 없으면
-run을 시작하기 전에 중단"이며, **G 레인 작업으로 남는다.** 그때까지 방어선은 위의
-하드 실패와, run 기록의 `host.gpu`(`docs/CONTRACTS.md` §272~275)로 사후에 드러나는 것
-둘뿐이다.
+**시작 시점 차단이 붙었다 (2026-08-02, G 레인).** 이미지가 넣은
+`TRAINBENCH_CUDA_ARCHS`를 `scripts/bench.py`의 프리플라이트가 읽고,
+`docker/entrypoint.sh`가 첫 setting 전에 그것을 부른다. 목록 밖 GPU면 측정 없이
+종료한다 — `docs/methodology.md` §7.
+
+읽는 값은 `nvidia-smi`가 아니라 `torch.cuda.get_device_capability()`다. 파싱할 텍스트
+출력이 없고, 변환 규칙이 두 벌 생기지 않기 때문이다: torch 자신이
+`_get_cuda_arch_flags()`에서 capability를 `f"{major}{minor}"`로 만들어
+`-gencode=arch=compute_XX,code=sm_XX`를 짓고(`torch/utils/cpp_extension.py`, torch
+2.13.0), 위 표의 arch 목록이 바로 그 표기다 — transformer-engine 기본값에 `89`가
+들어 있는 것이 그 증거다(Ada = capability 8.9).
+
+`TRAINBENCH_CUDA_ARCHS`가 **없는 이미지는 거부한다.** 이 파일이 그 변수를 넣은
+`ENV`는 프레임워크와 무관하게 `docker/Dockerfile.framework`에 있고, 그 검사를 부르는
+`docker/entrypoint.sh`를 이미지에 넣는 것도 같은 파일이다. 즉 검사를 갖고 변수를 갖지
+않는 이미지는 이 저장소가 만들 수 없는 상태이며, 그런 이미지가 나타났다면 커버 범위를
+알 수 없는 이미지다. 비어 있으면 통과시키는 쪽이 이 저장소가 열 번 낸 실패다.
 
 ### axolotl 실패 원인 — 베이스 이미지의 시스템 의존성 누락
 
@@ -660,8 +670,10 @@ editable로 참조하는 최소 프로젝트를 만들고 그 소스 디렉터�
 - **`MAX_JOBS=2`가 causal-conv1d를 얼마나 늦추는지 측정하지 않았다.** ninja 기본
   병렬도에서 내려오므로 느려지는 방향인 것은 확실하고, 23.6분이 얼마가 되는지는
   돌려봐야 안다. `timeout-minutes: 330`이 그 상한이다
-- **arch 불일치 차단은 만들지 못했다.** `TRAINBENCH_CUDA_ARCHS`를 읽는 코드가 없다
-  (위 "좁힌 결정과 그 대가")
+- ~~**arch 불일치 차단은 만들지 못했다.**~~ 해소됨 (2026-08-02, G 레인):
+  프리플라이트가 `TRAINBENCH_CUDA_ARCHS`를 읽고 목록 밖 GPU면 측정 전에 종료한다
+  (위 "좁힌 결정과 그 대가"). **실제 GPU에서는 아직 안 돌았다** — 검사는 CPU
+  호스트에서 capability를 주입해 양방향으로 고정돼 있고, 첫 파드가 실물 판정이다
 
 ### 레인 게이트 (2026-08-02)
 

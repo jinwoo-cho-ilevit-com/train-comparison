@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import io
 import json
 import pickle
 import subprocess
@@ -1409,3 +1410,159 @@ def test_report_renders_the_refusal_as_a_reason_and_not_as_a_measurement(
     assert "Transformer Engine recipe" in document
     assert "which is not implemented" in document
     assert "지표 없음" in document
+
+
+# --- the preflight: the whole plan, before the first setting ----------------------
+
+
+@pytest.fixture
+def pod_gpu(monkeypatch):
+    """A pod on an A100 with an image that says which GPUs it covers.
+
+    Both halves are stubbed for a reason a CPU host cannot avoid: there is no GPU
+    to read a capability from, and no Docker ENV to carry the arch list. The
+    stubbing is at the seam the pod uses — `current_gpu_arch` reads
+    `torch.cuda.get_device_capability`, the variable is read from the environment —
+    so a test about the plan is never also a test about the hardware.
+    """
+    monkeypatch.setenv(bench_entry.CUDA_ARCHS_ENV, "80;90;100")
+    monkeypatch.setattr(bench_entry, "current_gpu_arch", lambda: "80")
+
+
+def plan_file(tmp_path, items):
+    path = tmp_path / "resolved_plan.json"
+    path.write_text(json.dumps(items))
+    return path
+
+
+def plan_item(name, config):
+    """A plan item as `orchestrate.Run.summary()` writes one."""
+    return {"name": name, "role": "experiment", "overrides": [], "config": config}
+
+
+def test_a_plan_whose_settings_can_all_be_applied_passes(tmp_path, config_mapping, pod_gpu):  # noqa: F811
+    config = bench(config_mapping).model_dump(mode="json")
+    path = plan_file(tmp_path, [plan_item("a", config), plan_item("b", config)])
+    assert bench_entry.preflight(path) == 0
+
+
+def test_one_unapplicable_setting_refuses_the_whole_plan(tmp_path, config_mapping, pod_gpu):  # noqa: F811
+    """`kernels_hub` is refused on every host: transformers turns hub kernels on in
+    two places, neither of which is this call site (`axes._patch_kernels_hub`)."""
+    good = bench(config_mapping).model_dump(mode="json")
+    bad = bench(config_mapping, **{"kernel.name": "kernels_hub"}).model_dump(mode="json")
+    path = plan_file(tmp_path, [plan_item("a", good), plan_item("b", bad)])
+    assert bench_entry.preflight(path) == bench_entry.PREFLIGHT_EXIT
+
+
+def test_an_empty_plan_is_a_refusal_and_not_a_clean_bill(tmp_path, pod_gpu):
+    """Zero settings checked is the state this exists to catch, not the state it
+    reports as fine (docs/CONTRACTS.md §6: an empty input is a failure)."""
+    assert bench_entry.preflight(plan_file(tmp_path, [])) == bench_entry.PREFLIGHT_EXIT
+
+
+def test_a_plan_with_nothing_composable_in_it_is_a_refusal(tmp_path, pod_gpu):
+    path = plan_file(tmp_path, [{"name": "a"}, {"name": "b", "config": {}}])
+    assert bench_entry.preflight(path) == bench_entry.PREFLIGHT_EXIT
+
+
+def test_a_plan_that_cannot_be_read_is_a_refusal(tmp_path, pod_gpu):
+    assert bench_entry.preflight(tmp_path / "absent.json") == bench_entry.PREFLIGHT_EXIT
+    unparseable = tmp_path / "plan.json"
+    unparseable.write_text("{ not json")
+    assert bench_entry.preflight(unparseable) == bench_entry.PREFLIGHT_EXIT
+
+
+def test_one_malformed_item_does_not_take_the_settings_beside_it_down(
+    tmp_path,
+    config_mapping,  # noqa: F811
+    pod_gpu,
+):
+    """`docker/entrypoint.sh` stops that setting alone and publishes a record naming
+    it; refusing the pod here would overturn that from the other side."""
+    config = bench(config_mapping).model_dump(mode="json")
+    path = plan_file(tmp_path, [plan_item("a", config), {"name": "b"}])
+    assert bench_entry.preflight(path) == 0
+
+
+# --- the preflight: is this pod's GPU one the image compiled kernels for ---------
+
+
+@pytest.mark.parametrize(
+    ("capability", "arch"),
+    [((8, 0), "80"), ((9, 0), "90"), ((10, 0), "100"), ((8, 9), "89"), ((12, 0), "120")],
+)
+def test_a_capability_is_spelled_the_way_every_arch_list_spells_it(capability, arch):
+    """torch builds its own `-gencode` this way (`_get_cuda_arch_flags`): the
+    capability becomes `f'{major}.{minor}'` and then `num = f"{major}{minor}"`.
+    `89` is why the reading is unambiguous — Ada is capability 8.9."""
+    assert bench_entry.device_arch(capability) == arch
+
+
+@pytest.mark.parametrize(
+    ("declared", "archs"),
+    [
+        ("80;90;100", ["80", "90", "100"]),
+        (" 80 ; 90 ", ["80", "90"]),
+        ("80,90", ["80", "90"]),
+        # Architecture-specific SASS is still that device's arch, not a fourth kind
+        # of number. Nothing in the image uses one today.
+        ("90a;100", ["90", "100"]),
+        ("", []),
+        (None, []),
+    ],
+)
+def test_the_images_arch_list_is_read_the_way_the_dockerfile_writes_it(declared, archs):
+    assert bench_entry.declared_archs(declared) == archs
+
+
+def test_a_gpu_the_image_compiled_for_is_not_refused():
+    assert bench_entry.gpu_refusal("80;90;100", "80") is None
+    assert bench_entry.gpu_refusal("80;90;100", "100") is None
+
+
+def test_a_gpu_outside_the_images_arch_list_is_refused():
+    reason = bench_entry.gpu_refusal("80;90;100", "120")
+    assert "sm_120" in reason and "sm_80/sm_90/sm_100" in reason
+
+
+def test_an_image_that_declares_no_archs_is_refused_rather_than_assumed():
+    """The absence is not evidence that the image is wide. `Dockerfile.framework`
+    sets this variable in the same file that copies the entrypoint which calls
+    this, so an image with the check and without the variable is not a state this
+    repository builds — and passing on nothing to compare against would pass
+    exactly the pods the check exists for."""
+    assert bench_entry.CUDA_ARCHS_ENV in bench_entry.gpu_refusal(None, "80")
+    assert bench_entry.CUDA_ARCHS_ENV in bench_entry.gpu_refusal("", "80")
+
+
+def test_a_pod_booted_to_measure_with_no_visible_gpu_is_refused():
+    assert "no CUDA device is visible" in bench_entry.gpu_refusal("80;90;100", None)
+
+
+def test_the_arch_check_reads_the_current_device_and_names_none(monkeypatch):
+    """No device string is constructed, so this is not a second device resolver
+    beside `trainbench/device.py` — and with no CUDA there is nothing to read."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert bench_entry.current_gpu_arch() is None
+
+
+def test_a_runnable_plan_on_the_wrong_gpu_measures_nothing(tmp_path, config_mapping, monkeypatch):  # noqa: F811
+    monkeypatch.setenv(bench_entry.CUDA_ARCHS_ENV, "80;90;100")
+    monkeypatch.setattr(bench_entry, "current_gpu_arch", lambda: "120")
+    config = bench(config_mapping).model_dump(mode="json")
+    path = plan_file(tmp_path, [plan_item("a", config)])
+    assert bench_entry.preflight(path) == bench_entry.PREFLIGHT_EXIT
+
+
+def test_a_pod_wrong_in_both_ways_is_told_both(tmp_path, config_mapping, monkeypatch):  # noqa: F811
+    """One pod log naming the GPU and the setting is worth more than two relaunches."""
+    monkeypatch.setenv(bench_entry.CUDA_ARCHS_ENV, "80;90;100")
+    monkeypatch.setattr(bench_entry, "current_gpu_arch", lambda: "120")
+    bad = bench(config_mapping, **{"kernel.name": "kernels_hub"}).model_dump(mode="json")
+    path = plan_file(tmp_path, [plan_item("a", bad)])
+    log = io.StringIO()
+    assert bench_entry.preflight(path, stream=log) == bench_entry.PREFLIGHT_EXIT
+    printed = log.getvalue()
+    assert "this pod's GPU" in printed
+    assert "kernels_hub" in printed

@@ -29,6 +29,8 @@ pod and the reason stayed in a log nobody reads afterwards.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 import sys
 from collections.abc import Iterable, Iterator
@@ -40,7 +42,7 @@ import torch
 
 from trainbench import axes, metrics
 from trainbench.applied import AppliedMismatch, AppliedState, assert_matches, capture
-from trainbench.config import load_bench_config
+from trainbench.config import load_bench_config, to_bench_config
 from trainbench.config_schema import BenchConfig, axis_knobs
 from trainbench.device import get_device
 from trainbench.embedding import align_padding_side, packed_last_token_pool
@@ -54,6 +56,19 @@ from trainbench.seed import set_seed
 # 127. The pod log is the only place an exit code is read, and "refused" and
 # "crashed" are different findings there.
 REFUSED_EXIT = 3
+
+# Exit code for a plan whose settings cannot all run. Distinct from REFUSED_EXIT
+# because they are different findings: that one is a setting that was attempted
+# and declined, this one is a pod that measured nothing at all, and the pod log is
+# where both are read.
+PREFLIGHT_EXIT = 4
+
+# The GPUs this image's compiled kernels cover, written into the image by
+# `docker/Dockerfile.framework` beside the `FLASH_ATTN_CUDA_ARCHS` /
+# `NVTE_CUDA_ARCHS` it mirrors. flash-attn emits `code=sm_XX` and no PTX, so a pod
+# on a GPU outside the list fails with "no kernel image is available for execution
+# on the device" — after the model is loaded and the first kernel launches.
+CUDA_ARCHS_ENV = "TRAINBENCH_CUDA_ARCHS"
 
 # `status` prefix on a refusal record. Not `no_result`: that value belongs to
 # `publish_result.fallback_record` and means no result file existed, which is the
@@ -946,11 +961,211 @@ def build_run(config: BenchConfig, device: torch.device) -> tuple[Any, list[str]
     return built, applied, state
 
 
+def device_arch(capability: tuple[int, int]) -> str:
+    """`(8, 0)` -> `"80"`. The one place this project spells a capability as an arch.
+
+    Not a convention chosen here. torch builds its own `-gencode` flags this way —
+    `capability = torch.cuda.get_device_capability(i)` becomes
+    `arch = f'{major}.{minor}'`, then `num = f"{major}{minor}"` and
+    `-gencode=arch=compute_{num},code=sm_{num}` (`torch/utils/cpp_extension.py`,
+    `_get_cuda_arch_flags`, torch 2.13.0). The arch lists in
+    `docker/Dockerfile.framework` are in that same spelling, which is why
+    transformer-engine's own default can contain `89`: Ada is capability 8.9, and
+    no other reading of that number exists.
+
+    Concatenation rather than `major * 10 + minor`, to stay identical to the line
+    above rather than merely equal to it for the capabilities that exist today.
+    """
+    major, minor = capability
+    return f"{major}{minor}"
+
+
+def declared_archs(value: str | None) -> list[str]:
+    """The image's arch list, as `Dockerfile.framework` writes it: `80;90;100`.
+
+    A trailing letter is dropped — `90a` is architecture-specific SASS for
+    capability 9.0, so it is that device's arch and not a fourth kind of number.
+    Nothing in the current image uses one; the alternative is that such an entry
+    silently matches no GPU at all.
+    """
+    if not value:
+        return []
+    archs = []
+    for entry in value.replace(",", ";").split(";"):
+        digits = "".join(ch for ch in entry.strip() if ch.isdigit())
+        if digits:
+            archs.append(digits)
+    return archs
+
+
+def current_gpu_arch() -> str | None:
+    """The arch of the GPU this process would run on, or None if there is no GPU.
+
+    Reads the current device rather than naming one: no device string is
+    constructed here, so this is not a second device resolver beside
+    `trainbench/device.py` (AGENTS.md).
+    """
+    if not torch.cuda.is_available():
+        return None
+    return device_arch(torch.cuda.get_device_capability())
+
+
+def gpu_refusal(declared: str | None, arch: str | None) -> str | None:
+    """Why this pod's GPU cannot run this image's kernels, or None if it can.
+
+    **An image that declares nothing is refused.**
+    `docker/Dockerfile.framework` sets `TRAINBENCH_CUDA_ARCHS` unconditionally,
+    for every framework, in the same file that copies `docker/entrypoint.sh` — the
+    only thing that calls this. So an image carrying this check and not the
+    variable is not a state this repository can build; it is an image from before
+    the narrowing, or one whose env was overridden, and in either case what its
+    kernels cover is unknown. Passing on "nothing to compare against" is the shape
+    this repository has shipped ten times, and here it would pass exactly the pods
+    the check exists for. The cost of being wrong is one loud relaunch with the
+    variable set; the cost the other way is a pod that dies after loading a model.
+
+    A pod with no visible GPU is refused for the same reason and not the same one:
+    the plan reached here only through the timing/profile/quality branch, so this
+    pod was booted to measure on a GPU, and it has none.
+    """
+    archs = declared_archs(declared)
+    if not archs:
+        return (
+            f"{CUDA_ARCHS_ENV} is not set, so this image does not say which GPUs its "
+            "kernels were compiled for. Every image built by "
+            "docker/Dockerfile.framework sets it; an image without it is older than "
+            "that or had its environment overridden, and flash-attn ships no PTX to "
+            "fall back on."
+        )
+    if arch is None:
+        return (
+            f"no CUDA device is visible, but this pod was launched to measure on one "
+            f"(the image compiled kernels for sm_{'/sm_'.join(archs)})."
+        )
+    if arch not in archs:
+        return (
+            f"this GPU is sm_{arch} and the image compiled kernels for "
+            f"sm_{'/sm_'.join(archs)} only. flash-attn emits code=sm_XX with no PTX, "
+            "so the run would die with 'no kernel image is available for execution on "
+            "the device' once the first kernel launched."
+        )
+    return None
+
+
+def preflight(plan_path: Path, stream: Any = None) -> int:
+    """Put every setting of this pod's plan through the refusals, before any of them run.
+
+    The pod is the only place this question can be answered. Whether `axes.patch`
+    accepts a setting depends on what the image contains — fla, causal-conv1d, a
+    CUDA runtime — and the audit host has none of them, so the same check run on a
+    laptop inverts: it rejects the `kernel=fla` baseline that every pod is about to
+    run correctly and passes the `kernel=none` setting that dies on a Qwen3.5
+    image. That measurement is why this is not a gate in `scripts/audit_plan.py`.
+
+    `bench.py` already refuses a setting at `axes.patch`, so what this adds is
+    *when*. A sweep learns about its second setting only after the first has
+    finished, and a pod whose whole plan is unrunnable finds that out after it has
+    booted a B200, pulled an image and downloaded a checkpoint. This costs seconds
+    and it costs them before the model exists.
+
+    Only the three call sites that need no model can run here — `patch`,
+    `load_kwargs`, `step_context`. `assemble` and `assert_matches` are what
+    `main` does per setting, and nothing here replaces them: a plan that passes
+    preflight can still be refused for what the built model turns out to be.
+
+    An empty plan is a refusal, and so is a plan with nothing composable in it. A
+    pod that measures nothing is the failure this exists to catch, and reading zero
+    settings as "none refused" would make the check quietest exactly where it has
+    seen the least.
+
+    A plan item carrying no resolved config is reported and *not* counted against
+    the plan. It is a malformed plan rather than an axis this image cannot apply,
+    `docker/entrypoint.sh` already stops that setting alone and publishes a record
+    naming it, and taking the pod down over it here would silently overturn that —
+    the rest of the axis is still worth the pod that was booted for it.
+
+    The GPU is checked too, and before the settings, because it is a property of
+    the pod rather than of any one of them (`gpu_refusal`). Both are reported even
+    when the first has already decided the answer: one pod log that names the wrong
+    GPU *and* the unrunnable setting is worth more than two relaunches.
+    """
+    # Resolved per call, not in the signature: a default argument binds the
+    # `sys.stdout` that existed at import, which is not the one a caller replacing
+    # it is reading.
+    stream = sys.stdout if stream is None else stream
+    try:
+        plan = json.loads(plan_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"preflight: cannot read the plan at {plan_path}: {exc}", file=stream)
+        return PREFLIGHT_EXIT
+    if not isinstance(plan, list) or not plan:
+        print(
+            f"preflight: {plan_path} carries no settings; this pod would measure nothing",
+            file=stream,
+        )
+        return PREFLIGHT_EXIT
+
+    arch = current_gpu_arch()
+    gpu = gpu_refusal(os.environ.get(CUDA_ARCHS_ENV), arch)
+    if gpu is None:
+        print(f"preflight: this pod's GPU is sm_{arch}, which the image covers OK", file=stream)
+
+    refused, checked = [], 0
+    for index, item in enumerate(plan):
+        name = (isinstance(item, dict) and item.get("name")) or f"setting-{index}"
+        resolved = item.get("config") if isinstance(item, dict) else None
+        if not isinstance(resolved, dict) or not resolved:
+            print(f"preflight: {name} carries no resolved config; not checked", file=stream)
+            continue
+        checked += 1
+        try:
+            config = to_bench_config(resolved)
+            axes.patch(config)
+            axes.load_kwargs(config)
+            with axes.step_context(config):
+                pass
+        except Exception as exc:  # noqa: BLE001 - anything that stops a setting stops the pod
+            refused.append(f"{name}: {type(exc).__name__}: {' '.join(str(exc).split())}")
+            continue
+        print(f"preflight: {name} OK", file=stream)
+    if gpu is not None:
+        print(f"preflight REFUSED this pod's GPU: {gpu}", file=stream)
+    for line in refused:
+        print(f"preflight REFUSED {line}", file=stream)
+    if refused or gpu is not None:
+        counted = f"{len(refused)} of the {checked} setting(s) it could compose"
+        cause = counted if refused else "this pod's GPU"
+        if refused and gpu is not None:
+            cause = f"{counted}, and this pod's GPU,"
+        print(f"preflight: {cause} cannot run in this image; nothing is measured", file=stream)
+        return PREFLIGHT_EXIT
+    if not checked:
+        print(
+            f"preflight: none of the {len(plan)} plan item(s) carried a config to check; "
+            "this pod would measure nothing",
+            file=stream,
+        )
+        return PREFLIGHT_EXIT
+    print(f"preflight: all {checked} setting(s) can run", file=stream)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True, type=Path, help="resolved config JSON")
-    parser.add_argument("--out", required=True, type=Path, help="where to write the result")
+    parser.add_argument("--config", type=Path, help="resolved config JSON")
+    parser.add_argument("--out", type=Path, help="where to write the result")
+    parser.add_argument(
+        "--preflight",
+        type=Path,
+        metavar="PLAN",
+        help="check every setting of this plan and measure nothing",
+    )
     args = parser.parse_args(argv)
+
+    if args.preflight is not None:
+        return preflight(args.preflight)
+    if args.config is None or args.out is None:
+        parser.error("--config and --out are required unless --preflight is given")
 
     config = load_bench_config(args.config)
     device = get_device(config.device)

@@ -136,6 +136,9 @@ pod이 다르면 물리 호스트가 다르다. host vCPU 수와 메모리 대�
 
 ### 미해소 위험 — canonical baseline이 `kernel=none`을 만족하지 못할 수 있다
 
+> **해소됨 (2026-08-02). 아래는 그 당시의 기록이고, 결론과 남은 작업은 §7에 있다.**
+> 시나리오는 사실로 확인됐고 선택지 2(“config가 선언하게 한다”)로 닫았다.
+
 **미검증. 이 레인에서 확인할 수단이 없다.** 축 검증 레인이 `kernel=none`이 6개 이미지
 전부에서 불만족이라고 보고했다. 사실이라면 그 영향이 떨어지는 곳은 baseline이다.
 
@@ -313,6 +316,82 @@ safetensors 헤더)으로 재서 채운다. **재기 전까지 비율을 인용�
    한정 조건이 된다
 
 ---
+
+## 7. 파드의 계획이 돌 수 있는지는 파드 안에서만 답할 수 있다 — 프리플라이트
+
+§4의 "미해소 위험"은 해소됐고, 답은 그 절이 적어둔 두 갈래 중 뒤쪽이었다.
+`_baselines.yaml`의 canonical과 `phase2-loss-qwen3_5_0_8b.yaml`이 이제 `kernel=fla`를
+명시한다 — Qwen3.5에서 fla는 `kernel` 축의 값이 아니라 이 아키텍처가 이 이미지들에서
+갖는 기본 동작이므로, config가 그것을 선언한다.
+
+남은 질문은 다르다: **어떤 매니페스트가 그 선언을 빠뜨렸을 때 누가 잡는가.**
+`phase2-loss-qwen3_5_0_8b.yaml`이 정확히 그 상태로 커밋돼 있었고, 두 setting 모두
+`axes.patch()`에서 거부되는 파드였다. 파드는 뜨고, 이미지를 받고, 체크포인트를 받고,
+아무것도 측정하지 않는다.
+
+### 이것은 감사 게이트가 될 수 없다 — 실측
+
+`scripts/audit_plan.py`에 넣으려던 시도가 실측으로 무산됐다. 27개 계획 런을 감사
+호스트에서 `axes.patch()`에 통과시키면 **답이 뒤집힌다**:
+
+| 환경 | 거부되는 런 |
+|---|---|
+| 파드 이미지 (fla·causal-conv1d·CUDA 있음) | 0 / 27 |
+| 감사 호스트 (셋 다 없음) | 5 / 27 — 전부 `kernel=fla`, 즉 **옳게 고친 쪽** |
+
+감사 호스트에는 fla가 없어 `axes._fla_binding()`이 거짓이 되고, 그러면
+`_environment_bound_kernel`이 빈 문자열을 돌려주므로 **실제로 죽는 `kernel=none`
+setting이 통과**한다. 랩톱에서 도는 검사는 옳은 config를 빨갛게, 죽는 config를
+초록으로 만든다. 이 질문의 답은 이미지의 내용물이고, 그것을 아는 것은 파드뿐이다.
+
+### 그래서 파드가 스스로 검사한다
+
+`docker/entrypoint.sh`가 첫 setting을 시작하기 전에 한 번,
+`scripts/bench.py --preflight <plan>`을 부른다. 계획의 모든 setting을
+`axes.patch` / `load_kwargs` / `step_context` — 모델 없이 답할 수 있는 세 호출
+지점 — 에 통과시키고, 하나라도 거부되면 **아무것도 측정하지 않고** 모든 setting을
+"측정 안 함 + 사유"로 발행한 뒤 끝난다.
+
+`bench.py`는 원래도 `axes.patch`에서 거부한다. 프리플라이트가 더하는 것은 **시점**이다:
+스윕은 두 번째 setting의 거부를 첫 번째가 끝난 뒤에야 알고, 계획 전체가 못 도는
+파드는 GPU를 띄우고 이미지를 받고 체크포인트를 받은 뒤에야 안다. 프리플라이트는
+파드 시간 몇 초다.
+
+### 같은 자리에서 GPU도 본다
+
+이미지 레인이 소스 빌드를 러너가 견디게 하려고 CUDA 아키텍처를 `80;90;100`
+(A100 / H200 / B200 — `PLAN.md`가 이름 붙인 셋)으로 좁혔고, 그 목록을
+`TRAINBENCH_CUDA_ARCHS`로 이미지에 넣었다. 목록 밖 GPU는 **조용히 느려지지 않는다** —
+flash-attn이 `code=sm_XX`만 내보내고 PTX를 넣지 않아 JIT으로 흘러갈 경로가 없고,
+`no kernel image is available for execution on the device`로 죽는다. 문제는 그 죽음이
+**모델을 적재하고 첫 커널을 띄운 뒤에** 온다는 것이다. 프리플라이트가 먼저 본다.
+
+**읽는 값은 `nvidia-smi`가 아니라 `torch.cuda.get_device_capability()`다.** 파싱할
+텍스트 출력이 없고 변환 규칙이 두 벌 생기지 않는다: torch 자신이
+`_get_cuda_arch_flags()`에서 capability를 `f"{major}{minor}"`로 만들어
+`-gencode=arch=compute_XX,code=sm_XX`를 짓고(`torch/utils/cpp_extension.py`,
+torch 2.13.0 설치본 확인), `Dockerfile.framework`의 arch 목록이 바로 그 표기다.
+transformer-engine 기본값에 `89`가 있는 것이 그 표기의 증거다 — Ada는 capability 8.9이고
+`8*10+9`로 읽든 `"8"+"9"`로 읽든 같은 자리를 가리키는 수는 이것뿐이다.
+
+**변수가 없는 이미지는 거부한다.** 그 `ENV`는 프레임워크와 무관하게
+`docker/Dockerfile.framework`에 있고, 이 검사를 부르는 `docker/entrypoint.sh`를
+이미지에 넣는 것도 같은 파일이다. 검사를 갖고 변수를 갖지 않는 이미지는 이 저장소가
+만들 수 없는 상태이고, 그런 것이 나타났다면 커버 범위를 알 수 없는 이미지다.
+틀렸을 때의 대가는 변수를 넣고 한 번 다시 띄우는 것이고, 반대 방향의 대가는 모델을
+적재한 뒤 죽는 파드다.
+
+**이 검사가 실제 GPU에서 돌아본 적은 없다.** 이 저장소를 개발하는 호스트에는 NVIDIA
+GPU도 `nvidia-smi`도 없다. 양방향(목록 안/밖, 변수 있음/없음, GPU 없음)은 capability를
+주입해 고정했고, 실물 판정은 첫 파드다.
+
+**이것이 증명하지 않는 것**: `assemble`과 `assert_matches`는 모델을 필요로 하므로
+프리플라이트에 없다. 통과한 계획도 빌드된 모델이 요청과 다르면 setting별로 거부된다.
+프리플라이트는 "이 이미지에서 이 축을 켤 수 있는가"만 답하고 "켜졌는가"는 답하지
+않는다 — 뒤쪽은 `applied.capture`의 질문이다.
+
+**이 검사는 이미지에 구워진다.** `entrypoint.sh`·`bench.py`·`trainbench/`를 고치면
+이미지를 다시 빌드해야 반영된다.
 
 ## 재현 조건 — 게이트 통과와 재현 가능은 다르다
 

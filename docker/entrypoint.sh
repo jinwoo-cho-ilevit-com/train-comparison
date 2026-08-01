@@ -181,6 +181,24 @@ elif [[ "${purpose}" == "timing" || "${purpose}" == "profile" || "${purpose}" ==
         run_status=2
     else
         run_status=0
+        # Every setting of the plan through the axis refusals before the first one
+        # measures anything. `bench.py` refuses a setting it cannot apply anyway,
+        # but only once that setting's turn comes: a pod whose whole plan is
+        # unrunnable would learn it after booting a GPU, pulling an image and
+        # downloading a checkpoint, and a sweep would learn about its second
+        # setting only after the first had finished. This costs seconds.
+        #
+        # It runs here rather than in a gate on the audit host because the answer
+        # is a property of the image — fla, causal-conv1d and a CUDA runtime are
+        # what decide it, and on a laptop the same check inverts (it rejects the
+        # `kernel=fla` baseline every pod runs correctly and passes the
+        # `kernel=none` setting that dies on a Qwen3.5 image).
+        #
+        # No secrets: it builds no model and reaches no network, so wrapping it in
+        # the Infisical call would only add a way for it to fail.
+        echo "-- preflight"
+        "${PYTHON[@]}" "${REPO_DIR}/scripts/bench.py" --preflight "${PLAN_PATH}"
+        preflight_status=$?
         for i in $(seq 0 $((settings - 1))); do
             setting_config=$(setting_config_path "${i}")
             setting_out=$(setting_result_path "${i}")
@@ -194,7 +212,16 @@ elif [[ "${purpose}" == "timing" || "${purpose}" == "profile" || "${purpose}" ==
                 label="setting-${i}"
             fi
             note="exit ${status}"
-            if (( status == 0 )); then
+            if (( preflight_status != 0 )); then
+                # Not measured, and every setting says so. Skipping the publish
+                # instead would leave the axis looking as though the pod was never
+                # launched, which is the one thing this file exists to prevent —
+                # and the plan is refused as a whole, so this holds for the
+                # settings that would have passed on their own too.
+                status=${preflight_status}
+                note="preflight refused this pod's plan (exit ${status}); nothing was measured"
+                echo "-- setting ${i} not started: ${note}" >&2
+            elif (( status == 0 )); then
                 # The deadline is the POD's, not each setting's. Handed to `timeout`
                 # whole once per setting, an N-setting sweep bills N times the budget
                 # and the guard whose entire purpose is bounding the bill stops

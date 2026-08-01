@@ -11,6 +11,17 @@ run: timing
 gpu_type_id: NVIDIA B200
 baseline: canonical
 axis: loss
+# Not part of the comparison, and not optional either. transformers binds fla
+# while it imports the Qwen3.5 modelling module whenever the package, the version
+# floor and CUDA are all present (`axes._fla_binding`), and every image in `envs/`
+# ships it — so on this architecture `kernel=none`, the default every run inherits
+# from `configs/config.yaml`, is a request nothing can satisfy, and `axes.patch()`
+# refuses it for a run that reports a number. Without this line neither setting on
+# this pod starts: the pod boots, bills, and measures nothing. The same reasoning
+# pins `kernel=fla` in `_baselines.yaml`; the other two phase-2 pods need no such
+# line because `axes.FLA_ARCHS` is `{qwen3_5}` alone.
+overrides:
+  - kernel=fla
 settings:
   mnrl:
     - loss=mnrl

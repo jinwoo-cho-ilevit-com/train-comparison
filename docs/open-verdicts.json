@@ -32,16 +32,20 @@
       "summary": "configs/experiment/phase2-loss-qwen3_5_0_8b.yaml이 kernel을 오버라이드하지 않아 기본값 none으로 떨어지고, qwen3_5 이미지에서는 transformers가 fla를 바인딩하므로 두 setting 모두 patch()에서 거부된다. 이 파드는 단 하나의 setting도 돌지 않는다.",
       "closes_when": {
         "criterion": "매니페스트의 overrides에 kernel=fla가 있고, 파드 이미지 환경에서 두 setting 모두 patch()를 통과할 것.",
-        "command": "uv run python /Users/jwcho/.claude/jobs/ac9d76bf/tmp/rev_kernel3/manifest_probe.py",
-        "expected": "setting=mnrl / setting=cached_mnrl 둘 다 patch() OK",
-        "observed": "setting=mnrl, setting=cached_mnrl 모두 REFUSED: kernel=none on arch=qwen3_5 (2026-08-02)"
+        "command": "infisical run --env=dev -- uv run --extra compose python $CLAUDE_JOB_DIR/tmp/blockers/manifest_patch_probe.py --as-pod",
+        "expected": "파드 이미지 환경에서 계획된 모든 런이 patch() 통과",
+        "observed": "planned 27 run(s), refused 0 (2026-08-02, --as-pod). 고치기 전 상태를 같은 환경에서 재현: setting=mnrl / cached_mnrl 둘 다 REFUSED (kernel=none on arch=qwen3_5)."
       },
       "anchor": {
         "kind": "text",
         "file": "configs/experiment/phase2-loss-qwen3_5_0_8b.yaml",
         "pattern": "kernel=fla"
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "C (오케스트레이션)",
+        "evidence": "고친 것 — `configs/experiment/phase2-loss-qwen3_5_0_8b.yaml`에 `overrides: [kernel=fla]` 한 줄. 다른 두 phase2 매니페스트(gemma4_e2b, qwen3_vl_emb_2b)는 고치지 않았고, 그것이 옳다: `axes.FLA_ARCHS`가 `{qwen3_5}` 하나뿐이라 `_environment_bound_kernel`이 두 아키텍처에서 빈 문자열을 돌려주고 `kernel=none`이 정직한 요청이다 — 실측으로 확인했다(configs/model/*.yaml의 arch: gemma4 / qwen3_vl).\n검증 — `closes_when.command`를 바꿨다. 원래 명령(`$CLAUDE_JOB_DIR/tmp/rev_kernel3/manifest_probe.py`)은 매니페스트를 읽지 않고 그 매니페스트가 만들어낼 override 목록을 리터럴로 박아두고 있어서, **파일을 어떻게 고쳐도 답이 바뀌지 않는다.** 새 프로브는 `orchestrate.load_experiments` + `plan_runs`로 실제 매니페스트를 읽고 27개 계획 런 전부를 `patch`/`load_kwargs`/`step_context`에 통과시킨다.\n실행 결과 (`--as-pod`: fla·causal_conv1d·CUDA를 이미지처럼 세운 환경) —\n    environment: cuda=True fla=True\n    planned 27 run(s), refused 0\n부수기 증거 — 같은 환경에서 이 한 줄만 인메모리로 제거하고 다시 계획하면(`$CLAUDE_JOB_DIR/tmp/blockers/drop_override.py`, 공유 트리는 건드리지 않음):\n    overrides after removal: []\n      baseline:canonical   kernel=fla   -> patch() OK\n      mnrl                 kernel=none  -> REFUSED: kernel=none on arch=qwen3_5: transformers binds fla while it imports the modelling module,\n      cached_mnrl          kernel=none  -> REFUSED: (같음)\n즉 판정서가 적은 '두 setting 모두 죽는다'가 그대로 재현되고, 그 줄 하나가 차이를 만든다.\n게이트 — `uv run pytest` 678 passed, `ruff check`/`format --check` 통과, `audit_plan.py` 10/13 (`config-groups`·`plan-files`·`axis-values` 모두 이전과 같은 값).\n실 API로 확인한 것과 코드 판독만 한 것 — 이 항목은 **전부 로컬 실행**이다. `patch()`가 진짜 파드 이미지에서 어떤 답을 내는지는 fla/CUDA를 스텁으로 세운 것이지 실제 이미지에서 잰 것이 아니다. 실제 이미지에서의 확인은 `gate-cannot-tell-whether-a-pods-settings-can-run`이 넣은 프리플라이트가 첫 파드에서 대신 답한다 — 거부가 하나라도 있으면 측정 없이 종료한다."
+      }
     },
     {
       "id": "gate-cannot-tell-whether-a-pods-settings-can-run",
@@ -52,16 +56,20 @@
       "summary": "매니페스트의 setting이 실제로 축을 켤 수 있는지 보는 검사가 어디에도 없다. audit_plan.py에 넣으려 했으나 실측으로 무산됐다: 감사 호스트에는 CUDA도 fla도 없어 patch()의 답이 파드와 반대로 나온다. 27개 계획 런을 patch()에 통과시키면 canonical baseline의 kernel=fla 3건이 '거부'로 나오고(호스트에 fla 부재 — 파드 이미지에는 전부 있다), 정작 죽는 kernel=none 2건은 통과한다(CUDA 부재 -> fla 바인딩 없음). 즉 랩톱에서 도는 검사는 옳은 config를 빨갛게, 죽는 config를 초록으로 만든다. 이 질문은 파드 이미지 안에서만 답할 수 있다.",
       "closes_when": {
         "criterion": "파드가 첫 측정을 시작하기 전에 자기 계획의 모든 setting을 compose + patch()에 통과시키고, 하나라도 거부되면 측정 없이 종료할 것. 감사 게이트가 아니라 이미지 안(entrypoint 또는 bench.py 프리플라이트)의 검사다.",
-        "command": "uv run python /Users/jwcho/.claude/jobs/ac9d76bf/tmp/probe_manifest.py",
-        "expected": "파드 이미지 환경에서 실행되어 27건 중 거부 0건",
-        "observed": "감사 호스트(cuda: False, fla 미설치)에서 baseline:canonical 3건이 kernel=fla로 거부, 문제의 phase2-loss setting 4건은 전부 통과 (2026-08-02)"
+        "command": "infisical run --env=dev -- uv run pytest tests/test_pods.py tests/test_smoke_cpu.py -q (프리플라이트 테스트 포함); 파드에서는 docker/entrypoint.sh가 첫 setting 전에 `scripts/bench.py --preflight <plan>`을 부른다",
+        "expected": "계획의 setting이 하나라도 거부되면 측정 없이 종료하고, 전부 통과하면 예전과 똑같이 측정한다",
+        "observed": "199 passed (test_pods 155 + test_smoke_cpu 44). 이미지 환경을 세운 파드 시뮬레이션에서 `preflight: all 3 setting(s) can run` 후 3개 setting 측정, fla/CUDA 없는 호스트에서는 `preflight REFUSED baseline:canonical` 후 측정 0건·`timeout` 호출 0건 (2026-08-02)"
       },
       "anchor": {
         "kind": "text",
         "file": "docs/methodology.md",
         "pattern": "프리플라이트"
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "C/G (파드 이미지 안의 프리플라이트)",
+        "evidence": "감사 게이트가 될 수 없다는 앞 레인의 실측을 먼저 재현했다. 매니페스트를 실제로 읽는 프로브로 27개 계획 런을 돌린 결과:\n    환경 = 파드 이미지 (--as-pod): planned 27 run(s), refused 0\n    환경 = 감사 호스트:            planned 27 run(s), refused 5\n                                   전부 `kernel=fla`, 즉 옳게 고친 쪽\n                                   (phase2-loss 3종의 baseline:canonical 포함)\n감사 호스트에는 fla가 없어 `_environment_bound_kernel`이 빈 문자열을 돌려주므로 **실제로 죽는 `kernel=none`은 통과한다.** 그래서 이 질문은 이미지 안에서만 답한다.\n고친 것 — (1) `scripts/bench.py`에 `--preflight <plan>`. 계획의 모든 항목을 `to_bench_config` -> `axes.patch` -> `load_kwargs` -> `step_context`에 통과시키고 하나라도 거부되면 `PREFLIGHT_EXIT=4`. 빈 계획도, 검사할 config가 하나도 없는 계획도 거부다(CONTRACTS §6). config가 없는 **개별** 항목은 거부가 아니라 '검사하지 않음'으로 보고한다 — entrypoint가 이미 그 setting 하나만 막고 기록을 발행하며, 여기서 파드를 통째로 죽이면 그 동작을 조용히 뒤집는다. (2) `docker/entrypoint.sh`가 첫 setting 전에 한 번 부르고, 거부되면 모든 setting을 '측정 안 함 + 사유'로 발행한 뒤 아무것도 실행하지 않는다. (3) `docs/methodology.md` §7이 위 표와 프리플라이트가 증명하지 않는 것(`assemble`/`assert_matches`는 모델이 필요하므로 빠져 있다)을 적는다.\n실행 결과 — 전체 `uv run pytest` 678 passed(659 -> 678, 추가 19개), `ruff check`/`format --check` 통과, `audit_plan.py` 10/13 유지(`assert-called` PASS: bench.py가 다섯 호출을 그대로 한다).\n부수기 증거 (공유 트리 밖의 사본 `$CLAUDE_JOB_DIR/tmp/blockers/tree`에서 파일 변이) — 기준 199 passed.\n  MUT-P1 `preflight`가 항상 0을 돌려줌 -> 5 failed:\n    test_the_whole_plan_is_checked_before_the_first_setting_runs\n    test_a_plan_this_image_cannot_run_measures_nothing\n    test_one_unrunnable_setting_stops_the_settings_that_would_have_run\n    test_one_unapplicable_setting_refuses_the_whole_plan\n    test_a_plan_with_nothing_composable_in_it_is_a_refusal\n  MUT-P2 entrypoint가 프리플라이트를 아예 부르지 않음 -> 3 failed (위 앞 세 개)\n  MUT-P3 프리플라이트가 첫 setting만 검사 -> 3 failed (계획 마지막 setting이 못 도는 경우를 놓친다)\n  변이를 되돌리면 199 passed로 복귀.\nentrypoint 테스트가 스텁 bench를 쓰지만 **프리플라이트만은 실물을 부른다** — FAKE_BENCH가 `--preflight`를 받으면 저장소의 진짜 `scripts/bench.py`를 파일 경로로 로드해 `preflight()`를 실행한다. 검사 자체를 스텁으로 두면 '계획이 못 돈다'를 검사하는 코드의 두 번째 구현을 검사하는 꼴이 된다.\n실 API로 확인한 것과 코드 판독만 한 것 — 이 항목에 실 API는 없다. 파드 이미지 환경은 fla/causal_conv1d/CUDA를 세운 시뮬레이션이고, 진짜 이미지에서 `patch()`가 무엇을 하는지는 첫 파드가 이 프리플라이트로 직접 답한다.\n**이미지 재빌드 필요**: `docker/entrypoint.sh`와 `scripts/bench.py`가 둘 다 이미지에 구워진다(`docker/Dockerfile.framework`가 `COPY scripts`, `COPY docker/entrypoint.sh`). 지금 도는 빌드에는 이 변경이 없다.\n덧 (2026-08-02, 같은 레인) — 이미지 레인이 `ed5b323`에서 CUDA arch를 `80;90;100`으로 좁히고 `TRAINBENCH_CUDA_ARCHS`를 이미지에 넣었으나 읽는 쪽이 없었다. 같은 프리플라이트에 GPU 검사를 얹었다: 파드의 compute capability가 그 목록에 없으면 측정 없이 종료한다. 이후 게이트 `uv run pytest` **699 passed**(678 -> 699), `audit_plan.py` 10/13 유지. 부수기 4건 전부 이름 붙은 테스트로 죽었다(가드 무력화 -> 6 failed, 변수 부재를 통과로 -> 2 failed, capability의 minor 무시 -> `[capability3-89]`, arch 문자열 파싱 제거 -> `[90a;100]`). **실제 GPU에서는 안 돌았다** — 이 호스트에 NVIDIA GPU도 nvidia-smi도 없어 capability를 주입해 고정했고, `nvidia-smi` 출력 형식을 실측하지 못했으므로 값은 `torch.cuda.get_device_capability()`에서 읽는다(변환 규칙은 torch의 `_get_cuda_arch_flags` 소스에서 확인)."
+      }
     },
     {
       "id": "kernel-liger-on-qwen3_5-dies-far-from-its-cause",
@@ -463,9 +471,9 @@
       "summary": "trainbench/pods.py::observe가 runtime의 존재만 보고 running을 반환한다. 컨테이너가 17초마다 40번 재시작하는 10분 내내 observe()는 계속 running을 돌려줬고, orchestrate는 오지 않을 결과를 데드라인(3600초)까지 기다린다. 감시자도 사람도 '정상'으로 읽는다. 파드 1대가 한 시간을 태울 뻔했고, 이번에는 로그를 직접 읽어서야 드러났다.",
       "closes_when": {
         "criterion": "observe가 재시작 반복을 running과 구별하고, orchestrate가 그 상태에서 기다리지 않을 것. RunPod가 재시작 횟수를 어디에 노출하는지 먼저 실측으로 확인해야 한다 — 추측으로 필드를 고르면 이 저장소가 반복해 온 '검사 대상이 실제 대상이 아니다'가 된다.",
-        "command": "크래시루프 상태의 파드에 pods.observe()를 호출",
+        "command": "infisical run --env=dev -- uv run pytest tests/test_pods.py -q (anchor 테스트 포함), 그리고 RunPod 실 API 필드 조사",
         "expected": "running이 아닌 별도 상태",
-        "observed": "RUNNING/running (10분간, 재시작 40회, 2026-08-02)"
+        "observed": "restarting (pods.RESTARTING). 크래시루프 파드는 REASON_RESTARTED로 감시가 끝나고, 건강한 런은 여전히 running으로 읽힌다 — 양방향 모두 테스트로 고정 (2026-08-02)"
       },
       "anchor": {
         "kind": "test",
@@ -474,7 +482,11 @@
           "test_a_restarting_container_is_not_read_as_a_healthy_run"
         ]
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "C (오케스트레이션)",
+        "evidence": "먼저 실측 — RunPod가 재시작 횟수를 **어디에도 내주지 않는다**는 것을 실계정에 대고 확인했다(읽기 전용 조회만, 파드 생성 없음, 2026-08-02).\n  (1) REST: `rest.runpod.io/v1/openapi.json`의 `Pod` 스키마 32개 속성에 재시작 관련 필드가 없다(있는 것은 `desiredStatus`/`lastStartedAt`/`lastStatusChange`). 실제 `GET /pods` 50건의 키 합집합도 같다.\n  (2) GraphQL: introspection이 막혀 있어(`introspection is not allowed by Apollo Server`) 후보 이름을 하나씩 물어 서버가 `Cannot query field \"X\" on type \"Pod\"`로 답하게 했다. `Pod`에 `restartCount`/`restarts`/`restartPolicy`/`podStatus`/`status`/`containerStatus`/`exitCode`/`lastExitCode` 전부 없음. `PodRuntime`에 `restartCount`/`restarts`/`exitCode`/`status` 전부 없음. 존재하는 것은 `uptimeInSeconds`/`container`/`gpus`/`ports`.\n  (3) `Pod.uptimeSeconds`는 존재하지만 실행 중인 파드를 포함해 50개 전부 0이다.\n  (4) 남는 것은 `runtime.uptimeInSeconds` 하나이고, 이것이 **컨테이너 시계**임을 실행 중인 파드 21대로 확인했다: `now - uptime`이 `createdAt`보다 15대는 10~140초 뒤(이미지 pull), 6대는 몇 시간~8.9일 뒤였고, 그동안 `lastStartedAt`은 50대 전부 `createdAt`과 같았다. 즉 API가 계속 RUNNING이라고 말하는 파드 아래에서 이 필드만 리셋된다.\n고친 것 — `observe`가 `Reading(status, uptime_seconds)`를 돌려주고 `previous_uptime`을 받는다. 시계가 `UPTIME_JITTER_SECONDS`(1초, 필드가 정수 초라 복제본 간 반올림 차이의 크기) 넘게 떨어지면 `RESTARTING`이고, `PodWatch`가 그 상태에서 감시를 끝내며 `REASON_RESTARTED`로 기록한다. `orchestrate`는 결과가 나오면 곧바로 terminate하므로 별도 변경이 없다. 재시작을 한 번도 봐주지 않는 이유는 entrypoint가 파드의 계획을 처음부터 다시 돌리기 때문이다 — 두 번째 컨테이너는 이미 발행한 setting을 다시 발행하고 다시 과금한다.\n실행 결과 — `infisical run --env=dev -- uv run pytest tests/test_pods.py -q`: 155 passed. 전체 `uv run pytest`: 678 passed.\n부수기 증거 (양방향, 인메모리 pytest 플러그인 `$CLAUDE_JOB_DIR/tmp/blockers/mut_pods.py`가 `pods.restarted`만 갈아끼운다) —\n  MUT=off(이 변경 전의 동작: 아무것도 재시작이 아님) -> 5 failed:\n    test_a_restarting_container_is_not_read_as_a_healthy_run\n    test_a_crashloop_ends_the_watch_instead_of_billing_to_the_deadline\n    test_a_second_of_wobble_in_the_container_clock_is_not_a_restart\n    test_a_restart_behind_a_failed_call_is_still_a_restart\n    test_the_outcome_says_how_long_the_container_that_ended_it_had_lived\n  MUT=always(가드를 반대로 무디게: 전부 재시작) -> 12 failed, 그중 건강한 런 쪽이 실제로 물린다:\n    test_a_long_healthy_run_is_never_called_a_crashloop\n    test_a_runtime_that_blinks_does_not_terminate_a_running_pod\n    test_a_pod_survives_a_transient_api_failure_and_still_completes\n    test_a_runtime_with_no_readable_clock_still_reads_as_running[4개 파라미터]\n  MUT=nojitter(1초 허용을 제거) -> 1 failed: test_a_second_of_wobble_in_the_container_clock_is_not_a_restart\n즉 크래시루프 쪽만 고정한 것이 아니라 '정상 실행은 여전히 running'도 고정돼 있다.\n실 API로 확인한 것과 코드 판독만 한 것 — 필드의 **존재/부재와 의미**는 실 API 실측이다(위 (1)~(4)). 실측하지 못한 것: 크래시루프 중인 파드에 대고 실제로 `observe()`를 부르지 못했다. 문제의 카나리 파드는 이미 사라졌고 파드를 새로 만들지 말라는 지시가 있어, 크래시루프 상태는 관측된 필드 의미 위에서 스텁으로 재현했다. 따라서 남는 미확인 한 가지는 **컨테이너가 정상 종료(exit 0)한 뒤에도 RunPod이 재시작하는가**이다 — 그렇다면 성공한 파드도 `restarted`로 감시가 끝난다. 어느 쪽이든 데드라인까지 기다리는 것보다는 낫고, 어느 쪽인지는 `PodOutcome.uptime_seconds`가 원장에 남으므로 첫 캠페인에서 바로 읽힌다(17초짜리 컨테이너와 40분짜리 컨테이너가 구별된다)."
+      }
     },
     {
       "id": "loss-empty-pixel-slice-on-a-real-checkpoint-is-unverified",

@@ -24,6 +24,27 @@ terminating stay on the `runpod` SDK's GraphQL calls. Neither half is a preferen
   GraphQL `get_pod` returned a non-null runtime for a RUNNING pod and a null one
   for an EXITED pod. Moving `get` to REST would make every pod read as pending
   forever.
+
+A restarting container is a third thing, and neither transport counts restarts.
+Measured 2026-08-02 against the live account, because guessing the field is how
+this repository has repeatedly ended up checking something other than the thing:
+
+- REST publishes its `Pod` schema at `rest.runpod.io/v1/openapi.json`. It carries
+  `desiredStatus`, `lastStartedAt` and `lastStatusChange`, and no restart count.
+- GraphQL blocks introspection, so the candidates were probed one at a time and
+  the server answered `Cannot query field "X" on type "Pod"`. `restartCount`,
+  `restarts`, `restartPolicy`, `podStatus`, `status`, `containerStatus`,
+  `exitCode` and `lastExitCode` do not exist on `Pod`; `restartCount`,
+  `restarts`, `exitCode` and `status` do not exist on `PodRuntime`.
+- `Pod.uptimeSeconds` exists and was 0 on all 50 pods, running ones included.
+
+What is left is `runtime.uptimeInSeconds`, and it is a *container* clock rather
+than a rental clock. Over the 21 running pods in the account, `now - uptime`
+landed 10-140s after `createdAt` for fifteen of them — the image pull — and
+hours to 8.9 days after it for six, while `lastStartedAt` equalled `createdAt`
+for every single pod. So the field resets under a pod that the rest of the API
+describes as continuously up, and that reset is the only restart this API will
+ever report. `observe` reads it; nothing else can.
 """
 
 from __future__ import annotations
@@ -62,9 +83,18 @@ CONFIRMATIONS_REQUIRED = 2
 # One observation of a pod.
 PENDING = "pending"  # created, no runtime yet (provisioning or pulling the image)
 RUNNING = "running"  # runtime present
+RESTARTING = "restarting"  # runtime present, but not the container the last reading saw
 EXITED = "exited"  # RunPod says the container will not run again
 GONE = "gone"  # the API no longer knows this pod
 UNKNOWN = "unknown"  # the API call itself failed; nothing was learned
+
+# How far `runtime.uptimeInSeconds` may fall between two readings and still be the
+# same container. The field is whole seconds derived from a start timestamp, so
+# two API replicas rounding `now - startedAt` differently can put one second
+# between them; a restart puts the entire life of the dead container between them.
+# Anything in between is not a case this has evidence for, and the cost of the two
+# mistakes is not symmetric — see REASON_RESTARTED.
+UPTIME_JITTER_SECONDS = 1
 
 # desiredStatus values that mean the container will not come back.
 TERMINAL_DESIRED_STATUS = frozenset({"TERMINATED", "EXITED"})
@@ -75,6 +105,13 @@ REASON_EXITED = "exited"
 REASON_STOPPED = "stopped"  # runtime went from present to absent
 REASON_GONE = "gone"
 REASON_TIMEOUT = "timeout"
+# The container was replaced by another one. Not tolerated even once, and the
+# reason is the entrypoint rather than the platform: it runs the pod's whole plan
+# from the top, so a second container repeats settings the first already published
+# and bills for them again. Waiting to see whether the next container fares better
+# is what cost the first A100 canary ten minutes of a pod that restarted forty
+# times while every reading said `running`.
+REASON_RESTARTED = "restarted"
 
 
 @dataclass(frozen=True)
@@ -227,8 +264,61 @@ def terminate(pod_id: str) -> None:
     _client().terminate_pod(pod_id)
 
 
-def observe(pod_id: str, get_pod: Callable[[str], dict[str, Any] | None] = get) -> str:
-    """One reading of a pod, with no memory of earlier readings.
+@dataclass(frozen=True)
+class Reading:
+    """One observation: the pod's state, and the clock that dates its container.
+
+    The uptime travels with the status because it is the input to the *next*
+    reading's restart test and it costs an API call to fetch. A caller that kept
+    only the status would have to ask again to learn what it already had.
+
+    `uptime_seconds` is None whenever the reading did not come with a readable
+    container clock — a pending pod, a failed call, or a runtime whose shape the
+    API changed. None never reads as a restart: an absence is not evidence, and
+    the alternative is terminating live pods over a field that moved.
+    """
+
+    status: str
+    uptime_seconds: int | None = None
+
+
+def container_uptime(runtime: Any) -> int | None:
+    """Seconds the current container has been up, or None if it cannot be read.
+
+    Tolerant on purpose. Before restarts were detected at all, any non-null
+    runtime read as `running` whatever its shape, and a stricter reading here
+    would turn a payload change into `unknown` for every pod at once.
+    """
+    if not isinstance(runtime, dict):
+        return None
+    uptime = runtime.get("uptimeInSeconds")
+    return uptime if isinstance(uptime, int) and not isinstance(uptime, bool) else None
+
+
+def restarted(previous: int | None, current: int | None) -> bool:
+    """Whether these two container clocks belong to two different containers.
+
+    A container's uptime only ever climbs while it lives, so a fall is a new
+    container — the single fact this API offers about restarts, the module
+    docstring records how that was established.
+    """
+    if previous is None or current is None:
+        return False
+    return previous - current > UPTIME_JITTER_SECONDS
+
+
+def observe(
+    pod_id: str,
+    get_pod: Callable[[str], dict[str, Any] | None] = get,
+    previous_uptime: int | None = None,
+) -> Reading:
+    """One reading of a pod, judged against the previous reading's container clock.
+
+    `previous_uptime` is the only memory here, and it is the caller's: a crashloop
+    is a transition, exactly like completion, and a snapshot cannot name one. Left
+    out, this reads a container on its fortieth start as `running` — which is what
+    the first A100 canary did for ten minutes while the orchestrator waited on a
+    result that was never coming.
 
     A failed API call returns `unknown` rather than propagating: a transient 502
     from the control plane says nothing about the pod, and treating "we could not
@@ -244,12 +334,18 @@ def observe(pod_id: str, get_pod: Callable[[str], dict[str, Any] | None] = get) 
     try:
         pod = get_pod(pod_id)
         if pod is None:
-            return GONE
+            return Reading(GONE)
         if pod.get("desiredStatus") in TERMINAL_DESIRED_STATUS:
-            return EXITED
-        return RUNNING if pod.get("runtime") is not None else PENDING
+            return Reading(EXITED)
+        runtime = pod.get("runtime")
+        if runtime is None:
+            return Reading(PENDING)
+        uptime = container_uptime(runtime)
+        if restarted(previous_uptime, uptime):
+            return Reading(RESTARTING, uptime)
+        return Reading(RUNNING, uptime)
     except Exception:  # noqa: BLE001 - any transport or shape failure is the same non-answer
-        return UNKNOWN
+        return Reading(UNKNOWN)
 
 
 def is_finished(status: str, ever_ran: bool) -> bool:
@@ -264,7 +360,7 @@ def is_finished(status: str, ever_ran: bool) -> bool:
     Whether one reading is enough is `PodWatch.poll`'s question — see
     CONFIRMATIONS_REQUIRED.
     """
-    if status in (EXITED, GONE):
+    if status in (EXITED, GONE, RESTARTING):
         return True
     if status == PENDING:
         return ever_ran
@@ -277,8 +373,16 @@ def is_stated(status: str) -> bool:
     `EXITED` comes from `desiredStatus`: the control plane says the container will
     not run again. `GONE` and a vanished runtime are inferences from an absence,
     and an absence is exactly what a momentarily inconsistent read looks like.
+
+    `RESTARTING` is here for a different reason: it cannot be confirmed by a second
+    reading. The container that replaced the dead one is alive and its clock
+    climbs, so the poll after a restart reads `running` again — demanding
+    agreement would mean never acting on a slow crashloop at all, and on a fast one
+    only by accident. It is also not an absence: two present, climbing clocks that
+    disagree is a positive reading, and `UPTIME_JITTER_SECONDS` is what absorbs the
+    noise a second reading would have.
     """
-    return status == EXITED
+    return status in (EXITED, RESTARTING)
 
 
 @dataclass
@@ -290,6 +394,12 @@ class PodOutcome:
     status: str
     ever_ran: bool
     waited_seconds: float
+    # The container clock behind the last reading. In the ledger it separates the
+    # two pods that both end as `restarted`: one whose container lived seventeen
+    # seconds, and one that ran its plan for forty minutes and was bounced after.
+    # A null here says the API stopped reporting the clock, which is the state in
+    # which restarts cannot be seen at all.
+    uptime_seconds: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -298,6 +408,7 @@ class PodOutcome:
             "last_status": self.status,
             "ever_ran": self.ever_ran,
             "waited_seconds": round(self.waited_seconds, 1),
+            "uptime_seconds": self.uptime_seconds,
         }
 
 
@@ -309,6 +420,11 @@ class _Tracked:
     last_status: str = PENDING
     # Consecutive readings agreeing on an inferred terminal state.
     agreed: int = 0
+    # The container clock of the last reading that carried one. Kept across polls
+    # rather than per reading: it is what the next reading is compared against, and
+    # it survives a `pending` or `unknown` in between so that a restart hidden
+    # behind one failed call is still a fall when the next answer arrives.
+    last_uptime: int | None = None
 
 
 @dataclass
@@ -343,8 +459,11 @@ class PodWatch:
         """One sweep over every watched pod. Finished pods stop being watched."""
         outcomes = []
         for pod_id, state in list(self._tracked.items()):
-            status = observe(pod_id, self.get_pod)
-            if status == RUNNING:
+            reading = observe(pod_id, self.get_pod, state.last_uptime)
+            status = reading.status
+            if reading.uptime_seconds is not None:
+                state.last_uptime = reading.uptime_seconds
+            if status in (RUNNING, RESTARTING):
                 state.ever_ran = True
             finished = is_finished(status, state.ever_ran)
             if finished and not is_stated(status):
@@ -363,7 +482,11 @@ class PodWatch:
             now = self.clock()
             reason = None
             if finished:
-                reason = {EXITED: REASON_EXITED, GONE: REASON_GONE}.get(status, REASON_STOPPED)
+                reason = {
+                    EXITED: REASON_EXITED,
+                    GONE: REASON_GONE,
+                    RESTARTING: REASON_RESTARTED,
+                }.get(status, REASON_STOPPED)
             elif now >= state.deadline:
                 reason = REASON_TIMEOUT
             if reason is None:
@@ -375,6 +498,7 @@ class PodWatch:
                     status=status,
                     ever_ran=state.ever_ran,
                     waited_seconds=now - state.started,
+                    uptime_seconds=reading.uptime_seconds,
                 )
             )
             self.forget(pod_id)

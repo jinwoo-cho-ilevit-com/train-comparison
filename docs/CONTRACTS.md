@@ -739,6 +739,76 @@ class ProbeReport:
   §1의 "공유(수정 금지)", `docs/model-spec.md`는 레인 E 소유다. 필드 이름 변경은
   한 커밋에 다 들어가지 않으면 어느 쪽도 합성되지 않으므로 나눌 수 없다.
 
+- 2026-08-02 **파드가 첫 측정 전에 자기 계획을 검사한다 — `bench.py --preflight`**
+  (`scripts/bench.py`, `docker/entrypoint.sh`, 둘 다 레인 G 소유. 소유 파일이지만
+  **이미지 재빌드가 필요하고** 다른 레인의 fixture에 닿으므로 남긴다).
+  `configs/experiment/phase2-loss-qwen3_5_0_8b.yaml`이 `kernel`을 오버라이드하지 않아
+  두 setting 모두 `axes.patch()`에서 거부되는 파드가 매니페스트로 커밋돼 있었다.
+  이 질문을 `audit_plan.py`에 넣으려던 시도는 실측으로 무산됐다 — 27개 계획 런을
+  감사 호스트에서 통과시키면 `kernel=fla` 5건이 거부되고(호스트에 fla 부재) 실제로
+  죽는 `kernel=none`은 통과한다. **답이 이미지의 내용물이라 파드만 답할 수 있다.**
+  - `scripts/bench.py --preflight <plan>`: 계획의 모든 항목을 `to_bench_config` ->
+    `patch`/`load_kwargs`/`step_context`에 통과시키고 하나라도 거부되면
+    `PREFLIGHT_EXIT=4`. `--config`/`--out`은 이제 required가 아니며, 둘 다 없고
+    `--preflight`도 없으면 `parser.error`다. **`assemble`/`assert_matches`는 모델이
+    필요하므로 빠져 있다** — 통과한 계획도 setting별로 거부될 수 있다.
+  - `docker/entrypoint.sh`가 스윕 루프 전에 한 번 부른다. 거부되면 모든 setting이
+    `preflight refused ...` 사유와 함께 발행되고 `timeout`은 한 번도 호출되지 않는다.
+    개별 항목에 config가 없는 경우는 거부가 아니라 "검사하지 않음"이다 — 그 setting
+    하나만 막는 기존 동작(`test_a_plan_item_without_a_resolved_config_stops_only_that_setting`)을
+    뒤집지 않기 위해서다.
+  - **다른 레인이 알아야 할 것**: `tests/test_pods.py`의 `Sweep` 네임드튜플에
+    `preflight` 필드가 생겼고(`Sweep(proc, bench, preflight, uploads, calls)`),
+    `sweep_pod(..., pod_image=True)`가 기본이다. 스윕 테스트를 추가하는 레인은
+    `pod_image=False`가 곧 "fla도 CUDA도 없는 호스트"이며 canonical baseline이
+    거부된다는 뜻임을 알아야 한다. FAKE_BENCH는 `--preflight`를 스텁하지 않고
+    저장소의 진짜 `bench.py`를 로드해 실행한다.
+  - **같은 프리플라이트가 GPU도 본다** (2026-08-02, 이미지 레인 `ed5b323`의 인계).
+    그 커밋이 CUDA arch를 `80;90;100`으로 좁히고 `TRAINBENCH_CUDA_ARCHS`를 이미지에
+    넣었으나 읽는 쪽이 없었다. 이제 `bench.py`의 `gpu_refusal`이 읽는다.
+    - 값은 `nvidia-smi`가 아니라 `torch.cuda.get_device_capability()`에서 온다.
+      변환은 `device_arch()` **한 곳**이고 규칙은 torch에서 읽었다:
+      `_get_cuda_arch_flags()`가 capability를 `f"{major}{minor}"`로 만들어
+      `code=sm_XX`를 짓는다(`torch/utils/cpp_extension.py`, 2.13.0). 이 저장소를
+      개발하는 호스트에 NVIDIA GPU가 없어 `nvidia-smi`의 출력 형식은 **실측하지
+      못했고**, 그래서 쓰지 않았다.
+    - **변수가 없으면 거부한다(fail-closed).** 그 `ENV`와 이 검사를 부르는
+      `entrypoint.sh`를 이미지에 넣는 것이 같은 파일(`Dockerfile.framework`)이므로,
+      검사를 갖고 변수를 갖지 않는 이미지는 이 저장소가 만들 수 없다. 다른 프레임워크
+      이미지도 예외가 아니다 — `ENV`는 `ARG FRAMEWORK`와 무관하게 걸린다.
+    - **다른 레인이 알아야 할 것**: `sweep_pod`에 `gpu_arch="80"` /
+      `cuda_archs="80;90;100"` 인자가 생겼다. 스윕 테스트는 이제 GPU를 가진 파드를
+      기본으로 흉내 내고, `gpu_arch`를 바꾸면 목록 밖 GPU가 된다.
+      `tests/test_smoke_cpu.py`의 `pod_gpu` fixture가 단위 테스트 쪽 대응물이다.
+    - `docs/support-matrix.md`(레인 E 소유)의 "읽는 코드가 없다" 두 곳을 갱신했다.
+  - 근거와 한계는 `docs/methodology.md` §7(레인 E 소유 파일, 경계 침범).
+    같은 절에서 §4의 "미해소 위험"에 해소 표시를 달았다 — 그 절은 미검증이라고 적힌
+    채였고, 저장소는 이미 그 시나리오가 사실이라는 전제로 `_baselines.yaml`을
+    고친 상태였다.
+
+- 2026-08-02 **`pods.observe`가 문자열이 아니라 `Reading`을 돌려주고, 재시작을
+  판정한다** (`trainbench/pods.py`, 레인 C 소유. **원장 스키마가 넓어지므로** 남긴다).
+  첫 A100 카나리에서 컨테이너가 17초마다 40번 재시작하는 10분 내내 `observe()`가
+  `running`을 돌려줬고 `orchestrate`는 오지 않을 결과를 데드라인까지 기다렸다.
+  RunPod은 재시작 횟수를 **어디에도 내주지 않는다**(실계정 실측: REST `Pod` 스키마
+  32개 속성에 없음, GraphQL `Pod`/`PodRuntime`에 후보 이름 전부 부재,
+  `Pod.uptimeSeconds`는 50대 전부 0). 유일한 관측 가능한 것은
+  `runtime.uptimeInSeconds`이고, 실행 중인 21대로 그것이 **컨테이너 시계**임을
+  확인했다 — 자세한 수치는 `pods.py` 모듈 docstring.
+  - `observe(pod_id, get_pod, previous_uptime=None) -> Reading(status, uptime_seconds)`.
+    시계가 `UPTIME_JITTER_SECONDS`(1초) 넘게 떨어지면 새 상태 `RESTARTING`.
+  - `PodWatch`가 시계를 pod별로 들고 있고, 재시작 한 번에 감시가 끝난다
+    (`REASON_RESTARTED`). 봐주지 않는 이유는 entrypoint가 계획을 처음부터 다시 돌려
+    이미 발행한 setting을 다시 발행하고 다시 과금하기 때문이다.
+  - **원장 스키마**: `PodOutcome.to_dict()`에 `uptime_seconds`가 추가된다.
+    `scripts/orchestrate.py`가 `entries[...]["outcome"]`에 그대로 넣으므로 원장
+    JSON에 필드 하나가 는다. 17초짜리 컨테이너와 40분짜리 컨테이너를 구별하는 것이
+    이 필드의 용도다.
+  - **미확인으로 남는 것**: 컨테이너가 exit 0으로 정상 종료한 뒤에도 RunPod이
+    재시작하는지는 재지 못했다(카나리 파드는 사라졌고 새 파드를 만들지 않았다).
+    그렇다면 성공한 파드도 `restarted`로 감시가 끝나며, 어느 쪽이든 데드라인까지
+    기다리는 것보다 낫다. 첫 캠페인의 `uptime_seconds`가 바로 답한다.
+
 **새 레인 의무 — 파일을 추가하면 `PLAN.md` 구조 블록에 한 줄 추가한다.**
 위 반대 방향 때문에 생긴다. 열거되는 디렉터리(저장소 루트, `configs/`,
 `trainbench/`, `scripts/`, `tests/`, `docs/`)에 추적되는 파일이나 디렉터리를 새로

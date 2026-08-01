@@ -33,6 +33,11 @@ STOPPED = {"desiredStatus": "RUNNING", "runtime": None}
 DONE = {"desiredStatus": "EXITED", "runtime": None}
 
 
+def live(uptime):
+    """A running pod whose container has been up `uptime` seconds."""
+    return {"desiredStatus": "RUNNING", "runtime": {"uptimeInSeconds": uptime}}
+
+
 class FakeClock:
     def __init__(self):
         self.now = 0.0
@@ -68,7 +73,7 @@ def watcher(responses, clock=None, timeout=600):
 
 
 def test_a_pod_still_pulling_its_image_is_not_finished():
-    assert pods.observe("p", lambda _: PULLING) == pods.PENDING
+    assert pods.observe("p", lambda _: PULLING).status == pods.PENDING
     assert pods.is_finished(pods.PENDING, ever_ran=False) is False
 
 
@@ -77,12 +82,12 @@ def test_a_pod_whose_runtime_disappeared_is_finished():
 
 
 def test_an_exited_desired_status_is_finished_even_without_a_transition():
-    assert pods.observe("p", lambda _: DONE) == pods.EXITED
+    assert pods.observe("p", lambda _: DONE).status == pods.EXITED
     assert pods.is_finished(pods.EXITED, ever_ran=False) is True
 
 
 def test_a_pod_the_api_forgot_is_finished():
-    assert pods.observe("p", lambda _: None) == pods.GONE
+    assert pods.observe("p", lambda _: None).status == pods.GONE
     assert pods.is_finished(pods.GONE, ever_ran=False) is True
 
 
@@ -103,13 +108,13 @@ def test_an_api_error_is_an_unknown_sentinel_not_a_crash():
     def explode(_):
         raise RuntimeError("502 from the control plane")
 
-    assert pods.observe("p", explode) == pods.UNKNOWN
+    assert pods.observe("p", explode).status == pods.UNKNOWN
 
 
 @pytest.mark.parametrize("payload", [["not", "a", "mapping"], "RUNNING", 7])
 def test_a_payload_of_the_wrong_shape_is_a_non_answer_not_a_crash(payload):
     """It raised through poll into a main with no handler, killing a live sweep."""
-    assert pods.observe("p", lambda _: payload) == pods.UNKNOWN
+    assert pods.observe("p", lambda _: payload).status == pods.UNKNOWN
 
 
 def test_an_unparseable_reading_does_not_take_the_orchestrator_down_with_it():
@@ -169,6 +174,93 @@ def test_a_status_the_api_states_outright_needs_no_second_reading():
     watch = watcher({"p": [DONE]})
     watch.track("p")
     assert [o.reason for o in watch.poll()] == [pods.REASON_EXITED]
+
+
+# --- a container on its fortieth start is not a running pod --------------------
+#
+# The first A100 canary: the container restarted every 17 seconds for ten minutes
+# and every reading said `running`, so the orchestrator waited on a result that
+# was never coming and the pod billed until somebody read its log. RunPod counts
+# restarts nowhere — the measurement behind that is in `pods.py`'s module
+# docstring — so the only witness is the container clock falling.
+
+
+def test_a_restarting_container_is_not_read_as_a_healthy_run():
+    """Both directions: the crashloop stops reading as `running`, the run does not."""
+    crashed = pods.observe("p", lambda _: live(3), previous_uptime=170)
+    assert crashed.status == pods.RESTARTING
+    assert crashed.uptime_seconds == 3
+
+    healthy = pods.observe("p", lambda _: live(190), previous_uptime=170)
+    assert healthy.status == pods.RUNNING
+    assert healthy.uptime_seconds == 190
+
+    # And with nothing to compare against, a first reading is not an accusation.
+    assert pods.observe("p", lambda _: live(3)).status == pods.RUNNING
+
+
+def test_a_crashloop_ends_the_watch_instead_of_billing_to_the_deadline():
+    """The canary's shape: a 17s restart cycle read by a poll every 20 seconds."""
+    clock = FakeClock()
+    readings = iter([live((20 * k) % 17) for k in range(1, 40)])
+    watch = pods.PodWatch(
+        timeout_seconds=3600,
+        get_pod=lambda _: next(readings),
+        clock=clock,
+        sleep=clock.advance,
+        poll_seconds=20,
+    )
+    watch.track("p")
+    outcomes = watch.wait_for_any()
+    assert [o.reason for o in outcomes] == [pods.REASON_RESTARTED]
+    assert outcomes[0].status == pods.RESTARTING
+    assert outcomes[0].ever_ran is True
+    # Against the 3600s the pod would otherwise have been given.
+    assert outcomes[0].waited_seconds < 200
+    assert watch.watching == []
+
+
+def test_a_long_healthy_run_is_never_called_a_crashloop():
+    """The guard's other half: blunting it would pass the test above on its own."""
+    clock = FakeClock()
+    climbing = [live(u) for u in range(30, 3000, 20)]
+    watch = watcher({"p": [*climbing, STOPPED, STOPPED]}, clock=clock, timeout=100_000)
+    watch.track("p")
+    outcomes = watch.wait_for_any()
+    assert [o.reason for o in outcomes] == [pods.REASON_STOPPED]
+    assert outcomes[0].waited_seconds > 1000
+
+
+def test_a_second_of_wobble_in_the_container_clock_is_not_a_restart():
+    """Whole seconds off two replicas' `now - startedAt` can disagree by one."""
+    assert pods.observe("p", lambda _: live(199), previous_uptime=200).status == pods.RUNNING
+    assert pods.observe("p", lambda _: live(198), previous_uptime=200).status == pods.RESTARTING
+
+
+def test_a_restart_behind_a_failed_call_is_still_a_restart():
+    """The clock is remembered across readings that carry none, not reset by them."""
+    watch = watcher({"p": [live(300), RuntimeError("502"), live(4)]})
+    watch.track("p")
+    assert watch.poll() == []
+    assert watch.poll() == []
+    assert [o.reason for o in watch.poll()] == [pods.REASON_RESTARTED]
+
+
+@pytest.mark.parametrize("runtime", [{}, {"uptimeInSeconds": None}, {"uptimeInSeconds": "12"}, []])
+def test_a_runtime_with_no_readable_clock_still_reads_as_running(runtime):
+    """A payload change must not turn every pod into a crashloop, or into unknown."""
+    pod = {"desiredStatus": "RUNNING", "runtime": runtime}
+    reading = pods.observe("p", lambda _: pod, previous_uptime=900)
+    assert reading.status == pods.RUNNING
+    assert reading.uptime_seconds is None
+
+
+def test_the_outcome_says_how_long_the_container_that_ended_it_had_lived():
+    """`restarted` after 17 seconds and `restarted` after 40 minutes are not one datum."""
+    watch = watcher({"p": [live(2400), live(11)]})
+    watch.track("p")
+    watch.poll()
+    assert watch.poll()[0].to_dict()["uptime_seconds"] == 11
 
 
 # --- per-pod deadlines ---------------------------------------------------------
@@ -1604,6 +1696,7 @@ and writes a result only for a config it accepted.
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
@@ -1614,9 +1707,50 @@ sys.path.insert(0, "__REPO__")
 from trainbench.config_schema import BenchConfig
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--config", type=Path, required=True)
-parser.add_argument("--out", type=Path, required=True)
+parser.add_argument("--config", type=Path)
+parser.add_argument("--out", type=Path)
+parser.add_argument("--preflight", type=Path)
 args = parser.parse_args()
+
+# The preflight is not stubbed. It builds no model and needs no checkpoint, which
+# is the whole reason the real one can run here — and a stand-in would be a second
+# implementation of the check whose entire subject is that a plan cannot run.
+if args.preflight is not None:
+    with open(os.environ["FAKE_BENCH_LOG"], "a") as handle:
+        handle.write(json.dumps({"preflight": str(args.preflight)}) + "\\n")
+    spec = importlib.util.spec_from_file_location("real_bench", "__REPO__/scripts/bench.py")
+    real = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(real)
+    if os.environ.get("FAKE_POD_IMAGE"):
+        # What every framework image carries and no test host does. Without it the
+        # canonical baseline's `kernel=fla` is refused here and every sweep test
+        # would assert on a pod that never measured anything — which is the
+        # inversion that stopped this check being a gate on the audit host in the
+        # first place.
+        import importlib.metadata
+
+        import torch
+
+        from trainbench import axes
+
+        present = ("fla", "causal_conv1d")
+        real_find_spec, real_version = importlib.util.find_spec, importlib.metadata.version
+        importlib.util.find_spec = lambda n, *a, **k: (
+            object() if n in present else real_find_spec(n, *a, **k)
+        )
+        importlib.metadata.version = lambda d: (
+            "0.4.1" if d in axes.FLA_DISTRIBUTIONS else real_version(d)
+        )
+        torch.cuda.is_available = lambda: True
+        # The GPU itself, which no test host has. Only the hardware is stubbed —
+        # TRAINBENCH_CUDA_ARCHS reaches the preflight as an environment variable,
+        # which is exactly how docker/Dockerfile.framework delivers it.
+        fake_arch = os.environ.get("FAKE_GPU_ARCH", "")
+        real.current_gpu_arch = lambda: fake_arch or None
+    raise SystemExit(real.preflight(args.preflight))
+
+if args.config is None or args.out is None:
+    parser.error("--config and --out are required unless --preflight is given")
 
 payload = json.loads(args.config.read_text())
 entry = {"out": args.out.name, "config": payload, "error": None}
@@ -1662,7 +1796,7 @@ sys.path.insert(0, "__HUB__")
 runpy.run_path("__PUBLISH__", run_name="__main__")
 '''
 
-Sweep = namedtuple("Sweep", "proc bench uploads calls")
+Sweep = namedtuple("Sweep", "proc bench preflight uploads calls")
 
 RESULT_FILE = f"/{publish_result.RESULT_NAME}"
 
@@ -1708,7 +1842,18 @@ def deadlines_handed_out(sweep):
     return [int(line.split()[3]) for line in sweep.calls if line.startswith("timeout --signal=")]
 
 
-def sweep_pod(tmp_path, plan, purpose="timing", fail="", config=None, budget=None, floor=None):
+def sweep_pod(
+    tmp_path,
+    plan,
+    purpose="timing",
+    fail="",
+    config=None,
+    budget=None,
+    floor=None,
+    pod_image=True,
+    gpu_arch="80",
+    cuda_archs="80;90;100",
+):
     """Run the entrypoint over `plan` with a fake bench.py and a fake Hub.
 
     The image the pod would run in has neither, so both are supplied through the
@@ -1742,12 +1887,26 @@ def sweep_pod(tmp_path, plan, purpose="timing", fail="", config=None, budget=Non
         "FAKE_HUB_LOG": str(hub_log),
         "FAKE_BENCH_FAIL": fail,
     }
+    if pod_image:
+        env["FAKE_POD_IMAGE"] = "1"
+        env["FAKE_GPU_ARCH"] = gpu_arch
+    if cuda_archs is not None:
+        env["TRAINBENCH_CUDA_ARCHS"] = cuda_archs
     if budget is not None:
         env["TRAINBENCH_TIMEOUT_SECONDS"] = str(budget)
     if floor is not None:
         env["TRAINBENCH_MIN_SETTING_SECONDS"] = str(floor)
     proc, calls = run_entrypoint(tmp_path, env, forward=True)
-    return Sweep(proc, read_records(bench_log), read_records(hub_log), calls)
+    logged = read_records(bench_log)
+    # The preflight and the settings go through the same entry point and the same
+    # log; a caller asking about one of them should never have to sift the other out.
+    return Sweep(
+        proc,
+        [entry for entry in logged if "preflight" not in entry],
+        [entry for entry in logged if "preflight" in entry],
+        read_records(hub_log),
+        calls,
+    )
 
 
 def published_results(sweep):
@@ -1846,6 +2005,91 @@ def test_a_setting_the_budget_cannot_fit_is_not_started_and_says_so(tmp_path):
     for body in results.values():
         assert body["status"] == "no_result"
         assert "budget" in body["probe"]["checks"][0]["error"]
+
+
+# --- the preflight: can this pod's plan run at all -------------------------------
+#
+# `bench.py` refuses a setting it cannot apply, but only when that setting's turn
+# comes — after the pod has booted, pulled its image and downloaded a checkpoint,
+# and for a sweep only one setting at a time. A manifest that left `kernel` at its
+# default shipped a Qwen3.5 pod on which neither setting could run at all.
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_the_whole_plan_is_checked_before_the_first_setting_runs(tmp_path):
+    plan = sweep_plan()
+    sweep = sweep_pod(tmp_path, plan)
+    assert sweep.preflight == [{"preflight": str(tmp_path / "result" / "resolved_plan.json")}]
+    assert "preflight: all 3 setting(s) can run" in sweep.proc.stdout
+    # And having passed, it changed nothing about what the pod then did.
+    assert len(sweep.bench) == len(plan)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_plan_this_image_cannot_run_measures_nothing(tmp_path):
+    """`pod_image=False` is this test host: no fla, no CUDA, so the canonical
+    baseline's `kernel=fla` is refused — the same shape as the Qwen3.5 pod whose
+    `kernel=none` settings are refused inside the image."""
+    plan = sweep_plan()
+    sweep = sweep_pod(tmp_path, plan, pod_image=False)
+    assert sweep.preflight != []
+    # Nothing measured: no `timeout` was ever handed a slice of the pod's budget.
+    assert sweep.bench == []
+    assert deadlines_handed_out(sweep) == []
+    assert "preflight REFUSED baseline:canonical" in sweep.proc.stdout
+    # And every setting still reaches the results repo saying why.
+    results = published_results(sweep)
+    assert len(results) == len(plan)
+    for body in results.values():
+        assert body["status"] == "no_result"
+        assert "preflight refused" in body["probe"]["checks"][0]["error"]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_one_unrunnable_setting_stops_the_settings_that_would_have_run(tmp_path):
+    """The pod is refused whole. A sweep publishing only the settings that happened
+    to survive would report an axis measured against a baseline that never ran."""
+    plan = sweep_plan()
+    plan[-1]["config"]["kernel"]["name"] = "kernels_hub"
+    sweep = sweep_pod(tmp_path, plan)
+    assert sweep.bench == []
+    assert f"preflight REFUSED {plan[-1]['name']}" in sweep.proc.stdout
+    assert "preflight: baseline:canonical OK" in sweep.proc.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_pod_on_a_gpu_the_image_has_no_kernels_for_measures_nothing(tmp_path):
+    """The image compiles SASS for sm_80/90/100 and flash-attn ships no PTX, so a
+    pod elsewhere dies with "no kernel image is available" — after the model load.
+    sm_120 is a 5090: a GPU RunPod will happily rent that PLAN.md never names."""
+    plan = sweep_plan()
+    sweep = sweep_pod(tmp_path, plan, gpu_arch="120")
+    assert sweep.bench == []
+    assert deadlines_handed_out(sweep) == []
+    assert "this GPU is sm_120" in sweep.proc.stdout
+    results = published_results(sweep)
+    assert len(results) == len(plan)
+    for body in results.values():
+        assert "preflight refused" in body["probe"]["checks"][0]["error"]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_an_image_that_does_not_say_which_gpus_it_covers_is_refused(tmp_path):
+    """Fail-closed, and it costs nothing real: `docker/Dockerfile.framework` sets
+    the variable in the same file that copies the entrypoint calling this check, so
+    an image can never carry one without the other."""
+    sweep = sweep_pod(tmp_path, sweep_plan(), cuda_archs=None)
+    assert sweep.bench == []
+    assert "TRAINBENCH_CUDA_ARCHS is not set" in sweep.proc.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_gpu_the_image_does_cover_is_not_in_the_way(tmp_path):
+    """The other half. sm_100 is the B200 every phase-2 manifest asks for."""
+    plan = sweep_plan()
+    sweep = sweep_pod(tmp_path, plan, gpu_arch="100")
+    assert len(sweep.bench) == len(plan)
+    assert "GPU is sm_100, which the image covers OK" in sweep.proc.stdout
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
