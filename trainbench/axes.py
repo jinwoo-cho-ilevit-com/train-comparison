@@ -261,10 +261,15 @@ def patch(config: BenchConfig) -> list[str]:
 
     That one is limited to the purposes whose numbers are reported, unlike every
     other refusal here. The others decline a value the run asked for; this one
-    declines the default because of what the image contains, and a probe is
-    precisely the run that exists to find that out (docs/CONTRACTS.md §2 does not
-    block probe or profile). Refusing them would delete the channel that reports
-    it.
+    declines because of what the image contains, and a probe is precisely the run
+    that exists to find that out (docs/CONTRACTS.md §2 does not block probe or
+    profile). Refusing them would delete the channel that reports it.
+
+    It is also asked of every value and not only of `none`. The environment binds
+    its library whatever the run requested, so on such an architecture `liger` is
+    a model made of both — `mixed(fla,liger)`, which is no setting — and reading
+    the binding only under `none` left that case to die at `assert_matches`, a
+    model-build away from the image that caused it.
 
     What is proven and what is not, kept apart because only the first is evidence:
     the routing, the refusals and the per-architecture support table are exercised
@@ -278,16 +283,10 @@ def patch(config: BenchConfig) -> list[str]:
     for `liger` and blocks the run.
     """
     name = config.kernel.name
+    reported = config.run.purpose in ENFORCED_PURPOSES
+    if reported and (bound := _environment_bound_kernel(config)) and bound != name:
+        raise UnappliedAxis(_environment_bound_refusal(config, name, bound))
     if name == "none":
-        reported = config.run.purpose in ENFORCED_PURPOSES
-        if reported and (bound := _environment_bound_kernel(config)):
-            raise UnappliedAxis(
-                f"kernel=none on arch={config.model.arch}: transformers binds {bound} while it "
-                "imports the modelling module, so this run would build a model made of that "
-                f"library's classes and report it as `none`. Nothing here can unbind it — "
-                f"kernel={bound} is what this environment measures, and a run without it needs "
-                "an image that does not ship the package."
-            )
         return []
     patcher = KERNEL_PATCHERS.get(name)
     if patcher is None:
@@ -414,6 +413,16 @@ def _fla_version() -> tuple[int, ...] | None:
 
     Only the release part is compared: the floor is a release and a suffix
     (`0.5.0.dev0`, `0.4.1+cu126`) never changes which side of it a version is on.
+
+    The fallback import is the one step here that runs somebody else's code, and
+    fla runs a lot of it — it imports triton at module scope, which raises
+    whatever triton raises on a box without a working device. `ImportError` means
+    the package is not importable and the caller reads that as absent; anything
+    else means the package is there and broken, which is neither "fla binds" nor
+    "fla is absent" and cannot be answered by returning either. It becomes the
+    axis's own refusal so that `patch` stops the run at the site that can name the
+    cause, instead of letting a triton error out of a function whose contract is
+    a version number.
     """
     for distribution in FLA_DISTRIBUTIONS:
         try:
@@ -424,6 +433,13 @@ def _fla_version() -> tuple[int, ...] | None:
         declared = getattr(importlib.import_module("fla"), "__version__", None)
     except ImportError:
         return None
+    except Exception as exc:
+        raise UnappliedAxis(
+            f"fla is installed but importing it raises {type(exc).__name__}: {exc}. "
+            "transformers imports it at module scope while it builds Qwen3.5, so nothing here "
+            "can tell whether the model would carry fla's classes — and an image where the "
+            "import itself fails measures no kernel value at all."
+        ) from exc
     return _release(declared) if declared else None
 
 
@@ -472,6 +488,35 @@ def _environment_bound_kernel(config: BenchConfig) -> str:
         return ""
     bound, _ = _fla_binding()
     return "fla" if bound else ""
+
+
+def _environment_bound_refusal(config: BenchConfig, name: str, bound: str) -> str:
+    """Why a requested kernel cannot be what this image measures.
+
+    Two consequences, because the requested value decides which one the run would
+    have hit. `none` would publish a model made of the bound library under the
+    label `none`; any other value would publish a model made of both, which
+    `_capture_kernel` reports as `mixed(...)` and no setting names.
+    """
+    head = (
+        f"kernel={name} on arch={config.model.arch}: transformers binds {bound} while it "
+        "imports the modelling module, so this run would build a model made of that "
+    )
+    if name == "none":
+        tail = (
+            "library's classes and report it as `none`. Nothing here can unbind it — "
+            f"kernel={bound} is what this environment measures, and a run without it needs "
+            "an image that does not ship the package."
+        )
+    else:
+        mixed = ",".join(sorted({bound, name}))
+        tail = (
+            f"library's classes as well as {name}'s. Nothing here can unbind it, so the model "
+            f"comes out mixed({mixed}) and would be refused after it was built — "
+            f"kernel={bound} is what this environment measures, and a kernel={name} run needs "
+            "an image that does not ship the package."
+        )
+    return head + tail
 
 
 def _patch_kernels_hub(config: BenchConfig) -> list[str]:

@@ -433,6 +433,57 @@ pass다. 어느 쪽이 CPU에서 증명되고 어느 쪽이 GPU 파드를 기다
 첫 GPU 파드에서 세 값 각각에 대해 `torch.cuda.max_memory_allocated`와 iteration
 time을 기록한다. 그때까지 이 축에 대해 어떤 수치도 쓰지 않는다.
 
+## 9. 커널이 모델의 얼마를 덮었는가 — `kernel_modules`, 측정 안 함
+
+`applied._capture_kernel`은 빌드된 모델의 모듈 클래스가 어느 패키지에서 왔는지로
+`kernel.name`을 판정한다. **그 판정에 임계값이 없다.** liger가 정의한 모듈이 하나뿐인
+모델도 `applied="liger"`로 읽히고 `kernel` 축은 mismatch 목록에 들어가지 않는다 —
+전체가 몇 개든 같은 답이다. 저장소 안의 근거는
+`tests/test_axes.py::test_a_model_built_entirely_after_the_patch_is_a_kernel_run`이며,
+`kernel_modules == {"liger": 1}`인 모델이 통과하는 것을 그대로 단언한다.
+
+임계값이 없는 것은 지금으로서는 옳다. liger의 엔트리포인트는 텍스트 디코더를 바꾸고
+비전 타워를 그대로 두는 것이 **문서화된 동작**이므로, 커버리지 하한을 지어내면 그
+라이브러리의 정상 동작을 거부하게 된다. 정상 커버리지가 몇인지는 이 저장소가 아직
+모르고, 모르는 수를 임계값으로 박는 것이 규칙 위반이다(컨벤션 16).
+
+**대신 기록은 한다.** `_capture_kernel`의 detail이 `kernel_modules`
+(라이브러리별 모듈 수)와 `modules_checked`(전체 모듈 수)를 담고,
+`record.py`가 `applied.to_dict()`를 런 레코드에 그대로 쓴다. 즉 **첫 GPU 파드의
+레코드에 실제 분포가 이미 들어온다** — 따로 계측을 붙일 것이 없다.
+
+부분 적용을 실제로 막는 것은 커버리지가 아니라 `_superseded_modules`다. 자기 모듈이
+이제 다른 클래스로 해석하는 이름으로 지어진 모듈이 하나라도 있으면 `partial(...)`이
+되어 런이 선다. 이것은 **패치 전에 지어진 모듈**을 잡지, 라이브러리가 애초에 손대지
+않는 부분을 잡지 않는다. 두 가지는 다른 상태이고, 뒤쪽이 여기서 미측정으로 남는 쪽이다.
+
+### 오늘의 이미지 세트에서 이 구멍이 열리지 않는 이유 — 우연이 아니라 세 개의 거부
+
+| 아키텍처 | `kernel=liger` | 근거 |
+|---|---|---|
+| gemma4 | 거부 | Liger-Kernel#1186 (`LIGER_UNSUPPORTED`) |
+| qwen3_vl | 거부 | 기록된 엔트리포인트 없음 (`LIGER_ENTRYPOINTS`) |
+| qwen3_5 | 거부 | 이미지가 fla를 바인딩한다 — `mixed(fla,liger)`가 될 런을 `patch()`가 막는다 |
+
+셋 다 커버리지와 무관한 이유이므로, **liger의 커버리지 질문은 오늘 아무 런에서도
+발생하지 않는다.** 발생하는 것은 `fla` 쪽이다: canonical baseline이 이제
+`kernel=fla`를 요청하고, Qwen3.5의 모듈 중 fla가 정의하는 것이 몇 개인지는 아무도
+모른다. 그 수가 작다면 지금의 판정은 "fla 패키지의 클래스가 모델 안에 하나라도
+있다"에 가깝다.
+
+### 닫는 방법 — 첫 GPU 파드
+
+1. Qwen3.5 + `kernel=fla` 런 레코드에서 `applied.axes[kernel.name].detail`의
+   `kernel_modules`와 `modules_checked`를 읽어 실제 분포를 적는다
+2. 같은 값을 `kernel=none`이 가능한 이미지(fla 없는 빌드)에서 한 번 더 읽어, 이
+   아키텍처에서 fla가 덮는 범위가 몇 퍼센트인지를 확정한다
+3. 그 두 수가 나온 뒤에 임계값을 넣을지, 아키텍처별 기대 커버리지를 표로 둘지를
+   정한다. **그 전에는 어떤 수도 여기에 쓰지 않는다.**
+
+liger에 대해서는 위 세 거부 중 하나가 풀리는 날 — qwen3_vl 엔트리포인트가 기록되거나,
+fla 없는 Qwen3.5 이미지가 생기거나, #1186이 닫히거나 — 같은 절차를 그 조합에서
+반복한다.
+
 ## 재현 조건 — 게이트 통과와 재현 가능은 다르다
 
 Wave 0 게이트는 `102 passed`로 통과했다. 그 결과는 **`configs/data/`가 로컬에

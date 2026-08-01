@@ -435,26 +435,36 @@ def test_a_request_for_liger_on_a_stock_model_is_a_mismatch(composed):
         assert_matches(state, config)
 
 
-def patched_modelling_module(monkeypatch, *, replacement) -> type[torch.nn.Module]:
-    """A transformers modelling module after a kernel library rebound one of its
-    names, and the stock class an instance built before that still carries.
+def patched_modelling_module(
+    monkeypatch,
+    *,
+    replacement,
+    module_name: str = "transformers.models.fake.modeling_fake",
+    class_name: str = "StockRMSNorm",
+) -> type[torch.nn.Module]:
+    """A modelling module after a kernel library rebound one of its names, and the
+    stock class an instance built before that still carries.
 
     This is the whole mechanism of a kernel patch — `modeling_x.Name = LigerName`
     and then construction — so the state it produces is what tells a fully covered
     model from a half covered one. Built here rather than with the real thing
     because liger-kernel does not install on this machine.
-    """
-    name = "transformers.models.fake.modeling_fake"
-    module = ModuleType(name)
 
-    class StockRMSNorm(torch.nn.Module):
+    `module_name` is a parameter because the module a kernel library rebinds is
+    not always a transformers one: on Qwen3.5 the first library in is fla, and a
+    second one patches over classes that belong to `fla.modules`.
+    """
+    module = ModuleType(module_name)
+
+    class StockModule(torch.nn.Module):
         pass
 
-    StockRMSNorm.__module__ = name
-    StockRMSNorm.__qualname__ = "StockRMSNorm"
-    module.StockRMSNorm = replacement
-    monkeypatch.setitem(sys.modules, name, module)
-    return StockRMSNorm
+    StockModule.__module__ = module_name
+    StockModule.__name__ = class_name
+    StockModule.__qualname__ = class_name
+    setattr(module, class_name, replacement)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    return StockModule
 
 
 def test_a_model_the_kernel_only_half_reached_is_not_a_full_kernel_run(composed, monkeypatch):
@@ -562,6 +572,10 @@ def test_every_kernel_the_schema_offers_routes_to_a_patcher():
 
 
 def test_liger_calls_the_entrypoint_for_this_architecture(composed, monkeypatch):
+    # An image without fla, stated rather than inherited from the host: Qwen3.5 on
+    # an image that has fla is refused before any entrypoint is reached, and the
+    # suite runs inside those images too.
+    fla_environment(monkeypatch, fla=None)
     module, calls = liger_stub(entrypoint="apply_liger_kernel_to_qwen3_5")
     install_liger(monkeypatch, module)
     config = qwen35(composed, **{"kernel.name": "liger"})
@@ -621,6 +635,7 @@ def test_liger_without_the_package_is_refused_as_an_axis_not_an_import_error(com
     """`UnappliedAxis` rather than the raw `ImportError`: the audit counts a refusal
     as the axis declining a value it cannot put into effect, and anything else as a
     value that broke for an unrelated reason."""
+    fla_environment(monkeypatch, fla=None)
     install_liger(monkeypatch, None)
     config = qwen35(composed, **{"kernel.name": "liger"})
 
@@ -632,6 +647,7 @@ def test_a_wrong_entrypoint_name_reports_what_liger_exports(composed, monkeypatc
     """`LIGER_ENTRYPOINTS` holds a name that could not be checked against an
     installed package. When it is wrong the refusal has to carry the correction,
     or the first pod reports `AttributeError: apply_liger_kernel_to_qwen3_5`."""
+    fla_environment(monkeypatch, fla=None)
     install_liger(monkeypatch, liger_stub(entrypoint=None)[0])
     config = qwen35(composed, **{"kernel.name": "liger"})
 
@@ -794,6 +810,155 @@ def test_kernel_none_stands_where_no_kernel_binds_itself(composed, monkeypatch):
     fla_environment(monkeypatch)
     assert axes.patch(bench(composed)) == []
     assert axes.patch(gemma(composed)) == []
+
+
+def fla_that_cannot_be_imported(monkeypatch, exc: BaseException) -> None:
+    """An image where fla is installed, publishes no distribution metadata, and
+    raises on import.
+
+    Not a hypothetical: fla imports triton at module scope, and triton raises on a
+    box with no usable device — a `RuntimeError`, not an `ImportError`. The
+    metadata half is what makes the import happen at all; with a readable version
+    `_fla_version` answers before it gets there.
+    """
+    fla_environment(monkeypatch, fla=None)
+    installed_elsewhere = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *a, **k: object() if name == "fla" else installed_elsewhere(name, *a, **k),
+    )
+    real_import = importlib.import_module
+
+    def import_module(name, *args, **kwargs):
+        if name == "fla":
+            raise exc
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+
+
+def test_a_kernel_none_run_whose_fla_import_fails_is_refused_as_an_axis(composed, monkeypatch):
+    """The package is present and unimportable, which is neither of the two
+    answers `_fla_binding` has. `_fla_version` caught `ImportError` alone, so the
+    triton error left `patch` as itself — the run stopped either way, but the
+    audit sorts a refused axis from an unrelated breakage by exception type, and
+    this one filed as breakage. `UnappliedAxis` is not merely a rename: it is the
+    only class here that says the axis declined, and it carries what raised."""
+    fla_that_cannot_be_imported(monkeypatch, RuntimeError("triton: no CUDA device found"))
+    config = qwen35(composed)
+
+    assert config.kernel.name == "none"
+    with pytest.raises(axes.UnappliedAxis, match="triton: no CUDA device found"):
+        axes.patch(config)
+
+    # The same environment reached from the other side. `kernel=fla` asks the same
+    # predicate through `_fla_fast_path`, and an escape there would be the same
+    # escape.
+    with pytest.raises(axes.UnappliedAxis, match="triton: no CUDA device found"):
+        axes.patch(qwen35(composed, **{"kernel.name": "fla"}))
+
+
+def test_a_kernel_the_image_binds_over_is_refused_at_patch(composed, monkeypatch):
+    """The image binds fla whatever the run asked for, so on this architecture
+    `liger` is not liger: the model comes out of both libraries, `_capture_kernel`
+    reads `mixed(fla,liger)`, and no setting names that. Consulting the binding
+    only under `kernel=none` left this value to die at `assert_matches`, a whole
+    model build away from the image that caused it."""
+    fla_environment(monkeypatch)
+    module, calls = liger_stub(entrypoint="apply_liger_kernel_to_qwen3_5")
+    install_liger(monkeypatch, module)
+    config = qwen35(composed, **{"kernel.name": "liger"})
+
+    with pytest.raises(axes.UnappliedAxis, match=r"mixed\(fla,liger\)") as refusal:
+        axes.patch(config)
+
+    assert "kernel=liger on arch=qwen3_5" in str(refusal.value)
+    # Refused before the library was touched. A patcher that ran and then raised
+    # would leave transformers rebound for every later run in the process.
+    assert calls == []
+
+
+def test_a_quality_run_refuses_an_environment_bound_kernel_too(composed, monkeypatch):
+    """The gate is `ENFORCED_PURPOSES`, not `timing`. A quality run publishes a
+    number as much as a timing one does — the retrieval metric it exists to
+    produce — and narrowing this to timing would let that metric be published
+    against a model made of a library the config says is absent. Only a probe is
+    exempt, because discovering exactly this is what a probe is for."""
+    fla_environment(monkeypatch)
+
+    for purpose in ("timing", "quality"):
+        with pytest.raises(axes.UnappliedAxis, match="kernel=none on arch=qwen3_5"):
+            axes.patch(qwen35(composed, **{"run.purpose": purpose}))
+
+    assert axes.patch(qwen35(composed, **{"run.purpose": "probe"})) == []
+
+
+def test_the_supersession_scan_covers_the_kernel_packages(composed, monkeypatch):
+    """A second library patching over the first leaves modules built from the
+    first one's classes, and those classes belong to a kernel package rather than
+    to transformers. Scanning transformers alone would read this model as fully
+    fla — every kernel module in it answers `fla` — while half of it was rebound
+    to liger after those modules were built."""
+    stock = patched_modelling_module(
+        monkeypatch,
+        replacement=LigerRMSNorm,
+        module_name="fla.modules.fused_norm_gate",
+        class_name="FusedRMSNormGated",
+    )
+    config = qwen35(composed, **{"kernel.name": "fla"})
+    model = plain_model()
+    model.add_module("built_before_the_second_patch", stock())
+
+    state = capture(Built(model=model), config)
+
+    assert axis(state, "kernel.name").applied == "partial(liger)"
+    with pytest.raises(AppliedMismatch, match="kernel.name"):
+        assert_matches(state, config)
+
+
+def test_a_nested_class_is_not_read_as_a_superseded_module(composed, monkeypatch):
+    """`Outer.Inner` and a module-level `Inner` are two names that share a
+    `__name__`. The scan resolves a class's own name in its own module, so without
+    the qualname guard a nested class is compared against whatever the module
+    binds at top level — and one kernel library rebinding that top-level name
+    would make every nested module in the model read as half-patched, turning a
+    correct run into `partial(...)` and refusing it."""
+    nested = patched_modelling_module(monkeypatch, replacement=LigerRMSNorm, class_name="RMSNorm")
+    nested.__qualname__ = "Outer.RMSNorm"
+    config = bench(composed)
+    model = plain_model()
+    model.add_module("nested", nested())
+
+    state = capture(Built(model=model), config)
+
+    assert axis(state, "kernel.name").applied == "none"
+    assert axis(state, "kernel.name").detail["superseded"] == 0
+    assert "kernel.name" not in [state_.axis for state_ in state.mismatched()]
+
+
+def test_an_fla_below_the_floor_does_not_bind_kernel_none(composed, monkeypatch):
+    """The version floor is half of what makes `kernel=none` refusable. Below
+    0.2.2 transformers binds nothing, so the model really is stock and `none` is
+    the honest label. A binding that asked only whether the package is present
+    would refuse the one image on which this run is correct, and the refusal would
+    read as the image shipping a kernel it does not bind.
+
+    The floor version itself is the other half. transformers' predicate is `>=`,
+    so the version equal to the floor binds — and a comparison one character off
+    would refuse the exact release transformers accepts, on an image that really
+    does build the model out of fla."""
+    floor = ".".join(map(str, axes.FLA_MIN_VERSION))
+    fla_environment(monkeypatch, fla="0.2.1")
+    config = qwen35(composed)
+
+    assert axes._environment_bound_kernel(config) == ""
+    assert axes.patch(config) == []
+
+    fla_environment(monkeypatch, fla=floor)
+
+    assert axes._environment_bound_kernel(config) == "fla"
+    assert axes.patch(qwen35(composed, **{"kernel.name": "fla"})) == ["kernel.name"]
 
 
 def test_kernels_hub_is_refused_with_the_entrypoints_it_actually_has(composed):
