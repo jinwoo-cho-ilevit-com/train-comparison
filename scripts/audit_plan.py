@@ -1311,6 +1311,230 @@ def every_offered_axis_value_can_be_applied() -> Result:
     )
 
 
+OPEN_VERDICTS = Path("docs/open-verdicts.json")
+
+# What every ledger item carries. Enforced rather than assumed: an item missing
+# its pass criterion is a TODO, and a TODO is what this check exists to replace.
+VERDICT_FIELDS = (
+    "id",
+    "axis",
+    "finding",
+    "owner",
+    "verdict",
+    "summary",
+    "closes_when",
+    "anchor",
+    "closed",
+)
+# The criterion a human re-runs. `observed` is what it does today, so a reader can
+# tell a criterion that was never run from one that was run and failed.
+CLOSES_WHEN_FIELDS = ("criterion", "command", "expected", "observed")
+# What the gate itself evaluates. `test` is the strong one: a named test function
+# has to exist. `text`/`absent` are for items whose deliverable *is* text — a
+# methodology section, a manifest override, a retracted sentence.
+ANCHOR_FIELDS = {
+    "test": ("file", "names"),
+    "text": ("file", "pattern"),
+    "absent": ("file", "pattern"),
+}
+
+
+def _defined_names(source: str) -> set[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+
+
+def anchor_holds(anchor: dict[str, Any], root: Path) -> bool:
+    """Whether the repository now shows what this item was waiting for."""
+    path = root / anchor["file"]
+    if not path.exists():
+        return False
+    text = path.read_text()
+    if anchor["kind"] == "test":
+        return set(anchor["names"]) <= _defined_names(text)
+    found = re.search(anchor["pattern"], text) is not None
+    return found if anchor["kind"] == "text" else not found
+
+
+def _committed_verdict_ids(root: Path) -> set[str]:
+    """Every id this ledger has ever carried, read out of git history.
+
+    The obvious way to make this check green is to delete the item. It has
+    happened twice here already in other checks — `plan-files` stayed true by
+    mentioning less, `doc-commands` was satisfied by removing the import — so the
+    ledger is not allowed to be its own only witness. History is the witness: an
+    id that was ever committed has to still be there. Its absence is reported by
+    name, and getting rid of the evidence means rewriting published history.
+
+    An id that was never committed is not pinned, so a typo caught before the
+    commit costs nothing and one caught after it is permanent.
+
+    Added lines are gathered first and searched as one text, rather than matching
+    an id per line: a ledger written without indentation puts every id on one
+    line, and a per-line pattern would find the first and pin nothing else.
+    """
+    log = subprocess.run(
+        ["git", "log", "-p", "--format=", "--", str(OPEN_VERDICTS)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    ).stdout
+    added = "\n".join(line for line in log.splitlines() if line.startswith("+"))
+    return set(re.findall(r'"id":\s*"([^"]+)"', added))
+
+
+def verdict_ledger_problems(
+    payload: Any, root: Path, committed: set[str]
+) -> tuple[list[str], list[str], list[str]]:
+    """Problems, open ids, closed ids. Pure, so the tests can drive every state."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        return ([f"{OPEN_VERDICTS} carries no `items` list"], [], [])
+    problems: list[str] = []
+    open_ids: list[str] = []
+    closed_ids: list[str] = []
+    for position, item in enumerate(payload["items"]):
+        label = f"item {position}"
+        if not isinstance(item, dict):
+            problems.append(f"{label} is not an object")
+            continue
+        label = str(item.get("id", label))
+        if missing := [field for field in VERDICT_FIELDS if field not in item]:
+            problems.append(f"{label}: missing {', '.join(missing)}")
+            continue
+        if label in open_ids or label in closed_ids:
+            problems.append(f"{label}: duplicate id")
+            continue
+        closes = item["closes_when"]
+        if not isinstance(closes, dict) or any(f not in closes for f in CLOSES_WHEN_FIELDS):
+            problems.append(f"{label}: closes_when needs {', '.join(CLOSES_WHEN_FIELDS)}")
+            continue
+        anchor = item["anchor"]
+        kind = anchor.get("kind") if isinstance(anchor, dict) else None
+        if kind not in ANCHOR_FIELDS or any(f not in anchor for f in ANCHOR_FIELDS[kind]):
+            problems.append(
+                f"{label}: anchor must name a kind in {'/'.join(ANCHOR_FIELDS)} "
+                f"and carry its fields"
+            )
+            continue
+        # An empty name list is a subset of every file's functions, so the item
+        # would close on nothing at all — the vacuous-truth shape this file's
+        # `_nothing_to_check` exists for, one level down.
+        if kind == "test" and not anchor["names"]:
+            problems.append(f"{label}: a test anchor naming no test closes on nothing")
+            continue
+        if kind != "test":
+            try:
+                re.compile(anchor["pattern"])
+            except re.error as exc:
+                # Reported rather than raised: a gate that crashes on a typo in
+                # one item stops answering for the other eighteen.
+                problems.append(f"{label}: anchor pattern does not compile ({exc})")
+                continue
+        holds = anchor_holds(anchor, root)
+        if holds and item["closed"] is None:
+            # Landing the fix is not the same as recording what it was measured
+            # against, and the recording is the part this repository keeps
+            # skipping. Same shape as a baseline entry that starts passing.
+            problems.append(f"{label}: anchor now holds; record the run in `closed` and close it")
+        elif not holds and item["closed"] is not None:
+            problems.append(f"{label}: recorded closed but its anchor is gone ({anchor['file']})")
+        elif holds:
+            closed_ids.append(label)
+        else:
+            open_ids.append(label)
+    known = set(open_ids) | set(closed_ids)
+    problems += [
+        f"{lost}: was committed to this ledger and is now absent"
+        for lost in sorted(committed - known)
+    ]
+    return problems, open_ids, closed_ids
+
+
+@check("verdicts-closed")
+def reverification_verdicts_have_been_acted_on() -> Result:
+    """The re-verification verdicts' "minimum action before merge" lists, tracked.
+
+    Six axes went through implement -> adversarial verification -> fix -> re-verify.
+    Round one: six implementers all reported break-evidence, six verifiers all
+    overturned them. Round two returned six conditional verdicts, each with a list
+    of things to do before merge — and the lists were not read, because the gate
+    was green. Green was never the evidence; that is this file's opening paragraph.
+    Whether anyone acted on a verdict was held in one person's memory, and this
+    check moves it to where `axis-wired` and `config-consumed` already are.
+
+    An item's state is *derived*, never declared. Each one names an `anchor` the
+    repository either shows or does not, so prose cannot close anything: writing
+    "fixed" in the summary changes nothing. Four states, three of them red:
+
+      anchor false, `closed` empty  -> open, which is the ordinary red
+      anchor false, `closed` filled -> the fix was landed and then lost
+      anchor true,  `closed` empty  -> landed but the run behind it is unrecorded
+      anchor true,  `closed` filled -> closed
+
+    What it deliberately does not do is run the mutations. Most items close when a
+    named mutation goes red — `MUT2=pad-last-only` passes 191 tests today and has
+    to fail — and running those here would cost tens of seconds per gate and
+    contend with the lanes for the same tree, which `doc-commands` already did
+    once by shelling out to `uv sync`. So the split is: the gate asks whether the
+    artifact that kills the mutation exists, and the item carries the command and
+    today's observed outcome so a person, or a re-verification lane, runs it. A
+    named test that exists but is vacuous satisfies the gate and not the item —
+    which is why `closed` has to quote the run, and why closing is a reviewer's
+    act rather than an author's.
+
+    Two ways this could go hollow, and what stops each:
+
+      Delete the item. Stopped by `_committed_verdict_ids`: git history names
+      every id the ledger ever carried, and a missing one is reported.
+
+      Repoint an anchor at a test that already passes. Not stopped. It is one
+      line in a reviewed diff next to a `closed` record that has to quote a
+      mutation run, and it is the same class of act as deleting the item — but
+      the check cannot tell it from an honest rename.
+    """
+    path = REPO / OPEN_VERDICTS
+    if not path.exists():
+        return Result(
+            "verdicts-closed",
+            False,
+            f"{OPEN_VERDICTS} is absent; the re-verification verdicts then have no "
+            "record in this repository and every open item is invisible",
+        )
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        return Result("verdicts-closed", False, f"{OPEN_VERDICTS} does not parse: {exc}")
+    committed = _committed_verdict_ids(REPO)
+    if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+        if empty := _nothing_to_check(payload["items"], "verdict items"):
+            return Result("verdicts-closed", False, empty)
+    problems, open_ids, closed_ids = verdict_ledger_problems(payload, REPO, committed)
+    history = f"history pins {len(committed)} id(s)"
+    if not problems and not open_ids:
+        return Result(
+            "verdicts-closed",
+            True,
+            f"all {len(closed_ids)} verdict item(s) closed with their anchors standing ({history})",
+        )
+    detail = []
+    if open_ids:
+        detail.append(f"{len(open_ids)} open: {', '.join(open_ids)}")
+    detail += problems
+    return Result(
+        "verdicts-closed",
+        False,
+        "; ".join(detail) + f" ({len(closed_ids)} closed, {history})",
+        count=len(open_ids) + len(problems),
+    )
+
+
 BASELINE = REPO / "docs" / "audit-baseline.json"
 
 

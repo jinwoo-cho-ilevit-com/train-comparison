@@ -25,11 +25,13 @@ from audit_plan import (  # noqa: E402
     _normalise,
     _reads_dotted,
     _test_imports,
+    anchor_holds,
     classify,
     merge_baseline,
     missing_plan_files,
     model_spec_problems,
     undocumented_files,
+    verdict_ledger_problems,
 )
 
 
@@ -334,16 +336,51 @@ def test_the_two_axis_value_fixtures_differ_only_in_carrying_an_image():
         assert with_images[index]["qry_image"] is not None
 
 
-def test_a_value_applicable_to_only_one_data_shape_is_named_not_counted():
-    """`loss/cached_mnrl` is implemented, and `_split_rows` refuses every batch
-    carrying `pixel_values` — so it applies to a text-only subset and to no run
-    this study is configured to make. Counted as applicable it read `loss 2/2`,
-    which a reader takes as GradCache being ready to measure."""
+def test_a_value_applicable_to_only_one_data_shape_is_named_not_counted(monkeypatch):
+    """The branch that names a data-dependent value instead of counting it.
+
+    `loss/cached_mnrl` was the live case and is not one any more — `axes._split_rows`
+    attributes `pixel_values` to rows from the per-row image counts the collate
+    records, so the value now applies to both fixtures. The case is therefore made
+    rather than waited for: `_gradcache_needs_splittable_data` is given back the
+    refusal it used to raise, and the check has to notice that the value passes on
+    one shape of data and not the other.
+
+    Written this way rather than deleted because the branch is the whole point of
+    asking twice. Without a test it would go on reporting whatever it reported when
+    the next value starts depending on its data.
+    """
+    from trainbench import axes
+
+    splittable = axes._gradcache_needs_splittable_data
+
+    def refuses_images(dataset):
+        splittable(dataset)
+        if axes.image_columns(dataset):
+            raise axes.UnappliedAxis("synthetic: this value refuses rows carrying images")
+
+    monkeypatch.setattr(axes, "_gradcache_needs_splittable_data", refuses_images)
+
     result = audit_plan.CHECKS["axis-values"]()
 
     assert "loss/cached_mnrl" in result.detail
     assert "applicable only to data this study does not measure" in result.detail
     assert "loss 1/2" in result.detail
+
+
+def test_gradcache_is_counted_applicable_on_both_data_shapes():
+    """The break for the test above, and the state the check reports today.
+
+    With the refusal really gone the two fixtures no longer separate any value, so
+    a `_split_rows` that quietly went back to refusing pixels — or a check that
+    stopped trying the image-carrying fixture at all — shows up as this assertion
+    rather than as a number a reader would take for progress.
+    """
+    result = audit_plan.CHECKS["axis-values"]()
+
+    assert "loss 2/2" not in result.detail, "groups are only listed when a value is unusable"
+    assert "loss/cached_mnrl" not in result.detail
+    assert "applicable only to data this study does not measure" not in result.detail
 
 
 def test_axis_values_draws_a_batch_so_the_collate_actually_runs(monkeypatch):
@@ -489,3 +526,234 @@ def test_every_check_returns_a_result_named_after_itself(name):
 
     assert result.name == name
     assert result.detail, "a failure with no detail cannot be acted on"
+
+
+# `verdicts-closed`. Round two of the axis re-verifications returned six
+# conditional verdicts, each carrying a list of things to do before merge, and
+# the lists were not read because the gate was green. These pin the ledger that
+# replaces that memory — and, more importantly, every way it could go hollow.
+def item(item_id="i", anchor=None, closed=None, **overrides):
+    """A ledger item in the stored shape, with only the field under test varied."""
+    base = {
+        "id": item_id,
+        "axis": "kernel",
+        "finding": "F1",
+        "owner": "D",
+        "verdict": "r2-rv-kernel.md",
+        "summary": "무언가가 열려 있다",
+        "closes_when": {
+            "criterion": "변이가 빨개질 것",
+            "command": "pytest -p mut",
+            "expected": "빨강",
+            "observed": "593 passed",
+        },
+        "anchor": anchor or {"kind": "test", "file": "tests/t.py", "names": ["test_absent"]},
+        "closed": closed,
+    }
+    return {**base, **overrides}
+
+
+def ledger(*items):
+    return {"items": list(items)}
+
+
+@pytest.fixture
+def anchored(tmp_path):
+    """A tree where one anchor holds and one does not."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "t.py").write_text("def test_present():\n    pass\n")
+    return tmp_path
+
+
+def test_an_open_item_keeps_the_gate_red(anchored):
+    """The whole point. An item whose anchor is not in the tree is open, and one
+    open item is enough."""
+    problems, open_ids, closed = verdict_ledger_problems(ledger(item()), anchored, set())
+
+    assert (problems, open_ids, closed) == ([], ["i"], [])
+
+
+def test_prose_cannot_close_an_item(anchored):
+    """Writing that it is fixed changes nothing: state is derived from the anchor.
+    A `closed` record over an anchor that does not hold is reported as a fix that
+    was landed and then lost, which is the same event as a regression."""
+    closed = {"date": "2026-08-02", "by": "누군가", "evidence": "고쳤다"}
+
+    problems, open_ids, _ = verdict_ledger_problems(ledger(item(closed=closed)), anchored, set())
+
+    assert open_ids == []
+    assert problems == ["i: recorded closed but its anchor is gone (tests/t.py)"]
+
+
+def test_landing_the_fix_without_recording_the_run_still_blocks(anchored):
+    """Same reason a baseline entry that starts passing blocks. The anchor is the
+    artifact; the mutation run behind it is the evidence, and this repository's
+    failure was skipping the second one while the first looked done."""
+    landed = {"kind": "test", "file": "tests/t.py", "names": ["test_present"]}
+
+    problems, open_ids, closed = verdict_ledger_problems(
+        ledger(item(anchor=landed)), anchored, set()
+    )
+
+    assert (open_ids, closed) == ([], [])
+    assert problems == ["i: anchor now holds; record the run in `closed` and close it"]
+
+
+def test_an_item_is_closed_only_with_both_the_anchor_and_the_record(anchored):
+    landed = {"kind": "test", "file": "tests/t.py", "names": ["test_present"]}
+    record = {"date": "2026-08-02", "by": "감사 레인", "evidence": "변이가 빨개짐"}
+
+    problems, open_ids, closed = verdict_ledger_problems(
+        ledger(item(anchor=landed, closed=record)), anchored, set()
+    )
+
+    assert (problems, open_ids, closed) == ([], [], ["i"])
+
+
+def test_deleting_an_item_is_reported_from_git_history(anchored):
+    """The obvious way to make this green is to delete the entry, and it is what
+    happened to two other checks here: `plan-files` stayed true by mentioning
+    less, `doc-commands` was satisfied by removing the import. History is the
+    second witness — an id that was ever committed has to still be there."""
+    problems, open_ids, _ = verdict_ledger_problems(ledger(item()), anchored, {"i", "deleted-one"})
+
+    assert open_ids == ["i"]
+    assert problems == ["deleted-one: was committed to this ledger and is now absent"]
+
+
+def test_git_history_pins_every_id_the_ledger_ever_carried(tmp_path):
+    """Two commits, the second one written without indentation so that every id
+    lands on a single line. A per-line pattern finds one id there and pins
+    nothing else, which would let the rest be deleted."""
+    path = tmp_path / audit_plan.OPEN_VERDICTS
+    path.parent.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+
+    def commit(payload, message, **dump):
+        path.write_text(json.dumps(payload, **dump))
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+        subprocess.run(
+            # --no-verify: the developer's own hooks are not this fixture's rules.
+            ["git", "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-qm", message, "-n"],
+            cwd=tmp_path,
+            check=True,
+        )
+
+    commit(ledger(item(item_id="first"), item(item_id="second")), "one", indent=2)
+    commit(ledger(item(item_id="first"), item(item_id="second"), item(item_id="third")), "two")
+    path.write_text(json.dumps(ledger(item(item_id="first"))))
+
+    committed = audit_plan._committed_verdict_ids(tmp_path)
+
+    assert committed == {"first", "second", "third"}
+    problems, _, _ = verdict_ledger_problems(json.loads(path.read_text()), tmp_path, committed)
+    assert problems == [
+        "second: was committed to this ledger and is now absent",
+        "third: was committed to this ledger and is now absent",
+    ]
+
+
+def test_an_empty_ledger_is_not_a_pass(anchored, monkeypatch):
+    """Convention §6: a check that iterates a set fails when the set is empty.
+    Emptying the file is deleting every item at once."""
+    monkeypatch.setattr(audit_plan, "REPO", anchored)
+    path = anchored / audit_plan.OPEN_VERDICTS
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"items": []}))
+
+    result = audit_plan.CHECKS["verdicts-closed"]()
+
+    assert not result.ok
+    assert "nothing to examine" in result.detail
+
+
+def test_an_unreadable_ledger_does_not_pass_quietly(anchored, monkeypatch):
+    monkeypatch.setattr(audit_plan, "REPO", anchored)
+    path = anchored / audit_plan.OPEN_VERDICTS
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json")
+
+    result = audit_plan.CHECKS["verdicts-closed"]()
+
+    assert not result.ok
+    assert "does not parse" in result.detail
+
+
+@pytest.mark.parametrize(
+    "broken, expected",
+    [
+        (item(closes_when={"criterion": "?"}), "closes_when needs"),
+        (item(anchor={"kind": "vibes", "file": "tests/t.py"}), "anchor must name a kind"),
+        (item(anchor={"kind": "test", "file": "tests/t.py"}), "anchor must name a kind"),
+        ({"id": "i", "axis": "kernel"}, "missing"),
+        ("just a string", "is not an object"),
+        # An empty name list is a subset of every file's functions, so this item
+        # would close on nothing — `_nothing_to_check`'s failure one level down.
+        (item(anchor={"kind": "test", "file": "tests/t.py", "names": []}), "closes on nothing"),
+        # A gate that raises on one item's typo stops answering for the rest.
+        (item(anchor={"kind": "text", "file": "tests/t.py", "pattern": "["}), "does not compile"),
+    ],
+)
+def test_a_malformed_item_is_a_failure_not_a_skip(anchored, broken, expected):
+    """An item the check cannot evaluate must not drop out of the count. Skipping
+    it silently is a hole shaped exactly like deleting it."""
+    problems, open_ids, closed = verdict_ledger_problems(ledger(broken), anchored, set())
+
+    assert (open_ids, closed) == ([], [])
+    assert len(problems) == 1 and expected in problems[0]
+
+
+def test_two_items_cannot_share_an_id(anchored):
+    """History pins ids, so a duplicate makes a deleted item indistinguishable
+    from a surviving one."""
+    problems, open_ids, _ = verdict_ledger_problems(ledger(item(), item()), anchored, set())
+
+    assert open_ids == ["i"]
+    assert problems == ["i: duplicate id"]
+
+
+def test_a_test_anchor_needs_the_test_to_be_defined_not_merely_mentioned(anchored):
+    """`grep` for a name is satisfied by the name in a comment, a docstring or a
+    skip marker. The names come out of the AST."""
+    (anchored / "tests" / "t.py").write_text(
+        '"""test_mentioned is what we should add."""\n_NOTE = "test_mentioned"\n'
+    )
+    anchor = {"kind": "test", "file": "tests/t.py", "names": ["test_mentioned"]}
+
+    assert not anchor_holds(anchor, anchored)
+
+
+def test_a_test_anchor_wants_every_name_it_lists(anchored):
+    """Four surviving mutants need four tests, and three of them is not closed."""
+    anchor = {"kind": "test", "file": "tests/t.py", "names": ["test_present", "test_absent"]}
+
+    assert not anchor_holds(anchor, anchored)
+    assert anchor_holds({**anchor, "names": ["test_present"]}, anchored)
+
+
+def test_an_absent_anchor_holds_only_once_the_wording_is_gone(anchored):
+    """For items whose deliverable is a retraction: a sentence claiming more than
+    the code checks, or a plan describing the wrong discriminator."""
+    (anchored / "PLAN.md").write_text("distinguished by `context_fn`\n")
+    anchor = {"kind": "absent", "file": "PLAN.md", "pattern": "`context_fn`"}
+
+    assert not anchor_holds(anchor, anchored)
+    (anchored / "PLAN.md").write_text("distinguished by the policy it carries\n")
+    assert anchor_holds(anchor, anchored)
+
+
+def test_an_anchor_whose_file_is_gone_does_not_close_an_item(anchored):
+    """Including the `absent` kind, where a missing file makes the pattern
+    trivially absent. Deleting the document is not doing the work."""
+    assert not anchor_holds({"kind": "absent", "file": "gone.md", "pattern": "x"}, anchored)
+    assert not anchor_holds({"kind": "text", "file": "gone.md", "pattern": "x"}, anchored)
+
+
+def test_the_repositorys_own_ledger_has_open_items_and_names_them():
+    """The live state. Six conditional verdicts, and the gate says so out loud
+    rather than leaving it to whoever remembers reading them."""
+    result = audit_plan.CHECKS["verdicts-closed"]()
+
+    assert not result.ok
+    assert "open:" in result.detail
+    assert result.count and result.count > 0

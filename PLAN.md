@@ -467,6 +467,7 @@ train-comparison/
     ├── methodology.md         # 측정 규율과 그 근거
     ├── model-spec.md          # 모델별 공식 규격 검증 (산문)
     ├── model-spec.yaml        # 같은 내용의 기계 판독본 (audit이 대조)
+    ├── open-verdicts.json     # 재검증 판정서의 미착지 항목 (verdicts-closed가 대조)
     ├── support-matrix.md      # Phase 0 산출물
     └── review-findings.md     # 리뷰 레인 결과와 수정 순서
 ```
