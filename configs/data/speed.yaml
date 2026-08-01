@@ -1,10 +1,26 @@
 repo_id: jinwoo-cho/mmeb-subset
-# Regenerated 2026-08-01 with the schema-checked pipeline. The previous pin
-# b750b9c3 is the corrupt subset (defect D1) and is now refused by
-# KNOWN_CORRUPT_REVISIONS in scripts/prepare_data.py.
-# 2048 rows, 20/20 configs at quota, 0 rows without a query image or positive.
-revision: 0cfae3fca21a61525166e81e5fa9fcb3dbad55de
+# 2048 rows, 20/20 configs at quota, 0 rows without a query image or positive,
+# 0 images whose pixels do not decode. Verified by re-reading this revision off
+# the Hub and recomputing the gate from it (`verify_pushed`), not from the rows
+# that were in memory when it was pushed.
+#
+# The collapse gate covers 5 of the 7 image-positive configs at this size: NIGHTS
+# (30 rows) and WebQA (33) are under MIN_ROWS_FOR_SHARE_GATE, so no share
+# threshold was applied to them. The manifest names them under
+# `collapse_gate_not_evaluated`. Quoting a "largest single image positive" figure
+# from this draw is quoting a number that may come from the ungated pair.
+#
+# Two revisions were pinned here before this one and neither should be reused:
+# b750b9c3 is the corrupt subset (defect D1, refused by CORRUPT_DATA_REVISIONS),
+# and f4363029 could not be loaded at all — `Dataset.push_to_hub` kept the repo's
+# existing card, so a corrected five-column subset shipped under D1's four-column
+# schema (defect D7).
+revision: 55aafaf9bfe171c65a8131224d3791df379f1651
 source_repo: MrZilinXiao/MMEB_train_with_image
+# The mirror's latest commit (2025-06-17, unchanged since). Both subsets were drawn
+# from it — every download URL in the regeneration logs resolves this sha — so the
+# pin records what was actually read rather than asserting it after the fact.
+source_revision: 9d0fd31789c12a007442de52fe22509e46e49e7d
 # 2048 rows drawn proportionally across all 20 MMEB configs with sample_seed 1234.
 # Speed and memory are measured on a small fixed sample by design (PLAN.md); what
 # has to match the real corpus is the length and image-resolution distribution,

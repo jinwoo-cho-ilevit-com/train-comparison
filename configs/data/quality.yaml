@@ -3,16 +3,25 @@
 # regeneration deletes the other subset's files: the pinned commit still resolves,
 # but the two configs would overwrite each other every time either is rebuilt.
 repo_id: jinwoo-cho/mmeb-subset-quality
-# Unpinned, and therefore unusable for purpose=quality: config_schema rejects a
-# null revision for any measured run. It stays null because the subset it would
-# pin does not exist yet — this repo has never been pushed, and inventing a sha is
-# exactly the kind of unmeasured number this project forbids. The audit item
-# `data-pinned` fails on this line by design until that push happens.
-revision: null
+# 65536 rows, 20/20 configs at quota, 0 rows without a query image or positive,
+# 0 images whose pixels do not decode, largest single image positive 0.38% of its
+# config — and at this size every image-positive config clears
+# MIN_ROWS_FOR_SHARE_GATE, so that figure is one the gate actually evaluated.
+# Verified by re-reading this revision off the Hub (`verify_pushed`).
+#
+# This is a *different draw* from speed.yaml, not the same one read deeper. The
+# seed is shared, but `shuffle_buffer(want)` scales with the per-config quota and
+# caps at 2000, so speed's smaller quotas produce a smaller buffer and therefore a
+# different shuffle in 12 of the 20 configs (measured; the 8 whose buffers both
+# reach 2000 do line up). Each draw is proportional to upstream and valid on its
+# own — what does not hold is any claim that one contains the other.
+revision: bd466a8671f4853dd00a5085a219fdab73fead1a
 source_repo: MrZilinXiao/MMEB_train_with_image
+# Same upstream commit as speed.yaml; see the note there.
+source_revision: 9d0fd31789c12a007442de52fe22509e46e49e7d
 subset_rows: 65536
-# Same seed as speed.yaml: the quality subset is a larger draw from the same
-# shuffled stream, so a quality run sees the distribution the timing runs saw.
+# Same seed as speed.yaml. That makes the draw reproducible, not identical to
+# speed's: the shuffle buffer moves with the quota (see the revision note above).
 sample_seed: 1234
 # null: a quality run reads the whole subset.
 limit: null
