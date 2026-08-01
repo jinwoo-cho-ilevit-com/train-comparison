@@ -475,6 +475,68 @@
         ]
       },
       "closed": null
+    },
+    {
+      "id": "loss-empty-pixel-slice-on-a-real-checkpoint-is-unverified",
+      "axis": "loss",
+      "owner": "D (axes)",
+      "finding": "행->픽셀 매핑 구현 중 GPU 없이 결정한 설계 선택 (2026-08-02)",
+      "verdict": "row-pixel-mapping 레인 보고",
+      "summary": "이미지를 하나도 안 실은 조각에서 axes._split_rows가 이미지 텐서를 조각에서 뺀다(빈 텐서를 넘기지 않는다). 텍스트 전용 배치와 같은 모양이라 받아들여질 것이라는 판단이고, 실제 체크포인트에서 확인한 적이 없다. 반대 선택(빈 pixel_values 전달)이 옳을 가능성도 배제하지 못한다.",
+      "closes_when": {
+        "criterion": "실제 VL 체크포인트에 이미지 없는 조각을 넣어 forward가 성공함을 파드에서 확인하고 evidence로 커밋할 것. 실패하면 빈 텐서를 넘기도록 고치고 그 분기를 단언하는 테스트를 둘 것.",
+        "command": "GPU 파드에서 loss=cached_mnrl + 이미지가 일부 행에만 있는 배치로 bench.py 1 스텝",
+        "expected": "forward 성공, 또는 실패 시 정확한 예외 문구가 evidence에 기록",
+        "observed": "측정 안 함 (이 저장소에 GPU 없음, 2026-08-02)"
+      },
+      "anchor": {
+        "kind": "text",
+        "file": "docs/evidence/README.md",
+        "pattern": "empty-pixel-slice"
+      },
+      "closed": null
+    },
+    {
+      "id": "loss-gradcache-memory-and-overhead-are-unmeasured",
+      "axis": "loss",
+      "owner": "D (axes)",
+      "finding": "행->픽셀 매핑 완료 후 남은 측정 부채 (2026-08-02)",
+      "verdict": "row-pixel-mapping 레인 보고",
+      "summary": "PLAN.md가 이 축을 넣은 이유인 '20% vs 2~2.4배' 오버헤드 주장이 아직 아무 수치로도 확인/반박되지 않았다. 이 저장소에서 잰 것은 autograd saved tensor 개수(테스트 텐서, float64)뿐이다: plain 580 / mini_batch=6 402 / 3 219 / 2 178.",
+      "closes_when": {
+        "criterion": "A100에서 loss=mnrl과 cached_mnrl을 같은 파드·같은 배치로 돌려 step p50과 peak_memory_bytes가 결과 JSON에 들어갈 것.",
+        "command": "configs/experiment/phase2-loss-*.yaml 스윕",
+        "expected": "두 설정의 result.json에 metrics 블록이 있고 images_read_total > 0",
+        "observed": "측정 안 함 (2026-08-02)"
+      },
+      "anchor": {
+        "kind": "text",
+        "file": "docs/support-matrix.md",
+        "pattern": "cached_mnrl"
+      },
+      "closed": null
+    },
+    {
+      "id": "model-spec-gemma4-tokens-per-image-contradicts-the-processor",
+      "axis": "model-spec",
+      "owner": "B (probe) / model-spec",
+      "finding": "행->픽셀 매핑 중 프로세서 실측에서 발견 (2026-08-02)",
+      "verdict": "row-pixel-mapping 레인 보고",
+      "summary": "docs/model-spec.yaml이 processor_config.json의 image_seq_length: 280을 tokens_per_image로 적어뒀으나, transformers 5.14.1의 Gemma4Processor는 이미지마다 num_soft_tokens_per_image를 종횡비에서 계산하고 280은 max_soft_tokens 상한이다. 실측: 64x64 -> 256, 768x256 -> 252, 1024x1024 -> 256. probe/steps.py::visual_token_count가 선언값과 다르면 raise하므로 **gemma-4 probe는 이미지를 재빌드해도 여기서 죽는다.**",
+      "closes_when": {
+        "criterion": "model-spec의 gemma4_e2b tokens_per_image가 실측과 맞거나(고정값이 아니면 null), visual_token_count가 상한 의미로 비교하도록 고쳐질 것.",
+        "command": "uv run python /Users/jwcho/.claude/jobs/ac9d76bf/tmp/probe_flat.py",
+        "expected": "선언값과 실측 placeholder 수가 일치",
+        "observed": "declared 280, measured 252~256 (2026-08-02)"
+      },
+      "anchor": {
+        "kind": "test",
+        "file": "tests/test_probe.py",
+        "names": [
+          "test_the_declared_tokens_per_image_matches_what_the_processor_emits"
+        ]
+      },
+      "closed": null
     }
   ]
 }

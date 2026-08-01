@@ -123,7 +123,17 @@ class FakeProcessor:
             ),
         }
         if images:
-            encoded["pixel_values"] = torch.zeros(len(images), 3, 4, 4)
+            # One sublist per row, which is the shape all three real processors
+            # take and the only shape `Gemma4Processor` takes at all (measured
+            # 2026-08-02). Checked rather than flattened silently: the equality
+            # below is `Gemma4Processor.validate_inputs`'s, and a collate that went
+            # back to a flat list would otherwise pass here and fail on a pod.
+            if len(images) != len(texts) or not all(isinstance(row, list) for row in images):
+                raise ValueError(
+                    f"images must be one list per row: got {len(images)} entr(ies) for "
+                    f"{len(texts)} text(s)"
+                )
+            encoded["pixel_values"] = torch.zeros(sum(len(row) for row in images), 3, 4, 4)
         return encoded
 
 
@@ -623,26 +633,163 @@ class GradSpySGD(torch.optim.SGD):
 
 
 def test_gradcache_stops_the_run_on_a_batch_it_cannot_split_by_rows(config_mapping):  # noqa: F811
-    """GradCache is text-only here: `pixel_values` counts patches (Qwen-VL) or
-    images (gemma-4), and mapping those back to rows needs that model's own
-    placeholder accounting, so `axes._split_rows` refuses rather than guess.
+    """`pixel_values` counts patches (Qwen-VL) or images (gemma-4), never rows, so
+    `axes._split_rows` cuts it from the per-row image counts the collate recorded —
+    and refuses when there are none rather than guessing.
 
-    `axes._gradcache_needs_splittable_data` refuses an image-carrying *dataset*
-    before a batch exists, which is the layer that covers every configured run.
-    This is the layer under it: the dataset here declares text only and a batch
-    turns up with pixels anyway. The refusal has to reach the caller. Swallowed
-    inside the timed window — by a `try` here, or by a context manager returning
-    True from `__exit__` — the run would go on to report a step time for a step
-    that computed nothing.
+    This is the batch that has pixels and no counts: `micro_batch` leaves
+    `images_per_row` at None, which is what every collate that drops images
+    produces. The refusal has to reach the caller. Swallowed inside the timed
+    window — by a `try` here, or by a context manager returning True from
+    `__exit__` — the run would go on to report a step time for a step that computed
+    nothing.
     """
     config = gradcache_config(config_mapping)
     with_pixels = micro_batch(2)
     with_pixels.tensors["pixel_values"] = torch.zeros(3, 3, 4, 4)
 
-    with pytest.raises(RuntimeError, match="cannot split"):
+    with pytest.raises(RuntimeError, match="cannot attribute"):
         bench_entry.train(
             built_with(TinyEmbedder(), config, dataset=text_only()), [with_pixels], config, CPU
         )
+
+
+def test_the_collate_counts_every_row_s_images_against_the_placeholders_it_wrote(
+    config_mapping,  # noqa: F811
+):
+    """`images_per_row` is the map GradCache cuts `pixel_values` with, and this is
+    the only place it can be checked against what it claims to describe.
+
+    The processor consumes the flat image list in the order the placeholders appear
+    across the batch, so the count recorded for a row has to equal the number of
+    placeholders that row's own text carries. Anything else — an order swapped
+    between the two halves, a `None` image counted, a dropped image still counted —
+    puts the batch's row boundaries somewhere the pixels are not, and
+    `_split_rows` would cut there without complaint because the vector is
+    self-consistent.
+
+    Rows are asymmetric on purpose: only some carry a positive image, so a
+    `images_per_row` built from the query side alone, or interleaved rather than
+    concatenated, is a different vector from the right one.
+    """
+    processor = FakeProcessor()
+    config = axis_config(config_mapping)
+    pairs = rows(2, qry_image=True) + rows(2, qry_image=True, pos_image=True, text="cd")
+
+    micro = bench_entry.Collate(processor, config)(pairs)
+    texts = bench_entry.Collate(processor, config).pair_texts(pairs).texts
+
+    assert micro.images_per_row == tuple(text.count("<img>") for text in texts)
+    assert len(micro.images_per_row) == micro.rows
+    assert sum(micro.images_per_row) == micro.images == int(micro.tensors["pixel_values"].shape[0])
+    # Queries first, positives after — not interleaved. Two of the four positives
+    # carry an image, and both are in the second half.
+    assert micro.images_per_row == (1, 1, 1, 1, 0, 0, 1, 1)
+
+
+def test_the_processor_is_handed_one_image_list_per_row(config_mapping):  # noqa: F811
+    """The other consumer of the same map, and the reason there is only one of it.
+
+    Measured 2026-08-02 against the real processors: `Gemma4Processor` reads a flat
+    list as a single row's images and raises "Received inconsistently sized batches
+    of images (1) and text (4)", so no gemma-4 batch carrying images could be built
+    at all — for any loss, not just this one. Both Qwen processors take either form
+    and return byte-identical tensors for one image per row, so the grouped form is
+    the one shape all three accept.
+
+    Grouping it with `images_per_row` rather than with a second walk of the rows is
+    what keeps the processor's view and `_split_rows`' view from drifting: a wrong
+    vector is now a batch the processor itself refuses.
+    """
+
+    class Recording(FakeProcessor):
+        def __call__(self, text, images=None, **kwargs):
+            self.images = images
+            return super().__call__(text, images=images, **kwargs)
+
+    processor = Recording()
+    config = axis_config(config_mapping)
+    pairs = rows(2, qry_image=True) + rows(2, qry_image=True, pos_image=True, text="cd")
+
+    micro = bench_entry.Collate(processor, config)(pairs)
+
+    assert [len(group) for group in processor.images] == list(micro.images_per_row)
+    assert len(processor.images) == micro.rows
+    # The two text-only positives get an empty list, not a missing entry: the count
+    # of sublists has to equal the count of texts.
+    assert processor.images[4] == [] and processor.images[5] == []
+
+
+def test_a_dropped_image_is_not_counted_as_one_the_row_still_carries(config_mapping):  # noqa: F811
+    """A text-only checkpoint takes no pixels, and `Collate` counts those images as
+    dropped. Counting them in `images_per_row` anyway would build boundaries for a
+    `pixel_values` that is not in the batch, and `_split_rows` would then refuse
+    every batch of a run that is otherwise fine."""
+    config = axis_config(config_mapping)
+    pairs = rows(2, qry_image=True, pos_image=True)
+
+    micro = bench_entry.Collate(FakeProcessor(accepts_images=False), config)(pairs)
+
+    assert micro.images_dropped == 4
+    assert micro.images_per_row == (0, 0, 0, 0)
+    assert "pixel_values" not in micro.tensors
+
+
+def test_the_pieces_a_real_batch_splits_into_carry_their_own_rows_pixels(config_mapping):  # noqa: F811
+    """The join between the two halves of this: a batch built by the real collate,
+    cut by the real split.
+
+    Everything either side of this seam is checked on its own — the collate's counts
+    against the placeholders it wrote, and `_split_rows` against a stand-in that
+    consumes pixels the way a VL model does — and neither notices if the two stop
+    describing the same batch. `TinyEmbedder` ignores `pixel_values` entirely, so
+    the measured loop below cannot notice either.
+
+    Half the rows carry a positive image and half do not, so the vector is not its
+    own reverse and not its own interleaving: a collate that built the counts in
+    the wrong order lands here as a different cut.
+    """
+    config = gradcache_config(config_mapping, **{"train.batch_size": 4, "loss.mini_batch": 4})
+    pairs = rows(2, qry_image=True) + rows(2, qry_image=True, pos_image=True, text="cd")
+
+    micro = bench_entry.build_collate(FakeProcessor(), config)(pairs)
+    pieces = axes._split_rows(micro.tensors, config.loss.mini_batch, micro.images_per_row)
+
+    assert micro.images_per_row == (1, 1, 1, 1, 0, 0, 1, 1)
+    # Four query rows with an image each, then two text-only positives and two with
+    # one. Cut down the middle, that is four images and then two.
+    assert [int(piece["pixel_values"].shape[0]) for piece in pieces] == [4, 2]
+    assert sum(int(piece["pixel_values"].shape[0]) for piece in pieces) == micro.images
+
+
+def test_gradcache_runs_a_measured_loop_over_image_carrying_rows(config_mapping):  # noqa: F811
+    """The whole chain in one run, on the data this study measures.
+
+    `configs/data`'s two subsets are MMEB draws with an image on nearly every row,
+    and this axis was refused for all of them until `_split_rows` could attribute
+    `pixel_values`. What has to hold now is every link at once: the collate records
+    how many images each row put in, `MicroBatch` carries that out of the worker,
+    the loop hands it to `gradcache_backward`, and the split cuts the pixels at a
+    row boundary. A break anywhere in it arrives here as a raise, because each
+    piece is checked against its own rows on the way through.
+
+    `built_with` is not used: its loader is supplied by the caller, and the point
+    here is the collate `build_collate` really returns.
+    """
+    config = gradcache_config(
+        config_mapping,
+        **{"train.batch_size": 2, "loss.mini_batch": 2, "data.num_workers": 0},
+    )
+    processor = FakeProcessor()
+    built = harness_loader(config, processor)
+
+    summary = bench_entry.train(built, built.dataloader, config, CPU)
+
+    assert summary["steps_measured"] == config.train.steps
+    # The pixels were in the batches this measured. A run that had quietly read a
+    # text-only view of an image corpus reports these the other way round.
+    assert summary["images_read_total"] > 0
+    assert summary["images_dropped_total"] == 0
 
 
 def test_a_loss_that_refuses_the_pooled_signature_dies_on_the_first_step(probe_config):
@@ -1082,33 +1229,6 @@ def timing_config(config_mapping, **overrides):  # noqa: F811
     return bench(config_mapping, **settings)
 
 
-def test_an_axis_this_data_cannot_apply_is_written_to_the_result_file(pod_setting, config_mapping):  # noqa: F811
-    """`loss=cached_mnrl` over image-carrying rows, which is a configured pod run.
-
-    `axes._gradcache_needs_splittable_data` refuses it in `assemble`. Before this,
-    the process died with no `--out`, docker/entrypoint.sh filed a fallback record
-    saying `exit 1`, and the reason — the sentence naming `pixel_values` and why a
-    row cannot be recovered from it — stayed in the pod log. The report then said
-    only that a pod-hour had been spent.
-    """
-    config = timing_config(config_mapping, **{"loss.name": "cached_mnrl", "loss.mini_batch": 2})
-
-    code, record = pod_setting(config, rows(8, qry_image=True))
-
-    assert code != 0, "a refusal is not a success; the sweep counts this setting as failed"
-    assert record is not None
-    # The body, not a category. This sentence is what the report has to be able to
-    # say, and nothing here paraphrases it.
-    assert "pixel_values" in record["refusal"]["reason"]
-    assert "_split_rows refuses every such batch" in record["refusal"]["reason"]
-    assert record["refusal"]["kind"] == "UnappliedAxis"
-    assert record["refusal"]["stage"] == "assemble"
-    # The setting, so the row is attributable without decoding the whole config.
-    assert record["refusal"]["requested_axes"]["loss.name"] == "cached_mnrl"
-    # Never. report.py renders a record carrying this as a measurement.
-    assert "metrics" not in record
-
-
 def test_an_axis_this_environment_cannot_apply_is_written_before_the_timer(
     pod_setting,
     config_mapping,  # noqa: F811
@@ -1119,14 +1239,27 @@ def test_an_axis_this_environment_cannot_apply_is_written_before_the_timer(
     calls it once up front so the refusal lands here rather than on step 0 inside
     the timed window, where the only choices are catching inside the loop or
     crashing on something that was knowable before it started.
+
+    This is also the check that a refused setting reaches `--out` at all. Its
+    subject used to be `loss=cached_mnrl` over image-carrying rows, which was every
+    configured pod run until `_split_rows` learned to attribute `pixel_values` to
+    rows; that refusal is gone, and the record path is the same one either way.
+    Before it existed, such a process died with no `--out`, docker/entrypoint.sh
+    filed a fallback record saying `exit 1`, and the reason stayed in the pod log.
     """
     config = timing_config(config_mapping, **{"precision.name": "mxfp8"})
 
     code, record = pod_setting(config, rows(8))
 
-    assert code != 0
+    assert code != 0, "a refusal is not a success; the sweep counts this setting as failed"
     assert record["refusal"]["stage"] == "step_context"
+    assert record["refusal"]["kind"] == "UnappliedAxis"
+    # The body, not a category. This sentence is what the report has to be able to
+    # say, and nothing here paraphrases it.
     assert "Transformer Engine recipe" in record["refusal"]["reason"]
+    # The setting, so the row is attributable without decoding the whole config.
+    assert record["refusal"]["requested_axes"]["precision.name"] == "mxfp8"
+    # Never. report.py renders a record carrying this as a measurement.
     assert "metrics" not in record
 
 
@@ -1245,8 +1378,8 @@ def test_report_renders_the_refusal_as_a_reason_and_not_as_a_measurement(
     that decides the lane, so without the control this test would also pass against
     a report that renders no measurement table at all.
     """
-    config = timing_config(config_mapping, **{"loss.name": "cached_mnrl", "loss.mini_batch": 2})
-    _, refused = pod_setting(config, rows(8, qry_image=True))
+    config = timing_config(config_mapping, **{"precision.name": "mxfp8"})
+    _, refused = pod_setting(config, rows(8))
 
     pod = "results/native/qwen3_vl_emb_2b/pod-a"
     measured = {
@@ -1262,17 +1395,17 @@ def test_report_renders_the_refusal_as_a_reason_and_not_as_a_measurement(
     document = merged_document(
         tmp_path,
         {
-            f"{pod}/loss-cached_mnrl/result.json": refused,
-            f"{pod}/loss-mnrl/result.json": measured,
+            f"{pod}/precision-mxfp8/result.json": refused,
+            f"{pod}/precision-bf16/result.json": measured,
         },
     )
 
-    rows_in_tables = [line for line in document.splitlines() if line.startswith("| loss-")]
+    rows_in_tables = [line for line in document.splitlines() if line.startswith("| precision-")]
     # The control landed in a table, so "not in a table" below is a distinction the
     # document can actually draw.
-    assert any(line.startswith("| loss-mnrl |") for line in rows_in_tables)
-    assert not any(line.startswith("| loss-cached_mnrl |") for line in rows_in_tables)
+    assert any(line.startswith("| precision-bf16 |") for line in rows_in_tables)
+    assert not any(line.startswith("| precision-mxfp8 |") for line in rows_in_tables)
     # And the reason is in the document, in full.
-    assert "pixel_values" in document
-    assert "_split_rows refuses every such batch" in document
+    assert "Transformer Engine recipe" in document
+    assert "which is not implemented" in document
     assert "지표 없음" in document

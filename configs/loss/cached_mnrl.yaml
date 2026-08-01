@@ -1,13 +1,15 @@
-# GradCache. Requestable, and today refused by `axes.assemble` on both configured
-# subsets: `configs/data/*.yaml` are MMEB draws with an image on nearly every row,
-# every model here is a VL model, and `axes._split_rows` cannot attribute a batch's
-# `pixel_values` to rows. A run asking for this on that data dies at `assemble`
-# rather than reporting plain in-batch negatives under a cached_mnrl label.
+# GradCache. `axes._split_rows` cuts a batch into `mini_batch`-row pieces, and
+# since 2026-08-02 it can cut `pixel_values` too: `scripts/bench.py::Collate`
+# records how many images each row put into the batch, and that vector is what says
+# where a row's pixels begin. Both configured subsets are MMEB draws with an image
+# on nearly every row, so before that this value was refused at `assemble` for every
+# run this study is set up to make — GradCache exists to save memory and images are
+# most of the memory, so the axis was measurable only on the half of its own subject
+# that costs the least.
 #
-# `axis-values` in `scripts/audit_plan.py` counts this value as applicable, and
-# that is a different question: its fixture is text-only, so it answers "axes.py
-# can apply it", not "a measured run of this study can". The refusal lifts when a
-# text-only subset is configured, or when a row->pixel mapping exists.
+# Still refused: a batch carrying pixels with no such counts, and a dataset whose
+# rows nothing can read. Both stop the run rather than splitting by position, which
+# would hand one row's pixels to another row.
 name: cached_mnrl
 temperature: 0.02
 mini_batch: 8

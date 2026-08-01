@@ -155,9 +155,38 @@ TOKENIZED_COLUMNS = ("input_ids",)
 # writes into both subsets; they are repeated rather than imported because
 # `trainbench/` does not import from `scripts/`, and a subset that spells them
 # differently is still caught by its declared feature type (`image_columns`).
-# What reads this is `loss=cached_mnrl`: an image in the row becomes
-# `pixel_values` in the batch, and `_split_rows` cannot attribute that to rows.
+# What reads this is `loss=cached_mnrl`, which needs to know that a dataset can be
+# read as rows at all before it will claim the axis
+# (`_gradcache_needs_splittable_data`).
 IMAGE_COLUMNS = ("qry_image", "pos_image")
+
+# Batch entries whose leading dimension counts images or image patches rather than
+# rows, with what each one counts. Read off the real processors rather than guessed:
+# every name and every meaning below was produced by running the processor on
+# batches whose rows carried different numbers of images (1/1/1/1, 1/0/2/1, 2/1),
+# transformers 5.14.1, 2026-08-02.
+#
+#   Qwen/Qwen3-VL-Embedding-2B   Qwen3VLProcessor   pixel_values        patches
+#   Qwen/Qwen3.5-0.8B            Qwen3VLProcessor   image_grid_thw      images
+#   google/gemma-4-E2B           Gemma4Processor    pixel_values        images
+#                                                   image_position_ids  images
+#
+# Both Qwen checkpoints load the same processor class and produced the same two
+# keys. Their `pixel_values` is `(sum of t*h*w over the batch's images, 1536)` —
+# four images gridded [1,4,4], [1,6,8], [1,8,10] and [1,12,12] came back as
+# (288, 1536), and 16+48+80+144 is 288 — while `image_grid_thw` is `(images, 3)`.
+# gemma-4 counts images in the leading dimension directly: three images came back
+# as pixel_values (3, 2520, 768) and image_position_ids (3, 2520, 2).
+#
+# `mm_token_type_ids` is deliberately absent. All three processors return it as
+# `(rows, sequence)`, so it is row-aligned and the row rule below already covers it.
+IMAGE_PAYLOAD_KEYS = ("pixel_values", "image_grid_thw", "image_position_ids")
+
+# The per-image tensor whose rows are that image's `(t, h, w)` patch grid. It is
+# what turns a per-row image count into a per-row *patch* count for the Qwen
+# processors, whose `pixel_values` counts patches: split this by images, multiply
+# each row out, and the cumulative sum is where each batch row's pixels begin.
+IMAGE_GRID_KEY = "image_grid_thw"
 
 # What a packed batch carries. `cu_seqlens` and `seq_lengths` are boundaries, not
 # model inputs: `model(**tensors)` would reject them, so the harness has to lift
@@ -1068,8 +1097,9 @@ def image_columns(dataset: Any) -> list[str] | None:
 
     `None` and `[]` are different answers, and the difference is the point: a
     dataset that declares no columns, or whose rows are not mappings, has not said
-    there are no images. `_gradcache_needs_splittable_data` turns the two into two
-    different refusals rather than letting silence pass as text-only.
+    there are no images. `_gradcache_needs_splittable_data` refuses on `None` alone
+    — silence is what it cannot work with, while a row that does carry an image is
+    splittable from the per-row counts the collate records.
     """
     columns = declared_columns(dataset)
     if columns is None:
@@ -1420,22 +1450,88 @@ def _restore_rng(state: dict[str, Any], device: torch.device) -> None:
         torch.cuda.set_rng_state(state["cuda"], device)
 
 
-def _split_rows(batch: dict[str, Any], size: int) -> list[dict[str, Any]]:
+def _cumulative(counts: Any) -> list[int]:
+    """`[0, c0, c0+c1, ...]` — where each row's share of a tensor begins."""
+    bounds = [0]
+    for count in counts:
+        bounds.append(bounds[-1] + int(count))
+    return bounds
+
+
+def _image_bounds(batch: dict[str, Any], images_per_row: Any, rows: int) -> dict[str, list[int]]:
+    """Where each row's images, and each row's image patches, begin.
+
+    Returns at most two boundary vectors of length `rows + 1`, keyed by what they
+    count. `images` comes straight from the per-row counts the collate recorded.
+    `patches` exists only where the batch carries `IMAGE_GRID_KEY`: that tensor has
+    one row per image, so slicing *it* by the image boundaries and multiplying each
+    slice out gives the patch count of every batch row — which is what the Qwen
+    processors' `pixel_values` is indexed by.
+
+    Both are derived from the same per-row counts, so a batch cannot end up with an
+    image boundary and a patch boundary that disagree about which row an image
+    belongs to.
+    """
+    if images_per_row is None:
+        return {}
+    counts = [int(count) for count in images_per_row]
+    if len(counts) != rows:
+        raise RuntimeError(
+            f"images_per_row has {len(counts)} entries for a {rows}-row batch. It is the "
+            "map from rows to pixels, so one that does not describe this batch would "
+            "attribute pixels by an offset nothing downstream could detect."
+        )
+    if any(count < 0 for count in counts):
+        raise RuntimeError(f"images_per_row carries a negative count: {counts}")
+    bounds = {"images": _cumulative(counts)}
+
+    grid = batch.get(IMAGE_GRID_KEY)
+    if torch.is_tensor(grid):
+        total = bounds["images"][-1]
+        if int(grid.shape[0]) != total:
+            raise RuntimeError(
+                f"{IMAGE_GRID_KEY} has {int(grid.shape[0])} rows but images_per_row accounts "
+                f"for {total} image(s). That tensor is one row per image, so the two are "
+                "answers to the same question and only one of them can be right; splitting "
+                "under either would put some row's patches in another row's piece."
+            )
+        per_image = grid.reshape(total, -1).prod(dim=1).tolist() if total else []
+        bounds["patches"] = _cumulative(per_image)
+    return bounds
+
+
+def _split_rows(
+    batch: dict[str, Any], size: int, images_per_row: Any = None
+) -> list[dict[str, Any]]:
     """The batch cut into `size`-row pieces along the batch dimension.
 
     Sliced rather than re-collated: the padded width stays whatever the collate
     produced, so a piece is the same tensor content as the corresponding rows of
     the whole batch and the recomputed representations are the same numbers.
 
-    A tensor whose leading dimension is not the row count stops the split. This is
-    the multimodal case and it is refused rather than guessed: `pixel_values`
-    counts patches for the Qwen models and images for gemma-4, and which of them
-    belongs to which row is recoverable only from that model's own placeholder
-    accounting. Splitting it by position would hand one row's pixels to another
-    row, and nothing downstream can tell a wrong embedding from a right one.
-    Non-tensor entries are refused on the same grounds — they cannot be shown to be
-    row-aligned, and a value silently copied into every piece is a value shared by
-    rows it does not describe.
+    Three ways an entry can be attributed to rows, and everything else is refused:
+
+    * one leading entry per row — `input_ids`, `attention_mask`, `mm_token_type_ids`;
+    * one leading entry per image, cut at the image boundaries `images_per_row`
+      implies — gemma-4's `pixel_values` and `image_position_ids`, and the Qwen
+      processors' `image_grid_thw`;
+    * one leading entry per image *patch*, cut where the grid says each row's
+      images end — the Qwen processors' `pixel_values`.
+
+    `images_per_row` is what makes the last two possible, and it is passed in rather
+    than inferred: the collate that built the batch is the only place that still
+    knows which row each image came from (`scripts/bench.py::Collate`). Without it
+    an image payload is refused exactly as before, which is why a caller that
+    forgets to thread it through gets a stopped run rather than a shifted one.
+
+    An entry in `IMAGE_PAYLOAD_KEYS` is never fitted to the row rule even if its
+    leading dimension happens to equal the row count. Those keys count images or
+    patches by measurement, and a batch where that number coincides with the row
+    count would otherwise be split by a rule that is right by accident.
+
+    Non-tensor entries stay refused: they cannot be shown to be row-aligned, and a
+    value silently copied into every piece is a value shared by rows it does not
+    describe.
     """
     mask = batch.get("attention_mask")
     if not torch.is_tensor(mask):
@@ -1449,24 +1545,57 @@ def _split_rows(batch: dict[str, Any], size: int) -> list[dict[str, Any]]:
             f"{rows} rows is odd, but queries and documents are the two halves of this "
             "batch; the pairing that InfoNCE scores would be off by one."
         )
-    unattributable = sorted(
-        key
-        for key, value in batch.items()
-        if not torch.is_tensor(value) or value.shape[:1] != mask.shape[:1]
-    )
+
+    bounds = _image_bounds(batch, images_per_row, rows)
+    row_bounds = list(range(rows + 1))
+    attribution: dict[str, list[int]] = {}
+    unattributable: list[str] = []
+    for key, value in batch.items():
+        if not torch.is_tensor(value):
+            unattributable.append(key)
+            continue
+        leading = int(value.shape[0])
+        if key in IMAGE_PAYLOAD_KEYS:
+            counted = next((name for name, vector in bounds.items() if vector[-1] == leading), None)
+            if counted is None:
+                unattributable.append(key)
+            else:
+                attribution[key] = bounds[counted]
+        elif leading == rows:
+            attribution[key] = row_bounds
+        else:
+            unattributable.append(key)
+
     if unattributable:
+        counted = {name: vector[-1] for name, vector in bounds.items()}
         raise RuntimeError(
-            f"loss=cached_mnrl cannot split {unattributable} by rows: they do not carry one "
-            f"leading entry per row ({rows}). pixel_values is the case this stops — its "
-            "leading dimension counts patches (Qwen-VL) or images (gemma-4), and mapping "
-            "those back to rows needs that model's own placeholder accounting. Until that "
-            "mapping exists GradCache is refused for multimodal batches rather than run on "
-            "pixels attributed to the wrong row."
+            f"loss=cached_mnrl cannot attribute {sorted(unattributable)} to rows: they carry "
+            f"neither one leading entry per row ({rows}) nor a count this batch's "
+            f"images_per_row explains ({counted or 'none supplied'}). pixel_values is the "
+            "case this stops — its leading dimension counts patches (Qwen-VL) or images "
+            "(gemma-4), so it is splittable only alongside the per-row image counts the "
+            "collate recorded. Splitting it by position would hand one row's pixels to "
+            "another row, and nothing downstream can tell a wrong embedding from a right one."
         )
-    return [
-        {key: value[start : start + size] for key, value in batch.items()}
-        for start in range(0, rows, size)
-    ]
+
+    pieces = []
+    for start in range(0, rows, size):
+        stop = min(start + size, rows)
+        piece = {}
+        for key, value in batch.items():
+            lower, upper = attribution[key][start], attribution[key][stop]
+            # A piece none of whose rows carried an image gets no image payload at
+            # all, rather than an empty one. That is the shape the processor
+            # returns for a text-only batch — `scripts/bench.py::Collate` passes
+            # `images=` only when there are some — so it is the shape the model is
+            # known to accept. What a real checkpoint does with a zero-length
+            # `pixel_values` is 측정 안 함: there is no GPU here and no model large
+            # enough to ask.
+            if key in IMAGE_PAYLOAD_KEYS and lower == upper:
+                continue
+            piece[key] = value[lower:upper]
+        pieces.append(piece)
+    return pieces
 
 
 def _gradcache_needs_splittable_data(dataset: Any) -> None:
@@ -1481,38 +1610,31 @@ def _gradcache_needs_splittable_data(dataset: Any) -> None:
     it on. That is the "the check passed and there was nothing to check" shape this
     repository keeps producing, and the honest answer is to refuse here.
 
-    Today that refusal covers every configured run. Both subsets are MMEB draws —
-    `configs/data/speed.yaml` records "0 rows without a query image or positive" —
-    and all three models are VL models whose processor turns those images into
-    `pixel_values`, whose leading dimension counts patches (Qwen-VL) or images
-    (gemma-4) rather than rows. So `loss=cached_mnrl` is *not applicable* to this
-    study as configured. It becomes applicable without a change here the moment a
-    text-only subset is configured; making it applicable to the image subsets needs
-    the row->pixel mapping `_split_rows` describes.
+    **Rows that carry images are no longer refused.** They were, and the refusal
+    covered every configured run — both subsets are MMEB draws and all three models
+    turn those images into `pixel_values` — which left the axis with the largest
+    part of the memory it exists to save outside anything this study could measure.
+    `_split_rows` now attributes an image payload to rows from the per-row image
+    counts `scripts/bench.py::Collate` records, so an image batch splits.
 
-    A dataset that says nothing about itself is refused too, and that is not
-    pedantry: not knowing is not evidence that the batches are splittable, and this
-    function exists precisely so that a run which cannot be split is never first
-    counted as one that can.
+    What is still refused is a dataset nothing can read as rows: `image_columns`
+    answers `None` when the dataset declares no columns, or when its rows are not
+    mappings, or when it cannot be indexed at all. That is also the reading the
+    collate needs — it counts a row's images by asking the row for them — so a
+    dataset that cannot answer it produces batches whose pixels have no row counts,
+    and `_split_rows` refuses every one of them. Not knowing is not evidence that
+    the batches split, and this function exists precisely so that a run which
+    cannot be split is never first counted as one that can.
     """
-    carried = image_columns(dataset)
-    if carried is None:
+    if image_columns(dataset) is None:
         raise UnappliedAxis(
             "loss=cached_mnrl splits the batch by rows, and this run's dataset "
             f"({type(dataset).__name__}) does not say whether its rows carry images: it "
-            "declares no columns, or no rows this can read as mappings. An image becomes "
-            "pixel_values, which _split_rows cannot attribute to rows, so the axis is "
-            "refused here rather than reported applied and then crashed at the first batch."
-        )
-    if carried:
-        raise UnappliedAxis(
-            f"loss=cached_mnrl cannot run on this dataset: {carried} carry images, and a "
-            "processed batch of them holds pixel_values, whose leading dimension counts "
-            "patches (Qwen-VL) or images (gemma-4) rather than rows. _split_rows refuses "
-            "every such batch, so applying the axis here would report it applied and then "
-            "die at step 1. Both configs/data subsets are MMEB draws with an image on "
-            "nearly every row: until a row->pixel mapping exists, this axis is not "
-            "applicable to them."
+            "declares no columns, or no rows this can read as mappings. Rows that carry "
+            "images are fine — _split_rows attributes their pixels from the per-row image "
+            "counts the collate records — but a dataset whose rows cannot be read produces "
+            "no such counts, so the axis is refused here rather than reported applied and "
+            "then crashed at the first batch."
         )
 
 
@@ -1567,6 +1689,7 @@ def _loss(config: BenchConfig) -> tuple[Any, list[str]]:
         *,
         padding_side: str,
         scale: float = 1.0,
+        images_per_row: Any = None,
     ) -> torch.Tensor:
         """One batch's gradient, accumulated `mini_batch` rows at a time.
 
@@ -1591,12 +1714,19 @@ def _loss(config: BenchConfig) -> tuple[Any, list[str]]:
         accumulates micro-batches with `scale=1/grad_accum` and still records the
         unscaled loss, which is the convention `scripts/bench.py` already uses.
 
+        `images_per_row` is how many images each row of `batch` put into the batch,
+        in batch-row order. It is the whole of what makes a multimodal batch
+        splittable: the processor flattens every row's images into one
+        `pixel_values`, and the collate that fed it is the last place that still
+        knows which row each one came from. A caller that omits it on a batch
+        carrying pixels gets the refusal `_split_rows` has always raised.
+
         Returns the detached loss. Nothing here reads a device tensor into Python:
         the conversion is a synchronisation and belongs outside the timed window.
         """
         from trainbench.probe.steps import encode
 
-        pieces = _split_rows(batch, mini_batch)
+        pieces = _split_rows(batch, mini_batch, images_per_row)
         device = pieces[0]["attention_mask"].device
         states = []
         representations = []

@@ -645,6 +645,65 @@ class ProbeReport:
     돌아오고(+1 inert) cached_mnrl이 data-dependent로 잡힌다(+1). 이전 2가 실제보다
     낙관적이었던 것이다.
 
+- 2026-08-02 **`loss=cached_mnrl`이 이미지 배치에서 돈다 — 행->픽셀 매핑**
+  (`trainbench/axes.py`, `scripts/bench.py`, loss 레인). 위 두 항목이 기록한
+  "이 연구가 설정한 어떤 런에도 적용되지 않는다"를 해소한다.
+  - **실측이 근거다.** 세 체크포인트의 프로세서를 실제로 돌려 텐서 이름과 leading
+    dim이 무엇을 세는지 읽었다(transformers 5.14.1, 행별 이미지 수를 1/1/1/1,
+    1/0/2/1, 2/1로 바꿔가며). Qwen 두 모델은 `Qwen3VLProcessor`로 같고
+    `pixel_values`가 **패치**를(grid `[1,4,4] [1,6,8] [1,8,10] [1,12,12]` -> `(288,
+    1536)`), `image_grid_thw`가 **이미지**를 센다. gemma-4는 `Gemma4Processor`이고
+    `pixel_values` `(images, 2520, 768)`, `image_position_ids` `(images, 2520, 2)`로
+    둘 다 이미지를 센다. `mm_token_type_ids`는 셋 다 `(rows, seq)`라 행 정렬이다.
+    `axes.IMAGE_PAYLOAD_KEYS` 위 주석이 이 표를 담고 있다.
+  - **계약 변경 1건**: `built.loss_fn.gradcache_backward(...)`가 키워드 인자
+    `images_per_row`를 받는다. `scripts/bench.py::MicroBatch`에 같은 이름의 필드가
+    생겼고 `Collate`가 채운다(행 순서 = 배치 행 순서 = 쿼리 전부, 그다음 positive
+    전부). 넘기지 않으면 픽셀을 실은 배치는 **종전대로 거부된다** — 이 작업은 거부를
+    없앤 것이 아니라 좁힌 것이다.
+  - **여전히 거부하는 것**: 귀속 근거가 없는 텐서(행 수도 아니고 이 배치의
+    `images_per_row`가 설명하는 수도 아닌 leading dim), 텐서가 아닌 값, 그리고
+    `image_columns(dataset)`가 `None`인 dataset(컬럼을 선언하지 않거나 행이 매핑이
+    아니어서 collate가 행별 이미지 수를 셀 수 없는 경우).
+  - **같이 고친 것 — `Collate`가 프로세서에 이미지를 행별로 묶어 넘긴다.** 읽다가
+    실측으로 확인했다: `Gemma4Processor`는 평평한 리스트를 **거부한다**
+    (`make_nested_list_of_images`가 한 행의 이미지로 읽고 `validate_inputs`가
+    "Received inconsistently sized batches of images (1) and text (4)"로 raise).
+    행마다 이미지가 하나씩일 때도 거부한다. 즉 **gemma-4는 이미지가 실린 배치를
+    지금까지 하나도 만들 수 없었다** — GradCache만의 문제가 아니라 모든 loss가
+    그렇다. Qwen 두 프로세서는 두 형태를 다 받고 행당 1장인 경우 텐서가 바이트 단위로
+    같음을 확인했으므로, 묶은 형태가 셋 다 받는 유일한 모양이다. 묶는 데 쓰는 벡터는
+    `images_per_row` 그 자체다 — 지도를 두 벌 두지 않으려는 것이고, 그래서 잘못된
+    벡터는 이제 프로세서 자신이 거부하는 배치가 된다.
+    `tests/test_smoke_cpu.py::FakeProcessor`도 같은 등식을 검사하도록 바꿨다.
+  - **다른 레인이 알아야 할 것**: `axes.image_columns`의 *어느* 컬럼이 이미지인지를
+    가리는 부분은 이제 어떤 런의 동작도 결정하지 않는다. `None`인지 아닌지만 본다.
+    그 함수의 `datasets.Image` 피처 경로는 `scripts/audit_plan.py`의 두 fixture를
+    가르는 데만 쓰이므로, 정리는 감사 레인 몫이다.
+  - **레인 경계 침범 2건**(§1 "공유", 축 등재라 같은 커밋에 들어간다):
+    `tests/test_audit.py` — `test_a_value_applicable_to_only_one_data_shape_is_named_not_counted`가
+    실물 대신 `_gradcache_needs_splittable_data`를 monkeypatch해 data-dependent
+    케이스를 **만들어** 검사하도록 바꿨다(살아 있는 사례가 없어졌기 때문이고, 지우면
+    그 분기가 무검사로 남는다). 반대 방향을 보는
+    `test_gradcache_is_counted_applicable_on_both_data_shapes`를 추가했다.
+    `configs/loss/cached_mnrl.yaml` — 주석이 "두 서브셋 모두에서 거부된다"고
+    적혀 있어 거짓이 됐으므로 고쳤다.
+  - baseline `axis-values` 4->2 (loss 1/2 -> 2/2, 31/46 -> 32/46). note에 적었다.
+  - **GPU 없이 확인 못 한 것**: 조각 하나가 실제 체크포인트에 `pixel_values` 없이
+    들어갈 때(그 조각의 행이 이미지를 하나도 안 실은 경우) 무엇이 일어나는지는
+    측정 안 함이다. 텍스트 전용 배치와 같은 모양이라 받아들여질 것이라는 판단으로
+    빈 이미지 텐서를 조각에서 **뺐다**. 실제 모델에서의 확인은 첫 pod 몫이다.
+    GradCache의 메모리 절감량과 오버헤드 자체도 측정 안 함이다 — 이 저장소에 GPU가
+    없고, 여기서 잰 것은 autograd의 saved tensor 개수(테스트 텐서 기준)뿐이다.
+  - **다른 레인에 넘기는 제보 — gemma-4의 `tokens_per_image` 280이 실측과 다르다.**
+    `docs/model-spec.yaml`은 `processor_config.json`의 `image_seq_length: 280`을
+    적어뒀지만, transformers 5.14.1의 `Gemma4Processor`는 이미지마다
+    `num_soft_tokens_per_image`를 종횡비에서 계산하고 280은 `max_soft_tokens`
+    상한이다. 실측(2026-08-02): 64x64 -> 256, 768x256 -> 252, 1024x1024 -> 256.
+    `trainbench/probe/steps.py::visual_token_count`는 선언값과 다르면 raise하므로
+    gemma-4 probe는 이 지점에서 죽는다. `docs/model-spec.yaml`도
+    `probe/steps.py`도 이 레인 소유가 아니라 손대지 않았다.
+
 **새 레인 의무 — 파일을 추가하면 `PLAN.md` 구조 블록에 한 줄 추가한다.**
 위 반대 방향 때문에 생긴다. 열거되는 디렉터리(저장소 루트, `configs/`,
 `trainbench/`, `scripts/`, `tests/`, `docs/`)에 추적되는 파일이나 디렉터리를 새로

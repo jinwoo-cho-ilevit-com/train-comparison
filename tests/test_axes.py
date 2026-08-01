@@ -1720,6 +1720,122 @@ def pair_batch(rows: int = 8, width: int = 5) -> dict[str, torch.Tensor]:
     }
 
 
+# The id the multimodal fixtures below use as the image placeholder. A real
+# processor expands one image into many of them; one is enough here, and it is what
+# lets `TinyImageEncoder` tell a piece holding the wrong pixels from one holding
+# the right ones.
+IMAGE_TOKEN = 10
+
+
+class TinyImageEncoder(TinyEncoder):
+    """`TinyEncoder` plus the one thing that makes splitting a batch hard: pixels
+    that have to land on the row they came from.
+
+    Consumes them the way transformers' VL models do — one feature per image,
+    scattered into the placeholder positions in the order those placeholders appear
+    — and, like them, refuses a piece whose image count does not match its
+    placeholder count.
+
+    That refusal is not decoration, and it is the reason a wrong split is caught
+    rather than measured. A piece is a contiguous run of rows, so the only thing a
+    piece boundary decides is *how many* images fall on each side of it; get that
+    number wrong and some piece is handed a count its rows did not ask for. There
+    is no arrangement of contiguous pieces that misattributes pixels while every
+    count still matches.
+
+    Two pixel layouts, because the three checkpoints have two (measured 2026-08-02
+    from the real processors): with `image_grid_thw=None` `pixel_values` carries one
+    leading entry per image, which is gemma-4's; with a grid it carries one per
+    patch and the grid is what says where each image's patches end, which is both
+    Qwen processors'.
+
+    The pooled representation mixes across the row — `TinyEncoder` is pointwise, so
+    the last token would not depend on any pixel and an image test built on it
+    would grade nothing. The mixing is strictly within a row, so a piece is still
+    the same function of its rows as the whole batch is.
+    """
+
+    def __init__(self, dropout: float = 0.0) -> None:
+        super().__init__(dropout)
+        self.pixels = torch.nn.Linear(4, 6)
+
+    @staticmethod
+    def _per_image(pixel_values, grid):
+        if grid is None:
+            return pixel_values
+        sizes = grid.reshape(int(grid.shape[0]), -1).prod(dim=1).tolist()
+        if sum(sizes) != int(pixel_values.shape[0]):
+            raise ValueError(
+                f"{int(pixel_values.shape[0])} patch(es) against a grid describing "
+                f"{sum(sizes)}; this piece's pixels and its grid disagree"
+            )
+        return torch.stack([image.mean(dim=0) for image in torch.split(pixel_values, sizes)])
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        pixel_values=None,
+        image_grid_thw=None,
+        output_hidden_states=False,
+    ):
+        self.calls += 1
+        self.widest = max(self.widest, int(input_ids.shape[0]))
+        hidden = self.embed(input_ids)
+        if pixel_values is not None:
+            features = self.pixels(self._per_image(pixel_values, image_grid_thw))
+            spots = input_ids == IMAGE_TOKEN
+            if int(spots.sum()) != int(features.shape[0]):
+                raise ValueError(
+                    f"{int(spots.sum())} image placeholder(s) against {int(features.shape[0])} "
+                    "image feature(s); this piece was handed pixels its rows did not ask for"
+                )
+            hidden = hidden.masked_scatter(spots.unsqueeze(-1), features)
+        attended = attention_mask.unsqueeze(-1).to(hidden.dtype)
+        context = (hidden * attended).sum(dim=1, keepdim=True) / attended.sum(
+            dim=1, keepdim=True
+        ).clamp(min=1)
+        return SimpleNamespace(last_hidden_state=self.drop(self.proj(hidden + context)))
+
+
+def tiny_image_encoder(dropout: float = 0.0) -> TinyImageEncoder:
+    torch.manual_seed(7)
+    return TinyImageEncoder(dropout).double().train()
+
+
+def image_pair_batch(images_per_row, width: int = 6, grid=None) -> dict[str, torch.Tensor]:
+    """A right-padded batch whose row `i` carries `images_per_row[i]` images.
+
+    `grid` chooses the layout, and the two are the two the real processors return:
+    `None` gives gemma-4's `pixel_values` of one row per image, while a sequence of
+    `(t, h, w)` per image gives the Qwen processors', where `pixel_values` has one
+    row per patch and `image_grid_thw` travels alongside it.
+    """
+    generator = torch.Generator().manual_seed(11)
+    rows = len(images_per_row)
+    ids = torch.randint(1, IMAGE_TOKEN, (rows, width), generator=generator)
+    mask = torch.zeros(rows, width, dtype=torch.long)
+    for index, count in enumerate(images_per_row):
+        ids[index, :count] = IMAGE_TOKEN
+        # Every placeholder attended, and the rows still ragged so that a pooling
+        # side passed as a literal would show up.
+        mask[index, : max(count + 1, 2 + index % (width - 1))] = 1
+    batch = {"input_ids": ids, "attention_mask": mask}
+    if not sum(images_per_row):
+        # No pixels at all rather than an empty `pixel_values`: a batch of rows that
+        # carry no image is what the processor returns for a text-only draw, and it
+        # is the comparison the memory test needs.
+        return batch
+    if grid is None:
+        patches = sum(images_per_row)
+    else:
+        thw = torch.tensor(list(grid), dtype=torch.long)
+        batch["image_grid_thw"] = thw
+        patches = int(thw.prod(dim=1).sum())
+    batch["pixel_values"] = torch.randn((patches, 4), generator=generator, dtype=torch.float64)
+    return batch
+
+
 def cached(composed, **overrides):
     return bench(composed, **{"loss.name": "cached_mnrl", "loss.mini_batch": 4, **overrides})
 
@@ -1970,16 +2086,214 @@ def test_scale_multiplies_the_gradient_and_leaves_the_reported_loss_alone(compos
 
 
 def test_a_batch_whose_pixels_cannot_be_attributed_to_rows_is_refused(composed):
-    """The multimodal case, and the reason this axis does not reach two of the three
-    models yet. `pixel_values` counts patches or images, not rows; splitting it by
-    position would hand one row's pixels to another and nothing downstream could
-    tell the resulting embedding from a real one."""
+    """Pixels with no map from rows to them are still refused, which is what keeps
+    the map from being optional.
+
+    `pixel_values` counts patches (Qwen-VL) or images (gemma-4), never rows.
+    `images_per_row` is what says where a row's share of it begins, and a caller
+    that does not pass one has given this function no way to cut it — so it stops,
+    exactly as it did before any of this was splittable. Splitting by position
+    would hand one row's pixels to another and nothing downstream could tell the
+    resulting embedding from a real one.
+    """
     batch = pair_batch()
     batch["pixel_values"] = torch.zeros(3, 4)
     loss_fn, _ = axes._loss(cached(composed))
 
     with pytest.raises(RuntimeError, match="pixel_values"):
         loss_fn.gradcache_backward(tiny_encoder(), batch, padding_side="right")
+
+
+def test_pixels_are_never_cut_by_position_even_when_the_counts_would_line_up(composed):
+    """`pixel_values` whose leading dimension happens to equal the row count is
+    still not row-sliced.
+
+    This is the one shape where the old rule — "leading entry per row, or refuse" —
+    would have accepted a multimodal batch, and it would have been right by
+    accident: eight images across eight rows says nothing about which row each one
+    belongs to, and here the first row carries two of them while two rows carry
+    none. Drop `IMAGE_PAYLOAD_KEYS` from the check and this batch splits silently
+    down the middle.
+    """
+    counts = (2, 0, 1, 1, 2, 1, 1, 0)
+    batch = image_pair_batch(counts)
+    assert batch["pixel_values"].shape[0] == batch["attention_mask"].shape[0]
+    loss_fn, _ = axes._loss(cached(composed))
+
+    with pytest.raises(RuntimeError, match="pixel_values"):
+        loss_fn.gradcache_backward(tiny_image_encoder(), batch, padding_side="right")
+
+    # And with the map it is not merely accepted, it is cut where the rows are:
+    # the first piece holds the four images its four rows asked for, not the first
+    # four of the batch.
+    pieces = axes._split_rows(batch, 4, counts)
+    assert [int(piece["pixel_values"].shape[0]) for piece in pieces] == [4, 4]
+    assert [int((piece["input_ids"] == IMAGE_TOKEN).sum()) for piece in pieces] == [4, 4]
+
+
+# gemma-4 puts one leading entry per image in `pixel_values`; the Qwen processors
+# put one per patch and send `image_grid_thw` alongside. Both were read off the real
+# processors on 2026-08-02 (trainbench/axes.py::IMAGE_PAYLOAD_KEYS records the
+# shapes), and both are parametrised below rather than one standing in for the
+# other: the patch layout needs a second derivation — the grid split by images,
+# multiplied out — that the image layout does not exercise at all.
+PIXEL_LAYOUTS = {
+    "gemma4-per-image": None,
+    "qwen-per-patch": ((1, 2, 2), (1, 4, 2), (1, 2, 3), (1, 3, 4), (1, 2, 2), (1, 6, 2)),
+}
+
+
+@pytest.mark.parametrize("layout", sorted(PIXEL_LAYOUTS))
+@pytest.mark.parametrize("mini_batch", [4, 3])
+def test_gradcache_on_an_image_batch_computes_the_gradient_a_plain_backward_would(
+    composed, layout, mini_batch
+):
+    """The equivalence test, on the data this axis exists for.
+
+    GradCache is a memory technique and images are most of the memory, so a
+    version of it that only works on text measures the cheap half of its own
+    subject. What has to hold is what held for text: the gradient every parameter
+    ends up with is the one a single unsplit backward would have produced —
+    including `pixels`, the only parameter a wrong row->pixel map can reach.
+
+    `mini_batch=3` over six rows is the uneven split, and it is the case that
+    matters most here: the pieces then cut the batch at a row whose image count is
+    not a multiple of anything, so the boundary has to come from the counts rather
+    than from a stride.
+    """
+    counts = (2, 0, 1, 1, 1, 1)
+    config = cached(composed, **{"loss.mini_batch": mini_batch})
+    batch = image_pair_batch(counts, grid=PIXEL_LAYOUTS[layout])
+    reference, gradcached = tiny_image_encoder(), tiny_image_encoder()
+    expected = whole_batch_backward(reference, batch, config.loss.temperature)
+
+    loss_fn, _ = axes._loss(config)
+    loss = loss_fn.gradcache_backward(
+        gradcached, batch, padding_side="right", images_per_row=counts
+    )
+
+    assert float(loss) == pytest.approx(float(expected), rel=1e-12)
+    assert reference.pixels.weight.grad.abs().sum() > 0, (
+        "the reference never used its pixels, so this compares two text-only runs"
+    )
+    for (name, want), (_, got) in zip(
+        reference.named_parameters(), gradcached.named_parameters(), strict=True
+    ):
+        assert want.grad is not None, name
+        torch.testing.assert_close(got.grad, want.grad, rtol=1e-10, atol=1e-12, msg=name)
+
+
+@pytest.mark.parametrize("layout", sorted(PIXEL_LAYOUTS))
+def test_an_image_moved_across_a_piece_boundary_does_not_produce_a_number(composed, layout):
+    """The break for the test above, and a statement of exactly how much of the map
+    is load-bearing.
+
+    A piece is a contiguous run of rows, so the only thing its boundary decides is
+    how many images fall on each side of it. Move one across that boundary — here
+    the map gives row 4 an image that row 3 owns, with `mini_batch=4` cutting
+    between them — and the first piece is handed three images against four
+    placeholders, which is the mismatch a real VL model raises on too. The failure
+    is loud: the run stops instead of returning a loss built from another row's
+    pixels. The two layouts stop at different sentences and both are the same
+    finding — under the per-image layout the piece's image count is wrong, under
+    the per-patch one its grid and its pixels stop agreeing first.
+
+    The other half of the same fact, and the reason this test moves an image
+    *across* a boundary rather than anywhere: a map that misplaces an image between
+    two rows of the *same* piece changes nothing at all. The piece holds the same
+    pixels in the same order either way, and so does the unsplit batch. Only the
+    boundaries are load-bearing, which is why `scripts/bench.py`'s counts are
+    checked against the placeholders they stand for in `tests/test_smoke_cpu.py`
+    rather than only here.
+    """
+    counts = (2, 0, 1, 1, 1, 1)
+    batch = image_pair_batch(counts, grid=PIXEL_LAYOUTS[layout])
+    loss_fn, _ = axes._loss(cached(composed))
+
+    moved = list(counts)
+    moved[3] -= 1
+    moved[4] += 1
+    with pytest.raises(ValueError, match="did not ask for|pixels and its grid disagree"):
+        loss_fn.gradcache_backward(
+            tiny_image_encoder(), batch, padding_side="right", images_per_row=moved
+        )
+
+
+def test_a_map_that_does_not_describe_this_batch_is_refused(composed):
+    """A count vector of the wrong length is a map for a different batch, and every
+    boundary it produces is off. Refused where it arrives rather than sliced with,
+    because a short vector would otherwise just make the last pieces empty."""
+    counts = (1, 1, 1, 1)
+    batch = image_pair_batch(counts)
+    loss_fn, _ = axes._loss(cached(composed))
+
+    with pytest.raises(RuntimeError, match="images_per_row has 3 entries"):
+        loss_fn.gradcache_backward(
+            tiny_image_encoder(), batch, padding_side="right", images_per_row=counts[:3]
+        )
+
+
+def test_a_grid_that_disagrees_with_the_counts_is_refused(composed):
+    """`image_grid_thw` has one row per image and so does `images_per_row`'s sum.
+    Two answers to one question, and the patch boundaries are built out of both —
+    so a disagreement is refused rather than resolved in favour of either."""
+    counts = (1, 1, 1, 1)
+    batch = image_pair_batch(counts, grid=((1, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)))
+    batch["image_grid_thw"] = batch["image_grid_thw"][:3]
+    loss_fn, _ = axes._loss(cached(composed))
+
+    with pytest.raises(RuntimeError, match="image_grid_thw has 3 rows"):
+        loss_fn.gradcache_backward(
+            tiny_image_encoder(), batch, padding_side="right", images_per_row=counts
+        )
+
+
+def test_gradcache_holds_less_activation_than_a_plain_backward_on_an_image_batch(composed):
+    """The reason this axis exists, measured with the pixels in.
+
+    Two readings, because the first alone would pass a split that copied every
+    pixel into every piece: GradCache holds less live activation than the plain
+    backward, *and* halving `mini_batch` halves what it holds. A `pixel_values`
+    replicated per piece would keep the second number flat while the first stayed
+    green.
+
+    The text-only figures are taken from the same model on the same rows with no
+    images, so the gap between them is the pixels and nothing else.
+    """
+    counts = (2, 0, 1, 1, 1, 1)
+    batch = image_pair_batch(counts)
+
+    def held(run) -> int:
+        watcher = LiveActivations()
+        with watcher.watching():
+            run()
+        return watcher.peak
+
+    plain = held(lambda: whole_batch_backward(tiny_image_encoder(), batch, 0.05))
+
+    def gradcached(size: int) -> int:
+        loss_fn, _ = axes._loss(cached(composed, **{"loss.mini_batch": size}))
+        return held(
+            lambda: loss_fn.gradcache_backward(
+                tiny_image_encoder(), batch, padding_side="right", images_per_row=counts
+            )
+        )
+
+    wide, narrow = gradcached(6), gradcached(2)
+    text_only = held(
+        lambda: whole_batch_backward(tiny_image_encoder(), image_pair_batch((0,) * 6), 0.05)
+    )
+
+    assert plain > text_only, "the pixels reached no graph, so this measured a text-only run"
+    assert wide < plain, (
+        f"GradCache held {wide} elements against the plain backward's {plain}: it is paying "
+        "the second forward pass and saving nothing"
+    )
+    assert narrow < wide, (
+        f"mini_batch=2 held {narrow} elements and mini_batch=6 held {wide}: the pieces are "
+        "not carrying their own share of the pixels, which is what a replicated "
+        "pixel_values looks like"
+    )
 
 
 def test_a_packed_batch_cannot_be_split_by_rows(composed):
@@ -2089,34 +2403,38 @@ def test_the_cached_loss_is_read_back_as_cached_mnrl(composed):
     assert "loss.name" in names
 
 
-def test_gradcache_is_refused_on_the_subsets_this_study_measures(composed):
-    """The axis cannot run on the data the runs read, and that has to be said where
-    the axis is counted rather than at the first batch.
+def test_gradcache_is_not_refused_on_the_subsets_this_study_measures(composed):
+    """The axis reaches the data the runs actually read.
 
     `configs/data/*.yaml` are MMEB draws — speed.yaml records "0 rows without a
-    query image or positive" — and every model here is a VL model, so every batch
-    carries `pixel_values` and `_split_rows` refuses all of them. Building the loss
-    anyway would name the axis applied, satisfy `assert_matches`, be counted
-    applicable by `audit_plan.py`'s `axis-values`, and then die at step 1.
+    query image or positive" — so a refusal on rows carrying images was a refusal
+    of every configured run, and it left GradCache measurable only on the half of
+    its own subject that costs the least memory. `_split_rows` now attributes those
+    pixels from the per-row counts the collate records, so the dataset is no longer
+    what decides.
     """
-    for column in ("qry_image", "pos_image"):
-        with pytest.raises(axes.UnappliedAxis, match=f"'{column}'"):
-            axes.assemble(
-                plain_model(),
-                cached(composed),
-                CPU,
-                framework="native",
-                dataset=subset_rows(**{column: True}),
-            )
+    for columns in (
+        {"qry_image": True},
+        {"pos_image": True},
+        {"qry_image": True, "pos_image": True},
+    ):
+        built, names = axes.assemble(
+            plain_model(),
+            cached(composed),
+            CPU,
+            framework="native",
+            dataset=subset_rows(**columns),
+        )
+
+        assert "loss.name" in names
+        assert axis(capture(built, cached(composed)), "loss.name").applied == "cached_mnrl"
 
 
 def test_the_same_subset_schema_without_images_in_it_is_not_refused(composed):
-    """The break for the check above. Four of the twenty MMEB configs carry no
+    """Text-only draws stay unrefused too. Four of the twenty MMEB configs carry no
     `qry_image` and thirteen no `pos_image`, and `bench.py::Collate` skips a `None`
-    there — so a draw can hold the column and no image. Refusing on the column name
-    would refuse a text-only draw stored in the subset's schema, which is a
-    different claim from the one this axis is refused for, and would make the
-    refusal impossible to lift by changing the data."""
+    there — so a draw can hold the column and no image. Both shapes reach the axis
+    now, and this is the one that always did."""
     built, names = axes.assemble(
         plain_model(), cached(composed), CPU, framework="native", dataset=subset_rows()
     )
@@ -2125,38 +2443,16 @@ def test_the_same_subset_schema_without_images_in_it_is_not_refused(composed):
     assert axis(capture(built, cached(composed)), "loss.name").applied == "cached_mnrl"
 
 
-def test_an_image_column_under_another_name_is_still_refused(composed):
-    """The break for the check above: a name list alone would pass a subset that
-    renamed its image column, and its batches would still carry pixels.
-
-    The row's `picture` is `None`, so a reading that fell through to the rows would
-    find no image and let the run start.
-
-    `Image` here stands in for `datasets.Image`, so this pins the reading and not
-    the name it reads for. The test below pins the name against the real type.
-    """
-
-    class Image:
-        pass
-
-    declared = SubsetRows([{"qry": "a", "picture": None}])
-    declared.features = {"qry": "string", "picture": Image()}
-
-    with pytest.raises(axes.UnappliedAxis, match="picture"):
-        axes.assemble(plain_model(), cached(composed), CPU, framework="native", dataset=declared)
-
-
 def test_the_feature_type_that_reading_depends_on_is_still_called_image():
     """`axes.image_columns` decides by comparing a type name to the literal
-    "Image", so the reading above is correct only while `datasets` keeps calling
-    it that. Nothing else holds that name down — the test above defines its own
-    class named `Image` and asserts the string against itself.
+    "Image", and `scripts/audit_plan.py`'s two `axis-values` fixtures are told
+    apart by what it answers.
 
-    What a rename would cost: both pinned subsets are MMEB draws that carry
-    images, so they would read as text-only, `_gradcache_needs_splittable_data`
-    would stop refusing, and `loss=cached_mnrl` would reach batches it cannot
-    split by rows. `datasets` is imported here rather than stood in for because
-    the documented setup installs it (`uv sync --extra compose --extra native`).
+    It no longer decides whether `loss=cached_mnrl` runs — only `None` versus an
+    answer does that now — so a rename in `datasets` would cost the audit its
+    resolution rather than costing a run its correctness. `datasets` is imported
+    here rather than stood in for because the documented setup installs it
+    (`uv sync --extra compose --extra native`).
     """
     from datasets import Image, Value
 
@@ -2167,10 +2463,15 @@ def test_the_feature_type_that_reading_depends_on_is_still_called_image():
 
 
 def test_gradcache_is_refused_when_nothing_says_the_rows_can_be_split(composed):
-    """Not knowing is not evidence that the batches split. A dataset that declares
-    no columns — and `assemble` called with none at all, which is how
-    `audit_plan.py` probes every axis value — leaves the question unanswered, and an
-    unanswered question is what this axis kept being counted on."""
+    """Not knowing is not evidence that the batches split, and this is the refusal
+    that stayed after rows carrying images stopped being one.
+
+    A dataset that declares no columns, or whose rows are not mappings, is one the
+    collate cannot ask "how many images does this row have" — and without that
+    answer `_split_rows` refuses every batch that carries pixels. `assemble` called
+    with no dataset at all is the same case, and it is how `audit_plan.py` probed
+    every axis value until 2026-08-02.
+    """
     unreadable = (
         None,
         # Declares nothing about itself.

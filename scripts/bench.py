@@ -92,14 +92,33 @@ class MicroBatch(NamedTuple):
     # belong to pooling, not to the forward pass (axes.PACKED_BOUNDARY_KEYS).
     # None is what tells the step to pool the padded way.
     cu_seqlens: torch.Tensor | None = None
+    # How many images each row of `tensors` contributed, in batch-row order. The
+    # processor flattens every row's images into one `pixel_values` and keeps no
+    # record of where the boundaries were, so this collate is the last place that
+    # knows — and `loss=cached_mnrl` cannot split a multimodal batch without it
+    # (axes._split_rows). Kept out of `tensors` for the same reason as the
+    # boundaries above: `model(**tensors)` would reject it.
+    #
+    # None means no batch of this shape carries pixels (the packed and pretokenized
+    # collates drop images), not that the counts are zero — and `_split_rows`
+    # refuses rather than assumes if pixels turn up anyway.
+    images_per_row: tuple[int, ...] | None = None
 
 
 class PairTexts(NamedTuple):
-    """One batch's 2N templated strings, queries first, and the images for them."""
+    """One batch's 2N templated strings, queries first, and the images for them.
+
+    `images_per_row` counts, for each of those 2N strings and in the same order,
+    how many of `images` belong to it. That is the map `loss=cached_mnrl` needs to
+    cut `pixel_values` at the right place, and it is recoverable here and nowhere
+    later: the processor consumes the flat list in placeholder order and returns
+    one concatenated tensor.
+    """
 
     texts: list[str]
     images: list[Any]
     images_dropped: int
+    images_per_row: tuple[int, ...]
 
 
 class PairDataset(torch.utils.data.Dataset):
@@ -154,6 +173,29 @@ def load_pairs(config: BenchConfig) -> PairDataset:
             f"asked for {wanted}; a short corpus makes every throughput figure optimistic"
         )
     return PairDataset(rows)
+
+
+def _group_by_row(images: list[Any], images_per_row: tuple[int, ...]) -> list[list[Any]]:
+    """The flat image list cut into one sublist per batch row.
+
+    The same vector that tells `axes._split_rows` where a row's pixels begin also
+    tells the processor which row each image belongs to, so there is one map and
+    not two. A row that carries none gets `[]`, which is what keeps the sublist
+    count equal to the text count — the equality `Gemma4Processor.validate_inputs`
+    checks.
+    """
+    grouped: list[list[Any]] = []
+    cursor = 0
+    for count in images_per_row:
+        grouped.append(images[cursor : cursor + count])
+        cursor += count
+    if cursor != len(images):
+        raise RuntimeError(
+            f"images_per_row accounts for {cursor} image(s) and the batch carries {len(images)}; "
+            "the two are built in the same loop, so a disagreement means one row's images would "
+            "be handed to another row's placeholders"
+        )
+    return grouped
 
 
 class Collate:
@@ -234,6 +276,8 @@ class Collate:
         positives: list[str] = []
         query_images: list[Any] = []
         positive_images: list[Any] = []
+        query_counts: list[int] = []
+        positive_counts: list[int] = []
         dropped = 0
         take_images = with_images and self.accepts_images
 
@@ -257,11 +301,17 @@ class Collate:
             # there are placeholders, in the same order.
             queries.append(self.prompt + self._text(row.get("qry"), side_images[0]))
             positives.append(self._text(row.get("pos_text"), side_images[1]))
+            query_counts.append(int(side_images[0]))
+            positive_counts.append(int(side_images[1]))
 
+        # Concatenated the same way as the texts and the images: every query row
+        # first, then every positive. One order for all three, so a count belongs
+        # to the string above it and to that string's slice of the flat image list.
         return PairTexts(
             texts=queries + positives,
             images=query_images + positive_images,
             images_dropped=dropped + sum(int(row.get("images_dropped", 0) or 0) for row in rows),
+            images_per_row=tuple(query_counts + positive_counts),
         )
 
     def __call__(self, rows: list[dict[str, Any]]) -> MicroBatch:
@@ -274,7 +324,15 @@ class Collate:
             "padding": True,
         }
         if images:
-            kwargs["images"] = images
+            # Grouped per row, not one flat list. Measured 2026-08-02 against the
+            # real processors: `Gemma4Processor` rejects a flat list outright —
+            # `make_nested_list_of_images` reads it as one row's images and
+            # `validate_inputs` raises "Received inconsistently sized batches of
+            # images (1) and text (4)" — so no gemma-4 batch carrying images could
+            # be built at all, for any loss. Both Qwen processors accept either and
+            # return byte-identical tensors for the one-image-per-row case, so the
+            # grouped form is the one shape all three take.
+            kwargs["images"] = _group_by_row(images, built.images_per_row)
         else:
             # Truncation is safe only with no pixels in the batch. `max_seq_len` is
             # enforced against the image case below instead of by cutting it: the
@@ -304,6 +362,7 @@ class Collate:
             samples=len(rows),
             images=len(images),
             images_dropped=dropped,
+            images_per_row=built.images_per_row,
         )
 
 
@@ -664,8 +723,18 @@ def train(built: Any, loader: Any, config: BenchConfig, device: torch.device) ->
                     # from the cache. `scale` multiplies the gradient rather than
                     # the returned loss, so the loss recorded below is the unscaled
                     # one on this path too.
+                    #
+                    # `images_per_row` is what lets it cut `pixel_values` at a row
+                    # boundary instead of refusing the batch. It is passed even
+                    # when it is None — a text-only batch needs no map, and a
+                    # multimodal one whose collate recorded none is refused rather
+                    # than split by position.
                     loss = gradcache_backward(
-                        built.model, tensors, padding_side=side, scale=1.0 / grad_accum
+                        built.model,
+                        tensors,
+                        padding_side=side,
+                        scale=1.0 / grad_accum,
+                        images_per_row=micro.images_per_row,
                     )
                 else:
                     # `micro.cu_seqlens` is None unless `dataloader.packing=true`,
