@@ -20,13 +20,24 @@ dependencies = [
 [dependency-groups]
 # Installed as the image's first sync pass. Every env declares it so the
 # Dockerfile has one code path; envs/native explains what depends on it.
-build = ["torch", "setuptools>=77", "packaging", "wheel", "ninja"]
+# cffi is here only for this env: see no-build-isolation-package below.
+build = ["torch", "setuptools>=77", "packaging", "wheel", "ninja", "cffi>=1.17"]
 
 [tool.uv]
 # These images only ever run on linux/CUDA pods. Resolving for the host platform
 # would drag in wheels that do not exist there.
 environments = ["sys_platform == 'linux'"]
 default-groups = ["build"]
+# axolotl 0.18.0 pins zstandard==0.22.0 exactly, and that sdist pins
+# `cffi==1.16.0` exactly in build-system.requires. cffi 1.16.0 has no cp313 wheel
+# and its _cffi_backend.c calls _PyErr_WriteUnraisableMsg(), a private CPython
+# symbol that 3.13 removed — so under build isolation it compiles and then fails
+# to import, which is the recorded axolotl build failure. Building zstandard
+# against the environment's own cffi (2.1.0, resolved via cryptography) sidesteps
+# the stale build pin without overriding what axolotl asked for at runtime.
+# On CPython, zstandard's cffi backend is optional at runtime but make_cffi.py
+# still runs at build time, which is where it died.
+no-build-isolation-package = ["zstandard"]
 
 [tool.uv.sources]
 trainbench = { path = "../..", editable = true }

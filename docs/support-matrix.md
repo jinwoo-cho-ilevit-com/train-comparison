@@ -252,32 +252,102 @@ pod 실행으로 판정한다.
 revision을 `configs/data/speed.yaml`에 고정했다. 이 값이 모든 run의 데이터 버전으로
 기록된다. `data/quality.yaml`은 행 수가 달라 별도 서브셋이 필요하므로 아직 미고정이다.
 
-## 이미지 빌드 결과 (2026-08-01, GitHub Actions / linux-amd64)
+## 이미지 빌드 결과 (커밋 `821f8f4`, GitHub Actions / linux-amd64)
 
-베이스 1개 + 프레임워크 6개 = 이미지 7개. **6/7 성공.**
+3단 sync + `libffi-dev` + CUDA 소스 빌드 4종이 들어간 뒤 처음 돈 빌드다. 앞선
+(커밋 `9188fd8` 이전) 결과 표는 서술 대상 Dockerfile이 사라졌으므로 이 표로 교체했다 —
+두 결과를 나란히 두지 않는다.
 
-> **이 결과가 서술하는 Dockerfile은 더 이상 존재하지 않는다** (2026-08-02 확인).
-> 커밋 `9188fd8`이 `docker/Dockerfile.base`(libffi-dev)와 `docker/Dockerfile.framework`
-> (3단 sync, `COPY trainbench` 순서, `USE_HF=1`)와 `build-images.yml`(sha 태그, base를
-> digest로 참조, registry 캐시)을 전부 바꿨고, **그 이후 어떤 이미지도 빌드되지 않았다**
-> (아래 "이번 변경의 검증 범위"). 즉 아래 표는 *이전* Dockerfile의 결과이며 현재
-> 트리에 대해서는 성공도 실패도 알려진 것이 없다. 특히 `envs/native`에 CUDA 소스 빌드
-> 4종(`flash-attn`, `deepspeed`, `causal-conv1d`, `transformer-engine-torch`)이 추가돼
-> native 이미지의 빌드 시간과 성공 여부가 이 표의 조건과 다르다.
-> **다음 빌드가 돌면 이 절 전체를 새 결과로 교체한다 — 두 결과를 나란히 두지 않는다.**
-
-| 이미지 | 결과 |
-|---|---|
-| base | success |
-| native | success |
-| unsloth | success |
-| ms-swift | success |
-| sentence-transformers | success |
-| tevatron | success |
-| **axolotl** | **failure** |
+| 이미지 | 결과 | 소요 |
+|---|---|---|
+| base | success | 2분 50초 |
+| unsloth | success | 29분 |
+| tevatron | success | 26분 46초 |
+| sentence-transformers | success | 26분 33초 |
+| ms-swift | success | |
+| **native** | **failure** | 28분 20초 |
+| **axolotl** | **failure** | 3분 19초 |
 
 `uv sync --frozen`이 실제 linux/CUDA 환경에서 설치까지 도달한다는 첫 증거다. 지금까지는
-해석(`uv lock`)만 확인했었다.
+해석(`uv lock`)만 확인했었다. **5/7** — 실패한 둘은 서로 다른 원인이고 아래 두 절에서
+각각 다룬다.
+
+### native 실패 — 러너가 죽었고 로그는 이유를 말하지 않는다
+
+로그의 마지막 줄들이다.
+
+```
+#12 1346.1       Built transformer-engine-torch==2.17.0
+#12 1418.4       Built causal-conv1d==1.6.2.post1
+#12 1418.8 Prepared 106 packages in 23m 38s
+#12 1432.6    Building deepspeed==0.19.3
+#12 1433.7    Building flash-attn==2.8.3.post1
+#12 1446.3       Built deepspeed==0.19.3
+##[error]The runner has received a shutdown signal.
+```
+
+**의존성 충돌이 아니고 시간 초과도 아니다.** 빌드는 정상 진행 중이었고, 같은 워크플로의
+unsloth가 29분에 성공했다. 읽어낼 수 있는 것은 시점뿐이다.
+
+- `transformer-engine-torch`(22분)와 `causal-conv1d`(23.6분)는 **동시에** 돌고 둘 다 통과
+- `deepspeed`는 13.7초에 끝났다 — CUDA op을 굽지 않는 기본 JIT 설치이므로 부담이 아니다
+- `flash-attn`이 시작하고 **86초 뒤** 러너가 죽었다
+
+즉 부하를 만든 것은 flash-attn 하나다. 다만 **왜 죽었는지는 로그에 없다.** 메모리
+고갈과 디스크 고갈이 워크플로 로그에서 같은 모습이고, 러너가 죽으면 `if: always()`
+단계도 돌지 않아 아무 증거가 남지 않는다. 아래 조치는 두 가설을 모두 겨냥하고,
+동시에 다음 실패가 원인을 남기도록 계측을 넣는다.
+
+**"OOM이었다"는 아직 확정이 아니다.** 확정된 것은 러너가 flash-attn 컴파일 중에
+사라졌다는 것뿐이다.
+
+### 빌드 환경변수 — 이름을 소스에서 확인했다
+
+각 이름은 이 lock이 고정한 바로 그 버전의 sdist를 받아 읽었다. 추정이 아니다.
+
+| 변수 | 읽는 패키지 | 확인한 위치 | 기본값 |
+|---|---|---|---|
+| `FLASH_ATTN_CUDA_ARCHS` | flash-attn 2.8.3.post1 | `setup.py:70` `cuda_archs()` | `80;90;100;120` |
+| `NVCC_THREADS` | flash-attn 2.8.3.post1 | `setup.py:124` `append_nvcc_threads()` | `4` |
+| `MAX_JOBS` | flash-attn 2.8.3.post1 | `setup.py:513` `NinjaBuildExtension` | `min(코어/2, 여유메모리GB/9)` |
+| `NVTE_CUDA_ARCHS` | transformer-engine-torch 2.17.0 | `build_tools/utils.py:255` | CUDA 13에서 `75;80;89;90;100;120` |
+| `NVTE_BUILD_MAX_JOBS` | transformer-engine-torch 2.17.0 | `build_tools/utils.py:47` | 무제한 (`MAX_JOBS`가 fallback) |
+
+**`TORCH_CUDA_ARCH_LIST`는 여기서 아무 효과가 없다.** torch의
+`_get_cuda_arch_flags()`는 빌드가 자기 `-gencode`를 넘기면 즉시 `[]`를 돌려주는데
+(`torch/utils/cpp_extension.py:2643`, `if 'arch' in flag: return []`),
+flash-attn과 causal-conv1d 둘 다 `-gencode`를 직접 넘긴다. 이 변수를 넣었다면 30분을
+태우고 아무 변화도 얻지 못했을 것이므로 **넣지 않았다.**
+
+`flash-attn`의 `MAX_JOBS` 기본 계산에는 `import psutil`이 들어 있다. 값이 무엇이었는지
+로그에 남지 않으므로 명시해서 추측을 없앤다. 그 계산 옆의 상류 주석이
+"each JOB peak memory cost is ~8-9GB when threads = 4"라고 적고 있고, nvcc의
+`--threads`는 gencode 사이를 병렬화하므로 **메모리 지렛대는 `MAX_JOBS`가 아니라
+`NVCC_THREADS`와 arch 개수**다.
+
+`causal-conv1d` 1.6.2.post1에는 대응하는 변수가 **없다.** `setup.py:179-199`가 CUDA 13
+아래에서 9개 gencode(75/80/87/90/100/120/103/110/121)를 무조건 넣고 arch 변수를 읽지
+않는다. 좁힐 수 없으므로 `MAX_JOBS`로만 묶인다.
+
+### `TORCH_CUDA_ARCH_LIST` 대신 arch를 좁힌 결정과 그 대가
+
+`80;90;100` = A100 / H200 / B200. `PLAN.md`가 이름을 붙인 GPU 셋 전부이고, 그 이상은
+없다. Phase 0~1은 A100, Phase 2~3은 B200, "B200 확보 실패 시 H200 전면 전환"이 문서화된
+분기이므로 sm_90을 빼면 그 분기가 재빌드를 요구하게 된다. 실제로 뺀 것은 flash-attn의
+sm_120과 transformer-engine의 sm_75/89/120이며, 어느 것도 계획에 등장하지 않는다.
+
+**좁히면 그 이미지는 목록 밖 GPU에서 못 돈다.** 다만 조용히 틀리지는 않는다:
+flash-attn은 `code=sm_XX`만 내보내고 PTX를 넣지 않으므로 JIT으로 흘러갈 경로가 없고,
+목록 밖 GPU는 `no kernel image is available for execution on the device`로 죽는다.
+느린 fallback으로 떨어져 잘못된 숫자를 내는 부류의 위험이 아니다.
+
+**그래도 시작 시점 차단은 만들지 못했다.** 이미지에 `TRAINBENCH_CUDA_ARCHS`를
+넣어 컨테이너 안에서 목록을 읽을 수 있게 해뒀지만, **읽는 쪽이 없다.** pod 진입점인
+`docker/entrypoint.sh`는 F 레인 소유가 아니다(`docs/CONTRACTS.md` §1에서 G 소유).
+필요한 검사는 "`nvidia-smi`의 compute capability가 `TRAINBENCH_CUDA_ARCHS`에 없으면
+run을 시작하기 전에 중단"이며, **G 레인 작업으로 남는다.** 그때까지 방어선은 위의
+하드 실패와, run 기록의 `host.gpu`(`docs/CONTRACTS.md` §272~275)로 사후에 드러나는 것
+둘뿐이다.
 
 ### axolotl 실패 원인 — 베이스 이미지의 시스템 의존성 누락
 
@@ -329,6 +399,67 @@ digest 태깅으로 베이스/프레임워크 이미지를 함께 손볼 예정�
 
 **미검증**: 이 수정으로 axolotl 이미지가 빌드된다는 것은 **확인하지 않았다.** 아래
 "이번 변경의 검증 범위"를 참조한다.
+
+### axolotl 실패 원인 — 근접 원인 뒤에 하나가 더 있었다 (커밋 `821f8f4` 빌드)
+
+`libffi-dev`는 옳았고 충분하지 않았다. 헤더가 생기자 `cffi==1.16.0`은 **컴파일에
+성공하고 임포트에서 죽는다.**
+
+```
+zstandard 0.22.0 sdist:
+  make_cffi.py → cffi.FFI() → import _cffi_backend
+  ImportError: _cffi_backend.cpython-313-x86_64-linux-gnu.so:
+               undefined symbol: _PyErr_WriteUnraisableMsg
+```
+
+위 7단계 표의 5번("cffi 1.16.0 휠도 cp312까지")에 이어지는 8번이다.
+
+| 단계 | 확인한 사실 | 근거 |
+|---|---|---|
+| 8 | cffi 1.16.0의 C 소스가 `_PyErr_WriteUnraisableMsg()`를 호출한다 | sdist의 `src/c/_cffi_backend.c:6121` |
+| 9 | 그 심볼이 CPython 3.13 헤더에 없다 (3.8~3.12의 비공개 API였다) | `cpython-3.13.13`의 `include/python3.13/` 전체 grep 무결과 |
+| 10 | ELF 확장모듈은 미정의 심볼이 있어도 링크되므로, 실패는 컴파일이 아니라 **임포트**에서 난다 | 위 빌드 로그 |
+
+따라서 **cffi 1.16.0은 3.13에서 동작할 수 없고**, zstandard 0.22.0 sdist가 그것을
+`build-system.requires`에 정확히 고정하는 한 격리 빌드로는 길이 없다. 근접 원인이
+아니라 막다른 골목이다.
+
+**조치 — 런타임 핀은 그대로 두고 빌드 환경만 바꿨다.** `envs/axolotl`에
+
+- `[tool.uv] no-build-isolation-package = ["zstandard"]`
+- `[dependency-groups] build`에 `cffi>=1.17`
+
+`zstandard==0.22.0`(axolotl이 요구한 값)은 손대지 않는다. 격리를 끄면 zstandard가
+환경의 cffi(이 lock에서는 cryptography 경유 **2.1.0**)로 빌드되므로 sdist의 낡은 빌드
+핀을 우회한다. CPython에서 zstandard의 cffi 백엔드는 런타임 선택사항이지만
+`make_cffi.py`는 빌드 때 항상 돌고, 죽은 곳이 거기다.
+
+이전 기록이 `override-dependencies`로 zstandard를 0.25.0까지 올리는 안을
+"업스트림이 정확히 고정한 값을 거스른다"는 이유로 택하지 않았는데, 이 방법은 그
+반대를 하지 않는다 — 상류의 런타임 핀을 존중하면서 3.13에서 성립하지 않는 **빌드**
+핀만 비켜간다.
+
+**로컬 실측 (2026-08-02, macOS arm64 / CPython 3.13.13 / cffi 2.1.0)**
+
+실패 메커니즘이 플랫폼이 아니라 파이썬 버전에 걸린 것이라 로컬에서 재현·검증이 된다.
+
+```
+uv pip install --no-build-isolation zstandard==0.22.0
+  → Built zstandard==0.22.0
+  → zstandard/_cffi.cpython-313-darwin.so 가 생성됨   (make_cffi.py 통과)
+  → import zstandard; backend='cext'; 압축/해제 왕복 성공
+```
+
+**생성된 `_cffi.cpython-313-*.so`가 증거다** — CI에서 죽은 바로 그 `make_cffi.py`
+단계가 통과했다는 뜻이다.
+
+**미검증**: linux/amd64에서 같은 결과가 나온다는 것. zstandard의 C 소스는 이식 가능하고
+실패 원인은 파이썬 버전에 걸려 있으나, 확인은 빌드뿐이다.
+
+**남아 있는 대안 — 쓰지 않았다**: axolotl은 0.18.0이 최신이라(PyPI 확인) 상류에서
+핀이 풀린 버전으로 올라가는 길은 없다. 이 방법이 실패하면 남는 선택지는
+`override-dependencies`이거나, "axolotl 0.18.0은 CPython 3.13에서 이미지가 만들어지지
+않는다"를 Phase 0 결과로 기록하는 것이다.
 
 ## 축별 패키지 설치 (2026-08-01, Wave 2 F 레인)
 
@@ -499,6 +630,67 @@ editable로 참조하는 최소 프로젝트를 만들고 그 소스 디렉터�
 10GB인데 CUDA devel 베이스 + 프레임워크 6개를 `mode=max`로 올리면 한참 초과한다.
 초과하면 LRU로 서로를 밀어내고, **7개 이미지가 공유하는 베이스 레이어가 가장 먼저
 쫓겨난다.** GHCR에는 그 상한이 없고 어차피 push하고 있으므로 캐시를 그쪽에 둔다.
+
+## 이번 변경의 검증 범위 (2026-08-02, 이미지 빌드 수정)
+
+위 "이번 변경의 검증 범위 (2026-08-01, Wave 2 F)"의 "**CI가 돌지 않았다**" 항목은
+해소됐다 — 커밋 `821f8f4`에서 실제로 돌았고 결과가 위 표다. 나머지 항목은 그대로
+유효하다. **이번 변경에 대해서는 이 절이 유일한 기준이다.**
+
+### 실행으로 확인한 것
+
+| 항목 | 명령/방법 | 결과 |
+|---|---|---|
+| 빌드 환경변수 이름 5종 | lock이 고정한 버전의 sdist를 받아 `setup.py`/`build_tools` 직접 읽기 | 위 "빌드 환경변수" 표. 파일·행 번호까지 확인 |
+| `TORCH_CUDA_ARCH_LIST` 무효 | 설치된 `torch/utils/cpp_extension.py:2643` 읽기 | `-gencode`가 있으면 `[]` 반환. 넣지 않기로 결정 |
+| zstandard 0.22.0 격리 없이 빌드 | py3.13.13 venv + cffi 2.1.0, `uv pip install --no-build-isolation` | 성공. `_cffi.cpython-313-darwin.so` 생성, 임포트·왕복 통과 |
+| axolotl env 재해석 | `envs/axolotl`에서 `uv lock` | 241 패키지, 이전과 동수. 추가된 줄은 `cffi>=1.17` 뿐 |
+| 워크플로 문법 | `actionlint v1.7.7` | 지적 0건 |
+| 회귀 없음 | `uv run pytest` / `ruff` / `audit_plan.py` | 아래 "레인 게이트" |
+
+### 실행으로 확인하지 **않은** 것 — 주장하지 않는다
+
+- **어떤 이미지도 빌드하지 않았다.** 로컬은 macOS arm64이고 대상은 linux/amd64 CUDA다
+- **native가 이번에는 통과한다는 것은 미확인이다.** 새 설정의 최대 부하가 죽은 설정보다
+  낮다는 것은 두 인자(`NVCC_THREADS` 4→1, gencode 4→3)에서 따라 나오지만, 얼마나
+  낮아지는지는 재지 않았다. 상류 주석의 "8-9GB @ threads=4"는 상류의 수치이지 이
+  러너에서 측정한 값이 아니다
+- **러너가 죽은 원인이 메모리라는 것은 미확정이다.** 디스크 회수 확대와 사후 계측을
+  함께 넣은 이유가 그것이다
+- **`MAX_JOBS=2`가 causal-conv1d를 얼마나 늦추는지 측정하지 않았다.** ninja 기본
+  병렬도에서 내려오므로 느려지는 방향인 것은 확실하고, 23.6분이 얼마가 되는지는
+  돌려봐야 안다. `timeout-minutes: 330`이 그 상한이다
+- **arch 불일치 차단은 만들지 못했다.** `TRAINBENCH_CUDA_ARCHS`를 읽는 코드가 없다
+  (위 "좁힌 결정과 그 대가")
+
+### 레인 게이트 (2026-08-02)
+
+| | 결과 |
+|---|---|
+| `uv run pytest` | 669 passed (변경 전후 동일) |
+| `ruff check` / `ruff format --check` | 지적 0건 |
+| `scripts/audit_plan.py` | 10/13 (`verdicts-closed` 미해소는 기존 상태) |
+
+기준선이 659가 아니라 669인 것은 다른 레인이 테스트를 추가했기 때문이며, 변경 전에
+먼저 재서 확인했다.
+
+### 이 레인 것이 아닌 변화 — env lock 6종이 이미 낡아 있다
+
+`envs/axolotl`에서 `uv lock`을 돌리자 `cffi` 외에 `pytorch-optimizer`가 path 의존성
+메타데이터에 함께 들어왔다. 루트 `pyproject.toml`의 `native` extra가 바뀐 뒤 env lock이
+재생성되지 않은 것이고, **내 변경이 만든 것이 아니다.**
+
+`uv lock --check`로 6종을 전부 재보면 **axolotl을 제외한 5종이 stale**이다. 지금
+빌드가 깨지지 않는 이유는 Dockerfile이 `--frozen`을 쓰기 때문인데, 이 플래그는
+lock 신선도를 **검사하지 않는다**(검사하는 것은 `--locked`다). 즉
+`docker/Dockerfile.framework`의 주석 "A stale lock fails the build instead"는
+사실이 아니다.
+
+`envs/native/uv.lock`에는 `pytorch-optimizer`가 들어 있으므로(그 env의 직접 의존성)
+`optim/muon` 축은 영향받지 않는다. 나머지 5종의 stale은 이번 빌드의 성패와 무관하므로
+**이번 패스에서 재생성하지 않았다** — 비싼 첫 성공을 노리는 시점에 5개 lock을 함께
+움직이는 것이 이득보다 위험이 크다. `--frozen`을 `--locked`로 바꾸는 것과 함께 별도
+작업으로 남긴다.
 
 ---
 

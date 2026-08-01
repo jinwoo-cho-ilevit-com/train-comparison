@@ -10,6 +10,45 @@ ARG FRAMEWORK
 COPY pyproject.toml uv.lock README.md ./
 COPY envs/${FRAMEWORK} ./envs/${FRAMEWORK}
 
+# Bounds for the CUDA source builds in envs/native. Left unset, each upstream
+# sizes itself to the machine and compiles for every GPU it knows about, and the
+# GitHub runner (4 vCPU / 16 GB) died partway through flash-attn on those
+# defaults. Every name below was read out of the version this lock pins, because
+# the obvious guess is wrong: TORCH_CUDA_ARCH_LIST does nothing here. torch's
+# _get_cuda_arch_flags() returns [] as soon as a build passes its own -gencode
+# flags (cpp_extension.py), and flash-attn and causal-conv1d both do.
+#
+#   MAX_JOBS       concurrent compile jobs. Read by flash-attn (setup.py's
+#                  NinjaBuildExtension, which otherwise guesses from free memory
+#                  via psutil), by torch's ninja backend for causal-conv1d, and
+#                  by transformer-engine as a fallback for the next one.
+#   NVTE_BUILD_MAX_JOBS  transformer-engine's own, taking precedence over
+#                  MAX_JOBS, so bounding flash-attn does not also slow the cmake
+#                  build that already succeeded at full width.
+#   NVCC_THREADS   passed to nvcc as --threads by flash-attn alone. Upstream puts
+#                  one job at ~8-9 GB with the default of 4; nvcc parallelises
+#                  across gencodes, so this is the memory lever, not MAX_JOBS.
+#   *_CUDA_ARCHS   which GPUs get SASS. 80/90/100 is A100, H200, B200 — exactly
+#                  the three PLAN.md names, including the H200 fallback. Dropping
+#                  the rest cuts flash-attn from 4 gencodes to 3 and
+#                  transformer-engine from 6 to 3.
+#
+# causal-conv1d 1.6.2.post1 has no equivalent knob: it hardcodes nine gencodes
+# and reads no arch variable, so it still builds all nine under MAX_JOBS.
+#
+# The archs are baked into the image, so a pod on a GPU outside this list gets
+# "no kernel image is available for execution on the device" rather than a wrong
+# number — flash-attn emits code=sm_XX only, with no PTX to JIT from.
+# TRAINBENCH_CUDA_ARCHS carries the list into the running container so a
+# start-up check can compare it against the GPU before a run begins; nothing
+# reads it yet (see docs/support-matrix.md).
+ENV MAX_JOBS=2 \
+    NVTE_BUILD_MAX_JOBS=4 \
+    NVCC_THREADS=1 \
+    FLASH_ATTN_CUDA_ARCHS="80;90;100" \
+    NVTE_CUDA_ARCHS="80;90;100" \
+    TRAINBENCH_CUDA_ARCHS="80;90;100"
+
 # The sync runs in three passes.
 #
 # flash-attn and deepspeed publish no pyproject.toml, so a PEP 517 build sees only

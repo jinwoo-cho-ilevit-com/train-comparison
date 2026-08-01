@@ -3054,6 +3054,7 @@ requires-dist = [
     { name = "pillow", marker = "extra == 'native'", specifier = ">=11.0" },
     { name = "pyarrow", marker = "extra == 'compose'", specifier = ">=21.0" },
     { name = "pydantic", specifier = ">=2.7" },
+    { name = "pytorch-optimizer", marker = "extra == 'native'", specifier = ">=3.10" },
     { name = "pyyaml", marker = "extra == 'compose'", specifier = ">=6.0" },
     { name = "rich", specifier = ">=13.0" },
     { name = "runpod", marker = "extra == 'compose'", specifier = ">=1.11" },
@@ -3086,6 +3087,7 @@ dependencies = [
 
 [package.dev-dependencies]
 build = [
+    { name = "cffi", marker = "sys_platform == 'linux'" },
     { name = "ninja", marker = "sys_platform == 'linux'" },
     { name = "packaging", marker = "sys_platform == 'linux'" },
     { name = "setuptools", marker = "sys_platform == 'linux'" },
@@ -3103,6 +3105,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 build = [
+    { name = "cffi", specifier = ">=1.17" },
     { name = "ninja" },
     { name = "packaging" },
     { name = "setuptools", specifier = ">=77" },
