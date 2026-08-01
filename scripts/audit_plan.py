@@ -272,11 +272,13 @@ def axis_group_leaves_are_classified() -> Result:
     )
 
 
-# What the measurement entry point has to invoke. Each is a place an axis is
-# either applied or verified, and each is silently skippable: a harness that never
-# calls `step_context` runs an fp8 recipe that never wrapped the forward pass,
-# while the capture probe still finds the swapped modules and reports a match.
-ENTRY_POINT_CALLS = ("assemble", "step_context", "assert_matches")
+# What the measurement entry point has to invoke: every call site in axes.py plus
+# the verification. Each is silently skippable, and skipping one is invisible in
+# the result — a harness that never calls `step_context` runs an fp8 recipe that
+# never wrapped the forward pass while the capture probe still finds the swapped
+# modules and reports a match. The list is kept equal to the hooks documented in
+# docs/CONTRACTS.md; a hook missing from it is a hook nothing requires.
+ENTRY_POINT_CALLS = ("patch", "load_kwargs", "assemble", "step_context", "assert_matches")
 
 
 @check("assert-called")
