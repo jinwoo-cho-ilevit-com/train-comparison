@@ -4,7 +4,5 @@
   "axis-wired": "Wave 2 (D: axes) - one apply site and one capture probe per axis",
   "config-consumed": "Wave 2 (D: axes) + Wave 3 (G: harness) - wire every knob",
   "data-pinned": "Wave 1 (A: data) - regenerate subset and pin quality revision",
-  "doc-commands": "Wave 1 (E: docs) - fix README sync flags and its smoke command",
-  "evidence-committed": "Wave 1 (C: orch) - commit result artifacts to docs/evidence",
-  "plan-files": "Wave 1 (E: docs) + Wave 3 (G) - bench.py, methodology.md, report.md"
+  "evidence-committed": "Wave 1 (C: orch) - commit result artifacts to docs/evidence"
 }

@@ -62,9 +62,13 @@ pod은 이미 해석된 config JSON을 받아 검증만 한다. Hydra는 `compos
 
 교훈: 벤치마크 하네스의 코어는 **최대한 아무것도 강제하지 않아야 한다.**
 
-### env별 해석 결과 — 5/5 성공
+### env별 의존성 해석 결과 — 6/6 성공
 
-`uv lock` 기준. `envs/<fw>/uv.lock`에 커밋되어 있다.
+**`uv lock`의 해석 성공이지 설치도 실행도 아니다.** 이 표가 말하는 것은 "버전 조합이
+성립한다"까지다. 설치는 아래 "이미지 빌드 결과"에서 처음 확인됐고, 실제 적재·학습은
+"모델 x 프레임워크 적재 검증"의 pod 실행으로만 판정된다.
+
+`envs/<fw>/uv.lock`에 커밋되어 있다.
 
 | env | 패키지 수 | torch | transformers | datasets | accelerate | peft | hf-hub | numpy | pillow |
 |---|---|---|---|---|---|---|---|---|---|
@@ -124,9 +128,18 @@ Tevatron 2.0인지도 확인 대상이다.
 
 native 열은 로컬 macOS CPU 실측. 나머지는 이미지가 필요하므로 pod에서 채운다.
 
+**native OK의 한정 조건** — 셀 하나를 다른 조건으로 읽으면 안 되므로 명시한다.
+
+| 조건 | 값 |
+|---|---|
+| 하드웨어 / dtype | macOS CPU, **fp32**. GPU 아님, bf16 아님 |
+| 입력 | **텍스트 위주**. 멀티모달 forward 1건은 통과했으나 vision tower는 grad를 받지 않았다 |
+| 범위 | **3모델 중 2모델.** gemma-4-E2B는 미실행 |
+| 의미 | 적재 + 1 step backward가 된다는 것. 속도·메모리·커널 경로에 대해서는 아무것도 말하지 않는다 |
+
 | | Qwen3-VL-Embedding-2B | Qwen3.5-0.8B | gemma-4-E2B |
 |---|---|---|---|
-| native | **OK (7/7)** | **OK (7/7)** | 미확인 (CPU fp32 20GB, pod에서 확인) |
+| native | **OK (7/7, macOS CPU fp32)** | **OK (7/7, macOS CPU fp32)** | 미확인 (CPU fp32 20GB, pod에서 확인) |
 | unsloth | 미확인 | 미확인 | 미확인 |
 | ms-swift | 미확인 | 미확인 | 미확인 |
 | sentence-transformers | 미확인 | 미확인 | 미확인 |
@@ -218,7 +231,7 @@ revision을 `configs/data/speed.yaml`에 고정했다. 이 값이 모든 run의 
 
 ## 이미지 빌드 결과 (2026-08-01, GitHub Actions / linux-amd64)
 
-베이스 1개 + 프레임워크 6개. **5/6 성공.**
+베이스 1개 + 프레임워크 6개 = 이미지 7개. **6/7 성공.**
 
 | 이미지 | 결과 |
 |---|---|

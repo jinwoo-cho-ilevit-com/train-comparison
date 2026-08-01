@@ -8,18 +8,36 @@ throughput x memory x 품질 Pareto frontier를 리포트로 산출한다.
 
 ## 핵심 가설
 
-공개된 학습 속도 벤치마크는 대부분 SFT/CPT 기준이다. 임베딩 학습에는 LM head
-cross-entropy가 없으므로 Liger-Kernel의 FLCE, Axolotl의 Cut Cross Entropy 등
-대표 최적화가 무력화되고, 대신 in-batch negative를 위한 배치 크기가 지배 변수가 된다.
-즉 최적화 우선순위가 SFT와 다르다.
+**임베딩 학습 내부에서 축별 효과가 갈리고, 그 갈림이 모델마다 다르다.**
 
-또한 세 모델의 병목이 각각 다르다:
+측정 대상은 두 가지다.
+
+1. **축별 효과** — attention backend, 커널, precision, compile, 옵티마이저,
+   데이터 파이프라인, GradCache, freeze, PEFT, 병렬화 각각이 임베딩 학습의
+   throughput / peak memory에 얼마를 기여하는가
+2. **모델별 병목** — 같은 축이 세 아키텍처에서 다른 크기의 효과를 낸다
+
+세 모델의 병목 추정:
 
 - Qwen3-VL-Embedding-2B: attention (28/28 레이어 full attention)
 - Qwen3.5-0.8B: linear attention 커널 (18/24가 Gated DeltaNet)
-- gemma-4-E2B: 옵티마이저 메모리 (5.1B 중 약 2.8B가 PLE embedding 테이블)
+- gemma-4-E2B: 옵티마이저 메모리 (전체 5.104B 중 PLE 2.390B(46.8%),
+  주 `embed_tokens`까지 합친 전체 embedding은 2.751B — `docs/model-spec.md` 실측)
 
 따라서 "모델 무관 최적 레시피"는 존재하지 않는다는 것이 예상 결론이다.
+
+### SFT 대비 주장은 철회했다 (2026-08-01)
+
+당초 가설은 "임베딩 학습의 최적화 우선순위가 SFT와 다르다"였다. **철회한다.**
+동일 조건 SFT arm이 이 연구에 없고, 공개된 제3자 SFT 수치는 하드웨어·데이터·시퀀스
+길이가 달라 대조군이 되지 못한다. 반증 가능한 형태로 검증할 수단이 없는 주장이다.
+
+관련해서 Liger에 대한 서술도 정정한다. 임베딩 학습에는 LM head가 없으므로
+**Liger-Kernel의 FLCE(fused linear cross-entropy) 경로는 정의상 비활성**이다.
+이것은 "Liger가 무력화된다"와 다르다 — Liger는 RMSNorm / SwiGLU / RoPE 커널도
+제공하고 그 경로들은 임베딩 학습에서도 그대로 동작한다. Axolotl의 Cut Cross
+Entropy도 같은 이유로 CE 경로만 해당한다. 따라서 `kernel` 축은 "효과 없음"을
+전제하지 않고 **FLCE를 뺀 나머지 커널의 기여를 측정하는 축**으로 둔다.
 
 ## 대상 모델 (HF config 직접 확인, 2026-07-31)
 
@@ -37,7 +55,14 @@ cross-entropy가 없으므로 Liger-Kernel의 FLCE, Axolotl의 Cut Cross Entropy
 
 ## 실행 환경
 
-- 데이터: `TIGER-Lab/MMEB-train` (apache-2.0, image+text) / eval은 `TIGER-Lab/MMEB-eval` 서브셋
+- 데이터: MMEB-train. **실제로 읽는 저장소는 `TIGER-Lab/MMEB-train`이 아니다** —
+  그 저장소는 이미지 *경로*만 담고 이미지 자체가 없다. 이미지를 포함한 커뮤니티
+  미러 `MrZilinXiao/MMEB_train_with_image`(20 config / 1,068,472행)를 upstream으로
+  쓰고, 커뮤니티 유지 저장소이므로 브랜치가 아니라 커밋을 고정한다.
+  런은 upstream을 직접 읽지 않고 여기서 만든 고정 서브셋
+  `jinwoo-cho/mmeb-subset`(private)을 revision으로 고정해 읽는다
+  (`configs/data/speed.yaml`). eval은 `TIGER-Lab/MMEB-eval` 서브셋 예정 —
+  `configs/data/quality.yaml`은 아직 revision 미고정이다
 - 모달리티: 텍스트 + 이미지 (오디오 제외)
 - 산출물: 벤치마크 리포트 중심 + 측정 하네스
 
@@ -190,8 +215,9 @@ B200 재고 LOW 상황에서 12~18개 pod 동시 확보가 되는지는 실행 �
 
 - **고정 토큰 예산** 기준 비교 (고정 step 아님). vocab/토크나이저가 모델마다 다름
 - **이미지 토큰 예산 고정.** 미고정 시 나머지 측정이 전부 오염됨
-- **타이밍 런과 프로파일링 런 분리.** torch.profiler는 iteration time을 20~44%
-  부풀린다. 숫자는 프로파일러 off 상태에서만 측정, 프로파일은 원인 분석 전용
+- **타이밍 런과 프로파일링 런 분리.** 숫자는 프로파일러 off 상태에서만 측정하고,
+  프로파일은 원인 분석 전용이다. 부풀림 폭은 **미측정**이며 출처도 확보하지
+  못했다 — `docs/methodology.md` 참조. 규율 자체는 폭과 무관하게 유지한다
 - warmup step 폐기, 명시적 CUDA sync, 동일 seed 및 동일 데이터 순서
 
 ### 소수 샘플 정책 (속도 런과 품질 런의 분리)
@@ -286,8 +312,9 @@ LlamaFactory(SFT 중심), 커스텀 커널 DSL(Helion/ThunderKittens/CuTe, 스�
 - throughput x peak memory x 품질 3축 Pareto frontier
 - 모델별 권장 레시피
 - full FT vs LoRA 손익분기점
-- 공개 주장 수치 대비 실측 (Unsloth 1.5~3.3x, ms-swift packing 100%+,
-  FlashQLA 2~3x, NVFP4 1.73x가 이 태스크에서 얼마나 남는가)
+- 공개 주장 수치(Unsloth 1.5~3.3x, ms-swift packing 100%+, FlashQLA 2~3x,
+  NVFP4 1.73x)는 **참고 수치로만 병기**한다. 하드웨어·데이터·시퀀스 길이가 달라
+  대조군이 아니므로 "얼마나 남는가"라는 비교로 쓰지 않는다
 
 ---
 
@@ -351,60 +378,92 @@ LlamaFactory(SFT 중심), 커스텀 커널 DSL(Helion/ThunderKittens/CuTe, 스�
 | 06 Testing | **경량** | config 스키마 + MFU 계산 유닛 테스트 + **CPU 소수 샘플 E2E 스모크 1개**. 그 이상은 안 만든다 |
 | 13 Secret | **경량** | RunPod API key / HF token만 대상. `.env.example` + gitignore + 런타임 env 주입. Infisical은 이미 쓰고 있을 때만 |
 | 09 Agentic | **경량** | 하네스 코드에 작성자와 분리된 리뷰 1레인 |
-| 15 Doc tracking | **미적용** | 4계층 + docsync 마커 + ADR은 단기 리포트 프로젝트에 과함. `PLAN.md` + `docs/support-matrix.md` + `docs/report.md` 3개로 충분 |
+| 15 Doc tracking | **미적용** | 4계층 + docsync 마커 + ADR은 단기 리포트 프로젝트에 과함. `PLAN.md`(설계) + `docs/`(계약·규격·방법론·결과) 평면 구성으로 간다 |
 | 10 / 11 LLM API | **해당 없음** | 학습 프로젝트. API 추론 없음 |
 
 ## 저장소 구조
 
 flat layout. config group이 곧 실험 축이다.
 
+**아래 블록은 계획이 아니라 현재 존재하는 것만 적는다.** `scripts/audit_plan.py`의
+`plan-files` 체크가 이 블록을 트리로 파싱해 실제 파일과 대조하며, 없는 파일이 적혀
+있으면 게이트가 막는다. 계획 중인 파일은 블록 아래 "미작성" 목록에 둔다 — 아직 없는
+것을 구조도에 그려두면 어느 것이 이미 있는지 읽는 사람이 구분할 수 없다.
+
 ```
 train-comparison/
 ├── AGENTS.md                  # 공유 지침 (컨벤션 경로 참조)
 ├── CLAUDE.md                  # @AGENTS.md
 ├── PLAN.md                    # 이 문서
-├── pyproject.toml             # uv + ruff + torch platform marker
+├── README.md
+├── pyproject.toml             # uv + ruff + torch platform marker + extras
+├── uv.lock
 ├── .env.example               # RUNPOD_API_KEY, HF_TOKEN (키 이름만)
 ├── configs/                   # Hydra config groups = 실험 축
 │   ├── config.yaml
 │   ├── model/                 # qwen3_vl_emb_2b, qwen3_5_0_8b, gemma4_e2b
 │   ├── data/                  # speed(소수 샘플), quality(장기)
+│   ├── run/                   # probe, timing, profile, quality
+│   ├── train/                 # 단일 플래그 knob (batch, seed, checkpointing 등)
 │   ├── attn/                  # sdpa, fa2, fa3, fa4, flex
 │   ├── kernel/                # none, liger, fla, kernels_hub
 │   ├── precision/             # bf16, mxfp8, nvfp4
-│   ├── compile/               # off, default, max_autotune, regional
+│   ├── compile/               # none, default, max_autotune, regional
 │   ├── optim/                 # adamw_fused, adamw_8bit, muon
 │   ├── loss/                  # mnrl, cached_mnrl
 │   ├── peft/                  # full, lora, qlora
 │   ├── freeze/                # none, vision_tower, ple, vision_and_ple
-│   ├── dataloader/            # torch, dali, packing
+│   ├── dataloader/            # torch, torch_packed, dali, dali_packed
 │   ├── parallel/              # single, ddp, fsdp2, zero2, zero3
-│   ├── framework/             # native, unsloth, ms_swift, st, tevatron, axolotl
-│   └── experiment/            # 축 그룹별 ablation 조합 정의 (재실행 가능한 실험 목록)
+│   └── framework/             # native, unsloth, ms_swift, st, tevatron, axolotl
 ├── trainbench/
-│   ├── config_schema.py       # Pydantic 검증 (fail-fast)
+│   ├── config_schema.py       # Pydantic 검증 (fail-fast) + 축 마커
+│   ├── config.py              # 해석된 config JSON 입출력
+│   ├── compose.py             # Hydra 조합 -> 검증된 BenchConfig
 │   ├── device.py              # torch.accelerator 단일 헬퍼
 │   ├── seed.py                # 시드 단일 헬퍼
-│   ├── data/                  # MMEB 로더, --limit, 이미지 토큰 예산 고정
-│   ├── models/                # 3종 어댑터 (풀링 + 임베딩 헤드)
-│   ├── loss/                  # InfoNCE, GradCache
-│   ├── trainers/              # native 하네스 + 프레임워크 어댑터 6종
-│   ├── metrics/               # throughput, MFU, VRAM, canonical baseline 비교
-│   └── report/                # Pareto frontier 집계
+│   ├── record.py              # run 기록 + 원자적 쓰기
+│   ├── embedding.py           # 풀링 + InfoNCE
+│   ├── axes.py                # 축을 켜는 유일한 지점
+│   ├── applied.py             # 켜졌는지 읽는 유일한 지점
+│   ├── pods.py                # RunPod pod 수명주기
+│   └── probe/                 # 프레임워크별 적재·1step 검증 어댑터
 ├── scripts/
-│   ├── verify_env.py          # Phase 0 -> docs/support-matrix.md 생성
-│   ├── bench.py               # 단일 런 진입점 (Hydra)
+│   ├── verify_env.py          # Phase 0 프레임워크 x 모델 probe
+│   ├── env_report.py          # 하네스 관통 경로 점검 (모델 미적재)
+│   ├── compose_config.py      # 로컬에서 config JSON 해석 -> pod 전달
+│   ├── prepare_data.py        # MMEB 고정 서브셋 생성 + push
 │   ├── orchestrate.py         # RunPod 다중 pod 기동/큐잉/수집
-│   └── report.py              # pod별 결과 병합 -> docs/report.md
+│   ├── publish_result.py      # 결과를 HF repo로 push
+│   ├── report.py              # pod별 결과 병합
+│   └── audit_plan.py          # 계획-문서-코드 정합 회귀 추적기
 ├── tests/
 │   ├── test_config.py
-│   ├── test_metrics.py        # MFU 계산 (tolerance band)
-│   └── test_smoke_cpu.py      # CPU + 소수 샘플 E2E
+│   ├── test_applied.py
+│   ├── test_audit.py
+│   ├── test_device_seed.py
+│   └── test_probe.py
+├── docker/                    # Dockerfile.base + Dockerfile.framework + entrypoint
+├── envs/                      # 프레임워크별 독립 프로젝트 + 독립 lock
 └── docs/
+    ├── CONTRACTS.md           # 레인 간 공유 계약 (Wave 0 확정)
+    ├── methodology.md         # 측정 규율과 그 근거
+    ├── model-spec.md          # 모델별 공식 규격 검증 (산문)
+    ├── model-spec.yaml        # 같은 내용의 기계 판독본 (audit이 대조)
     ├── support-matrix.md      # Phase 0 산출물
-    ├── methodology.md         # 측정 규율 (재현용)
-    └── report.md              # Phase 4 최종 산출물
+    └── review-findings.md     # 리뷰 레인 결과와 수정 순서
 ```
+
+**미작성**
+
+| 파일 | 담당 | 역할 |
+|---|---|---|
+| `tests/test_axes.py` | Wave 2 D | 축 적용/확인 쌍 검증 |
+| `configs/experiment/` | Wave 2 D | 축 그룹별 ablation 조합 정의 |
+| `scripts/bench.py` | Wave 3 G | 단일 런 측정 진입점. `assert_matches`를 호출하는 유일한 하네스 |
+| `tests/test_metrics.py` | Wave 3 G | MFU 계산 (tolerance band) |
+| `tests/test_smoke_cpu.py` | Wave 3 G | CPU + 소수 샘플 E2E. `purpose=probe`로만 짤 수 있다(`docs/CONTRACTS.md` §6) |
+| `docs/report.md` | Phase 4 | 최종 산출물 |
 
 **설계 결정**
 
@@ -497,4 +556,6 @@ Task 1은 GPU가 필요 없으므로 즉시 시작 가능하다. Task 2의 이�
 - GradCache: https://github.com/luyug/GradCache
 - Transformer Engine: https://github.com/NVIDIA/TransformerEngine
 - HTA: https://hta.readthedocs.io/
-- 데이터: https://hf.co/datasets/TIGER-Lab/MMEB-train
+- 데이터(원본, 이미지 경로만): https://hf.co/datasets/TIGER-Lab/MMEB-train
+- 데이터(실제 upstream, 이미지 포함 커뮤니티 미러):
+  https://hf.co/datasets/MrZilinXiao/MMEB_train_with_image
