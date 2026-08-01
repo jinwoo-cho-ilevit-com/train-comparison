@@ -28,6 +28,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -55,6 +56,13 @@ class Result:
     name: str
     ok: bool
     detail: str
+    # How many problems this check found, when it counts anything. Recorded in the
+    # baseline so that progress and regression *inside* an already-failing check
+    # are visible: without it, reverting an entire wave's work left the summary
+    # line byte-identical, because the check was failing before and after.
+    # None where a count is meaningless — `assert-called` either finds the entry
+    # point calling the axis machinery or it does not.
+    count: int | None = None
 
 
 CHECKS: dict[str, Callable[[], Result]] = {}
@@ -235,6 +243,7 @@ def config_fields_are_read_by_code() -> Result:
         "all config leaves are read by code"
         if not orphans
         else f"{len(orphans)} unread knob(s): {', '.join(orphans)}",
+        count=len(orphans),
     )
 
 
@@ -257,11 +266,14 @@ def axes_are_applied_and_verified() -> Result:
     if empty := _nothing_to_check(declared, "axes declared by the schema"):
         return Result("axis-wired", False, empty)
     problems = []
-    if unknown := sorted(captured - declared):
+    unknown = sorted(captured - declared)
+    lopsided = sorted(captured ^ axes.IMPLEMENTED)
+    unwired = sorted(declared - captured)
+    if unknown:
         problems.append(f"capture probe for undeclared axis: {', '.join(unknown)}")
-    if lopsided := sorted(captured ^ axes.IMPLEMENTED):
+    if lopsided:
         problems.append(f"applied and verified sets disagree on: {', '.join(lopsided)}")
-    if unwired := sorted(declared - captured):
+    if unwired:
         problems.append(f"{len(unwired)} axis/axes with no capture probe: {', '.join(unwired)}")
     return Result(
         "axis-wired",
@@ -269,6 +281,9 @@ def axes_are_applied_and_verified() -> Result:
         f"all {len(declared)} axes are applied and verified"
         if not problems
         else "; ".join(problems),
+        # The unwired axes, not the problem strings: a set disagreement and a
+        # missing probe are one problem line each however many axes they name.
+        count=len(unwired) + len(unknown) + len(lopsided),
     )
 
 
@@ -522,14 +537,20 @@ AXIS_PACKAGES = {
     "optim/muon": ("pytorch-optimizer",),
     "parallel/zero2": ("deepspeed",),
     "parallel/zero3": ("deepspeed",),
-    "dataloader/dali": ("nvidia-dali",),
-    "dataloader/dali_packed": ("nvidia-dali",),
+    # `nvidia-dali` on PyPI is NVIDIA's own placeholder — its summary reads "A fake
+    # package to warn the user they are not installing the correct package". The
+    # CUDA-13 build is a separate distribution on pypi.nvidia.com, so the name here
+    # could never be satisfied by a correct install.
+    "dataloader/dali": ("nvidia-dali-cuda130",),
+    "dataloader/dali_packed": ("nvidia-dali-cuda130",),
     # peft/loss/framework were exempt via NON_AXIS_GROUPS, which hid two real
     # gaps: bitsandbytes is in 2 of 6 envs while qlora is offered to all six, and
     # no environment has a GradCache implementation at all — while three shipped
     # manifests already assign GPUs to the loss axis.
     "peft/qlora": ("bitsandbytes",),
-    "loss/cached_mnrl": ("grad-cache",),
+    # `grad-cache` is a 404. Upstream declares `name="GradCache"`, which PEP 503
+    # normalises to `gradcache`.
+    "loss/cached_mnrl": ("gradcache",),
     "framework/unsloth": ("unsloth",),
     "framework/ms_swift": ("ms-swift",),
     "framework/sentence_transformers": ("sentence-transformers",),
@@ -611,9 +632,13 @@ def axes_have_their_packages() -> Result:
     return Result(
         "axis-packages",
         not problems,
-        "every offered axis is backed by a package in some env"
+        # Not "backed": this is a string search for the distribution name in some
+        # env's lock. It does not prove the package installs, imports, builds its
+        # CUDA kernels, or is present in the image that runs that axis.
+        "every offered axis names a package in some env lock"
         if not problems
         else f"{len(problems)} problem(s): {'; '.join(problems)}",
+        count=len(problems),
     )
 
 
@@ -736,10 +761,106 @@ def model_spec_matches_config() -> Result:
     )
 
 
+# Values a group needs alongside it to compose at all. Not exemptions: without
+# these the schema rejects the override and the value would be miscounted as
+# inapplicable for a reason that has nothing to do with whether axes.py can apply
+# it. `max_autotune` spends its first steps benchmarking kernels, which the schema
+# requires be discarded (MAX_AUTOTUNE_MIN_WARMUP_STEPS).
+AXIS_VALUE_COMPANIONS: dict[str, tuple[str, ...]] = {
+    "compile/max_autotune": ("train.warmup_discard_steps=20",),
+    # The PLE tables exist only in gemma-4; the schema refuses the axis on the
+    # other two models rather than letting it freeze nothing.
+    "freeze/ple": ("model=gemma4_e2b",),
+    "freeze/vision_and_ple": ("model=gemma4_e2b",),
+}
+
+
+@check("axis-values")
+def every_offered_axis_value_can_be_applied() -> Result:
+    """How many of the values each axis group offers can actually be applied.
+
+    `axis-wired` asks whether an axis has an apply site and a capture probe. It is
+    a membership test on knob names, and an axis passes it while accepting exactly
+    one value — the inert one. Both readings are needed and neither substitutes for
+    the other: after Wave 2, `axis-wired` fell from 12 unwired to 2 while 7 of the
+    12 ablation groups still took only their default. That is the state
+    `docs/review-findings.md` D4 describes as "the same experiment under different
+    names", and the check meant to catch it was reporting progress.
+
+    Each variant is composed and pushed through all four call sites. `UnappliedAxis`
+    is the axis refusing the value, which is the honest outcome and what gets
+    counted. Any other exception is reported as its own problem rather than folded
+    into the count — a value that fails for an unrelated reason has not been
+    measured either way.
+    """
+    sys.path.insert(0, str(REPO))
+    import torch
+    from hydra import compose, initialize_config_dir
+
+    from trainbench import axes
+    from trainbench.compose import resolve
+
+    class _Tiny(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block = torch.nn.Linear(4, 4)
+
+    variants: dict[str, list[str]] = {}
+    for path in sorted(CONFIGS.rglob("*.yaml")):
+        group = path.parent.name
+        if path.parent == CONFIGS or group in NON_AXIS_GROUPS:
+            continue
+        variants.setdefault(group, []).append(path.stem)
+    if empty := _nothing_to_check(variants, "axis config groups"):
+        return Result("axis-values", False, empty)
+
+    applicable: dict[str, int] = {}
+    inert: list[str] = []
+    broken: list[str] = []
+    for group, names in sorted(variants.items()):
+        applicable[group] = 0
+        for name in sorted(names):
+            variant = f"{group}/{name}"
+            overrides = [f"{group}={name}", *AXIS_VALUE_COMPANIONS.get(variant, ())]
+            try:
+                with initialize_config_dir(config_dir=str(CONFIGS), version_base=None):
+                    config = resolve(compose(config_name="config", overrides=overrides))[0]
+                axes.patch(config)
+                axes.load_kwargs(config)
+                axes.assemble(_Tiny(), config, torch.device("cpu"), "native")
+                with axes.step_context(config):
+                    pass
+            except axes.UnappliedAxis:
+                continue
+            except Exception as exc:  # noqa: BLE001 - reported, never counted as applied
+                broken.append(f"{variant} ({type(exc).__name__}: {str(exc)[:80]})")
+                continue
+            applicable[group] += 1
+
+    total = sum(len(v) for v in variants.values())
+    usable = sum(applicable.values())
+    for group, count in sorted(applicable.items()):
+        if count <= 1 and len(variants[group]) > 1:
+            inert.append(f"{group} {count}/{len(variants[group])}")
+    problems = []
+    if inert:
+        problems.append(f"{len(inert)} group(s) offering one usable value: {', '.join(inert)}")
+    if broken:
+        problems.append(f"{len(broken)} value(s) failed for another reason: {'; '.join(broken)}")
+    return Result(
+        "axis-values",
+        not problems,
+        f"{usable}/{total} offered axis values can be applied"
+        if not problems
+        else f"{usable}/{total} applicable; " + "; ".join(problems),
+        count=len(inert) + len(broken),
+    )
+
+
 BASELINE = REPO / "docs" / "audit-baseline.json"
 
 
-def load_baseline() -> dict[str, str]:
+def load_baseline() -> dict[str, dict[str, Any]]:
     """Failures that are known, accepted, and scheduled.
 
     Without this the audit is unsatisfiable: its first run failed six of seven
@@ -747,27 +868,63 @@ def load_baseline() -> dict[str, str]:
     blocker would mean no wave could ever close. So the audit tracks regressions
     instead — a new failure blocks, and a baseline entry that starts passing also
     blocks, because a stale baseline quietly grants amnesty to future breakage.
+
+    Each entry carries `count` as well as `note`. Membership alone made the gate
+    blind to everything a wave did inside a check that was already failing:
+    deleting the whole of Wave 2's capture layer left `7/11 passing, 0 new
+    failure(s), 0 newly fixed` unchanged to the byte. A string entry from an older
+    baseline is read as a note with no recorded count, which disables only the
+    size comparison for that entry.
     """
     if not BASELINE.exists():
         return {}
-    return json.loads(BASELINE.read_text())
+    raw = json.loads(BASELINE.read_text())
+    return {
+        name: {"note": entry, "count": None} if isinstance(entry, str) else entry
+        for name, entry in raw.items()
+    }
 
 
-def merge_baseline(baseline: dict[str, str], results: list[Result]) -> dict[str, str]:
+def merge_baseline(
+    baseline: dict[str, dict[str, Any]], results: list[Result]
+) -> dict[str, dict[str, Any]]:
     """The new baseline after a full run.
 
     Existing annotations survive. They are the schedule — each entry names the
     wave that resolves it — and overwriting them with a placeholder turns the
-    baseline back into the excuse it was written not to be.
+    baseline back into the excuse it was written not to be. Counts do not survive:
+    they describe the run being recorded.
     """
-    failing = [r.name for r in results if not r.ok]
-    return {name: baseline.get(name, "unscheduled") for name in sorted(failing)}
+    failing = {r.name: r for r in results if not r.ok}
+    return {
+        name: {
+            "note": baseline.get(name, {}).get("note", "unscheduled"),
+            "count": failing[name].count,
+        }
+        for name in sorted(failing)
+    }
 
 
-def classify(results: list[Result], baseline: dict[str, str]) -> tuple[list[str], list[str]]:
+def classify(
+    results: list[Result], baseline: dict[str, dict[str, Any]]
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """New failures, newly passing, and failures that changed size in either direction.
+
+    A shrunk count blocks for the same reason a newly passing check blocks: the
+    baseline now grants amnesty for problems that no longer exist, and carrying
+    that forward is how a stale entry stops meaning anything.
+    """
     regressions = [r.name for r in results if not r.ok and r.name not in baseline]
     fixed = [r.name for r in results if r.ok and r.name in baseline]
-    return regressions, fixed
+    grew, shrank = [], []
+    for r in results:
+        if r.ok or r.count is None or r.name not in baseline:
+            continue
+        was = baseline[r.name].get("count")
+        if was is None or was == r.count:
+            continue
+        (grew if r.count > was else shrank).append(f"{r.name} {was}->{r.count}")
+    return regressions, fixed, grew, shrank
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -803,7 +960,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     width = max(len(r.name) for r in results)
-    regressions, fixed = classify(results, baseline)
+    regressions, fixed, grew, shrank = classify(results, baseline)
     for r in results:
         if r.ok and r.name in baseline:
             status = "FIXED"
@@ -813,21 +970,27 @@ def main(argv: list[str] | None = None) -> int:
             status = "KNOWN"
         else:
             status = "NEW"
-        suffix = f"  [{baseline[r.name]}]" if not r.ok and r.name in baseline else ""
+        suffix = f"  [{baseline[r.name]['note']}]" if not r.ok and r.name in baseline else ""
         print(f"{status:<5} {r.name:<{width}}  {r.detail}{suffix}")
 
     print(
         f"\n{sum(1 for r in results if r.ok)}/{len(results)} passing, "
-        f"{len(regressions)} new failure(s), {len(fixed)} newly fixed"
+        f"{len(regressions)} new failure(s), {len(fixed)} newly fixed, "
+        f"{len(grew)} grew, {len(shrank)} shrank"
     )
     if partial:
         print(f"PARTIAL RUN: {len(CHECKS) - len(selected)} check(s) not run; not a wave gate")
     if regressions:
         print(f"BLOCKED: new failures not in baseline: {', '.join(regressions)}")
+    if grew:
+        print(f"BLOCKED: accepted failures got worse: {', '.join(grew)}")
     if fixed:
         print(f"BLOCKED: baseline is stale, these now pass: {', '.join(fixed)}")
         print("  run --update-baseline after confirming, so amnesty is not carried forward")
-    return 1 if (regressions or fixed) else 0
+    if shrank:
+        print(f"BLOCKED: baseline is stale, these shrank: {', '.join(shrank)}")
+        print("  run --update-baseline after confirming, so amnesty is not carried forward")
+    return 1 if (regressions or fixed or grew or shrank) else 0
 
 
 if __name__ == "__main__":

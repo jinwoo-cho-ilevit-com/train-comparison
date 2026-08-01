@@ -295,6 +295,24 @@ class ProbeReport:
   미확인 축은 undetermined이고 timing을 차단한다. `axis_knobs() - _CAPTURES`에서
   동적으로 유도하지 않는 이유는 그 형태가 전 축이 배선된 순간 검사 대상 0개로
   조용히 통과하기 때문이다(§6의 "빈 입력은 통과가 아니라 실패다").
+- 2026-08-01 **`audit_plan.py` 감사 계층 수리 3건 + `tests/test_audit.py`.**
+  Wave 2 게이트 리뷰가 찾은 것: 병합 트리에서 D의 capture 계층을 통째로 되돌려도
+  `7/11 passing, 0 new failure(s), 0 newly fixed`가 바이트 단위로 동일했다. 게이트가
+  판정에 쓰는 줄이 이번 wave 산출물 전체를 보지 못했다.
+  - `Result.count` + baseline 형식 `{체크: {note, count}}`. 이미 실패 중인 체크
+    **안에서의** 크기 변화가 양방향으로 차단된다. 문자열 항목은 note로 읽어 크기
+    비교만 비활성화한다(옛 baseline 호환).
+  - **`axis-values` 신설.** `axis-wired`는 knob 이름의 멤버십 검사라 축이 비활성값
+    하나만 받아도 통과한다 — Wave 2 후 12→2로 내려갔지만 12개 ablation 그룹 중
+    7개가 여전히 기본값만 받는다. 새 체크는 각 variant를 실제로 4개 호출 지점에
+    통과시켜 적용 가능한 값을 센다(현재 25/43). 두 체크는 서로 다른 질문이고 어느
+    쪽도 다른 쪽을 대신하지 않는다.
+  - **`AXIS_PACKAGES` 이름 정정.** `nvidia-dali`는 NVIDIA가 오설치를 경고하려고
+    올린 자리표시자이고 `grad-cache`는 404다 — 올바른 설치가 영원히 체크를 만족시킬
+    수 없었다. `nvidia-dali-cuda130`/`gradcache`로 고치고, 통과 문구를 "어느 락엔가
+    이름이 있다"는 실제 의미로 바꿨다. 빌드·설치·import를 증명하지 않는다.
+  `tests/test_audit.py`(공유)는 옛 시그니처를 쓰고 있어 함께 고쳤고, 개수 회귀가
+  차단되는지 검사하는 테스트를 추가했다.
 - 2026-08-01 **레인 경계 침범 기록**. 아래 파일들을 레인 A 작업이 수정했다. 기술적
   위험은 낮지만(아래 근거) 소유 레인이 모르는 채로 남지 않도록 여기 남긴다.
   - `pyproject.toml`, `uv.lock` (레인 F 소유) — `compose` extra에 `pyarrow>=21.0`

@@ -30,12 +30,17 @@ from audit_plan import (  # noqa: E402
 )
 
 
-def failing(*names):
-    return [Result(name, False, "") for name in names]
+def failing(*names, count=None):
+    return [Result(name, False, "", count=count) for name in names]
 
 
 def passing(*names):
     return [Result(name, True, "") for name in names]
+
+
+def accepted(**notes):
+    """A baseline in the stored shape: a note plus the size it was accepted at."""
+    return {name: {"note": note, "count": count} for name, (note, count) in notes.items()}
 
 
 def test_a_bare_identifier_is_not_a_consumer():
@@ -62,23 +67,29 @@ def test_updating_the_baseline_keeps_the_schedule():
     """Each entry names the wave that resolves it. That is what makes the
     baseline a schedule rather than an excuse, and overwriting it with a
     placeholder erases the plan for every lane at once."""
-    baseline = {"axis-packages": "Wave 2 (F)", "config-consumed": "Wave 2 (D)"}
+    baseline = accepted(
+        **{"axis-packages": ("Wave 2 (F)", 3), "config-consumed": ("Wave 2 (D)", 13)}
+    )
 
-    merged = merge_baseline(baseline, failing("axis-packages", "config-consumed"))
+    merged = merge_baseline(baseline, failing("axis-packages", "config-consumed", count=3))
 
-    assert merged == baseline
+    assert [entry["note"] for entry in merged.values()] == ["Wave 2 (F)", "Wave 2 (D)"]
 
 
 def test_a_newly_failing_check_enters_as_unscheduled():
     merged = merge_baseline(
-        {"axis-packages": "Wave 2 (F)"}, failing("axis-packages", "data-pinned")
+        accepted(**{"axis-packages": ("Wave 2 (F)", 4)}),
+        failing("axis-packages", "data-pinned", count=2),
     )
 
-    assert merged == {"axis-packages": "Wave 2 (F)", "data-pinned": "unscheduled"}
+    assert merged == {
+        "axis-packages": {"note": "Wave 2 (F)", "count": 2},
+        "data-pinned": {"note": "unscheduled", "count": 2},
+    }
 
 
 def test_a_check_that_now_passes_leaves_the_baseline():
-    merged = merge_baseline({"data-pinned": "Wave 1 (A)"}, passing("data-pinned"))
+    merged = merge_baseline(accepted(**{"data-pinned": ("Wave 1 (A)", 1)}), passing("data-pinned"))
 
     assert merged == {}
 
@@ -102,17 +113,57 @@ def test_selecting_no_checks_is_an_error_not_a_pass():
 
 
 def test_a_new_failure_blocks_and_a_known_one_does_not():
-    regressions, fixed = classify(failing("a", "b"), {"a": "Wave 1"})
+    regressions, fixed, grew, shrank = classify(failing("a", "b"), accepted(a=("Wave 1", None)))
 
     assert regressions == ["b"]
-    assert fixed == []
+    assert (fixed, grew, shrank) == ([], [], [])
 
 
 def test_a_baseline_entry_that_starts_passing_blocks():
     """A stale baseline grants amnesty to whatever breaks there next."""
-    regressions, fixed = classify(passing("a"), {"a": "Wave 1"})
+    regressions, fixed, grew, shrank = classify(passing("a"), accepted(a=("Wave 1", 3)))
 
-    assert (regressions, fixed) == ([], ["a"])
+    assert (regressions, fixed, grew, shrank) == ([], ["a"], [], [])
+
+
+def test_an_accepted_failure_that_got_worse_blocks():
+    """Membership alone made the gate blind to everything a wave did inside a check
+    that was already failing: deleting Wave 2's entire capture layer left
+    `7/11 passing, 0 new failure(s), 0 newly fixed` identical to the byte, because
+    `axis-wired` failed before and after."""
+    regressions, fixed, grew, shrank = classify(
+        failing("a", count=22), accepted(a=("Wave 2 (D)", 2))
+    )
+
+    assert grew == ["a 2->22"]
+    assert (regressions, fixed, shrank) == ([], [], [])
+
+
+def test_an_accepted_failure_that_shrank_blocks_as_a_stale_baseline():
+    """Same reason a newly passing check blocks: an entry accepting 12 problems
+    when 2 remain grants amnesty for 10 that no longer exist."""
+    regressions, fixed, grew, shrank = classify(
+        failing("a", count=2), accepted(a=("Wave 2 (D)", 12))
+    )
+
+    assert shrank == ["a 12->2"]
+    assert (regressions, fixed, grew) == ([], [], [])
+
+
+def test_a_check_that_does_not_count_is_not_compared_by_size():
+    """`assert-called` either finds the entry point or does not; inventing a count
+    for it would make the comparison fire on nothing."""
+    assert classify(failing("a"), accepted(a=("Wave 3 (G)", None)))[2:] == ([], [])
+
+
+def test_an_old_string_baseline_still_loads(tmp_path, monkeypatch):
+    """Entries written before counts existed must keep working, with the size
+    comparison disabled for them rather than the whole file rejected."""
+    baseline = tmp_path / "audit-baseline.json"
+    baseline.write_text(json.dumps({"a": "Wave 1 (A)"}))
+    monkeypatch.setattr(audit_plan, "BASELINE", baseline)
+
+    assert audit_plan.load_baseline() == {"a": {"note": "Wave 1 (A)", "count": None}}
 
 
 LAYOUT = """train-comparison/
