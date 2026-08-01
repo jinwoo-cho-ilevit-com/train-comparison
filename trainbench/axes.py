@@ -58,10 +58,71 @@ from trainbench.embedding import info_nce
 # than an enumerated list because the layer index is part of the name.
 PLE_PARAM_MARKER = "per_layer"
 
+# Vision-tower parameters, per architecture. Read off each checkpoint rather than
+# guessed: docs/model-spec.md says in as many words that a guessed marker freezes
+# zero tensors and records that as success, which is the failure `_ple_report`
+# had already shipped once with `altup`.
+#
+# Measured 2026-08-01 from each repo's safetensors header on `main`:
+#
+#   Qwen/Qwen3-VL-Embedding-2B   model.visual.*         315 of  625 tensors
+#   Qwen/Qwen3.5-0.8B            model.visual.*         153 of  488 tensors
+#   google/gemma-4-E2B           model.vision_tower.*   658 of 2011 tensors
+#                                model.embed_vision.*     1
+#
+# Both Qwen models keep the projector inside the tower (`visual.merger`), while
+# gemma-4 keeps it outside as `embed_vision.embedding_projection`; it is included
+# so the axis means the same thing on all three. gemma-4's `audio_tower` is
+# deliberately not here — it is a third tower, not the vision one.
+VISION_PARAM_MARKERS = {
+    "qwen3_vl": ("visual.",),
+    "qwen3_5": ("visual.",),
+    "gemma4": ("vision_tower.", "embed_vision."),
+}
+
+# Class definitions from these packages inside a built model are the evidence
+# that a kernel library patched it. Liger replaces the transformers classes
+# (`apply_liger_kernel_to_llama()` then "# 2. Instantiate patched model"), so a
+# model built afterwards carries their modules; a model built before it does not.
+KERNEL_MODULE_ROOTS = {
+    "liger_kernel": "liger",
+    "fla": "fla",
+    "kernels": "kernels_hub",
+}
+
+# Columns whose presence means the rows arrived already tokenised. Read off the
+# dataset the loader was built around, because that is where `pretokenize` moves
+# the work to — the loader itself looks the same either way.
+TOKENIZED_COLUMNS = ("input_ids",)
+
 # Axis knobs this module can actually put into effect. Required to equal
 # `applied._CAPTURES`: `audit_plan.py`'s `axis-wired` check enforces it, and
 # `tests/test_applied.py::test_applied_and_verified_sets_agree` pins it.
-IMPLEMENTED = frozenset({"attn.name", "freeze.ple", "optim.name", "loss.name", "framework.name"})
+#
+# `precision.name` and `train.offload` are absent on purpose. Neither has a site
+# here: the load dtype is chosen by `probe/steps.py::dtype_for` from the device,
+# and offload is inseparable from `deepspeed.initialize`, which builds the model,
+# optimizer and dataloader together. The module docstring of tests/test_axes.py
+# carries the long form.
+IMPLEMENTED = frozenset(
+    {
+        "attn.name",
+        "compile.mode",
+        "dataloader.backend",
+        "dataloader.packing",
+        "dataloader.pretokenize",
+        "framework.name",
+        "freeze.ple",
+        "freeze.vision_tower",
+        "kernel.name",
+        "loss.name",
+        "optim.name",
+        "parallel.cross_device_negatives",
+        "parallel.strategy",
+        "peft.mode",
+        "train.gradient_checkpointing",
+    }
+)
 
 
 class UnappliedAxis(RuntimeError):
@@ -102,6 +163,27 @@ def ple_parameters(model: Any) -> list[tuple[str, Any]]:
     return [(n, p) for n, p in model.named_parameters() if PLE_PARAM_MARKER in n]
 
 
+def vision_parameters(model: Any, arch: str) -> list[tuple[str, Any]]:
+    """The vision tower's tensors, by name, for this architecture.
+
+    Raises for an architecture with no measured marker rather than returning
+    nothing: an empty list would freeze nothing and read as a tower that happens
+    to be small, and `freeze.vision_tower` would then be reported as applied.
+    """
+    markers = VISION_PARAM_MARKERS.get(arch)
+    if markers is None:
+        raise UnappliedAxis(
+            f"no vision-tower parameter marker is recorded for arch={arch!r}; "
+            f"known: {sorted(VISION_PARAM_MARKERS)}. Read it off the checkpoint's "
+            "safetensors header before adding one (docs/model-spec.md)."
+        )
+    return [
+        (name, param)
+        for name, param in model.named_parameters()
+        if any(marker in name for marker in markers)
+    ]
+
+
 def assemble(
     model: Any,
     config: BenchConfig,
@@ -125,6 +207,11 @@ def assemble(
             f"parallel={config.parallel.strategy} / offload={config.train.offload} needs "
             "deepspeed.initialize, which returns the model, optimizer and dataloader "
             "together; it has to be built here rather than by the pieces below."
+        )
+    if config.parallel.strategy != "single":
+        raise UnappliedAxis(
+            f"parallel.strategy={config.parallel.strategy} wraps the model (DDP, FSDP2) "
+            "and needs an initialised process group; not implemented."
         )
 
     model, names = _apply_to_model(model, config)
@@ -163,13 +250,135 @@ def step_context(config: BenchConfig) -> contextlib.AbstractContextManager:
 
 
 def _apply_to_model(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
-    """Axes that change the model itself. May return a different object."""
-    applied = []
+    """Axes that change the model itself. May return a different object.
+
+    One ordering constraint is real and one is a structuring choice, and they are
+    labelled here because an invented reason is worse than none.
+
+    Real: freezing runs before peft, because peft freezes every base parameter and
+    the freeze axes would have nothing left to decide afterwards; and all of it
+    runs before the optimizer is built (docs/CONTRACTS.md §2 fixes this — FSDP2
+    needs the optimizer built over sharded parameters), so the optimizer holds the
+    parameters the run actually trains.
+
+    A choice: `_compile` is last because it is the only site that replaces the
+    object rather than mutating it, so keeping it last means every other site
+    receives the model it was handed. This is not a correctness requirement. An
+    earlier version of this docstring claimed checkpointing had to precede compile
+    because "the compiled wrapper is not that model"; that is false —
+    `OptimizedModule.__getattr__` delegates to `_orig_mod`, so the hook reaches
+    through, the flags get set on the inner modules, and `named_modules()` still
+    finds them. Reversing the two leaves the suite green. Whether the reverse
+    order costs anything at run time is unmeasured.
+
+    An axis whose configured value is the inert one — `compile=none`,
+    `peft=full`, `freeze.*=false` — applies nothing and so is not named here.
+    What it means is read back by `applied.capture`, which looks at the object
+    rather than at this list.
+    """
+    applied: list[str] = []
+    applied += _freeze(model, config)
+    model, names = _peft(model, config)
+    applied += names
+    applied += _gradient_checkpointing(model, config)
+    model, names = _compile(model, config)
+    applied += names
+    return model, applied
+
+
+def _freeze(model: Any, config: BenchConfig) -> list[str]:
+    """Turn off gradients for the tensors each freeze axis names.
+
+    A marker that matches nothing is left to the capture probe rather than raised
+    on here: `applied._capture_freeze_ple` reports zero matches as undetermined,
+    which blocks a reportable run without stopping a probe whose job is to find
+    out what the checkpoint actually contains.
+    """
+    applied: list[str] = []
     if config.freeze.ple:
         for _, param in ple_parameters(model):
             param.requires_grad_(False)
         applied.append("freeze.ple")
-    return model, applied
+    if config.freeze.vision_tower:
+        for _, param in vision_parameters(model, config.model.arch):
+            param.requires_grad_(False)
+        applied.append("freeze.vision_tower")
+    return applied
+
+
+def _peft(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
+    """Adapter attachment. `full` attaches nothing, which is the whole of it.
+
+    LoRA is refused rather than attached because `get_peft_model` freezes every
+    base parameter, so a `freeze.ple=false` LoRA run would read back as frozen and
+    every LoRA timing run would be blocked the moment this axis starts reporting
+    (docs/CONTRACTS.md §2). What `freeze.*` should mean under an adapter — frozen,
+    or frozen on top of what peft froze — is a decision that has to be made and
+    tested against a real peft model, and this lane has no environment with peft
+    in it to test either answer against.
+    """
+    if config.peft.mode != "full":
+        raise UnappliedAxis(
+            f"peft.mode={config.peft.mode} needs get_peft_model, which rewrites the model "
+            "in place and freezes every base parameter; how that combines with the freeze "
+            "axes is undecided (docs/CONTRACTS.md §2), so it is refused rather than run as "
+            "full finetuning under a LoRA label."
+        )
+    return model, []
+
+
+def _gradient_checkpointing(model: Any, config: BenchConfig) -> list[str]:
+    """Trade compute for activation memory.
+
+    `use_reentrant=False` is not a tuning choice here: the reentrant variant skips
+    the recomputation entirely when no input to a checkpointed block requires
+    grad, which is exactly what a frozen vision tower produces — and `freeze.*`
+    and this axis are crossed in the ablation.
+    """
+    mode = config.train.gradient_checkpointing
+    if mode == "none":
+        return []
+    if mode != "full":
+        raise UnappliedAxis(
+            f"train.gradient_checkpointing={mode} needs a policy for "
+            "torch.utils.checkpoint.create_selective_checkpoint_contexts; not implemented."
+        )
+    enable = getattr(model, "gradient_checkpointing_enable", None)
+    if not callable(enable):
+        raise UnappliedAxis(
+            f"{type(model).__name__} has no gradient_checkpointing_enable, so nothing here "
+            "can turn train.gradient_checkpointing=full on for it."
+        )
+    enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    return ["train.gradient_checkpointing"]
+
+
+def _compile(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
+    """`torch.compile`, whole-model or per repeated block.
+
+    The schema's values other than `none` are torch's own mode spellings, so they
+    are passed through rather than translated; a translation table would be a
+    second place for `max-autotune` to be spelled. `none` is spelled that way
+    because YAML reads a bare `off` as boolean False.
+
+    Regional compilation goes through the model's own `compile_repeated_blocks`
+    rather than a walk of the module tree: which blocks repeat is a property of
+    the architecture, and guessing it would compile the wrong thing under the
+    right name.
+    """
+    mode = config.compile.mode
+    if mode == "none":
+        return model, []
+    if mode == "regional":
+        compile_blocks = getattr(model, "compile_repeated_blocks", None)
+        if not callable(compile_blocks):
+            raise UnappliedAxis(
+                f"compile=regional needs {type(model).__name__}.compile_repeated_blocks, "
+                "which this model does not have."
+            )
+        compile_blocks()
+        return model, ["compile.mode"]
+    return torch.compile(model, mode=mode), ["compile.mode"]
 
 
 def _optimizer(params: Any, config: BenchConfig, device: torch.device) -> tuple[Any, list[str]]:
@@ -210,8 +419,10 @@ def _dataloader(dataset: Any, config: BenchConfig) -> tuple[Any, list[str]]:
         num_workers=config.data.num_workers,
     )
     # The backend axis is only applied once a loader exists; without a dataset
-    # nothing was decided, and the capture probe reports it undetermined.
-    return loader, []
+    # nothing was decided, and the capture probe reports it undetermined. packing
+    # and pretokenize are not named: both are false here, and false is the absence
+    # of an application rather than one.
+    return loader, ["dataloader.backend"]
 
 
 def _loss(config: BenchConfig) -> tuple[Any, list[str]]:
@@ -237,4 +448,9 @@ def _loss(config: BenchConfig) -> tuple[Any, list[str]]:
     # Read back by applied._capture_loss: the function's identity is the only
     # evidence of which loss a run actually computed.
     mnrl.axis_value = "mnrl"
+    # A literal set by the branch that built the non-gathering closure, not a copy
+    # of the config. `mnrl` above computes similarities over the local batch only,
+    # so this records what the function does, and a loss built anywhere else
+    # declares nothing and comes back undetermined.
+    mnrl.axis_cross_device_negatives = False
     return mnrl, ["loss.name"]

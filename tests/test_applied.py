@@ -161,13 +161,24 @@ def test_the_axis_set_is_exactly_this(config_mapping):
 
 
 def test_an_axis_without_a_probe_blocks_a_timing_run(config_mapping):
-    """Undetermined must not read as fine, or the mechanism is decorative."""
+    """Undetermined must not read as fine, or the mechanism is decorative.
+
+    The undetermined axis is synthetic rather than whichever real axis happens to
+    be unwired today. Naming a real one couples this test to the axis inventory,
+    which `audit_plan.py`'s `axis-wired` already tracks — and it would break here
+    every time a lane does its job, until someone stops reading the failure and
+    just edits the name. A synthetic axis also cannot go vacuous: deriving the
+    subject from `axis_knobs() - _CAPTURES` would silently check nothing once
+    every axis is wired.
+    """
     config = bench(config_mapping)
     state = capture(built(), config)
+    state = AppliedState(
+        axes=(*state.axes, AxisState(axis="synthetic.unwired", requested="x", applied=None))
+    )
 
-    unverified = {a.axis for a in state.undetermined()}
-    assert "compile.mode" in unverified, "an axis with no capture probe must be undetermined"
-    with pytest.raises(AppliedMismatch, match="compile.mode"):
+    assert "synthetic.unwired" in {a.axis for a in state.undetermined()}
+    with pytest.raises(AppliedMismatch, match="synthetic.unwired"):
         assert_matches(state, config)
 
 
