@@ -1,4 +1,4 @@
-"""Merge probe results into the support matrix.
+"""Merge what the pods uploaded into the support matrix and the results tables.
 
 Only rewrites the generated section of docs/support-matrix.md. Everything above
 the marker is hand-written analysis and stays untouched.
@@ -13,16 +13,31 @@ Three distinctions this file exists to preserve:
   is the only place that knows, and `all_ok` cannot say it.
 * "Launched and produced nothing" is not "never attempted". Collapsing them turns
   a lost pod-hour into a combination nobody notices was never measured.
+
+An artifact goes down exactly one of three lanes, because the three answer
+different questions and one table cannot hold all three:
+
+* **matrix** — a probe (or the fallback record standing in for one). What loads.
+* **measurement** — a run with a measuring purpose. What it cost. These carry
+  `metrics` and no probe checks; reading them through `checks_of` reported a run
+  that produced every figure as "기동됨, 결과 없음".
+* **baseline** — the canonical reference workload every measuring pod repeats.
+  It is filed by *pod*, not by cell: its config names one fixed combination, so
+  every pod's copy would otherwise land on the single `(native, qwen3_5_0_8b)`
+  cell and be discarded as a duplicate of whatever probed that cell.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import publish_result
 
 MARKER = "<!-- generated: probe results -->"
 
@@ -35,13 +50,51 @@ GENERATED_HEADING = f"## {MATRIX_HEADING} (자동 생성)"
 FRAMEWORKS = ["native", "unsloth", "ms_swift", "sentence_transformers", "tevatron", "axolotl"]
 MODELS = ["qwen3_vl_emb_2b", "qwen3_5_0_8b", "gemma4_e2b"]
 
-RESULT_NAME = "result.json"
-STARTED_NAME = "started.json"
+RESULT_NAME = publish_result.RESULT_NAME
+STARTED_NAME = publish_result.STARTED_NAME
 
 NOT_ATTEMPTED = "미시도"
 NO_RESULT = "결과 없음(기동됨)"
 LAUNCH_FAILED = "기동 실패"
 UNSUPPORTED = "미지원(문서화됨)"
+NO_METRICS = "지표 없음"
+
+# Purposes that exist to produce numbers. `probe` is absent: it answers whether a
+# combination loads, which is the matrix's question and not this one.
+MEASURING_PURPOSES = frozenset({"timing", "profile", "quality"})
+
+# `orchestrate.plan_runs` names every canonical baseline run `baseline:<name>`,
+# and the pod publishes it under `publish_result.setting_dir(<that name>)`. The
+# prefix is sanitised the same way rather than spelled out, so the two cannot
+# drift apart into a baseline that uploads fine and is never recognised.
+BASELINE_RUN_PREFIX = "baseline:"
+BASELINE_DIR_PREFIX = publish_result.UNSAFE_IN_PATH.sub("-", BASELINE_RUN_PREFIX)
+
+# What a pod's baseline is compared on. The median step time is the measured
+# quantity itself; samples/s and tokens/s are derived from it through per-step
+# counts that differ with padding, so a deviation in one of those does not say
+# whether the *host* was slower.
+BASELINE_METRIC = "step_seconds_p50"
+
+# AGENTS.md and PLAN.md (다중 pod 규칙 3): a pod deviating from the canonical
+# baseline by more than this is thrown out rather than averaged in.
+BASELINE_DEVIATION_LIMIT = 0.03
+
+# Printed next to every deviation figure. docs/methodology.md §4 states this
+# outright, and a threshold that looks derived is worse than no threshold: the
+# first GPU pod repeats the baseline five times and the measured spread is what
+# fixes the number. Until then this is a convention, not evidence.
+BASELINE_DEVIATION_SOURCE = (
+    "**미교정 임계값이다.** docs/methodology.md §4가 근거 없는 값이라고 명시한다 — "
+    "동일 pod에서 baseline을 5회 반복해 편차를 실측한 뒤 확정한다. 실측 편차가 이 값을 "
+    "넘으면 임계값이 아니라 측정 절차를 고쳐야 한다는 신호다. 아래 판정은 그 교정 전의 "
+    "잠정 판정이다."
+)
+
+POD_OK = "OK"
+POD_INVALID = "무효"
+POD_NO_BASELINE = "기준선 없음"
+POD_UNJUDGED = "판정 불가"
 
 
 @dataclass
@@ -69,6 +122,74 @@ class Artifact:
         answered, and the cell would read as if the probe had produced nothing.
         """
         return self.produced_result and bool(checks_of(self))
+
+    @property
+    def purpose(self) -> str:
+        """What the run was for, from its own resolved config."""
+        run = (self.payload.get("config") or {}).get("run") or {}
+        return str(run.get("purpose") or "unknown")
+
+    @property
+    def measuring(self) -> bool:
+        return self.purpose in MEASURING_PURPOSES
+
+    @property
+    def metrics(self) -> dict[str, Any] | None:
+        """`metrics.summarise`'s output, as `build_record(**extra)` carried it.
+
+        None means the run reported no figures. For a measuring purpose that is a
+        finding and not a blank: the pod-hour was spent and nothing came back.
+        """
+        value = self.payload.get("metrics")
+        return value if isinstance(value, dict) else None
+
+    @property
+    def _tail(self) -> tuple[str, ...]:
+        """Path segments below `results/{framework}/{model}/`.
+
+        Anchored on the model directory named by the artifact's own config, so a
+        `--results` directory that is the repo root and one that is already the
+        `results/` subtree both resolve to the same pod. The baseline anchors
+        correctly too — it is filed under *its own* combination on every pod,
+        which is the whole reason it needs filing by pod instead.
+        """
+        parts = self.path.parts
+        for index in range(len(parts) - 1, 0, -1):
+            if parts[index - 1] == self.model:
+                return parts[index:]
+        return ()
+
+    @property
+    def pod(self) -> str:
+        """Which pod produced this — the unit a baseline deviation is charged to.
+
+        `host.runpod_pod_id` first: `record.host_spec` and `publish_result` both
+        write it, and it is the pod's own answer rather than an inference from
+        where the file was filed.
+        """
+        recorded = (self.payload.get("host") or {}).get("runpod_pod_id")
+        if recorded:
+            return str(recorded)
+        tail = self._tail
+        return tail[0] if tail else "unknown"
+
+    @property
+    def label(self) -> str | None:
+        """The setting this artifact is one of, or None for a single-run pod.
+
+        A sweep publishes one directory per setting under the pod's own, so the
+        segment between the pod and the file names the run.
+        """
+        tail = self._tail
+        return tail[1] if len(tail) > 2 else None
+
+    @property
+    def is_baseline(self) -> bool:
+        return (self.label or "").startswith(BASELINE_DIR_PREFIX)
+
+    @property
+    def run_name(self) -> str:
+        return self.label or str(self.payload.get("experiment") or "(단일 런)")
 
 
 def _combination(payload: dict[str, Any]) -> tuple[str, str]:
@@ -115,6 +236,37 @@ def load_artifacts(results_dir: Path) -> tuple[list[Artifact], list[str]]:
             )
         )
     return artifacts, skipped
+
+
+@dataclass(frozen=True)
+class Lanes:
+    """The three kinds of artifact, separated before anything is ranked."""
+
+    matrix: list[Artifact]
+    measured: list[Artifact]
+    baselines: list[Artifact]
+
+
+def split_lanes(artifacts: list[Artifact]) -> Lanes:
+    """Sort artifacts by the question they can answer.
+
+    Baselines leave the matrix first. Every pod runs the same canonical workload,
+    whose config names `native x qwen3_5_0_8b`, so left in they all pile onto that
+    one cell, lose to the probe that graded it, and are reported as duplicates —
+    which is how a per-pod control run disappears from a per-cell table.
+
+    Measuring runs leave next. They carry no probe checks, so the matrix could
+    only ever render them as "launched, produced nothing".
+    """
+    matrix, measured, baselines = [], [], []
+    for artifact in artifacts:
+        if artifact.is_baseline:
+            baselines.append(artifact)
+        elif artifact.measuring:
+            measured.append(artifact)
+        else:
+            matrix.append(artifact)
+    return Lanes(matrix=matrix, measured=measured, baselines=baselines)
 
 
 def newest_per_combination(
@@ -185,8 +337,137 @@ def checks_of(artifact: Artifact | None) -> list[dict[str, Any]]:
     return (artifact.payload.get("probe") or {}).get("checks") or []
 
 
-def cell(artifact: Artifact | None, launched: list[dict[str, Any]] | None) -> str:
+@dataclass(frozen=True)
+class PodVerdict:
+    """Whether one pod's numbers may be compared with the other pods'."""
+
+    pod: str
+    value: float | None
+    deviation: float | None
+    status: str
+    note: str
+
+    @property
+    def usable(self) -> bool:
+        return self.status == POD_OK
+
+
+# A pod nothing is known about is not a pod that passed. Used where a verdict is
+# looked up for an artifact whose pod never reached the gate.
+_UNKNOWN_POD = PodVerdict("unknown", None, None, POD_NO_BASELINE, "판정 기록이 없는 파드")
+
+
+def _baseline_value(artifact: Artifact) -> tuple[float | None, str]:
+    metrics = artifact.metrics
+    if metrics is None:
+        return None, f"baseline 레코드에 `metrics`가 없다 ({artifact.path})"
+    raw = metrics.get(BASELINE_METRIC)
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool) or raw <= 0:
+        return None, f"baseline의 `{BASELINE_METRIC}`가 양수가 아니다: {raw!r}"
+    if metrics.get("profiled"):
+        # AGENTS.md: a profiled step is inflated by an unmeasured amount, so it
+        # cannot stand in for the host's speed.
+        return None, "baseline이 프로파일러를 켠 채 측정됐다 — 호스트 속도의 근거가 못 된다"
+    return float(raw), ""
+
+
+def baseline_gate(
+    baselines: list[Artifact], measured: list[Artifact]
+) -> tuple[dict[str, PodVerdict], float | None, list[str]]:
+    """Per-pod verdicts, the reference they were compared against, and warnings.
+
+    The reference is the **lower median** of the pods' baseline figures. Two
+    alternatives were rejected: the first pod makes the whole campaign depend on
+    launch order and lets a single slow host invalidate every other pod, and a
+    mean is dragged by the outlier it is supposed to expose. `median_low` also
+    keeps the reference a number some pod actually measured, which is the same
+    reason `metrics.percentile` refuses to interpolate.
+
+    A pod that produced measurements but no baseline is not silently fine. It is
+    the case this gate exists for — nothing says whether its host was comparable —
+    so it gets its own verdict rather than an absence.
+    """
+    newest: dict[str, Artifact] = {}
+    notes: list[str] = []
+    for artifact in sorted(baselines, key=lambda a: (a.produced_result, a.timestamp)):
+        if (previous := newest.get(artifact.pod)) is not None:
+            notes.append(f"{artifact.pod}: baseline이 둘 이상 — {previous.path}를 무시했다")
+        newest[artifact.pod] = artifact
+
+    values: dict[str, float] = {}
+    reasons: dict[str, str] = {}
+    for pod, artifact in newest.items():
+        value, reason = _baseline_value(artifact)
+        if value is None:
+            reasons[pod] = reason
+        else:
+            values[pod] = value
+
+    reference = statistics.median_low(values.values()) if values else None
+    verdicts: dict[str, PodVerdict] = {}
+    for pod in sorted(newest):
+        if pod not in values:
+            verdicts[pod] = PodVerdict(pod, None, None, POD_UNJUDGED, reasons[pod])
+            continue
+        value = values[pod]
+        deviation = abs(value - reference) / reference
+        over = deviation > BASELINE_DEVIATION_LIMIT
+        verdicts[pod] = PodVerdict(
+            pod,
+            value,
+            deviation,
+            POD_INVALID if over else POD_OK,
+            "임계값 초과 — 이 파드의 결과는 다른 파드와 같은 표에 들어갈 수 없다" if over else "",
+        )
+
+    for artifact in measured:
+        if artifact.pod in verdicts:
+            continue
+        verdicts[artifact.pod] = PodVerdict(
+            artifact.pod,
+            None,
+            None,
+            POD_NO_BASELINE,
+            "측정 결과는 있는데 canonical baseline 레코드가 없다 — 호스트 비교 근거가 없다",
+        )
+
+    if len(values) == 1:
+        pod = next(iter(values))
+        notes.append(
+            f"baseline을 낸 파드가 {pod} 하나뿐이라 기준값이 곧 자기 자신이다. "
+            "편차 0%는 측정된 일치가 아니라 비교 대상의 부재다"
+        )
+    if not values and (baselines or measured):
+        notes.append("어느 파드도 쓸 수 있는 baseline 수치를 내지 않아 편차를 계산하지 못했다")
+    return verdicts, reference, notes
+
+
+def _measured_cell(measured: list[Artifact], verdicts: dict[str, PodVerdict]) -> str:
+    """What a cell says when timing ran on it but no probe ever did.
+
+    Loading is not in question once a run trained on the combination, so the cell
+    does not read as untried. It carries no verdict of its own: what those runs
+    cost is the measurement table's subject, and the pod's standing is the gate's.
+    """
+    invalid = sum(1 for a in measured if not verdicts.get(a.pod, _UNKNOWN_POD).usable)
+    suffix = f", 파드 판정 미통과 {invalid}건" if invalid else ""
+    return f"측정 {len(measured)}건(probe 없음{suffix})"
+
+
+def cell(
+    artifact: Artifact | None,
+    launched: list[dict[str, Any]] | None,
+    measured: list[Artifact] | None = None,
+    verdicts: dict[str, PodVerdict] | None = None,
+) -> str:
     """One matrix cell. Absent stays '미시도' — never inferred from a neighbour."""
+    verdicts = verdicts or {}
+    # Only a run that reported figures says the combination trained. A measuring
+    # run that produced none is a spent pod-hour, and the ledger's "launched,
+    # produced nothing" is the honest answer for the cell.
+    reported = [a for a in measured or [] if a.metrics]
+    if reported and (artifact is None or not artifact.produced_result or not checks_of(artifact)):
+        return _measured_cell(reported, verdicts)
     if artifact is None:
         return launch_state(launched)
     if not artifact.produced_result:
@@ -221,12 +502,267 @@ def unexpected_passes(artifact: Artifact | None) -> list[str]:
     return [c["name"] for c in checks_of(artifact) if c.get("expected_failure") and c["ok"]]
 
 
+def _number(value: Any, spec: str) -> str:
+    """A figure, or '-' where there is none. Never a zero standing in for absence."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "-"
+    return format(value, spec)
+
+
+def _gib(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "-"
+    return format(value / 1024**3, ".2f")
+
+
+def _verdict_cell(verdict: PodVerdict) -> str:
+    if verdict.deviation is None:
+        return verdict.status
+    return f"{verdict.status} (편차 {verdict.deviation * 100:.2f}%)"
+
+
+def render_measurements(measured: list[Artifact], verdicts: dict[str, PodVerdict]) -> list[str]:
+    """The figures a timing run produced, and what is missing from the ones that did not.
+
+    Profiled runs are tabled apart. AGENTS.md forbids reporting a number measured
+    with the profiler on, and a `profiled` column in the same table is an opt-in
+    to noticing — a reader comparing two rows is reading the numbers, not the
+    flags beside them.
+    """
+    if not measured:
+        return []
+    ordered = sorted(measured, key=lambda a: (a.pod, a.run_name, a.path))
+    timed = [a for a in ordered if a.metrics and not a.metrics.get("profiled")]
+    profiled = [a for a in ordered if a.metrics and a.metrics.get("profiled")]
+    barren = [a for a in ordered if not a.metrics]
+
+    lines = [
+        "",
+        "### 측정 결과",
+        "",
+        f"측정 목적(`{'`/`'.join(sorted(MEASURING_PURPOSES))}`) 런 {len(ordered)}건 중 "
+        f"수치를 낸 것 {len(timed) + len(profiled)}건, `{NO_METRICS}` {len(barren)}건. "
+        "각 수치가 무엇을 센 것인지는 아래 '지표 정의'에 있다.",
+    ]
+
+    def table(rows: list[Artifact]) -> list[str]:
+        out = [
+            "",
+            "| 런 | 파드 | 프레임워크 x 모델 | 목적 | step p50 (s) | p95 (s) | mean (s) "
+            "| samples/s | tokens/s | peak mem (GiB) | steps 계측/폐기/측정 | 파드 판정 |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for artifact in rows:
+            metrics = artifact.metrics or {}
+            verdict = verdicts.get(artifact.pod, _UNKNOWN_POD)
+            out.append(
+                f"| {artifact.run_name} | {artifact.pod} | "
+                f"{artifact.framework} x {artifact.model} | {artifact.purpose} | "
+                f"{_number(metrics.get('step_seconds_p50'), '.4f')} | "
+                f"{_number(metrics.get('step_seconds_p95'), '.4f')} | "
+                f"{_number(metrics.get('step_seconds_mean'), '.4f')} | "
+                f"{_number(metrics.get('samples_per_second'), '.2f')} | "
+                f"{_number(metrics.get('tokens_per_second'), '.1f')} | "
+                f"{_gib(metrics.get('peak_memory_bytes'))} | "
+                f"{metrics.get('steps_timed', '-')}/{metrics.get('steps_discarded', '-')}"
+                f"/{metrics.get('steps_measured', '-')} | "
+                f"{_verdict_cell(verdict)} |"
+            )
+        return out
+
+    if timed:
+        lines += table(timed)
+        lines += [
+            "",
+            "| 런 | 파드 | rows/step | padded tokens/step | tokens/step | images/step "
+            "| images dropped/step | images dropped 합계 | MFU |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+        for artifact in timed:
+            metrics = artifact.metrics or {}
+            lines.append(
+                f"| {artifact.run_name} | {artifact.pod} | "
+                f"{_number(metrics.get('rows_per_step'), '.1f')} | "
+                f"{_number(metrics.get('padded_tokens_per_step'), '.1f')} | "
+                f"{_number(metrics.get('tokens_per_step'), '.1f')} | "
+                f"{_number(metrics.get('images_per_step'), '.2f')} | "
+                f"{_number(metrics.get('images_dropped_per_step'), '.2f')} | "
+                f"{metrics.get('images_dropped_total', '-')} | "
+                f"{metrics.get('mfu') if metrics.get('mfu') is not None else '없음'} |"
+            )
+        reasons = sorted(
+            {
+                str(a.metrics.get("mfu_reason"))
+                for a in timed
+                if (a.metrics or {}).get("mfu") is None
+            }
+            - {"None"}
+        )
+        for reason in reasons:
+            lines.append(f"\nMFU가 비어 있는 이유: {reason}")
+
+    dropped = [a for a in timed + profiled if (a.metrics or {}).get("images_dropped_total")]
+    if dropped:
+        lines += [
+            "",
+            "#### 이미지를 텍스트로만 읽은 런",
+            "",
+            "`images_dropped`가 0이 아니다. 프로세서가 받지 못한 이미지가 있었다는 뜻이므로, "
+            "이 런들은 이미지 코퍼스를 **텍스트 전용 뷰로** 읽었다. 같은 표의 다른 런과 "
+            "같은 작업량을 잰 것이 아니다.",
+            "",
+        ]
+        for artifact in dropped:
+            metrics = artifact.metrics or {}
+            lines.append(
+                f"- **{artifact.run_name}** ({artifact.pod}, {artifact.model}) — "
+                f"버려진 이미지 {metrics.get('images_dropped_total')}장, "
+                f"처리된 이미지 {metrics.get('images_read_total', '-')}장"
+            )
+
+    if profiled:
+        lines += [
+            "",
+            "#### 프로파일러가 켜진 런 — 비교표에 인용하지 않는다",
+            "",
+            "AGENTS.md: 프로파일러를 켜고 잰 수치는 보고하지 않는다. 프로파일러가 이 저장소에서 "
+            "iteration time을 얼마나 부풀리는지는 **측정 안 함**(docs/methodology.md)이므로 "
+            "보정도 불가능하다. 아래는 커널 분해용 기록이며 위 표의 수치와 같은 축에 놓을 수 없다.",
+        ]
+        lines += table(profiled)
+
+    if barren:
+        lines += [
+            "",
+            f"#### {NO_METRICS} — 측정 목적으로 돌았으나 수치가 없다",
+            "",
+            "파드 시간은 썼는데 `metrics`가 레코드에 없다. 실패한 런이거나 결과가 잘린 런이며, "
+            "어느 쪽이든 이 조합의 수치는 아직 존재하지 않는다.",
+            "",
+        ]
+        for artifact in barren:
+            status = artifact.payload.get("status") or (
+                "기동 기록만 있다"
+                if artifact.kind == "started"
+                else "결과 파일은 올라왔는데 `metrics` 키가 없다"
+            )
+            lines.append(
+                f"- **{artifact.run_name}** ({artifact.pod}, {artifact.framework} x "
+                f"{artifact.model}, {artifact.purpose}) — {status}, `{artifact.path}`"
+            )
+    return lines
+
+
+def render_baseline_gate(
+    verdicts: dict[str, PodVerdict], reference: float | None, notes: list[str]
+) -> list[str]:
+    """The cross-pod deviation gate, with the threshold's provenance attached."""
+    if not verdicts:
+        return []
+    shown = (
+        f"{reference:.4f}s"
+        if reference is not None
+        else "없음 — 계산할 수 있는 baseline 수치가 하나도 없다"
+    )
+    lines = [
+        "",
+        "### 파드 baseline 편차 게이트",
+        "",
+        f"모든 측정 파드가 canonical baseline 1개를 돌리고, `{BASELINE_METRIC}`를 파드끼리 "
+        f"비교한다. 기준값은 파드별 값의 **하위 중앙값**이다 — 첫 파드를 기준으로 삼으면 기동 "
+        "순서가 판정을 정하고, 평균을 쓰면 드러내야 할 이상치가 기준값을 끌고 간다. 중앙값은 "
+        "어느 파드가 실제로 낸 값이기도 하다(보간하지 않는다).",
+        "",
+        f"임계값 {BASELINE_DEVIATION_LIMIT * 100:.0f}% — {BASELINE_DEVIATION_SOURCE}",
+        "",
+        f"기준값: {shown}",
+        "",
+        "| 파드 | baseline step p50 (s) | 편차 | 판정 | 비고 |",
+        "|---|---|---|---|---|",
+    ]
+    for pod in sorted(verdicts):
+        verdict = verdicts[pod]
+        deviation = "-" if verdict.deviation is None else f"{verdict.deviation * 100:.2f}%"
+        lines.append(
+            f"| {pod} | {_number(verdict.value, '.4f')} | {deviation} | "
+            f"{verdict.status} | {verdict.note or '-'} |"
+        )
+    unusable = [v for v in verdicts.values() if not v.usable]
+    if unusable:
+        lines += [
+            "",
+            "**위 판정을 통과하지 못한 파드의 수치는 다른 파드의 수치와 같은 비교에 넣을 수 "
+            "없다.** 재실행하거나 폐기한다. 측정 결과 표의 '파드 판정' 열이 어느 행이 여기 "
+            "해당하는지를 표시한다.",
+            "",
+        ]
+        lines += [f"- {v.pod}: {v.status} — {v.note or '-'}" for v in unusable]
+    if notes:
+        lines += ["", *[f"- {note}" for note in notes]]
+    return lines
+
+
+def render_metric_definitions(measured: list[Artifact]) -> list[str]:
+    """The definitions the records carried, verbatim.
+
+    Read out of the results rather than imported from `trainbench.metrics`: the
+    definition that belongs next to a number is the one that travelled with it.
+    A record written before a definition changed would otherwise be re-labelled
+    by whatever the current code says, which is how a number gets misread later.
+    """
+    carried: dict[str, dict[str, list[str]]] = {}
+    missing = []
+    for artifact in sorted(measured, key=lambda a: (a.pod, a.run_name)):
+        definitions = (artifact.metrics or {}).get("metric_definitions")
+        if not isinstance(definitions, dict) or not definitions:
+            if artifact.metrics is not None:
+                missing.append(artifact)
+            continue
+        for name, text in definitions.items():
+            carried.setdefault(str(name), {}).setdefault(str(text), []).append(artifact.run_name)
+    if not carried and not missing:
+        return []
+    lines = [
+        "",
+        "### 지표 정의",
+        "",
+        "레코드가 싣고 온 정의 그대로다. 정의 없는 숫자는 나중에 오독된다 — 특히 `tokens`는 "
+        "패딩을 세지 않고 모델별 상수(`instruction_prompt`)를 포함하며, `rows`는 `samples`의 "
+        "2배다.",
+        "",
+    ]
+    for name in sorted(carried):
+        texts = carried[name]
+        if len(texts) == 1:
+            lines.append(f"- **{name}** — {next(iter(texts))}")
+            continue
+        lines.append(f"- **{name}** — 런마다 정의가 다르다. 이 이름의 수치는 서로 비교할 수 없다:")
+        for text, runs in sorted(texts.items()):
+            lines.append(f"  - `{', '.join(sorted(set(runs)))}`: {text}")
+    if missing:
+        lines += [
+            "",
+            "정의를 싣지 않은 런(수치의 의미를 이 문서만으로는 확정할 수 없다): "
+            + ", ".join(f"`{a.run_name}` ({a.pod})" for a in missing),
+        ]
+    return lines
+
+
 def render(
     chosen: dict[tuple[str, str], Artifact],
     ledger: dict[tuple[str, str], list[dict[str, Any]]],
     duplicates: list[str],
     skipped: list[str],
+    measured: list[Artifact] | None = None,
+    baselines: list[Artifact] | None = None,
 ) -> str:
+    measured = list(measured or [])
+    baselines = list(baselines or [])
+    verdicts, reference, gate_notes = baseline_gate(baselines, measured)
+    per_combination: dict[tuple[str, str], list[Artifact]] = {}
+    for artifact in measured:
+        per_combination.setdefault((artifact.framework, artifact.model), []).append(artifact)
+
     results = [a for a in chosen.values() if a.produced_result]
     lines = [
         MARKER,
@@ -243,7 +779,13 @@ def render(
     ]
     for framework in FRAMEWORKS:
         row = [
-            cell(chosen.get((framework, model)), ledger.get((framework, model))) for model in MODELS
+            cell(
+                chosen.get((framework, model)),
+                ledger.get((framework, model)),
+                per_combination.get((framework, model)),
+                verdicts,
+            )
+            for model in MODELS
         ]
         lines.append(f"| {framework} | " + " | ".join(row) + " |")
 
@@ -298,6 +840,10 @@ def render(
                 lines.append(f"  - `{check['error'].strip().splitlines()[0][:180]}`")
     if not any_failure:
         lines.append("실패 없음.")
+
+    lines += render_measurements(measured, verdicts)
+    lines += render_baseline_gate(verdicts, reference, gate_notes)
+    lines += render_metric_definitions(measured + baselines)
 
     if duplicates or skipped:
         lines += ["", "### 병합에서 제외한 파일", ""]
@@ -363,11 +909,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no artifacts under {args.results} and no ledger", file=sys.stderr)
         return 1
 
-    chosen, duplicates = newest_per_combination(artifacts)
+    lanes = split_lanes(artifacts)
+    chosen, duplicates = newest_per_combination(lanes.matrix)
     for item in duplicates:
         print(f"duplicate {item}", file=sys.stderr)
 
-    generated = render(chosen, ledger, duplicates, skipped)
+    # On stderr as well as in the document: whoever runs the merge is the person
+    # who can still re-run the pod, and they read a terminal, not a diff.
+    verdicts, _, _ = baseline_gate(lanes.baselines, lanes.measured)
+    for pod, verdict in sorted(verdicts.items()):
+        if not verdict.usable:
+            print(f"pod {pod}: {verdict.status} — {verdict.note}", file=sys.stderr)
+
+    generated = render(
+        chosen,
+        ledger,
+        duplicates,
+        skipped,
+        measured=lanes.measured,
+        baselines=lanes.baselines,
+    )
     existing = args.matrix.read_text() if args.matrix.exists() else ""
     try:
         head = document_head(existing)
@@ -375,7 +936,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{args.matrix}: {exc}", file=sys.stderr)
         return 2
     args.matrix.write_text(f"{head}\n\n{generated}")
-    print(f"merged {len(chosen)} artifact(s) into {args.matrix}")
+    print(
+        f"merged {len(chosen)} probe, {len(lanes.measured)} measurement and "
+        f"{len(lanes.baselines)} baseline artifact(s) into {args.matrix}"
+    )
     return 0
 
 
