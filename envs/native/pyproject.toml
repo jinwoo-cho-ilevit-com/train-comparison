@@ -5,19 +5,76 @@
 name = "trainbench-env-native"
 version = "0.1.0"
 requires-python = ">=3.13,<3.14"
+# This env carries the ablation packages because the ablation runs here: every
+# phase2 manifest in configs/experiment/ sets `framework: native`. A framework
+# image gets an axis package only when its own default path needs it, which keeps
+# five of the six images off the multi-hour CUDA source builds below.
 dependencies = [
     "trainbench[native]",
+    # attn/fa2, attn/fa3, attn/fa4
+    "flash-attn>=2.8",
+    # kernel/fla. Also Qwen3.5's Gated DeltaNet fast path, which is why every
+    # other env carries these two as well.
+    "flash-linear-attention>=0.5",
+    "causal-conv1d>=1.6",
+    # kernel/liger, kernel/kernels_hub. Present only in the axolotl image until
+    # now, which meant the axis was offered to a native run that could not do it.
+    "liger-kernel>=0.6",
+    "kernels>=0.10",
+    # precision/mxfp8, precision/nvfp4. The bare `transformer-engine` distribution
+    # is a shim whose entire content sits behind extras, so installing it without
+    # them would satisfy a name check and provide no kernels. core-cu13 matches
+    # the CUDA 13 base image and the cu130 torch index.
+    "transformer-engine[core-cu13,pytorch]>=2.17",
+    # optim/adamw_8bit and peft/qlora. Was in 2 of 6 envs, never in this one.
+    "bitsandbytes>=0.48",
+    # optim/muon
+    "pytorch-optimizer>=3.10",
+    # parallel/zero2, parallel/zero3
+    "deepspeed>=0.19",
+    # dataloader/dali, dataloader/dali_packed. Pulls the CUDA 13 nvjpeg and
+    # nvimgcodec stack, which is the hardware JPEG decode this axis exists to
+    # measure. See the index comment below for why the name is CUDA-suffixed.
+    "nvidia-dali-cuda130>=2.2",
+    # loss/cached_mnrl. No release on PyPI resolves to this project: `grad-cache`
+    # is a 404 and `gradcache` is a stale 0.0.1 upload, while upstream is 0.1.0.
+    # The git source is pinned to a commit by uv.lock, same as tevatron.
+    "gradcache @ git+https://github.com/luyug/GradCache.git",
 ]
+
+[dependency-groups]
+# flash-attn and deepspeed ship no pyproject.toml, so a PEP 517 build sees only
+# setuptools' default requires while their setup.py does `import torch` at module
+# level. Build isolation cannot work for them, hence no-build-isolation-package
+# below — and that ban means the environment itself has to supply the build
+# dependencies. The image installs this group first for exactly that reason.
+# causal-conv1d and transformer-engine-torch declare torch in build-system.requires
+# and so build under isolation unaided; they are left alone.
+build = ["torch", "setuptools>=77", "packaging", "wheel", "ninja"]
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
+no-build-isolation-package = ["flash-attn", "deepspeed"]
+# Kept in the default set so the second sync pass cannot uninstall setuptools out
+# from under the source builds it is about to run.
+default-groups = ["build"]
 
 [tool.uv.sources]
 trainbench = { path = "../..", editable = true }
 torch = [{ index = "pytorch-cuda" }]
 torchvision = [{ index = "pytorch-cuda" }]
+nvidia-dali-cuda130 = [{ index = "nvidia" }]
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
 url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+# DALI is not on PyPI under a usable name: PyPI's `nvidia-dali` is NVIDIA's own
+# placeholder ("a fake package to warn the user they are not installing the
+# correct package") and this index's `nvidia-dali` stops at 0.7.0/cp37 (2019).
+# The maintained distribution is per-CUDA-major and lives only here.
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
 explicit = true

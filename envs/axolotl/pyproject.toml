@@ -8,12 +8,25 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "trainbench",
     "axolotl>=0.18",
+    # Qwen3.5's Gated DeltaNet path, not an ablation axis. See envs/unsloth.
+    # No floor here: axolotl 0.18.0 pins flash-linear-attention==0.4.1 exactly, so
+    # `>=0.5` is unsatisfiable and the only way to take 0.5.2 would be to downgrade
+    # axolotl itself. This image therefore runs a different GDN kernel version than
+    # the other five; docs/support-matrix.md records it as a version confound.
+    "flash-linear-attention",
+    "causal-conv1d>=1.6",
 ]
+
+[dependency-groups]
+# Installed as the image's first sync pass. Every env declares it so the
+# Dockerfile has one code path; envs/native explains what depends on it.
+build = ["torch", "setuptools>=77", "packaging", "wheel", "ninja"]
 
 [tool.uv]
 # These images only ever run on linux/CUDA pods. Resolving for the host platform
 # would drag in wheels that do not exist there.
 environments = ["sys_platform == 'linux'"]
+default-groups = ["build"]
 
 [tool.uv.sources]
 trainbench = { path = "../..", editable = true }

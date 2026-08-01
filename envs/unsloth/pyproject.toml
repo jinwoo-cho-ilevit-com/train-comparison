@@ -8,12 +8,25 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "trainbench",
     "unsloth>=2026.7",
+    # Qwen3.5's Gated DeltaNet path, not an ablation axis. transformers falls back
+    # to a slow torch implementation with only a log line when these are missing
+    # (docs/support-matrix.md), and 75% of that model's layers are GDN. Every env
+    # probes Qwen3.5, so leaving them out of one image would compare a fused
+    # kernel against a fallback and call the difference a framework difference.
+    "flash-linear-attention>=0.5",
+    "causal-conv1d>=1.6",
 ]
+
+[dependency-groups]
+# Installed as the image's first sync pass. Every env declares it so the
+# Dockerfile has one code path; envs/native explains what depends on it.
+build = ["torch", "setuptools>=77", "packaging", "wheel", "ninja"]
 
 [tool.uv]
 # These images only ever run on linux/CUDA pods. Resolving for the host platform
 # would drag in wheels that do not exist there.
 environments = ["sys_platform == 'linux'"]
+default-groups = ["build"]
 
 [tool.uv.sources]
 trainbench = { path = "../..", editable = true }

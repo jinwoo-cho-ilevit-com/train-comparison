@@ -26,6 +26,7 @@ jobs:
       packages: write
     outputs:
       image: ${{ steps.name.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v5
 
@@ -48,13 +49,30 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
           file: docker/Dockerfile.base
           push: true
-          tags: ${{ steps.name.outputs.image }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # `latest` moves, so it cannot appear in a result. The commit tag is what
+          # scripts/orchestrate.py --tag names to get a run back to the image that
+          # produced it; orchestrate then resolves that tag to a digest itself.
+          tags: |
+            ${{ steps.name.outputs.image }}:latest
+            ${{ steps.name.outputs.image }}:${{ github.sha }}
+          # Registry cache rather than type=gha: the GitHub Actions cache is capped
+          # at 10 GB per repository, and one CUDA devel base plus six framework
+          # images with mode=max is far past that. Under the cap the caches evict
+          # each other, so builds miss at random and the base layer — the one thing
+          # all seven images share — is the most likely eviction. GHCR has no such
+          # cap, and we are already pushing there.
+          cache-from: type=registry,ref=${{ steps.name.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.name.outputs.image }}:buildcache,mode=max
+
+      - name: record digest
+        run: |
+          echo "base ${{ steps.name.outputs.image }}@${{ steps.build.outputs.digest }}" \
+            >> "$GITHUB_STEP_SUMMARY"
 
   frameworks:
     needs: base
@@ -83,6 +101,15 @@ jobs:
                       /usr/local/share/boost "${AGENT_TOOLSDIRECTORY}"
           df -h /
 
+      # Same lowercasing as the base job. GHCR rejects an uppercase path, so an
+      # owner whose login is not already lowercase would fail only here.
+      - id: name
+        run: |
+          echo "image=${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/trainbench-${MATRIX_FRAMEWORK}" \
+            >> "$GITHUB_OUTPUT"
+        env:
+          MATRIX_FRAMEWORK: ${{ matrix.framework }}
+
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -91,13 +118,23 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
           file: docker/Dockerfile.framework
           push: true
           build-args: |
-            BASE_IMAGE=${{ needs.base.outputs.image }}:latest
+            BASE_IMAGE=${{ needs.base.outputs.image }}@${{ needs.base.outputs.digest }}
             FRAMEWORK=${{ matrix.framework }}
-          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/trainbench-${{ matrix.framework }}:latest
-          cache-from: type=gha,scope=${{ matrix.framework }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.framework }}
+          tags: |
+            ${{ steps.name.outputs.image }}:latest
+            ${{ steps.name.outputs.image }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ steps.name.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.name.outputs.image }}:buildcache,mode=max
+
+      - name: record digest
+        run: |
+          echo "${MATRIX_FRAMEWORK} ${{ steps.name.outputs.image }}@${{ steps.build.outputs.digest }}" \
+            >> "$GITHUB_STEP_SUMMARY"
+        env:
+          MATRIX_FRAMEWORK: ${{ matrix.framework }}

@@ -268,3 +268,201 @@ axolotl 행을 "미지원"으로 채우면 안 된다.
 **조치**: Wave 2 F 레인(이미지)에서 `libffi-dev`를 베이스에 추가하고 재빌드한다.
 지금 단독 재빌드하지 않는 이유는 F 레인이 어차피 `COPY trainbench` 순서 변경과
 digest 태깅으로 베이스/프레임워크 이미지를 함께 손볼 예정이기 때문이다.
+
+### axolotl 실패 원인 — 상류 확정 (2026-08-01, Wave 2 F)
+
+위 기록의 `libffi-dev` 부재는 **근접 원인이 맞다.** 다만 "axolotl의 의존성 트리만
+`zstandard==0.22.0`을 끌어온다"는 서술이 왜 그런지까지는 밝히지 않았다. 인과 사슬을
+끝까지 확인했다. 각 줄은 PyPI JSON API와 sdist 실측이다.
+
+| 단계 | 확인한 사실 | 근거 |
+|---|---|---|
+| 1 | `axolotl==0.18.0`이 `zstandard==0.22.0`을 **정확히 고정** | `requires_dist`에 `zstandard==0.22.0` |
+| 2 | zstandard 0.22.0(2023-11-01) 휠은 cp38~cp312뿐, **cp313 없음** | 휠 태그 `['cp310','cp311','cp312','cp38','cp39']` |
+| 3 | 프로젝트가 3.13 고정이므로 sdist 빌드로 떨어짐 | `envs/axolotl/uv.lock:3448`에 `sdist`만 있고 `wheels` 목록이 없다 |
+| 4 | zstandard 0.22.0 sdist가 `cffi==1.16.0`을 **빌드 요구로 정확히 고정** | sdist의 `[build-system] requires = ["cffi==1.16.0", "setuptools==68.2.2", "wheel==0.41.2"]` |
+| 5 | cffi 1.16.0 휠도 cp38~cp312뿐, **cp313 없음** | 휠 태그 `['cp310','cp311','cp312','cp38','cp39']` |
+| 6 | 따라서 cffi가 소스 컴파일되고 `ffi.h`가 필요해짐 | 기록된 빌드 로그 |
+| 7 | `libffi-dev`가 베이스 apt 목록에 없다 (`build-essential`이 끌어오지 않는다) | `docker/Dockerfile.base` |
+
+**왜 axolotl만인가**: ms-swift도 zstandard를 쓰지만 버전을 고정하지 않아
+**0.25.0**으로 잡힌다(`envs/ms-swift/uv.lock:2328`). 0.25.0에는 cp313 휠이 있으므로
+컴파일 자체가 일어나지 않는다. 즉 이 실패는 "cp313 이전에 멈춘 정확 고정 2개"가
+프로젝트의 3.13 하한과 만난 지점이고, 정확 고정을 하는 프레임워크는 axolotl뿐이다.
+
+**조치**: `docker/Dockerfile.base`에 `libffi-dev`를 추가했다. `zstandard`를
+`override-dependencies`로 0.25.0까지 올리는 방법도 있으나 **택하지 않았다** —
+업스트림이 정확히 고정한 값을 거스르는 것이고, GPU 없이 검증할 수 없다.
+
+**미검증**: 이 수정으로 axolotl 이미지가 빌드된다는 것은 **확인하지 않았다.** 아래
+"이번 변경의 검증 범위"를 참조한다.
+
+## 축별 패키지 설치 (2026-08-01, Wave 2 F 레인)
+
+`scripts/audit_plan.py`의 `axis-packages`가 12건을 보고했다 — config group이 값으로
+제공하지만 어느 env에도 패키지가 없어 이름표에 그친 축들이다.
+
+### 배치 원칙
+
+**ablation 축 패키지는 `envs/native`에 둔다.** 근거는 추정이 아니라 매니페스트다:
+`configs/experiment/phase2-*.yaml` 전부가 `framework: native`다. 축 sweep이 도는
+곳이 native이므로 축을 켜는 패키지도 거기 있어야 한다. 프레임워크 env는 자기
+기본 경로에 필요한 것만 받는다 — 이 규칙 덕분에 6개 중 5개 이미지가 아래의
+CUDA 소스 빌드를 피한다.
+
+**예외 하나: `flash-linear-attention` + `causal-conv1d`는 6개 env 전부.** 이것은
+ablation 축이기 이전에 Qwen3.5의 Gated DeltaNet 경로다. 두 패키지가 없으면
+transformers가 예외도 경고도 아닌 **로그 한 줄만 남기고** 느린 torch 구현으로
+떨어지며(위 "Qwen3.5 GDN 커널" 절), 그 모델은 레이어의 75%가 GDN이다. Phase 0
+매니페스트 6종이 모두 Qwen3.5를 적재하므로, 한 이미지에만 빼면 "프레임워크 차이"라는
+이름으로 융합 커널 대 fallback을 비교하게 된다.
+
+### 어디에 무엇이 들어갔나
+
+| 축 | 패키지 | 들어간 env | 이유 |
+|---|---|---|---|
+| `attn/fa2,fa3,fa4` | `flash-attn>=2.8` | native | 축 sweep이 native에서 돈다 |
+| `kernel/fla` | `flash-linear-attention`, `causal-conv1d>=1.6` | **6개 전부** | GDN 무음 fallback 제거 (위 예외) |
+| `kernel/liger` | `liger-kernel>=0.6` | native | axolotl에만 전이 의존으로 있었다 |
+| `kernel/kernels_hub` | `kernels>=0.10` | native | 위와 같음 |
+| `precision/mxfp8,nvfp4` | `transformer-engine[core-cu13,pytorch]>=2.17` | native | extras 필수, 아래 참조 |
+| `optim/adamw_8bit`, `peft/qlora` | `bitsandbytes>=0.48` | native | 6개 중 2개에만 있었고 native는 아니었다 |
+| `optim/muon` | `pytorch-optimizer>=3.10` | native | |
+| `parallel/zero2,zero3` | `deepspeed>=0.19` | native | |
+| `dataloader/dali,dali_packed` | `nvidia-dali-cuda130>=2.2` | native | 이름 문제, 아래 참조 |
+| `loss/cached_mnrl` | `gradcache` (git) | native | 이름 문제, 아래 참조 |
+
+`transformer-engine`을 extras 없이 넣으면 안 된다. PyPI의 `transformer-engine`
+2.17.0은 **내용이 전부 extras 뒤에 있는 shim**이다(`requires_dist`가
+`transformer_engine_cu12/cu13/torch/jax`를 전부 extra 조건부로만 선언). 이름 검사는
+통과시키면서 커널은 하나도 주지 않으므로 `[core-cu13,pytorch]`를 명시했다. `cu13`은
+베이스 이미지의 CUDA 13 및 `cu130` torch 인덱스와 맞춘 것이다.
+
+### 패키지 이름이 존재하지 않는 축 2건 — 계약 변경 요청
+
+`AXIS_PACKAGES`(`scripts/audit_plan.py`, 공유 파일이라 수정하지 않았다)가 지정한
+이름 중 둘은 **설치 가능한 배포판이 아니다.**
+
+| 축 | 계약이 요구하는 이름 | 실측 |
+|---|---|---|
+| `dataloader/dali` | `nvidia-dali` | PyPI 0.0.1.dev5, summary가 **"A fake package to warn the user they are not installing the correct package"** — NVIDIA 본인이 올린 자리표시자다. `pypi.nvidia.com`의 `nvidia-dali`도 0.7.0/cp35~cp37(2019)에서 멈춰 있다 |
+| `loss/cached_mnrl` | `grad-cache` | PyPI에서 **404**. 업스트림 `luyug/GradCache`의 `setup.py`는 `name='GradCache'`이고, 이는 PEP 503 정규화로 `gradcache`가 되지 `grad-cache`가 되지 않는다 |
+
+실제로 설치한 것은 유지되는 배포판 쪽이다.
+
+- `nvidia-dali-cuda130` 2.2.0 (`https://pypi.nvidia.com`, 별도 인덱스 선언).
+  CUDA 13용 `nvidia-nvjpeg` / `nvidia-nvimgcodec-cu13` / `nvidia-nvtiff-cu13`를
+  함께 끌어온다 — 이 축이 재려는 하드웨어 JPEG 디코드가 바로 그것이다
+- `gradcache` 0.1.0을 git 소스에서. `uv.lock`이 커밋
+  `906f03835fbc183132a9db32612a9e8f180ca3b4`로 고정한다 (tevatron과 같은 방식)
+
+**따라서 `axis-packages`는 12건 → 3건으로 줄었을 뿐 PASS가 되지 않는다.** 남은 3건
+(`dataloader/dali` x2, `loss/cached_mnrl`)은 설치 부재가 아니라 계약의 이름이
+틀린 것이므로, `docs/audit-baseline.json`의 `axis-packages` 줄을 **지우지 않았다.**
+`AXIS_PACKAGES`를 `nvidia-dali-cuda130` / `gradcache`로 고치는 것은 계약 변경이다.
+
+### 부딪힌 충돌 — 1건
+
+레진 결과이므로 숨기지 않고 기록한다. 원문:
+
+```
+× No solution found when resolving dependencies for split (markers:
+│ python_full_version == '3.13.*' and sys_platform == 'linux'):
+╰─▶ Because only axolotl<=0.18.0 is available and axolotl==0.18.0 depends
+    on flash-linear-attention{platform_machine != 'aarch64'}==0.4.1, we can
+    conclude that axolotl>=0.18.0 depends on flash-linear-attention==0.4.1.
+    And because your project depends on axolotl>=0.18 and
+    flash-linear-attention>=0.5, we can conclude that your project's
+    requirements are unsatisfiable.
+```
+
+axolotl 0.18.0이 `flash-linear-attention==0.4.1`을 정확히 고정한다. `>=0.5`를 얻는
+유일한 방법은 axolotl 자체를 내리는 것이므로 **강제하지 않고 axolotl의 고정을
+받아들였다**(하한 없이 선언).
+
+**결과로서의 제약**: axolotl 이미지만 GDN 커널이 **0.4.1**이고 나머지 다섯은
+**0.5.2**다. 이미 기록된 torch 2.11/2.12/2.13 분산과 같은 종류의 버전 교란이며,
+Phase 3에서 axolotl x Qwen3.5 수치를 다른 프레임워크와 나란히 놓을 때 이 차이를
+함께 표기해야 한다.
+
+나머지 5개 env는 충돌 없이 해석됐다. 부수 변화로 `torchvision`이 인덱스 접미사가
+붙은 형태(`0.26.0+cu130` 등)로 다시 잡혔는데, 상류 인덱스 변화이고 torch/transformers
+버전은 움직이지 않았다.
+
+### 소스 빌드가 필요한 패키지 — 이미지 빌드 구조를 바꿨다
+
+추가한 패키지 중 넷은 **휠이 없다**(전부 sdist 전용). PyPI JSON API 실측이다.
+
+| 패키지 | 빌드 격리 | 근거 |
+|---|---|---|
+| `causal-conv1d` | 가능 | `[build-system] requires = ["setuptools", "wheel", "torch"]` |
+| `transformer-engine-torch` | 가능 | `requires = ["setuptools>=61.0", "pip", "torch>=2.1"]` |
+| **`flash-attn`** | **불가** | sdist에 `pyproject.toml`이 **없다**. `setup.py`가 `import torch` |
+| **`deepspeed`** | **불가** | 같음. sdist에 `pyproject.toml`이 없고 `setup.py`가 `import torch` |
+
+뒤의 둘은 PEP 517 격리 빌드가 setuptools 기본 requires만 보는데 `setup.py`는 최상위에서
+torch를 임포트하므로 **원리적으로 격리 빌드가 불가능하다.** 그래서
+
+- `envs/native/pyproject.toml`에 `no-build-isolation-package = ["flash-attn", "deepspeed"]`
+- 격리를 끄면 빌드 의존을 환경이 직접 제공해야 하므로 `[dependency-groups] build`
+  (`torch`, `setuptools`, `packaging`, `wheel`, `ninja`)를 두고 `default-groups`에 넣었다.
+  기본 그룹에 넣지 않으면 2차 sync가 소스 빌드 직전에 setuptools를 지워버린다
+- `docker/Dockerfile.framework`가 **3단 sync**로 바뀌었다. env 6개 전부 같은 `build`
+  그룹을 선언하므로 Dockerfile에 프레임워크별 분기가 없다
+
+## 이번 변경의 검증 범위 (2026-08-01, Wave 2 F)
+
+**무엇이 증명됐는지에 대해 이 절이 유일한 기준이다.**
+
+### 실행으로 확인한 것
+
+| 항목 | 명령 | 결과 |
+|---|---|---|
+| env 6종 해석 | 각 `envs/<fw>`에서 `uv lock` | 6/6 성공 (native 142 / unsloth 108 / ms-swift 158 / sentence-transformers 73 / tevatron 87 / axolotl 241 패키지) |
+| 워크플로 문법 | `actionlint v1.7.7` | 지적 0건 |
+| 3단 sync 순서 | 최소 재현 프로젝트를 /tmp에 만들어 실행 | 아래 참조 |
+| 회귀 없음 | `uv run pytest`, `ruff`, `audit_plan.py` | 281 passed / 지적 0건 / 신규 실패 0 |
+
+3단 sync는 CUDA 없이도 검증 가능한 부분만 따로 떼어 실제로 돌렸다. path 의존성을
+editable로 참조하는 최소 프로젝트를 만들고 그 소스 디렉터리를 **지운 상태에서**
+1·2단이 성공하는지, 소스를 되돌린 뒤 3단이 editable 설치를 하고 `build` 그룹이
+살아남는지를 확인했다. 세 단계 모두 통과했다. 이것으로 확인된 것은 **sync 순서와
+`--no-install-package`의 동작**이지 CUDA 컴파일이 아니다.
+
+### 실행으로 확인하지 **않은** 것 — 주장하지 않는다
+
+- **어떤 이미지도 빌드하지 않았다.** 로컬은 macOS arm64이고 대상은 linux/amd64 CUDA다
+- **어떤 이미지도 push하지 않았다.** GPU pod도 기동하지 않았다
+- **CI가 돌지 않았다.** 로컬 main이 원격에 push된 적이 없어 이 세션에서 워크플로가
+  실행될 수 없다. `actionlint` 통과는 문법이 유효하다는 뜻이지 빌드가 성공한다는
+  뜻이 아니다
+- **`libffi-dev` 추가로 axolotl이 빌드된다는 것은 미확인이다.** 인과 사슬 7단계는
+  전부 근거가 있지만, 마지막 확인은 빌드뿐이다
+- **`flash-attn` / `deepspeed` / `causal-conv1d` / `transformer-engine-torch`의 소스
+  빌드가 성공하는지 미확인이다.** 이 넷은 nvcc로 CUDA 커널을 컴파일하며 시간·메모리를
+  많이 쓴다. GitHub Actions 무료 러너의 6시간 잡 제한에 걸릴 가능성이 실재하고,
+  걸리는지 여부는 돌려봐야 안다
+- **`USE_HF=1`이 gemma-4를 찾게 해주는지 미확인이다.** 확인한 것은 ms-swift 4.4.2의
+  `swift/utils/env.py`가 `strtobool(os.environ.get('USE_HF', '0'))`으로 기본값이
+  ModelScope라는 사실뿐이다
+- **설치·임포트·실행 어느 것도 확인하지 않았다.** `uv lock`은 해석만 증명한다
+
+### 이미지 추적성 — `latest` 단독 태그 해소
+
+결과에서 이미지를 되짚을 수 없던 문제(`latest`만 붙었다)를 다음으로 바꿨다.
+
+- 모든 이미지에 `:latest`와 **`:<commit sha>`**를 함께 push한다.
+  `scripts/orchestrate.py --tag <sha>`가 그 태그를 digest로 해석해 run에 기록한다
+  (해당 기능은 이미 있다 — `image_digest()`)
+- 프레임워크 이미지는 베이스를 **digest로** 참조한다
+  (`BASE_IMAGE=<image>@sha256:...`). 태그로 받으면 베이스가 움직였을 때 어떤 베이스
+  위에서 구워졌는지 알 수 없다
+- 각 잡이 push된 digest를 job summary에 남긴다
+
+### GHA 캐시 10GB 상한
+
+`type=gha,mode=max`를 **레지스트리 캐시**로 바꿨다
+(`type=registry,ref=<image>:buildcache,mode=max`). GitHub Actions 캐시는 저장소당
+10GB인데 CUDA devel 베이스 + 프레임워크 6개를 `mode=max`로 올리면 한참 초과한다.
+초과하면 LRU로 서로를 밀어내고, **7개 이미지가 공유하는 베이스 레이어가 가장 먼저
+쫓겨난다.** GHCR에는 그 상한이 없고 어차피 push하고 있으므로 캐시를 그쪽에 둔다.

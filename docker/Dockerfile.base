@@ -14,6 +14,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         git \
         build-essential \
+        # libffi headers, which build-essential does not carry. axolotl 0.18.0
+        # pins zstandard==0.22.0, whose last wheels are cp312, so on this
+        # project's 3.13 floor it builds from its sdist; that sdist pins
+        # cffi==1.16.0 as a build requirement, whose last wheels are also cp312,
+        # so cffi compiles too and needs ffi.h. Its absence is the whole of the
+        # axolotl image failure recorded in docs/support-matrix.md — the other
+        # five images resolve zstandard 0.25.0 and never compile it.
+        libffi-dev \
     && curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | bash \
     && apt-get update && apt-get install -y --no-install-recommends infisical \
     && rm -rf /var/lib/apt/lists/*

@@ -5,20 +5,43 @@ FROM ${BASE_IMAGE}
 
 ARG FRAMEWORK
 
-# Root project first: envs/<framework> depends on it by path, and its metadata
-# changes far less often than the framework lock.
+# Root project metadata only. envs/<framework> depends on trainbench by path, and
+# this metadata changes far less often than the source under it.
 COPY pyproject.toml uv.lock README.md ./
-COPY trainbench ./trainbench
-
 COPY envs/${FRAMEWORK} ./envs/${FRAMEWORK}
+
+# The sync runs in three passes.
+#
+# flash-attn and deepspeed publish no pyproject.toml, so a PEP 517 build sees only
+# setuptools' default requires while their setup.py does `import torch` at module
+# level. They cannot build under isolation, which is why envs/*/pyproject.toml
+# names them in no-build-isolation-package — and that in turn means torch and
+# setuptools must already be installed when they build. Pass one puts them there.
+#
 # --frozen so an image can never silently resolve something other than the lock
 # that was reviewed. A stale lock fails the build instead.
+RUN cd envs/${FRAMEWORK} && uv sync --frozen --only-group build
+# Pass two: everything except trainbench, so that the expensive layer is finished
+# before any project source is copied. Copying trainbench first meant a one-line
+# edit re-ran the entire sync, which for axolotl is 240 packages plus CUDA
+# source builds.
+RUN cd envs/${FRAMEWORK} && uv sync --frozen --no-install-package trainbench
+
+# Below here layers are invalidated by ordinary edits, so nothing expensive follows.
+COPY trainbench ./trainbench
+# Pass three: trainbench itself, installed editable against the source just copied.
 RUN cd envs/${FRAMEWORK} && uv sync --frozen
 
 COPY scripts ./scripts
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# ms-swift resolves models and datasets through ModelScope unless told otherwise
+# (swift/utils/env.py in 4.4.2: `strtobool(os.environ.get('USE_HF', '0'))`), while
+# the three models under test are pinned by HuggingFace repo id and revision — and
+# gemma-4-E2B is not guaranteed to exist on ModelScope at all. Set unconditionally
+# because ms-swift is the only framework here that reads it.
+ENV USE_HF=1
 ENV TRAINBENCH_ENV_DIR=/workspace/train-comparison/envs/${FRAMEWORK}
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
