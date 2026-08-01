@@ -26,17 +26,25 @@ _MODULES = {
 
 
 def run_probe(config: BenchConfig, device: torch.device) -> ProbeReport:
+    """Run the adapter for the configured framework and return its report.
+
+    The report is built here and handed to the adapter rather than returned by it.
+    An adapter that raises outside a `report.run` — `model.to(device)` running out
+    of memory, a framework exploding on import halfway through — would otherwise
+    take every check it had already recorded with it, and those checks are the
+    expensive ones. Owning the report means the crash costs one check, not the run.
+    """
     framework = config.framework.name
     module_path = _MODULES[framework]
-    fallback = ProbeReport(framework=framework, model=config.model.name)
+    report = ProbeReport(framework=framework, model=config.model.name)
     try:
         module = importlib.import_module(module_path)
-        return module.run(config, device)
+        module.run(config, device, report)
     except BaseException as exc:  # noqa: BLE001 - any failure here is itself a result
         # Covers both an unimportable probe module and a framework that is absent
         # or explodes on import inside run(). A probe must never take the process
         # down: "this combination does not work" is the output we came for.
-        fallback.add(
+        report.add(
             Check(
                 name="probe_import",
                 ok=False,
@@ -45,4 +53,4 @@ def run_probe(config: BenchConfig, device: torch.device) -> ProbeReport:
                 traceback=traceback.format_exc()[-MAX_TRACEBACK_CHARS:],
             )
         )
-        return fallback
+    return report

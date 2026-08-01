@@ -177,6 +177,36 @@ def test_model_spec_notices_a_missing_field():
 # when its set was empty: `configs/data/` was matched by an unanchored `data/` in
 # .gitignore and had never been committed, so `data-pinned` announced that every
 # data config pins a commit sha — of which there were none.
+def test_an_orchestrator_manifest_is_not_a_config_knob(tmp_path, monkeypatch):
+    """`configs/experiment/` holds pod work orders, not run settings. Treating its
+    keys as unread knobs charged lane C's files to lane D's audit item, which D
+    could then never clear."""
+    configs = tmp_path / "configs"
+    (configs / "attn").mkdir(parents=True)
+    (configs / "experiment").mkdir()
+    (configs / "config.yaml").write_text("defaults:\n  - attn: sdpa\n")
+    (configs / "attn" / "sdpa.yaml").write_text("name: sdpa\n")
+    (configs / "experiment" / "job.yaml").write_text("phase: 0\naxis: attn\n")
+    monkeypatch.setattr(audit_plan, "CONFIGS", configs)
+
+    assert audit_plan._config_leaf_keys() == {"attn": {"name"}}
+
+
+def test_a_config_directory_nothing_composes_must_be_declared(tmp_path, monkeypatch):
+    """Narrowing to composed groups would otherwise fail open: an axis group added
+    to configs/ but forgotten in `defaults` would vanish from every check at once
+    while also never reaching a run."""
+    configs = tmp_path / "configs"
+    (configs / "newaxis").mkdir(parents=True)
+    (configs / "config.yaml").write_text("defaults:\n  - attn: sdpa\n")
+    monkeypatch.setattr(audit_plan, "CONFIGS", configs)
+
+    result = audit_plan.CHECKS["config-groups"]()
+
+    assert not result.ok
+    assert "newaxis" in result.detail
+
+
 SET_CHECKS = ("config-consumed", "axis-fields", "axis-packages", "data-pinned", "model-spec")
 
 

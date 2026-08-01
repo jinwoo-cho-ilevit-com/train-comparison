@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 
-def set_seed(seed: int, *, deterministic: bool) -> None:
+def set_seed(seed: int, *, deterministic: bool, warn_only: bool = False) -> None:
     """Seed every RNG.
 
     `deterministic` is False for measurement runs. Deterministic algorithms disable
@@ -17,6 +17,12 @@ def set_seed(seed: int, *, deterministic: bool) -> None:
     project measures — leaving it on would distort every number. Tests and CPU
     smoke runs keep it True. The measured cost of the switch is recorded in
     docs/methodology.md, which is the evidence convention 07 requires.
+
+    `warn_only` downgrades "this operation has no deterministic implementation"
+    from a RuntimeError to a warning. Probes set it: a probe answers whether a
+    framework x model combination runs, and an op that only lacks a deterministic
+    kernel would otherwise be recorded as the framework not supporting the model.
+    That is a false entry in the support matrix, produced by our own seeding.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -26,7 +32,7 @@ def set_seed(seed: int, *, deterministic: bool) -> None:
         # Deterministic cuBLAS refuses to run without this; it is only read when the
         # CUDA context is created, so setting it later in a process is a no-op.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-        torch.use_deterministic_algorithms(True)
+        torch.use_deterministic_algorithms(True, warn_only=warn_only)
         torch.backends.cudnn.benchmark = False
     else:
         torch.use_deterministic_algorithms(False)

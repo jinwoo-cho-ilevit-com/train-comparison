@@ -234,9 +234,14 @@ class BenchConfig(Strict):
 
     @model_validator(mode="after")
     def _timing_runs_are_uncontaminated(self) -> BenchConfig:
-        """torch.profiler inflates iteration time by 20-44%, and deterministic mode
-        disables the kernel autotuning under measurement. Neither may be on for a run
-        whose numbers get reported."""
+        """The profiler inflates iteration time and deterministic mode disables the
+        kernel autotuning under measurement. Neither may be on for a run whose
+        numbers get reported.
+
+        No percentage is quoted here on purpose: the figure this docstring used to
+        carry had no source, and the overhead varies with hardware and with which
+        profiler options are on. docs/methodology.md records the gap and how it is
+        closed."""
         if self.run.purpose == "timing":
             if self.run.profiler:
                 raise ValueError(
