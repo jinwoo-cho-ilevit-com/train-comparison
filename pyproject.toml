@@ -33,7 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Local/orchestrator side: composes experiment variants and writes resolved JSON.
-compose = ["hydra-core>=1.3", "runpod>=1.11"]
+compose = ["hydra-core>=1.3", "runpod>=1.11", "pyyaml>=6.0"]
 native = [
     "transformers>=5.14",
     "datasets>=5.0",
