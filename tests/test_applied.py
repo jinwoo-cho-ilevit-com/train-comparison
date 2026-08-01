@@ -93,7 +93,8 @@ def test_vision_tower_left_on_sdpa_is_a_mismatch(config_mapping):
     attn = axis(state, "attn.name")
     assert attn.applied == "mixed(flash_attention_2,sdpa)"
     assert not attn.matches
-    assert attn.detail["per_module"] == {"model": "flash_attention_2", "visual": "sdpa"}
+    assert attn.detail["implementations"] == {"flash_attention_2": 1, "sdpa": 1}
+    assert attn.detail["dissenting"] == ["visual"]
 
 
 def test_uniform_submodules_still_match(config_mapping):
@@ -211,8 +212,31 @@ def test_applied_state_serialises_for_the_record(config_mapping):
         "applied": "sdpa",
         "determined": True,
         "matches": True,
-        "detail": {"per_module": {"model": "sdpa"}},
+        "detail": {"implementations": {"sdpa": 1}, "modules_checked": 1},
     }
+
+
+def test_the_attention_detail_does_not_grow_with_the_model():
+    """A real VLM records the implementation once per layer — twelve places on a
+    tiny test model, hundreds on a 5B one. Carrying that map in every result file
+    would make the evidence the largest thing in it."""
+    from trainbench.applied import _capture_attn
+
+    wide = SimpleNamespace(
+        config=SimpleNamespace(_attn_implementation="sdpa", sub_configs=()),
+        named_modules=lambda: [
+            (
+                f"layers.{i}.attn",
+                SimpleNamespace(config=SimpleNamespace(_attn_implementation="sdpa")),
+            )
+            for i in range(500)
+        ],
+    )
+
+    _, detail = _capture_attn(wide, None)
+
+    assert detail == {"implementations": {"sdpa": 501}, "modules_checked": 501}
+    assert len(json.dumps(detail)) < 200
 
 
 def param(name: str, requires_grad: bool):

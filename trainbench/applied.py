@@ -140,12 +140,21 @@ def _capture_attn(model: Any, config: BenchConfig) -> tuple[str | None, dict[str
     per_module = _attn_per_module(model)
     if not per_module:
         return None, {"reason": "no _attn_implementation found on the model or its subconfigs"}
-    distinct = sorted(set(per_module.values()))
-    if len(distinct) > 1:
-        # Deliberately not equal to any requested value, so a partial application
-        # is a mismatch rather than a match on the majority.
-        return "mixed(" + ",".join(distinct) + ")", {"per_module": per_module}
-    return distinct[0], {"per_module": per_module}
+    # Counts rather than the whole map: a real VLM records this in one place per
+    # layer, so the map runs to hundreds of entries on a 5B model and would be
+    # carried by every result file. What matters is how many answers there are
+    # and which modules gave the minority one.
+    counts: dict[str, int] = {}
+    for impl in per_module.values():
+        counts[impl] = counts.get(impl, 0) + 1
+    detail = {"implementations": counts, "modules_checked": len(per_module)}
+    if len(counts) == 1:
+        return next(iter(counts)), detail
+    top = per_module.get("model")
+    dissenting = sorted(name for name, impl in per_module.items() if impl != top)
+    # Deliberately not equal to any requested value, so a partial application is a
+    # mismatch rather than a match on whatever the majority happened to be.
+    return "mixed(" + ",".join(sorted(counts)) + ")", {**detail, "dissenting": dissenting[:8]}
 
 
 def _capture_freeze_ple(model: Any, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
