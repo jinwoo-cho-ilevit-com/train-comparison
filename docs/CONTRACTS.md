@@ -59,6 +59,18 @@ G는 `docker/entrypoint.sh`(C 소유)를 반드시 고쳐야 한다 — pod 진�
 - 레인에서 **`--update-baseline`을 실행하지 않는다.** 전체 실행이 아니면 도구가
   거부하고, 전체 실행이면 다른 레인의 미완 항목까지 자기 상태로 덮어쓴다
 - 항목 추가는 계약 변경이다. 새 실패는 baseline이 아니라 수정으로 해소한다
+- **note는 어느 레인 소관인지가 아니라 그 구멍의 결과를 적는다.** 이건 스타일 규칙이
+  아니라 이 저장소에서 여섯 번 반복된 실패의 수리다. `axis-wired`의 note는
+  "Wave 2 (D: axes) - one apply site and one capture probe per axis"였는데,
+  그 상태의 실제 의미는 **`assert_matches`가 모든 `purpose=timing` 런을 거부해
+  측정이 하나도 불가능하다**는 것이었다. 감사는 사실을 보고하고 있었고 note가
+  그 함의를 가렸으며, 그 위에 Wave 3이 얹혔다. note를 읽는 사람은 다음 레인이고,
+  그가 알아야 하는 것은 담당자가 아니라 지금 무엇이 안 되는가다
+
+`--update-baseline`은 note를 보존하지만 **count는 이번 실행 값으로 덮어쓴다.**
+그래서 다른 레인이 고친 것이 내 count에 흡수될 수 있다. 실행하지 않는 이유가
+하나 더 있는 셈이고, count가 움직였는데 내가 한 일이 아니면 baseline이 아니라
+보고로 올린다.
 
 레인별 담당 항목:
 
@@ -339,6 +351,58 @@ class ProbeReport:
     `pyarrow` 고정이 하나도 없어 이미지 해석에 영향이 없고, `uv.lock` 변화는 2줄이다.
   - `tests/test_config.py` (공유) — 위 두 검증기의 테스트 추가. 스키마 변경과 같은
     커밋에 들어가지 않으면 검증기가 테스트 없이 랜딩한다.
+- 2026-08-02 **레인 경계 침범 기록 (35a9a62, Wave 3 G -> 레인 A).**
+  `scripts/prepare_data.py`(§1에서 A 소유)를 G의 커밋이 수정했다(+3 -9):
+  자체 `_percentile`을 지우고 `trainbench.metrics.percentile`을 import한다.
+  같은 커밋의 C->G 이관은 위 §"Wave 3 시작 시 이관"에 꼼꼼히 남겼는데 이건 남기지
+  않았다. **레인 A는 이 변경을 모른 채였다.** 중복 제거 자체는 컨벤션 01대로 옳다 —
+  nearest-rank 정의가 두 곳에 있으면 그게 D1(컬럼 목록 2개)의 재현이다.
+  **의존 방향은 남겨둔다(이동하지 않는다), 근거는 아래.** `trainbench/metrics/`의
+  docstring은 자기를 "What a timing run reports, and how it is measured"라고
+  적고 있고 `percentile`은 측정 개념이 아니라 산술 유틸이므로, 데이터 준비
+  스크립트가 타이밍 보고 모듈에 의존하는 모양이 된 것은 사실이다. 그럼에도
+  옮기지 않는 이유는 (a) 중립 모듈을 새로 만들면 함수 하나짜리 모듈이 생기고
+  §1의 소유 표에 또 한 줄이 필요해진다, (b) 두 소비자가 같은 것을 원하는 이유가
+  실제로 같다 — `percentile`의 docstring이 말하는 "보간하면 아무 step도 걸리지
+  않은 시간을 보고하게 된다"가 prepare_data의 행 길이 분포에도 그대로 적용된다,
+  (c) 이 방향은 순환이 아니고 `trainbench.metrics`는 torch 외에 아무것도 import하지
+  않는다. **재검토 조건**: `trainbench/metrics/`가 타이밍 런 상태(step 시간 버퍼,
+  device 핸들)를 들고 있게 되는 순간 이 근거는 무효다. 그때 산술만 중립 모듈로
+  분리한다.
+- 2026-08-02 **`config-consumed`를 정규식에서 AST로 옮긴다** + **`plan-files`가
+  양방향이 된다**(`audit_plan.py`, `tests/test_audit.py`). 리뷰가 두 체크를 각각
+  무력화했다.
+  - `_strip_prose()`는 자기가 막으려던 구멍의 절반만 막고 있었다. 문자열을 이름에
+    대입하면(`_NOTE = "config.data.subset_rows"`) `ast.Expr`가 아니라 `ast.Assign`이라
+    살아남았고, 속성 정규식에 앵커가 없어 `anything.data.subset_rows`도 읽기로
+    셌으며, `if False:` 블록 안의 접근도 셌다. 셋 다 미읽음 수를 5에서 3~4로
+    떨어뜨렸다. 산문 제거를 고치는 대신 **읽기 자체를 AST로 판정**한다 —
+    `config_schema.py`가 검증기 에러 메시지에 knob 이름을 관용적으로 넣으므로
+    문자열을 금지하는 방향은 쓸 수 없다. 앵커는 **그룹 바로 앞 이름**이라
+    `self.config.model.add_generation_prompt`는 읽기로 잡히고
+    `anything.data.subset_rows`는 아니다. 덤으로 fail-closed 버그도 사라진다 —
+    주석 제거가 `line.split("#", 1)[0]`이라 문자열 안의 `#` 뒤가 잘려나갔다.
+    **잔여 한계**: 상수 조건만 접는다. `if 1 == 2:`는 접지 않고, 읽은 값이
+    쓰이는지도 보지 않는다(그건 `axis-values`의 질문이다).
+  - `plan-files`는 **적혀 있는데 없는 것**만 봤다. 반대 방향이 없어서
+    `trainbench/metrics/`, `scripts/bench.py`, 테스트 6개가 전부 구조 블록에 없는
+    채로 통과했다 — 블록은 언급을 줄이면 참으로 유지된다. 그리고 확장자 있는
+    항목만 검사 대상이라 `configs/nonexistent/`가 블록에 있어도 통과했다.
+    이제 디렉터리 존재도 확인하고 **저장소에 있는데 블록에 없는 것도 막는다.**
+    범위는 트리에서 유도한다: **자식이 적힌 디렉터리는 완전한 목록을 주장하는
+    것으로 보고 그 안을 검사하고, 자식 없이 이름만 적힌 디렉터리**(`docker/`,
+    `envs/`, `trainbench/probe/`, 각 config 그룹)**는 통째로 문서화된 것으로 보고
+    안을 보지 않는다.** dot 항목과 `__init__.py`는 제외이며, 이 범위는 체크가
+    통과할 때도 자기 출력에 적는다 — 무엇을 안 봤는지가 보여야 한다.
+
+**새 레인 의무 — 파일을 추가하면 `PLAN.md` 구조 블록에 한 줄 추가한다.**
+위 반대 방향 때문에 생긴다. 열거되는 디렉터리(저장소 루트, `configs/`,
+`trainbench/`, `scripts/`, `tests/`, `docs/`)에 추적되는 파일이나 디렉터리를 새로
+만들면 **추가한 레인의 게이트가 막힌다.** `PLAN.md`는 E 소유지만 이 한 줄은 파일을
+만든 레인이 직접 넣는다 — 매번 계약 변경으로 올리게 하면 이 체크가 우회 대상이 된다.
+`docker/`, `envs/`, config 그룹 안쪽은 해당 없다(통째로 문서화된 디렉터리다).
+`PLAN.md`의 "미작성" 표는 이 체크가 보지 않으므로 여전히 손으로 관리한다 — 구조
+블록은 뒤처질 수 없고 그 표만 뒤처질 수 있다.
 
 모델별 사용 규격은 코드가 아니라 config에 있다. 기계 판독 가능한 형태는
 `docs/model-spec.yaml`이고, `audit_plan.py`의 `model-spec`이 **값 대 값으로** 대조한다

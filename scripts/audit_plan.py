@@ -40,10 +40,10 @@ CODE_ROOTS = (REPO / "trainbench", REPO / "scripts")
 # order to say what was requested, so counting it as a consumer would certify an
 # axis as wired on the strength of the code that only labels it.
 #
-# This file is excluded for a blunter reason: it lives under `scripts/`, so it
-# scans itself, and its own docstrings spell out the patterns it searches for.
-# `attn.name` passed for exactly that reason and nothing else — the only wired
-# axis was certified by the checker's prose about how it certifies axes.
+# This file is excluded because it lives under `scripts/` and so scans itself. It
+# once passed `attn.name` on the strength of its own prose about how it certifies
+# axes; the read detection is AST-based now and prose can no longer satisfy it,
+# but a checker is still not a consumer of the values it checks.
 NOT_A_CONSUMER = (REPO / "trainbench" / "applied.py", Path(__file__).resolve())
 
 # The measurement entry point. Named here because a check that only asks for
@@ -85,36 +85,100 @@ def _code_files(exclude: tuple[Path, ...] = ()) -> list[Path]:
     ]
 
 
-def _strip_prose(source: str) -> str:
-    """Source with its comments and docstrings removed.
+# What a config object is called where it is read. The value is only reachable
+# through it, so the access has to start there: an unanchored match counted
+# `anything.data.subset_rows` inside an unrelated function as a read of
+# `config.data.subset_rows`, and `getattr(model, "name")` as a read of
+# `model.name`. `data`, `run`, `train` and `model` are common name fragments.
+#
+# The anchor is the segment immediately before the group, so the config may be
+# held on something: `self.config.model.add_generation_prompt` in `bench.py` is a
+# read, and requiring a bare name would have reported that knob unread while the
+# harness passes it to the tokenizer.
+#
+# The cost of anchoring is that an alias is invisible: `prepare_data.py` binds
+# `data = config.data` and then reads `data.subset_rows`, which this reports as
+# unread. That is a known false alarm, tracked in the baseline, and the safe
+# direction — the other one certifies knobs nothing reads.
+CONFIG_OBJECT_NAMES = frozenset({"config", "cfg"})
 
-    `config-consumed` matches a regex, and a regex over raw source is satisfied by
-    a file that merely *talks about* the knob. Found the hard way: `bench.py`'s
-    docstring named `config.data.subset_rows` while no statement read it, and the
-    check reported the knob as consumed. `assert-called` is AST-parsed for exactly
-    this reason and said so; this one had the flaw it was written to avoid.
 
-    String literals in general are kept — the subscript form the check also accepts
-    (`config["data"]["subset_rows"]`) is made of them. Only whole-statement strings
-    go, which is what a docstring is.
+class _DropUnreachable(ast.NodeTransformer):
+    """Branches a literal condition can never enter.
+
+    `if False:\n    _ = config.data.subset_rows` is a read the interpreter never
+    performs, and it is one of three ways a reviewer defeated the previous
+    text-stripping version of this check.
+
+    Only literal conditions fold. `if 1 == 2:` is not evaluated here, and nothing
+    in this module proves that a read reaches anything — `config-consumed` asks
+    whether the knob is read at all, and `axis-values` is the check that asks
+    whether reading it does something.
+    """
+
+    def visit_If(self, node: ast.If) -> Any:
+        self.generic_visit(node)
+        try:
+            taken = bool(ast.literal_eval(node.test))
+        except (ValueError, TypeError, SyntaxError):
+            return node
+        return node.body if taken else node.orelse
+
+
+def _string(node: ast.expr | None) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _config_reads(source: str) -> set[str]:
+    """Every `group.key` this source reads off the config object.
+
+    Parsed rather than searched. A regex over raw source is satisfied by a file
+    that merely *talks about* the knob, and stripping the prose first only moved
+    the hole: a docstring assigned to a name (`_NOTE = "config.data.subset_rows"`)
+    is an `ast.Assign`, not an `ast.Expr`, so it survived the strip and counted as
+    a read. `assert-called` has been AST-parsed since it was written, for exactly
+    this reason; this check now is too, and a string can no longer be a read
+    however it is spelled.
     """
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return source
-    lines = source.splitlines()
+        return set()
+    tree = _DropUnreachable().visit(tree)
+    reads: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Constant):
-            continue
-        if not isinstance(node.value.value, str) or node.end_lineno is None:
-            continue
-        for line in range(node.lineno - 1, node.end_lineno):
-            lines[line] = ""
-    return "\n".join(line.split("#", 1)[0] if "#" in line else line for line in lines)
+        # config.group.key
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute):
+            if _is_config_object(node.value.value):
+                reads.add(f"{node.value.attr}.{node.attr}")
+        # config["group"]["key"]
+        elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Subscript):
+            group, key = _string(node.value.slice), _string(node.slice)
+            if group and key and _is_config_object(node.value.value):
+                reads.add(f"{group}.{key}")
+        # getattr(config.group, "key")
+        elif isinstance(node, ast.Call) and getattr(node.func, "id", None) == "getattr":
+            target = node.args[0] if node.args else None
+            key = _string(node.args[1]) if len(node.args) > 1 else None
+            if key and isinstance(target, ast.Attribute) and _is_config_object(target.value):
+                reads.add(f"{target.attr}.{key}")
+    return reads
 
 
-def _code_text(exclude: tuple[Path, ...] = ()) -> str:
-    return "\n".join(_strip_prose(p.read_text()) for p in _code_files(exclude))
+def _is_config_object(node: ast.expr) -> bool:
+    """`config`, `cfg`, or either of them held on something (`self.config`).
+
+    What is anchored is the name directly in front of the group, which is what
+    tells `config.data.subset_rows` apart from `anything.data.subset_rows`. How
+    the config itself was reached does not change that.
+    """
+    if isinstance(node, ast.Name):
+        return node.id in CONFIG_OBJECT_NAMES
+    return isinstance(node, ast.Attribute) and node.attr in CONFIG_OBJECT_NAMES
+
+
+def _code_reads(exclude: tuple[Path, ...] = ()) -> set[str]:
+    return set().union(*(_config_reads(p.read_text()) for p in _code_files(exclude)), set())
 
 
 # Directories under configs/ that are not Hydra config groups. Each entry is a
@@ -161,20 +225,11 @@ def _config_leaf_keys() -> dict[str, set[str]]:
 def _reads_dotted(code: str, group: str, key: str) -> bool:
     """Whether the code reads this specific config value.
 
-    Matching the bare identifier finds `name` in eighteen unrelated files. The
-    value is only reached through the config object, so the access has to look
-    like one: `config.attn.name`, `cfg.attn.name`, or `["attn"]["name"]`.
+    Matching the bare identifier finds `name` in eighteen unrelated files, so the
+    access has to look like one through the config object: `config.attn.name`,
+    `cfg["attn"]["name"]`, or `getattr(config.attn, "name")`.
     """
-    attribute = rf"\.{re.escape(group)}\s*\.\s*{re.escape(key)}\b"
-    subscript = rf"\[\s*[\"']{re.escape(group)}[\"']\s*\]\s*\[\s*[\"']{re.escape(key)}[\"']\s*\]"
-    # Anchored on the config object. An unanchored first argument matched any
-    # variable whose name merely contained the group: `getattr(model, "name")`
-    # counted as reading `model.name`, and `getattr(runner, "purpose")` as
-    # `run.purpose`. `data`, `run`, `train` and `model` are common name fragments.
-    getattr_call = (
-        rf"getattr\(\s*(?:config|cfg)\.{re.escape(group)}\s*,\s*[\"']{re.escape(key)}[\"']"
-    )
-    return any(re.search(p, code) for p in (attribute, subscript, getattr_call))
+    return f"{group}.{key}" in _config_reads(code)
 
 
 def _nothing_to_check(items, what: str) -> str | None:
@@ -251,13 +306,11 @@ def config_fields_are_read_by_code() -> Result:
     leaves = _config_leaf_keys()
     if empty := _nothing_to_check(leaves, "config groups under configs/"):
         return Result("config-consumed", False, empty)
-    code = _code_text(exclude=NOT_A_CONSUMER)
+    reads = _code_reads(exclude=NOT_A_CONSUMER)
 
     def consumed(group: str, key: str) -> bool:
-        if _reads_dotted(code, group, key):
-            return True
-        derived = DERIVED_LEAVES.get(f"{group}.{key}")
-        return bool(derived) and _reads_dotted(code, *derived.split("."))
+        leaf = f"{group}.{key}"
+        return leaf in reads or DERIVED_LEAVES.get(leaf, "") in reads
 
     orphans = [
         f"{group}.{key}"
@@ -441,10 +494,17 @@ def the_measurement_entry_point_calls_the_axis_machinery() -> Result:
 
 TREE_PREFIX = " │├└─"
 TREE_INDENT = 4
+# What the layout tree is held to describe. It names Python modules, documents,
+# and the manifests that define the project — not every artifact on disk.
+DOCUMENTABLE = re.compile(r"[A-Za-z0-9_.\-]+\.(?:py|md|toml|yaml|json|lock)")
+# Package markers. `trainbench/metrics/__init__.py` is the module's whole body,
+# but what a reader needs documented is `trainbench/metrics/`, and that is
+# reported as an undocumented directory. Listing both would be noise.
+NOT_DOCUMENTABLE = frozenset({"__init__.py"})
 
 
-def missing_plan_files(block: str, root: Path) -> list[str]:
-    """Files declared in a layout tree that do not exist where it puts them.
+def _layout_entries(block: str) -> list[tuple[str, bool]]:
+    """`(declared path, is a directory)` for every entry in the layout tree.
 
     The tree is read as a tree: an entry's path is its name under the directories
     that contain it. Comparing basenames instead — as this did first — matches
@@ -453,30 +513,97 @@ def missing_plan_files(block: str, root: Path) -> list[str]:
     under a directory it never looked at.
     """
     parents: dict[int, str] = {}
-    missing = []
+    entries = []
     for line in block.splitlines():
         entry = line.lstrip(TREE_PREFIX)
         if not entry.strip():
             continue
         depth = (len(line) - len(entry)) // TREE_INDENT
         name = entry.split("#")[0].split()[0]
+        # Everything below this depth belonged to whatever came before.
+        parents = {d: p for d, p in parents.items() if d < depth}
+        if depth == 0:
+            # The root line names the repository itself, contributing no segment.
+            parents[0] = name.rstrip("/")
+            continue
+        path = "/".join([parents[d] for d in sorted(parents) if d > 0] + [name.rstrip("/")])
         if name.endswith("/"):
-            # A directory: everything below this depth belongs to something else.
-            parents = {d: p for d, p in parents.items() if d < depth}
             parents[depth] = name.rstrip("/")
-            continue
-        if not re.fullmatch(r"[A-Za-z0-9_.\-]+\.(?:py|md|toml|yaml|lock)", name):
-            continue
-        # parents[0] is the repository root itself, so it contributes no segment.
-        declared = "/".join([parents[d] for d in sorted(parents) if d > 0] + [name])
-        if not (root / declared).exists():
-            missing.append(declared)
+        entries.append((path, name.endswith("/")))
+    return entries
+
+
+def missing_plan_files(block: str, root: Path) -> list[str]:
+    """Paths the layout tree declares that do not exist where it puts them.
+
+    Directories are checked too. The file regex used to be the only gate on what
+    was checkable, so an entry without an extension was used as a parent path and
+    never verified: `configs/nonexistent/` sat in the block and passed.
+    """
+    missing = []
+    for path, is_directory in _layout_entries(block):
+        if is_directory:
+            if not (root / path).is_dir():
+                missing.append(path + "/")
+        elif DOCUMENTABLE.fullmatch(path.rsplit("/", 1)[-1]) and not (root / path).exists():
+            missing.append(path)
     return missing
 
 
+def undocumented_files(block: str, tracked: list[str]) -> list[str]:
+    """Repository files inside a directory the tree enumerates that it does not name.
+
+    The other direction. `missing_plan_files` only asks whether what is written
+    down exists, which is why `trainbench/metrics/`, `scripts/bench.py` and four
+    test modules were all absent from the block while the check passed.
+
+    Scope is taken from the tree rather than declared separately, so it cannot
+    drift from it: a directory the tree lists children for claims to be a complete
+    listing and is enumerated; one listed without children (`docker/`, `envs/`,
+    `trainbench/probe/`, each config group) is documented as a unit and its
+    contents are not claimed. Descent stops at the first undocumented segment, so
+    an undocumented directory is reported once rather than once per file under it.
+    """
+    entries = _layout_entries(block)
+    documented = {path for path, _ in entries}
+    # "" is the repository root, whose children are the top-level entries.
+    enumerated = {path.rsplit("/", 1)[0] if "/" in path else "" for path in documented}
+    undocumented = set()
+    for path in tracked:
+        segments = path.split("/")
+        for depth, segment in enumerate(segments):
+            # Dot-entries (`.github/`, `.claude/`, `.pre-commit-config.yaml`) are
+            # tooling rather than the source layout, and the tree does not
+            # describe them.
+            if segment.startswith("."):
+                break
+            if "/".join(segments[:depth]) not in enumerated:
+                break  # inside a directory documented as a unit
+            current = "/".join(segments[: depth + 1])
+            if current in documented:
+                continue
+            if depth < len(segments) - 1:
+                undocumented.add(current + "/")
+            elif segment not in NOT_DOCUMENTABLE and DOCUMENTABLE.fullmatch(segment):
+                undocumented.add(current)
+            break
+    return sorted(undocumented)
+
+
+def _tracked_files() -> list[str]:
+    return subprocess.run(
+        ["git", "ls-files"], cwd=REPO, capture_output=True, text=True
+    ).stdout.split()
+
+
 @check("plan-files")
-def files_named_in_plan_exist() -> Result:
-    """PLAN.md's repository layout must describe reality, not intent."""
+def the_plan_layout_and_the_repository_agree() -> Result:
+    """PLAN.md's repository layout must describe reality, and all of it.
+
+    Both directions. A block that only has to be true about what it mentions is
+    kept true by mentioning less, and that is what happened: four Wave 3 files
+    were added and none of them reached the block while this reported a pass.
+    """
     plan = (REPO / "PLAN.md").read_text()
     # The language tag is optional in the fence: requiring a bare ``` meant that
     # adding `text` after it — an ordinary markdown edit — silently disabled the
@@ -489,13 +616,34 @@ def files_named_in_plan_exist() -> Result:
             "PLAN.md has no repository layout block; the check that the declared "
             "layout matches reality then has nothing to compare and passes for it",
         )
-    missing = missing_plan_files(block.group(1), REPO)
+    tracked = _tracked_files()
+    missing = sorted(set(missing_plan_files(block.group(1), REPO)))
+    undocumented = undocumented_files(block.group(1), tracked)
+    problems = []
+    if missing:
+        problems.append(f"{len(missing)} declared but absent: {', '.join(missing)}")
+    if undocumented:
+        problems.append(f"{len(undocumented)} present but undeclared: {', '.join(undocumented)}")
+    # Reported alongside the two directions rather than instead of them. With no
+    # file list the reverse direction is vacuous and has to say so, but the
+    # forward one still works and its answer is still worth having.
+    if empty := _nothing_to_check(tracked, "git-tracked files to compare the layout against"):
+        problems.append(empty)
+    # The scope is stated in the passing line too: a reader who sees this green
+    # needs to know that `docker/`, `envs/` and the config groups are documented
+    # as units, so nothing inside them was examined.
+    scope = (
+        f"scope: {len(tracked)} tracked path(s) under the directories the tree "
+        "enumerates; directories it lists without children are opaque, and "
+        "dot-entries and __init__.py are excluded"
+    )
     return Result(
         "plan-files",
-        not missing,
-        "every file named in PLAN.md exists"
-        if not missing
-        else f"{len(missing)} named but absent: {', '.join(sorted(set(missing)))}",
+        not problems,
+        f"PLAN.md's layout and the repository agree both ways ({scope})"
+        if not problems
+        else f"{'; '.join(problems)} ({scope})",
+        count=len(missing) + len(undocumented),
     )
 
 

@@ -213,7 +213,11 @@ B200 재고 LOW 상황에서 12~18개 pod 동시 확보가 되는지는 실행 �
 
 ### 측정 규율
 
-- **고정 토큰 예산** 기준 비교 (고정 step 아님). vocab/토크나이저가 모델마다 다름
+- **고정 step 기준 비교 + 실제 토큰 수 기록.** vocab/토크나이저가 모델마다 다르므로
+  같은 step 수가 같은 토큰 수를 뜻하지 않는다. 그렇다고 토큰 예산을 단위로 삼으면
+  모델마다 step 수가 달라져 step 단위 속성(peak VRAM, step 시간 분포)을 비교할 수
+  없다. 그래서 `train.steps`를 단위로 두고 **소비된 토큰 수를 측정해 결과에 남긴다** —
+  정규화는 리포트 단계에서 하고 측정 단계에서 하지 않는다 (2026-08-01 확정)
 - **이미지 토큰 예산 고정.** 미고정 시 나머지 측정이 전부 오염됨
 - **타이밍 런과 프로파일링 런 분리.** 숫자는 프로파일러 off 상태에서만 측정하고,
   프로파일은 원인 분석 전용이다. 부풀림 폭은 **미측정**이며 출처도 확보하지
@@ -405,6 +409,7 @@ train-comparison/
 │   ├── data/                  # speed(소수 샘플), quality(장기)
 │   ├── run/                   # probe, timing, profile, quality
 │   ├── train/                 # 단일 플래그 knob (batch, seed, checkpointing 등)
+│   ├── experiment/            # orchestrate.py가 읽는 매니페스트. defaults에 없어 합성되지 않음
 │   ├── attn/                  # sdpa, fa2, fa3, fa4, flex
 │   ├── kernel/                # none, liger, fla, kernels_hub
 │   ├── precision/             # bf16, mxfp8, nvfp4
@@ -427,8 +432,10 @@ train-comparison/
 │   ├── axes.py                # 축을 켜는 유일한 지점
 │   ├── applied.py             # 켜졌는지 읽는 유일한 지점
 │   ├── pods.py                # RunPod pod 수명주기
+│   ├── metrics/               # 타이밍 런이 보고하는 지표와 그 측정 방법
 │   └── probe/                 # 프레임워크별 적재·1step 검증 어댑터
 ├── scripts/
+│   ├── bench.py               # 단일 런 측정 진입점. assert_matches를 호출하는 유일한 하네스
 │   ├── verify_env.py          # Phase 0 프레임워크 x 모델 probe
 │   ├── env_report.py          # 하네스 관통 경로 점검 (모델 미적재)
 │   ├── compose_config.py      # 로컬에서 config JSON 해석 -> pod 전달
@@ -438,15 +445,24 @@ train-comparison/
 │   ├── report.py              # pod별 결과 병합
 │   └── audit_plan.py          # 계획-문서-코드 정합 회귀 추적기
 ├── tests/
+│   ├── conftest.py
 │   ├── test_config.py
 │   ├── test_applied.py
 │   ├── test_audit.py
+│   ├── test_axes.py
+│   ├── test_data.py
 │   ├── test_device_seed.py
-│   └── test_probe.py
+│   ├── test_embedding.py
+│   ├── test_metrics.py
+│   ├── test_pods.py
+│   ├── test_probe.py
+│   └── test_smoke_cpu.py
 ├── docker/                    # Dockerfile.base + Dockerfile.framework + entrypoint
 ├── envs/                      # 프레임워크별 독립 프로젝트 + 독립 lock
 └── docs/
     ├── CONTRACTS.md           # 레인 간 공유 계약 (Wave 0 확정)
+    ├── audit-baseline.json    # audit_plan.py가 KNOWN으로 통과시키는 실패 + 그 결과
+    ├── evidence/              # 커밋된 런 기록 (evidence-committed가 대조)
     ├── methodology.md         # 측정 규율과 그 근거
     ├── model-spec.md          # 모델별 공식 규격 검증 (산문)
     ├── model-spec.yaml        # 같은 내용의 기계 판독본 (audit이 대조)
@@ -458,12 +474,13 @@ train-comparison/
 
 | 파일 | 담당 | 역할 |
 |---|---|---|
-| `tests/test_axes.py` | Wave 2 D | 축 적용/확인 쌍 검증 |
-| `configs/experiment/` | Wave 2 D | 축 그룹별 ablation 조합 정의 |
-| `scripts/bench.py` | Wave 3 G | 단일 런 측정 진입점. `assert_matches`를 호출하는 유일한 하네스 |
-| `tests/test_metrics.py` | Wave 3 G | MFU 계산 (tolerance band) |
-| `tests/test_smoke_cpu.py` | Wave 3 G | CPU + 소수 샘플 E2E. `purpose=probe`로만 짤 수 있다(`docs/CONTRACTS.md` §6) |
 | `docs/report.md` | Phase 4 | 최종 산출물 |
+
+Wave 2~3에서 이 목록에 있던 `tests/test_axes.py`, `configs/experiment/`,
+`scripts/bench.py`, `tests/test_metrics.py`, `tests/test_smoke_cpu.py`가 전부
+작성되어 위 구조 블록으로 옮겨졌다. 이 표가 뒤처졌던 이유는 `plan-files`가 한쪽
+방향만 봤기 때문이다 — 지금은 저장소에 있는데 블록에 없는 파일도 막으므로 구조
+블록은 뒤처질 수 없다. 이 표는 여전히 손으로 관리한다.
 
 **설계 결정**
 

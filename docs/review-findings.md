@@ -181,3 +181,42 @@ parquet  : {qry, qry_image, pos_text, mmeb_config, pos_image}
   디코딩해 다시 JPEG로 인코딩(손실)한 것이었고, 지금은 원본 바이트를 그대로 담는다.
   DALI 축의 핵심이 하드웨어 JPEG 디코드이므로 이 차이는 dataloader 축 측정에 실제로
   영향을 준다.
+
+---
+
+## D8 — 체크가 참을 보고하는데 그 뜻이 안 보인다 (2026-08-02, Wave 3 게이트 리뷰)
+
+이 저장소에서 여섯 번째로 같은 모양이다. 사실은 정확히 출력되고 있었고, 그 사실이
+무엇을 뜻하는지가 어디에도 없었다.
+
+- **`axis-wired`의 baseline note가 blocker를 가렸다.** note는 "Wave 2 (D: axes) -
+  one apply site and one capture probe per axis"였다. `precision.name`과
+  `train.offload`에 probe가 없다는 사실은 맞게 보고됐지만, **그 상태의 결과는
+  `assert_matches`가 모든 `purpose=timing` 런을 거부해 측정이 하나도 불가능하다는
+  것**이었다. note는 담당 레인만 적고 그 결과를 적지 않았고, 그 위에 Wave 3이 얹혔다.
+  (해소: D 레인이 두 probe를 붙여 `axis-wired`는 이제 17/17 통과다. 남은 수리는
+  note 규칙 쪽이며 `docs/CONTRACTS.md` §1에 넣었다.)
+- **`axis-values`의 note는 담당 레인 자체가 틀렸다.** "F: build images so
+  kernel/parallel/dataloader/precision values can be applied"로 적혀 있으나
+  `axes.py`의 거부는 전부 무조건 `not implemented`이고 import 실패가 아니다.
+  이미지를 빌드해도 이 수는 안 움직인다 — 담당은 D다. 같은 이유로 이 체크는 환경
+  독립이며(flash-attn 없는 로컬에서도 attn 값이 applicable로 잡힌다) 게이트 수치로는
+  재현 가능하지만, **"축 기계가 값을 받는다"이지 "그 값이 동작한다"가 아니다.**
+
+## D9 — 감사 두 체크가 각각 무력화 가능했다 (2026-08-02)
+
+- `config-consumed`의 `_strip_prose()`는 세 가지로 뚫렸다: 이름에 대입한 문자열,
+  `if False:` 블록, 앵커 없는 속성 체인. 실제 방어는 Wave 2.5에서 넣은 count 추적
+  이었고(줄어들면 차단), **그 말은 자기 baseline 줄을 편집하는 레인이 방어를 없앨 수
+  있었다는 뜻이다.** 읽기 판정을 AST로 옮겨 체크 자체를 고쳤다.
+- `plan-files`는 한 방향만 봤다. **블록은 언급을 줄이면 참으로 유지된다** — Wave 3이
+  만든 `scripts/bench.py`, `trainbench/metrics/`, 테스트 6개가 전부 블록에 없는 채로
+  통과했다. 반대 방향을 넣었고, 그 결과 파일을 추가한 레인이 `PLAN.md` 구조 블록에도
+  한 줄을 넣어야 한다(`docs/CONTRACTS.md` §5의 새 레인 의무).
+
+## D10 — 기록되지 않은 레인 경계 침범 (2026-08-02)
+
+35a9a62(Wave 3 G)이 `scripts/prepare_data.py`(레인 A 소유)를 수정했다. 같은 커밋의
+C->G 이관은 꼼꼼히 기록됐는데 이건 기록이 없었다. 변경 자체는 옳고(중복 정의 제거),
+`percentile`이 타이밍 보고 모듈에 놓인 것에 대한 판단과 재검토 조건은
+`docs/CONTRACTS.md` §5에 남겼다.

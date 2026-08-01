@@ -27,6 +27,7 @@ from audit_plan import (  # noqa: E402
     merge_baseline,
     missing_plan_files,
     model_spec_problems,
+    undocumented_files,
 )
 
 
@@ -61,6 +62,40 @@ def test_a_config_access_is_a_consumer():
 def test_a_similar_name_is_not_the_same_knob():
     assert not _reads_dotted("config.attn.names", "attn", "name")
     assert not _reads_dotted("config.kernel.name", "attn", "name")
+
+
+# A reviewer defeated the previous version of this check three ways, all of them
+# by writing the knob's name somewhere the interpreter never reads it. The
+# defence at the time was the baseline's recorded count, which flags a shrink —
+# so a lane editing its own baseline line removed it. These fix the check itself.
+def test_a_string_that_names_a_knob_is_not_a_read():
+    """Stripping prose removed docstrings, which are `ast.Expr`. Assigning the
+    same string to a name makes it an `ast.Assign`, and it survived."""
+    assert not _reads_dotted('_NOTE = "see config.data.subset_rows"', "data", "subset_rows")
+    assert not _reads_dotted('"""Reads config.attn.name."""', "attn", "name")
+    assert not _reads_dotted("x = 1  # config.attn.name", "attn", "name")
+
+
+def test_a_branch_that_cannot_be_entered_is_not_a_read():
+    assert not _reads_dotted("if False:\n    _ = config.data.subset_rows\n", "data", "subset_rows")
+    assert _reads_dotted("if True:\n    _ = config.data.subset_rows\n", "data", "subset_rows")
+
+
+def test_another_objects_attributes_are_not_the_config():
+    """The attribute form was unanchored while the `getattr` form was anchored,
+    so any object with the right-shaped attribute chain satisfied it."""
+    code = "def _unrelated(anything):\n    return anything.data.subset_rows\n"
+
+    assert not _reads_dotted(code, "data", "subset_rows")
+    assert not _reads_dotted('payload["data"]["subset_rows"]', "data", "subset_rows")
+    assert not _reads_dotted('getattr(model, "name")', "model", "name")
+
+
+def test_a_hash_inside_a_string_does_not_hide_the_rest_of_the_line():
+    """Comments were stripped by cutting each line at its first `#`, which also
+    cut lines whose `#` was inside a literal. Fail-closed rather than fail-open,
+    so it corrupted nothing — it just reported a read knob as unread."""
+    assert _reads_dotted('log("#start", config.attn.name)', "attn", "name")
 
 
 def test_updating_the_baseline_keeps_the_schedule():
@@ -186,7 +221,20 @@ def test_a_declared_file_must_exist_where_the_tree_puts_it(tmp_path):
     (tmp_path / "elsewhere").mkdir()
     (tmp_path / "elsewhere" / "device.py").touch()
 
-    assert missing_plan_files(LAYOUT, tmp_path) == ["trainbench/device.py", "scripts/bench.py"]
+    assert missing_plan_files(LAYOUT, tmp_path) == [
+        "trainbench/device.py",
+        "scripts/",
+        "scripts/bench.py",
+    ]
+
+
+def test_a_declared_directory_must_exist_too(tmp_path):
+    """Only entries with a file extension were checkable, so a directory entry
+    was used as a parent path and never verified: `configs/nonexistent/` sat in
+    the block and passed."""
+    (tmp_path / "PLAN.md").touch()
+
+    assert "trainbench/" in missing_plan_files(LAYOUT, tmp_path)
 
 
 def test_a_directory_does_not_leak_into_its_sibling(tmp_path):
@@ -199,6 +247,48 @@ def test_a_directory_does_not_leak_into_its_sibling(tmp_path):
     (tmp_path / "PLAN.md").touch()
 
     assert missing_plan_files(LAYOUT, tmp_path) == ["trainbench/device.py"]
+
+
+# The other direction. `missing_plan_files` only asks whether what is written
+# down exists, so the block is kept true by mentioning less — which is how
+# `trainbench/metrics/`, `scripts/bench.py` and six test modules were all absent
+# from it while the check passed.
+OPAQUE_LAYOUT = """train-comparison/
+├── PLAN.md
+├── trainbench/
+│   ├── config.py
+│   └── probe/
+└── docker/
+"""
+
+
+def test_a_file_the_tree_does_not_name_is_reported():
+    tracked = ["PLAN.md", "trainbench/config.py", "trainbench/record.py"]
+
+    assert undocumented_files(OPAQUE_LAYOUT, tracked) == ["trainbench/record.py"]
+
+
+def test_a_directory_listed_without_children_is_documented_as_a_unit():
+    """`docker/`, `envs/` and each config group are named but not enumerated.
+    Holding their contents to the tree would mean listing every Dockerfile and
+    every axis variant in PLAN.md, which is the noise this scope avoids."""
+    tracked = ["docker/entrypoint.sh", "docker/Dockerfile.base", "trainbench/probe/native.py"]
+
+    assert undocumented_files(OPAQUE_LAYOUT, tracked) == []
+
+
+def test_an_undocumented_directory_is_reported_once_not_per_file():
+    tracked = ["trainbench/metrics/__init__.py", "trainbench/metrics/mfu.py"]
+
+    assert undocumented_files(OPAQUE_LAYOUT, tracked) == ["trainbench/metrics/"]
+
+
+def test_package_markers_and_dot_entries_are_out_of_scope():
+    """Stated in the check's own output, because a reader who sees this pass
+    needs to know what it did not examine."""
+    tracked = ["trainbench/__init__.py", ".github/workflows/build.yml", ".pre-commit-config.yaml"]
+
+    assert undocumented_files(OPAQUE_LAYOUT, tracked) == []
 
 
 def test_model_spec_compares_values_not_words():

@@ -1,14 +1,10 @@
 {
   "axis-values": {
     "count": 6,
-    "note": "Wave 3 (F: build images so kernel/parallel/dataloader/precision values can be applied) - 6 groups still take only their inert value; peft resolved in Wave 2.5"
-  },
-  "axis-wired": {
-    "count": 2,
-    "note": "Wave 2 (D: axes) - one apply site and one capture probe per axis"
+    "note": "결과: dataloader/kernel/loss/optim/parallel/precision 6개 축은 지금 어떤 값을 줘도 같은 런이 된다. 이 축들로 ablation을 돌리면 라벨만 다른 동일 결과 6줄이 나오고 '이 기법들은 효과 없음'으로 읽힌다 — 원인은 기법이 아니라 미구현이다. 구현 전까지 측정 대상이 아니다. 담당은 D(axes.py 구현)이며, 이전 note가 적어둔 F(이미지 빌드)는 오귀속이다: 거부는 전부 axes.py의 무조건 'not implemented'이고 import 실패가 아니라서 이미지를 빌드해도 이 수는 안 움직인다(패키지는 선행 조건이지 이 체크가 재는 것이 아니다). 같은 이유로 이 체크는 환경 독립이다 — flash-attn이 없는 로컬에서도 attn 값들이 applicable로 잡힌다. '축 기계가 값을 받는다'는 뜻이지 '그 값이 동작한다'는 뜻이 아니다"
   },
   "config-consumed": {
-    "count": 5,
-    "note": "Wave 3 \uc794\uc5ec - data.push_subset/data.subset_rows\ub294 prepare_data.py\uc758 `data = config.data` \ubcc4\uce6d \ub54c\ubb38\uc5d0 \uc548 \ubcf4\uc774\ub294 \uac83(\ub808\uc778 A, \ud638\ucd9c\ubd80 4\uc904), model.add_generation_prompt\ub294 chat template \uacbd\ub85c\uac00 \uc0dd\uaca8\uc57c \ud558\uace0, run.trackio_*\ub294 \uc2e4\ud589 \ub85c\uac70\ub97c \ubd99\uc77c \ub54c \uc18c\ube44\ub41c\ub2e4"
+    "count": 4,
+    "note": "결과가 knob마다 다르다. (1) data.subset_rows/data.push_subset은 오탐이다 — prepare_data.py가 `data = config.data` 별칭으로 읽고 있어 실행에는 영향이 없다. 대신 이 체크의 수가 실제 구멍보다 2 크므로 data 그룹에 진짜 미소비 knob이 새로 생겨도 목록에 묻힌다(레인 A, 호출부 4줄). (2) run.trackio_project/run.trackio_space_id는 진짜 미소비다 — 런이 트래커에 아무것도 올리지 않으므로 기록은 결과 JSON 하나뿐이고, 스윕 도중 죽은 pod은 흔적을 남기지 않는다. (3) model.add_generation_prompt는 Wave 3 하네스 레인이 bench.py에서 소비하기 시작해 해소됐다 — 여기 적힌 count 5는 그 이전 값이고 실제는 4다. count를 4로 내리는 것은 그 레인의 몫이다(CONTRACTS §1: 레인은 자기 항목만 건드린다). 2026-08-02 Wave 3 G가 `Collate._text`에서 `apply_chat_template`의 인자로 소비하면서 count를 4로 내렸다 — 자기 항목의 숫자 한 개만 고쳤고 `--update-baseline`은 돌리지 않았다"
   }
 }
