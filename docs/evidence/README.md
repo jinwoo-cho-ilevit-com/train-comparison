@@ -8,6 +8,39 @@ JSON이 하나라도 있으면 통과한다. **통과가 곧 근거는 아니다
 레코드가 커밋되어 있다"만 보고, 그 레코드가 무엇을 뒷받침하는지는 보지 않는다. 그래서
 파일마다 무엇을 근거하고 무엇을 근거하지 않는지 여기에 적는다.
 
+## data-subset-mmeb-subset.json / data-subset-mmeb-subset-quality.json
+
+`scripts/prepare_data.py`가 쓴 manifest. `configs/data/speed.yaml`(2048행)과
+`quality.yaml`(65536행)이 핀한 revision을 각각 만들어낸 실행의 기록이다.
+
+**근거하는 것**
+
+- 핀된 revision이 이 코드(`git_commit`, `git_dirty: false`)와 이 요청(`config`:
+  `source_repo`/`source_revision`/`sample_seed`/`subset_rows`)에서 나왔다
+- 20개 config 전부가 quota를 채웠다 (`quota` 대 `taken`)
+- 품질 지표: `rows_without_positive_content` 0, `rows_without_query_image` 0,
+  `rows_with_unreadable_image` 0, config별 positive 다양성과 이미지 해상도 분포
+- **`artifact_verified: true`** — 위 수치가 메모리 상의 행이 아니라 **push된 revision을
+  되읽어 재계산한 것과도 일치한다**. 이 필드가 없던 시절 `f4363029`가 핀됐고, 그
+  revision은 `load_dataset`이 아예 열지 못했다(D7). 그때도 `data-pinned`는 PASS였다 —
+  그 체크는 revision이 sha 모양인지만 본다
+
+**근거하지 않는 것**
+
+- 학습 속도·메모리에 대해 아무것도 말하지 않는다. `peak_rss_bytes`는 **서브셋을
+  준비한 프로세스**의 high-water mark이지 학습 프로세스의 것이 아니다
+- `mmeb-subset.json`의 `collapse_gate_not_evaluated`에 NIGHTS(30행)와 WebQA(33행)가
+  있다. 2048행 draw에서 이 둘은 `MIN_ROWS_FOR_SHARE_GATE=50` 미달이라 positive 붕괴
+  게이트를 **받지 않았다**. speed의 "최대 단일 image positive" 수치는 이 둘을 포함해
+  계산되므로, 그 값이 임계 아래라는 사실은 게이트가 확인해 준 것이 아니다.
+  `quality.json` 쪽은 전 config가 임계를 넘어 이 목록이 비어 있다
+- 두 서브셋은 **같은 draw가 아니다**. seed는 같지만 `shuffle_buffer`가 quota에 비례해
+  20개 중 12개 config에서 셔플이 다르다. 한쪽 지표를 다른 쪽으로 옮겨 읽을 수 없다
+- 아티팩트 재계산에서 image positive의 동일성은 `pos_image` 바이트 다이제스트로
+  판정한다. `pos_image_path`는 push되지 않기 때문이다. 다이제스트는 경로를 합칠 수는
+  있어도 쪼갤 수 없으므로 나오는 점유율은 manifest 값 이상이다 — 게이트를 느슨하게
+  만들지는 않지만 같은 양이라고 읽어서도 안 된다
+
 ## env-report-cpu-qwen3_5_0_8b-native.json
 
 `scripts/env_report.py`가 쓴 레코드.

@@ -1,0 +1,1253 @@
+{
+  "artifact_problems": [],
+  "artifact_verified": true,
+  "collapse_gate_not_evaluated": {
+    "NIGHTS": 30,
+    "WebQA": 33
+  },
+  "config": {
+    "limit": 2048,
+    "max_seq_len": 2048,
+    "num_workers": 8,
+    "push_subset": true,
+    "repo_id": "jinwoo-cho/mmeb-subset",
+    "revision": "55aafaf9bfe171c65a8131224d3791df379f1651",
+    "sample_seed": 1234,
+    "source_repo": "MrZilinXiao/MMEB_train_with_image",
+    "source_revision": "9d0fd31789c12a007442de52fe22509e46e49e7d",
+    "subset_rows": 2048
+  },
+  "declared_columns": {
+    "A-OKVQA": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "CIRR": [
+      "qry",
+      "qry_image",
+      "pos_text",
+      "pos_image"
+    ],
+    "ChartQA": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "DocVQA": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "HatefulMemes": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "ImageNet_1K": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "InfographicsVQA": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "MSCOCO": [
+      "qry",
+      "qry_image",
+      "pos_text",
+      "pos_image"
+    ],
+    "MSCOCO_i2t": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "MSCOCO_t2i": [
+      "qry",
+      "pos_text",
+      "pos_image"
+    ],
+    "N24News": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "NIGHTS": [
+      "qry",
+      "qry_image",
+      "pos_text",
+      "pos_image"
+    ],
+    "OK-VQA": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "SUN397": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "VOC2007": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "VisDial": [
+      "qry",
+      "pos_text",
+      "pos_image"
+    ],
+    "Visual7W": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "VisualNews_i2t": [
+      "qry",
+      "qry_image",
+      "pos_text"
+    ],
+    "VisualNews_t2i": [
+      "qry",
+      "pos_text",
+      "pos_image"
+    ],
+    "WebQA": [
+      "qry",
+      "pos_text",
+      "pos_image"
+    ]
+  },
+  "git_commit": "a9fe763c5c45c91204b8360c4d36043f2f6209e0",
+  "git_dirty": false,
+  "git_source": "git",
+  "limit": 2048,
+  "packages": {
+    "accelerate": "1.14.0",
+    "datasets": "5.0.1",
+    "peft": "0.20.0",
+    "torch": "2.13.0",
+    "torchvision": "0.28.0",
+    "transformers": "5.14.1"
+  },
+  "peak_rss_bytes": 1153744896,
+  "push_blockers": [],
+  "pushed": true,
+  "quality": {
+    "overall": {
+      "distinct_pos_text_count": 995,
+      "duplicate_pos_text_ratio": 0.5522,
+      "pos_text_chars": {
+        "count": 2048,
+        "max": 407,
+        "p50": 39,
+        "p95": 102
+      },
+      "qry_chars": {
+        "count": 2048,
+        "max": 1035,
+        "p50": 96,
+        "p95": 479
+      },
+      "rows": 2048,
+      "rows_with_text_only_query_by_design": 652,
+      "rows_with_unreadable_image": 0,
+      "rows_without_positive_content": 0,
+      "rows_without_query_image": 0
+    },
+    "per_config": {
+      "A-OKVQA": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 33,
+        "distinct_positive_count": 33,
+        "duplicate_pos_text_ratio": 0.0,
+        "duplicate_positive_ratio": 0.0,
+        "max_single_positive_share": 0.0303,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 33,
+          "max": 14,
+          "p50": 7,
+          "p95": 12
+        },
+        "qry_chars": {
+          "count": 33,
+          "max": 149,
+          "p50": 110,
+          "p95": 146
+        },
+        "qry_image_height": {
+          "count": 33,
+          "max": 640,
+          "p50": 447,
+          "p95": 640
+        },
+        "qry_image_pixels": {
+          "count": 33,
+          "max": 409600,
+          "p50": 273280,
+          "p95": 327680
+        },
+        "qry_image_width": {
+          "count": 33,
+          "max": 640,
+          "p50": 640,
+          "p95": 640
+        },
+        "rows": 33,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "CIRR": {
+        "declares_positive_image": true,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 1,
+        "distinct_positive_count": 50,
+        "duplicate_pos_text_ratio": 1.0,
+        "duplicate_positive_ratio": 0.0,
+        "max_single_positive_share": 0.02,
+        "pos_image_height": {
+          "count": 50,
+          "max": 384,
+          "p50": 256,
+          "p95": 384
+        },
+        "pos_image_pixels": {
+          "count": 50,
+          "max": 190464,
+          "p50": 98048,
+          "p95": 132352
+        },
+        "pos_image_width": {
+          "count": 50,
+          "max": 744,
+          "p50": 365,
+          "p95": 517
+        },
+        "pos_text_chars": {
+          "count": 50,
+          "max": 39,
+          "p50": 39,
+          "p95": 39
+        },
+        "qry_chars": {
+          "count": 50,
+          "max": 187,
+          "p50": 134,
+          "p95": 173
+        },
+        "qry_image_height": {
+          "count": 50,
+          "max": 388,
+          "p50": 256,
+          "p95": 384
+        },
+        "qry_image_pixels": {
+          "count": 50,
+          "max": 117504,
+          "p50": 89856,
+          "p95": 116480
+        },
+        "qry_image_width": {
+          "count": 50,
+          "max": 459,
+          "p50": 341,
+          "p95": 455
+        },
+        "rows": 50,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "ChartQA": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 49,
+        "distinct_positive_count": 49,
+        "duplicate_pos_text_ratio": 0.1481,
+        "duplicate_positive_ratio": 0.1481,
+        "max_single_positive_share": 0.0741,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 54,
+          "max": 28,
+          "p50": 4,
+          "p95": 12
+        },
+        "qry_chars": {
+          "count": 54,
+          "max": 177,
+          "p50": 122,
+          "p95": 160
+        },
+        "qry_image_height": {
+          "count": 54,
+          "max": 1406,
+          "p50": 557,
+          "p95": 1080
+        },
+        "qry_image_pixels": {
+          "count": 54,
+          "max": 1124800,
+          "p50": 445600,
+          "p95": 716800
+        },
+        "qry_image_width": {
+          "count": 54,
+          "max": 840,
+          "p50": 800,
+          "p95": 800
+        },
+        "rows": 54,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "DocVQA": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 74,
+        "distinct_positive_count": 74,
+        "duplicate_pos_text_ratio": 0.0526,
+        "duplicate_positive_ratio": 0.0526,
+        "max_single_positive_share": 0.0263,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 76,
+          "max": 66,
+          "p50": 7,
+          "p95": 30
+        },
+        "qry_chars": {
+          "count": 76,
+          "max": 180,
+          "p50": 111,
+          "p95": 143
+        },
+        "qry_image_height": {
+          "count": 76,
+          "max": 9723,
+          "p50": 2197,
+          "p95": 2290
+        },
+        "qry_image_pixels": {
+          "count": 76,
+          "max": 69256929,
+          "p50": 3798540,
+          "p95": 5819632
+        },
+        "qry_image_width": {
+          "count": 76,
+          "max": 7123,
+          "p50": 1692,
+          "p95": 2667
+        },
+        "rows": 76,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "HatefulMemes": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 2,
+        "distinct_positive_count": 2,
+        "duplicate_pos_text_ratio": 1.0,
+        "duplicate_positive_ratio": 1.0,
+        "max_single_positive_share": 0.625,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 16,
+          "max": 3,
+          "p50": 2,
+          "p95": 3
+        },
+        "qry_chars": {
+          "count": 16,
+          "max": 122,
+          "p50": 122,
+          "p95": 122
+        },
+        "qry_image_height": {
+          "count": 16,
+          "max": 800,
+          "p50": 400,
+          "p95": 800
+        },
+        "qry_image_pixels": {
+          "count": 16,
+          "max": 556800,
+          "p50": 209000,
+          "p95": 556800
+        },
+        "qry_image_width": {
+          "count": 16,
+          "max": 825,
+          "p50": 550,
+          "p95": 825
+        },
+        "rows": 16,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "ImageNet_1K": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 175,
+        "distinct_positive_count": 175,
+        "duplicate_pos_text_ratio": 0.1719,
+        "duplicate_positive_ratio": 0.1719,
+        "max_single_positive_share": 0.0156,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 192,
+          "max": 69,
+          "p50": 14,
+          "p95": 52
+        },
+        "qry_chars": {
+          "count": 192,
+          "max": 57,
+          "p50": 57,
+          "p95": 57
+        },
+        "qry_image_height": {
+          "count": 192,
+          "max": 1600,
+          "p50": 375,
+          "p95": 750
+        },
+        "qry_image_pixels": {
+          "count": 192,
+          "max": 1816000,
+          "p50": 187000,
+          "p95": 375000
+        },
+        "qry_image_width": {
+          "count": 192,
+          "max": 1295,
+          "p50": 500,
+          "p95": 600
+        },
+        "rows": 192,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "InfographicsVQA": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 43,
+        "distinct_positive_count": 43,
+        "duplicate_pos_text_ratio": 0.1304,
+        "duplicate_positive_ratio": 0.1304,
+        "max_single_positive_share": 0.0435,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 46,
+          "max": 45,
+          "p50": 3,
+          "p95": 16
+        },
+        "qry_chars": {
+          "count": 46,
+          "max": 189,
+          "p50": 131,
+          "p95": 175
+        },
+        "qry_image_height": {
+          "count": 46,
+          "max": 11757,
+          "p50": 1350,
+          "p95": 6983
+        },
+        "qry_image_pixels": {
+          "count": 46,
+          "max": 17635500,
+          "p50": 1440000,
+          "p95": 10312500
+        },
+        "qry_image_width": {
+          "count": 46,
+          "max": 3509,
+          "p50": 900,
+          "p95": 2500
+        },
+        "rows": 46,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "MSCOCO": {
+        "declares_positive_image": true,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 1,
+        "distinct_positive_count": 183,
+        "duplicate_pos_text_ratio": 1.0,
+        "duplicate_positive_ratio": 0.0938,
+        "max_single_positive_share": 0.0104,
+        "pos_image_height": {
+          "count": 192,
+          "max": 617,
+          "p50": 51,
+          "p95": 353
+        },
+        "pos_image_pixels": {
+          "count": 192,
+          "max": 307200,
+          "p50": 2170,
+          "p95": 162690
+        },
+        "pos_image_width": {
+          "count": 192,
+          "max": 640,
+          "p50": 48,
+          "p95": 566
+        },
+        "pos_text_chars": {
+          "count": 192,
+          "max": 59,
+          "p50": 59,
+          "p95": 59
+        },
+        "qry_chars": {
+          "count": 192,
+          "max": 96,
+          "p50": 89,
+          "p95": 95
+        },
+        "qry_image_height": {
+          "count": 192,
+          "max": 640,
+          "p50": 443,
+          "p95": 640
+        },
+        "qry_image_pixels": {
+          "count": 192,
+          "max": 409600,
+          "p50": 273280,
+          "p95": 327680
+        },
+        "qry_image_width": {
+          "count": 192,
+          "max": 640,
+          "p50": 640,
+          "p95": 640
+        },
+        "rows": 192,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "MSCOCO_i2t": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 217,
+        "distinct_positive_count": 217,
+        "duplicate_pos_text_ratio": 0.0,
+        "duplicate_positive_ratio": 0.0,
+        "max_single_positive_share": 0.0046,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 217,
+          "max": 88,
+          "p50": 50,
+          "p95": 71
+        },
+        "qry_chars": {
+          "count": 217,
+          "max": 71,
+          "p50": 71,
+          "p95": 71
+        },
+        "qry_image_height": {
+          "count": 217,
+          "max": 453,
+          "p50": 256,
+          "p95": 383
+        },
+        "qry_image_pixels": {
+          "count": 217,
+          "max": 116480,
+          "p50": 87552,
+          "p95": 103424
+        },
+        "qry_image_width": {
+          "count": 217,
+          "max": 455,
+          "p50": 341,
+          "p95": 386
+        },
+        "rows": 217,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "MSCOCO_t2i": {
+        "declares_positive_image": true,
+        "declares_query_image": false,
+        "distinct_pos_text_count": 1,
+        "distinct_positive_count": 192,
+        "duplicate_pos_text_ratio": 1.0,
+        "duplicate_positive_ratio": 0.0,
+        "max_single_positive_share": 0.0052,
+        "pos_image_height": {
+          "count": 192,
+          "max": 412,
+          "p50": 256,
+          "p95": 383
+        },
+        "pos_image_pixels": {
+          "count": 192,
+          "max": 226560,
+          "p50": 87552,
+          "p95": 116480
+        },
+        "pos_image_width": {
+          "count": 192,
+          "max": 885,
+          "p50": 341,
+          "p95": 455
+        },
+        "pos_text_chars": {
+          "count": 192,
+          "max": 39,
+          "p50": 39,
+          "p95": 39
+        },
+        "qry_chars": {
+          "count": 192,
+          "max": 188,
+          "p50": 110,
+          "p95": 136
+        },
+        "qry_image_height": null,
+        "qry_image_pixels": null,
+        "qry_image_width": null,
+        "rows": 192,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "N24News": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 24,
+        "distinct_positive_count": 24,
+        "duplicate_pos_text_ratio": 0.9787,
+        "duplicate_positive_ratio": 0.9787,
+        "max_single_positive_share": 0.0851,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 94,
+          "max": 15,
+          "p50": 6,
+          "p95": 15
+        },
+        "qry_chars": {
+          "count": 94,
+          "max": 434,
+          "p50": 214,
+          "p95": 328
+        },
+        "qry_image_height": {
+          "count": 94,
+          "max": 550,
+          "p50": 550,
+          "p95": 550
+        },
+        "qry_image_pixels": {
+          "count": 94,
+          "max": 577500,
+          "p50": 577500,
+          "p95": 577500
+        },
+        "qry_image_width": {
+          "count": 94,
+          "max": 1050,
+          "p50": 1050,
+          "p95": 1050
+        },
+        "rows": 94,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "NIGHTS": {
+        "declares_positive_image": true,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 1,
+        "distinct_positive_count": 30,
+        "duplicate_pos_text_ratio": 1.0,
+        "duplicate_positive_ratio": 0.0,
+        "max_single_positive_share": 0.0333,
+        "pos_image_height": {
+          "count": 30,
+          "max": 256,
+          "p50": 256,
+          "p95": 256
+        },
+        "pos_image_pixels": {
+          "count": 30,
+          "max": 65536,
+          "p50": 65536,
+          "p95": 65536
+        },
+        "pos_image_width": {
+          "count": 30,
+          "max": 256,
+          "p50": 256,
+          "p95": 256
+        },
+        "pos_text_chars": {
+          "count": 30,
+          "max": 39,
+          "p50": 39,
+          "p95": 39
+        },
+        "qry_chars": {
+          "count": 30,
+          "max": 78,
+          "p50": 78,
+          "p95": 78
+        },
+        "qry_image_height": {
+          "count": 30,
+          "max": 256,
+          "p50": 256,
+          "p95": 256
+        },
+        "qry_image_pixels": {
+          "count": 30,
+          "max": 65536,
+          "p50": 65536,
+          "p95": 65536
+        },
+        "qry_image_width": {
+          "count": 30,
+          "max": 256,
+          "p50": 256,
+          "p95": 256
+        },
+        "rows": 30,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "OK-VQA": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 16,
+        "distinct_positive_count": 16,
+        "duplicate_pos_text_ratio": 0.1176,
+        "duplicate_positive_ratio": 0.1176,
+        "max_single_positive_share": 0.1176,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 17,
+          "max": 12,
+          "p50": 5,
+          "p95": 12
+        },
+        "qry_chars": {
+          "count": 17,
+          "max": 146,
+          "p50": 111,
+          "p95": 146
+        },
+        "qry_image_height": {
+          "count": 17,
+          "max": 550,
+          "p50": 427,
+          "p95": 550
+        },
+        "qry_image_pixels": {
+          "count": 17,
+          "max": 352000,
+          "p50": 273280,
+          "p95": 352000
+        },
+        "qry_image_width": {
+          "count": 17,
+          "max": 640,
+          "p50": 640,
+          "p95": 640
+        },
+        "rows": 17,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "SUN397": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 18,
+        "distinct_positive_count": 18,
+        "duplicate_pos_text_ratio": 0.8421,
+        "duplicate_positive_ratio": 0.8421,
+        "max_single_positive_share": 0.1053,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 38,
+          "max": 21,
+          "p50": 10,
+          "p95": 17
+        },
+        "qry_chars": {
+          "count": 38,
+          "max": 50,
+          "p50": 50,
+          "p95": 50
+        },
+        "qry_image_height": {
+          "count": 38,
+          "max": 1704,
+          "p50": 500,
+          "p95": 1600
+        },
+        "qry_image_pixels": {
+          "count": 38,
+          "max": 3871488,
+          "p50": 326200,
+          "p95": 3211520
+        },
+        "qry_image_width": {
+          "count": 38,
+          "max": 2292,
+          "p50": 640,
+          "p95": 2272
+        },
+        "rows": 38,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "VOC2007": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 7,
+        "distinct_positive_count": 7,
+        "duplicate_pos_text_ratio": 0.7333,
+        "duplicate_positive_ratio": 0.7333,
+        "max_single_positive_share": 0.4667,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 15,
+          "max": 6,
+          "p50": 6,
+          "p95": 6
+        },
+        "qry_chars": {
+          "count": 15,
+          "max": 51,
+          "p50": 51,
+          "p95": 51
+        },
+        "qry_image_height": {
+          "count": 15,
+          "max": 499,
+          "p50": 246,
+          "p95": 499
+        },
+        "qry_image_pixels": {
+          "count": 15,
+          "max": 149700,
+          "p50": 54366,
+          "p95": 149700
+        },
+        "qry_image_width": {
+          "count": 15,
+          "max": 496,
+          "p50": 203,
+          "p95": 496
+        },
+        "rows": 15,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "VisDial": {
+        "declares_positive_image": true,
+        "declares_query_image": false,
+        "distinct_pos_text_count": 1,
+        "distinct_positive_count": 236,
+        "duplicate_pos_text_ratio": 1.0,
+        "duplicate_positive_ratio": 0.0,
+        "max_single_positive_share": 0.0042,
+        "pos_image_height": {
+          "count": 236,
+          "max": 640,
+          "p50": 474,
+          "p95": 640
+        },
+        "pos_image_pixels": {
+          "count": 236,
+          "max": 409600,
+          "p50": 273280,
+          "p95": 319360
+        },
+        "pos_image_width": {
+          "count": 236,
+          "max": 640,
+          "p50": 640,
+          "p95": 640
+        },
+        "pos_text_chars": {
+          "count": 236,
+          "max": 38,
+          "p50": 38,
+          "p95": 38
+        },
+        "qry_chars": {
+          "count": 236,
+          "max": 1035,
+          "p50": 469,
+          "p95": 698
+        },
+        "qry_image_height": null,
+        "qry_image_pixels": null,
+        "qry_image_width": null,
+        "rows": 236,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "Visual7W": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 118,
+        "distinct_positive_count": 118,
+        "duplicate_pos_text_ratio": 0.194,
+        "duplicate_positive_ratio": 0.194,
+        "max_single_positive_share": 0.0299,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 134,
+          "max": 35,
+          "p50": 8,
+          "p95": 23
+        },
+        "qry_chars": {
+          "count": 134,
+          "max": 126,
+          "p50": 94,
+          "p95": 110
+        },
+        "qry_image_height": {
+          "count": 134,
+          "max": 1024,
+          "p50": 375,
+          "p95": 768
+        },
+        "qry_image_pixels": {
+          "count": 134,
+          "max": 786432,
+          "p50": 187500,
+          "p95": 784384
+        },
+        "qry_image_width": {
+          "count": 134,
+          "max": 1024,
+          "p50": 500,
+          "p95": 1024
+        },
+        "rows": 134,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "VisualNews_i2t": {
+        "declares_positive_image": false,
+        "declares_query_image": true,
+        "distinct_pos_text_count": 192,
+        "distinct_positive_count": 192,
+        "duplicate_pos_text_ratio": 0.0,
+        "duplicate_positive_ratio": 0.0,
+        "max_single_positive_share": 0.0052,
+        "pos_image_height": null,
+        "pos_image_pixels": null,
+        "pos_image_width": null,
+        "pos_text_chars": {
+          "count": 192,
+          "max": 407,
+          "p50": 83,
+          "p95": 228
+        },
+        "qry_chars": {
+          "count": 192,
+          "max": 60,
+          "p50": 60,
+          "p95": 60
+        },
+        "qry_image_height": {
+          "count": 192,
+          "max": 455,
+          "p50": 256,
+          "p95": 339
+        },
+        "qry_image_pixels": {
+          "count": 192,
+          "max": 123392,
+          "p50": 101120,
+          "p95": 116480
+        },
+        "qry_image_width": {
+          "count": 192,
+          "max": 482,
+          "p50": 393,
+          "p95": 455
+        },
+        "rows": 192,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "VisualNews_t2i": {
+        "declares_positive_image": true,
+        "declares_query_image": false,
+        "distinct_pos_text_count": 1,
+        "distinct_positive_count": 191,
+        "duplicate_pos_text_ratio": 1.0,
+        "duplicate_positive_ratio": 0.0,
+        "max_single_positive_share": 0.0052,
+        "pos_image_height": {
+          "count": 191,
+          "max": 407,
+          "p50": 256,
+          "p95": 341
+        },
+        "pos_image_pixels": {
+          "count": 191,
+          "max": 121344,
+          "p50": 99072,
+          "p95": 116480
+        },
+        "pos_image_width": {
+          "count": 191,
+          "max": 474,
+          "p50": 387,
+          "p95": 455
+        },
+        "pos_text_chars": {
+          "count": 191,
+          "max": 39,
+          "p50": 39,
+          "p95": 39
+        },
+        "qry_chars": {
+          "count": 191,
+          "max": 603,
+          "p50": 124,
+          "p95": 319
+        },
+        "qry_image_height": null,
+        "qry_image_pixels": null,
+        "qry_image_width": null,
+        "rows": 191,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      },
+      "WebQA": {
+        "declares_positive_image": true,
+        "declares_query_image": false,
+        "distinct_pos_text_count": 33,
+        "distinct_positive_count": 33,
+        "duplicate_pos_text_ratio": 0.0,
+        "duplicate_positive_ratio": 0.0,
+        "max_single_positive_share": 0.0303,
+        "pos_image_height": {
+          "count": 33,
+          "max": 455,
+          "p50": 256,
+          "p95": 390
+        },
+        "pos_image_pixels": {
+          "count": 33,
+          "max": 116480,
+          "p50": 87296,
+          "p95": 116480
+        },
+        "pos_image_width": {
+          "count": 33,
+          "max": 455,
+          "p50": 340,
+          "p95": 426
+        },
+        "pos_text_chars": {
+          "count": 33,
+          "max": 368,
+          "p50": 176,
+          "p95": 354
+        },
+        "qry_chars": {
+          "count": 33,
+          "max": 279,
+          "p50": 160,
+          "p95": 205
+        },
+        "qry_image_height": null,
+        "qry_image_pixels": null,
+        "qry_image_width": null,
+        "rows": 33,
+        "rows_with_unreadable_pos_image": 0,
+        "rows_with_unreadable_qry_image": 0,
+        "rows_without_positive_content": 0,
+        "rows_without_query_image": 0
+      }
+    }
+  },
+  "quota": {
+    "A-OKVQA": 33,
+    "CIRR": 50,
+    "ChartQA": 54,
+    "DocVQA": 76,
+    "HatefulMemes": 16,
+    "ImageNet_1K": 192,
+    "InfographicsVQA": 46,
+    "MSCOCO": 192,
+    "MSCOCO_i2t": 217,
+    "MSCOCO_t2i": 192,
+    "N24News": 94,
+    "NIGHTS": 30,
+    "OK-VQA": 17,
+    "SUN397": 38,
+    "VOC2007": 15,
+    "VisDial": 236,
+    "Visual7W": 134,
+    "VisualNews_i2t": 192,
+    "VisualNews_t2i": 191,
+    "WebQA": 33
+  },
+  "requested_rows": 2048,
+  "sample_seed": 1234,
+  "shuffle_buffer": {
+    "A-OKVQA": 660,
+    "CIRR": 1000,
+    "ChartQA": 1080,
+    "DocVQA": 1520,
+    "HatefulMemes": 320,
+    "ImageNet_1K": 2000,
+    "InfographicsVQA": 920,
+    "MSCOCO": 2000,
+    "MSCOCO_i2t": 2000,
+    "MSCOCO_t2i": 2000,
+    "N24News": 1880,
+    "NIGHTS": 600,
+    "OK-VQA": 340,
+    "SUN397": 760,
+    "VOC2007": 300,
+    "VisDial": 2000,
+    "Visual7W": 2000,
+    "VisualNews_i2t": 2000,
+    "VisualNews_t2i": 2000,
+    "WebQA": 660
+  },
+  "source_repo": "MrZilinXiao/MMEB_train_with_image",
+  "source_revision": "9d0fd31789c12a007442de52fe22509e46e49e7d",
+  "subset_repo": "jinwoo-cho/mmeb-subset",
+  "subset_revision": "55aafaf9bfe171c65a8131224d3791df379f1651",
+  "subset_rows": 2048,
+  "taken": {
+    "A-OKVQA": 33,
+    "CIRR": 50,
+    "ChartQA": 54,
+    "DocVQA": 76,
+    "HatefulMemes": 16,
+    "ImageNet_1K": 192,
+    "InfographicsVQA": 46,
+    "MSCOCO": 192,
+    "MSCOCO_i2t": 217,
+    "MSCOCO_t2i": 192,
+    "N24News": 94,
+    "NIGHTS": 30,
+    "OK-VQA": 17,
+    "SUN397": 38,
+    "VOC2007": 15,
+    "VisDial": 236,
+    "Visual7W": 134,
+    "VisualNews_i2t": 192,
+    "VisualNews_t2i": 191,
+    "WebQA": 33
+  },
+  "thresholds": {
+    "max_rows_with_unreadable_image": 0,
+    "max_rows_without_positive": 0,
+    "max_rows_without_query_image": 0,
+    "max_single_positive_share": 0.2,
+    "min_rows_for_share_gate": 50
+  },
+  "upstream_row_counts": {
+    "A-OKVQA": 17056,
+    "CIRR": 26116,
+    "ChartQA": 28299,
+    "DocVQA": 39463,
+    "HatefulMemes": 8500,
+    "ImageNet_1K": 100000,
+    "InfographicsVQA": 23946,
+    "MSCOCO": 100000,
+    "MSCOCO_i2t": 113287,
+    "MSCOCO_t2i": 100000,
+    "N24News": 48988,
+    "NIGHTS": 15941,
+    "OK-VQA": 9009,
+    "SUN397": 19850,
+    "VOC2007": 7844,
+    "VisDial": 123287,
+    "Visual7W": 69817,
+    "VisualNews_i2t": 100000,
+    "VisualNews_t2i": 99903,
+    "WebQA": 17166
+  },
+  "violations": []
+}
