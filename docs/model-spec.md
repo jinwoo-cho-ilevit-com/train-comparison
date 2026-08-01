@@ -98,21 +98,107 @@ embedding이고, PLE만 따지면 **2.390B**다. 결론(옵티마이저 메모�
 
 ---
 
-## Qwen/Qwen3.5-0.8B
+### 이미지 처리 (`processor_config.json`)
 
-미확인. 생성형 모델이라 임베딩 규격이 없을 것으로 예상되나 확인하지 않았다.
-`padding_side`, chat template, LoRA target 관례 전부 미조회.
+| 항목 | 값 |
+|---|---|
+| `image_seq_length` / `max_soft_tokens` | **280 (고정)** |
+| `patch_size` / `pooling_kernel_size` | 16 / 3 |
+| 정규화 | `do_normalize: false`, mean 0 / std 1 |
+| 비디오 soft token | 70 (32 프레임) |
+
+**해상도와 무관하게 이미지당 280 토큰으로 고정된다.** 확장은 프로세서 단계에서
+일어난다(`image_seq_length`는 프로세서 개념). Qwen 계열의 픽셀 비례 방식과 근본적으로
+다르다.
 
 ---
 
-## 결정이 필요한 사항
+## Qwen/Qwen3.5-0.8B
 
-generic 경로를 유지할지(단순성·모델 간 비교 공정성) 모델별 공식 규격에 맞출지
-(현실성)를 항목별로 정해야 한다. **이 결정 자체가 리포트의 한정 조건이 된다.**
+**생성형 VLM이며 sentence-transformers 구조가 없다.** 공식 임베딩 규격이 존재하지
+않으므로 pooling·prompt를 우리가 정해야 한다.
 
-| 항목 | 선택지 |
+| 항목 | 값 | 근거 |
+|---|---|---|
+| `padding_side` | **키 없음 -> transformers 기본값 `right`** | `tokenizer_config.json` |
+| `pad_token` / `eos_token` | `<|endoftext|>` / `<|im_end|>` | `tokenizer_config.json` |
+| tokenizer | `Qwen2Tokenizer` | `tokenizer_config.json` |
+| image token | `<|image_pad|>` (+ `<|vision_start|>`/`<|vision_end|>`) | `extra_special_tokens` |
+| 이미지 해상도 | **동적**. `shortest_edge 65536`, `longest_edge 16777216` | `preprocessor_config.json` |
+| `patch_size` / `merge_size` | 16 / 2 | `preprocessor_config.json` |
+| `model_max_length` | 262144 | `tokenizer_config.json` |
+
+### `add_generation_prompt`의 함정 — 생성형 모델에서는 정반대로 작동한다
+
+`chat_template.jinja`에서 `add_generation_prompt`가 참이면 다음이 덧붙는다:
+
+```
+<|im_start|>assistant\n<think>\n\n</think>\n\n
+```
+
+**last-token pooling이면 이 thinking 스캐폴딩의 마지막 토큰이 임베딩이 된다.**
+Qwen3-VL-Embedding은 공식 임베딩 모델이라 `true`가 규격이지만, 생성형 모델에
+동일하게 적용하면 의미 없는 위치를 pooling하게 된다.
+
+---
+
+## 확정된 결정 (2026-08-01, 사용자)
+
+### 1. instruction prompt — 전 모델 무부착
+
+모델 간 입력 조건을 동일하게 유지해 비교 공정성을 확보한다.
+
+**대가**: Qwen3-VL-Embedding-2B는 `"Represent the user's input."`이 붙은 상태로
+학습된 모델이므로 **공식 사용법과 다르게 쓰인다.** 이 모델의 절대 품질 수치는 공식
+사용 대비 저평가될 수 있다. **리포트의 한정 조건으로 명시한다.** 속도 측정에는
+영향이 미미하다(prompt 토큰 수 차이만큼의 시퀀스 길이 변화).
+
+### 2. `add_generation_prompt` — 모델별로 공식/타당한 값에 맞춘다
+
+일괄 `true`가 아니다. 위에서 확인했듯 같은 플래그가 모델 성격에 따라 반대로 작동한다.
+
+| 모델 | 값 | 근거 |
+|---|---|---|
+| Qwen3-VL-Embedding-2B | **`true`** | `sentence_bert_config.json`이 명시한 공식 규격 |
+| Qwen3.5-0.8B | **`false`** | 생성형. `true`면 `<think>` 스캐폴딩 끝을 pooling |
+| gemma-4-E2B | **`false`** | 생성형. 임베딩 규격 없음 |
+
+현재 코드는 전부 `False`이므로 **Qwen3-VL-Embedding만 `true`로 바꾸면 된다.**
+(Wave 1 코어 정확성 레인 작업 항목)
+
+### 3. 이미지 토큰 예산 — 모델 간 고정은 포기한다
+
+| 모델 | 방식 |
 |---|---|
-| instruction prompt | (a) Qwen3-VL만 공식 prompt 부착 -> 모델 간 입력이 달라짐 (b) 전 모델 무부착 -> Qwen3-VL을 의도와 다르게 사용 (c) 전 모델에 동일한 자체 prompt 부착 |
-| `add_generation_prompt` | 공식이 `true`이고 last-token pooling에 직접 영향하므로 **맞추는 쪽을 권장** |
-| 구조화 메시지 입력 | Qwen3-VL만 지원. 맞추면 코드 경로가 갈라짐 |
-| 이미지 토큰 예산 | 동적 해상도(Qwen) vs 고정 280(gemma-4)이라 **모델 간 고정이 원리적으로 불가능.** 리포트 범위를 "모델 내 축 효과"로 좁히는 선택지 포함 |
+| Qwen3-VL-Embedding-2B | 픽셀 비례. `min_pixels 4096` ~ `max_pixels 1310720` |
+| Qwen3.5-0.8B | 픽셀 비례. `shortest_edge 65536` ~ `longest_edge 16777216` (범위가 다름) |
+| gemma-4-E2B | **해상도 무관 280 고정** |
+
+**세 모델의 토큰 예산을 동시에 고정하는 것은 원리적으로 불가능하다.** 고정 가능한
+것은 입력 픽셀 수뿐이고, 그래도 gemma-4는 항상 280이며 Qwen 두 모델은 서로 다른
+픽셀 범위를 갖는다.
+
+따라서:
+- 입력 이미지 픽셀 분포를 고정하고, **모델별 실제 visual token 분포(p50/p95/max)를
+  실측해 기록**한다
+- **모델 간 절대 throughput 비교는 리포트에서 한정한다.** 1차 결론은 "모델 내 축
+  효과"이고, 모델 간 비교는 토큰 분포를 함께 제시할 때만 언급한다
+
+이는 `PLAN.md`의 "모델 간 Pareto frontier"라는 헤드라인을 좁히는 결정이다.
+
+### 4. 구조화 메시지 입력 — 미채택
+
+Qwen3-VL-Embedding만 `message` 모달리티(`format: "structured"`)를 지원한다. 맞추면
+코드 경로가 모델별로 갈라지고 비교 공정성이 떨어지므로 채택하지 않는다. 위 1번과
+같은 성격의 한정 조건으로 기록한다.
+
+---
+
+## 남은 미확인
+
+| 항목 | 비고 |
+|---|---|
+| Qwen3-VL-Embedding-2B `padding_side` | `tokenizer_config.json` 미독 |
+| MRL(Matryoshka) 지원 차원 | 세 모델 모두 README 미독. 지원하면 임베딩 차원이 축이 될 수 있다 |
+| 모델별 LoRA target module 관례 | 현재 `all-linear`는 "모델별 target module 인식" 질문을 회피한다 |
+| gemma-4 placeholder 확장의 실제 관측값 | probe 미실행. `image_seq_length: 280`이 실제로 280개 토큰으로 나오는지 |
