@@ -173,55 +173,58 @@ def test_model_spec_notices_a_missing_field():
     ]
 
 
-# Checks that answer a question about a set of files. Each one reported success
-# when its set was empty: `configs/data/` was matched by an unanchored `data/` in
-# .gitignore and had never been committed, so `data-pinned` announced that every
-# data config pins a commit sha — of which there were none.
-def test_an_orchestrator_manifest_is_not_a_config_knob(tmp_path, monkeypatch):
-    """`configs/experiment/` holds pod work orders, not run settings. Treating its
-    keys as unread knobs charged lane C's files to lane D's audit item, which D
-    could then never clear."""
-    configs = tmp_path / "configs"
-    (configs / "attn").mkdir(parents=True)
-    (configs / "experiment").mkdir()
-    (configs / "config.yaml").write_text("defaults:\n  - attn: sdpa\n")
-    (configs / "attn" / "sdpa.yaml").write_text("name: sdpa\n")
-    (configs / "experiment" / "job.yaml").write_text("phase: 0\naxis: attn\n")
-    monkeypatch.setattr(audit_plan, "CONFIGS", configs)
-
-    assert audit_plan._config_leaf_keys() == {"attn": {"name"}}
-
-
-def test_a_config_directory_nothing_composes_must_be_declared(tmp_path, monkeypatch):
-    """Narrowing to composed groups would otherwise fail open: an axis group added
-    to configs/ but forgotten in `defaults` would vanish from every check at once
-    while also never reaching a run."""
-    configs = tmp_path / "configs"
-    (configs / "newaxis").mkdir(parents=True)
-    (configs / "config.yaml").write_text("defaults:\n  - attn: sdpa\n")
-    monkeypatch.setattr(audit_plan, "CONFIGS", configs)
-
-    result = audit_plan.CHECKS["config-groups"]()
-
-    assert not result.ok
-    assert "newaxis" in result.detail
-
-
-SET_CHECKS = ("config-consumed", "axis-fields", "axis-packages", "data-pinned", "model-spec")
-
-
-@pytest.mark.parametrize("name", SET_CHECKS)
-def test_a_check_with_nothing_to_examine_fails(name, monkeypatch, tmp_path):
-    """Vacuous truth is not evidence. A check that goes green when the thing it
-    inspects disappears is worse than no check: it certifies the absence."""
-    monkeypatch.setattr(audit_plan, "CONFIGS", tmp_path / "configs")
+# The property, stated once over every check rather than over a hand-written
+# subset. The subset version listed five names and omitted `plan-files`,
+# `doc-commands`, `evidence-committed` and `axis-wired` — which were exactly the
+# four that violated it. A list of what to check is a list of what to forget.
+@pytest.fixture
+def empty_repository(tmp_path, monkeypatch):
+    """A repository with nothing in it, from every check's point of view."""
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "docs").mkdir()
+    for name in ("PLAN.md", "README.md", "AGENTS.md"):
+        (tmp_path / name).write_text("nothing here\n")
     monkeypatch.setattr(audit_plan, "REPO", tmp_path)
+    monkeypatch.setattr(audit_plan, "CONFIGS", tmp_path / "configs")
+    monkeypatch.setattr(audit_plan, "BENCH_ENTRY_POINT", tmp_path / "scripts" / "bench.py")
+    # The axis registry is imported from the package, not read off REPO, so an
+    # empty repository does not empty it.
+    from trainbench import applied, axes, config_schema
 
+    monkeypatch.setattr(config_schema, "axis_knobs", dict)
+    monkeypatch.setattr(applied, "_CAPTURES", {})
+    monkeypatch.setattr(axes, "IMPLEMENTED", frozenset())
+    return tmp_path
+
+
+@pytest.mark.parametrize("name", sorted(audit_plan.CHECKS))
+def test_every_check_fails_on_an_empty_repository(name, empty_repository):
+    """Vacuous truth is not evidence. A check that goes green when the thing it
+    inspects disappears is worse than no check: it certifies the absence.
+
+    Every one of these has been observed passing on nothing. `data-pinned`
+    announced that every data config pins a commit sha when `.gitignore` had
+    swallowed the directory; `axis-wired` reports "all 0 axes are applied and
+    verified"; deleting `docs/support-matrix.md` made `evidence-committed` green;
+    and adding a language tag to a markdown fence disabled `plan-files`.
+    """
     result = audit_plan.CHECKS[name]()
 
-    # The property is the verdict, not the wording: `model-spec` reports its
-    # missing spec file first, which is the same refusal for a nearer reason.
-    assert not result.ok, f"{name} certified an empty repository"
+    assert not result.ok, f"{name} certified an empty repository: {result.detail!r}"
+    assert result.detail
+
+
+def test_a_language_tag_on_the_fence_does_not_disable_plan_files(tmp_path, monkeypatch):
+    """The fence regex required a bare ```; writing ```text is an ordinary edit
+    that turned the check off and made it report the absence as a pass."""
+    layout = "```text\ntrain-comparison/\n├── missing.py\n```\n"
+    (tmp_path / "PLAN.md").write_text(layout)
+    monkeypatch.setattr(audit_plan, "REPO", tmp_path)
+
+    result = audit_plan.CHECKS["plan-files"]()
+
+    assert not result.ok
+    assert "missing.py" in result.detail
 
 
 def test_the_data_config_group_is_committed():

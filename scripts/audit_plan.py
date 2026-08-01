@@ -254,6 +254,8 @@ def axes_are_applied_and_verified() -> Result:
 
     declared = set(axis_knobs())
     captured = set(_CAPTURES)
+    if empty := _nothing_to_check(declared, "axes declared by the schema"):
+        return Result("axis-wired", False, empty)
     problems = []
     if unknown := sorted(captured - declared):
         problems.append(f"capture probe for undeclared axis: {', '.join(unknown)}")
@@ -350,7 +352,7 @@ def axis_group_leaves_are_classified() -> Result:
     return Result(
         "axis-fields",
         not problems,
-        f"every leaf in {len(AXIS_GROUPS)} axis group(s) is classified"
+        f"every leaf in {len(leaves)} axis group(s) present is classified"
         if not problems
         else f"unclassified: {', '.join(problems)}",
     )
@@ -433,9 +435,17 @@ def missing_plan_files(block: str, root: Path) -> list[str]:
 def files_named_in_plan_exist() -> Result:
     """PLAN.md's repository layout must describe reality, not intent."""
     plan = (REPO / "PLAN.md").read_text()
-    block = re.search(r"```\n(train-comparison/.*?)```", plan, re.S)
+    # The language tag is optional in the fence: requiring a bare ``` meant that
+    # adding `text` after it — an ordinary markdown edit — silently disabled the
+    # check, which then reported the absence as a pass.
+    block = re.search(r"```[a-z]*\n(train-comparison/.*?)```", plan, re.S)
     if not block:
-        return Result("plan-files", True, "PLAN.md has no repository layout block")
+        return Result(
+            "plan-files",
+            False,
+            "PLAN.md has no repository layout block; the check that the declared "
+            "layout matches reality then has nothing to compare and passes for it",
+        )
     missing = missing_plan_files(block.group(1), REPO)
     return Result(
         "plan-files",
@@ -457,7 +467,13 @@ def measured_claims_have_committed_artifacts() -> Result:
     """
     matrix = REPO / "docs" / "support-matrix.md"
     if not matrix.exists():
-        return Result("evidence-committed", True, "no support matrix yet")
+        return Result(
+            "evidence-committed",
+            False,
+            "docs/support-matrix.md is absent; deleting the document whose numbers "
+            "this check traces turns the check green, which is not the same as the "
+            "numbers being traceable",
+        )
     tracked = subprocess.run(
         ["git", "ls-files", "docs/evidence"],
         cwd=REPO,
@@ -508,6 +524,17 @@ AXIS_PACKAGES = {
     "parallel/zero3": ("deepspeed",),
     "dataloader/dali": ("nvidia-dali",),
     "dataloader/dali_packed": ("nvidia-dali",),
+    # peft/loss/framework were exempt via NON_AXIS_GROUPS, which hid two real
+    # gaps: bitsandbytes is in 2 of 6 envs while qlora is offered to all six, and
+    # no environment has a GradCache implementation at all — while three shipped
+    # manifests already assign GPUs to the loss axis.
+    "peft/qlora": ("bitsandbytes",),
+    "loss/cached_mnrl": ("grad-cache",),
+    "framework/unsloth": ("unsloth",),
+    "framework/ms_swift": ("ms-swift",),
+    "framework/sentence_transformers": ("sentence-transformers",),
+    "framework/tevatron": ("tevatron",),
+    "framework/axolotl": ("axolotl",),
 }
 # Variants that need nothing beyond the core stack.
 AXIS_NEEDS_NOTHING = frozenset(
@@ -522,24 +549,28 @@ AXIS_NEEDS_NOTHING = frozenset(
         "parallel/fsdp2",
         "dataloader/torch",
         "dataloader/torch_packed",
+        "peft/full",
+        "peft/lora",
+        "loss/mnrl",
+        "freeze/none",
+        "freeze/vision_tower",
+        "freeze/ple",
+        "freeze/vision_and_ple",
+        "compile/none",
+        "compile/default",
+        "compile/max_autotune",
+        "compile/regional",
+        "framework/native",
     }
 )
 # Config groups that select something other than an optimisation, so no package
 # backs them.
-NON_AXIS_GROUPS = frozenset(
-    {
-        "data",
-        "model",
-        "run",
-        "train",
-        "experiment",
-        "framework",
-        "peft",
-        "loss",
-        "freeze",
-        "compile",
-    }
-)
+# Groups that select something other than an optimisation, so no package backs
+# them. `framework`, `peft`, `loss`, `freeze` and `compile` used to be here and
+# are not: exempting a whole group from the package check is how `peft/qlora`
+# (bitsandbytes in 2 of 6 envs) and `loss/cached_mnrl` (no GradCache anywhere)
+# stayed invisible while `axis-fields` counted both as axes.
+NON_AXIS_GROUPS = frozenset({"data", "model", "run", "train", "experiment"})
 
 
 @check("axis-packages")
@@ -568,8 +599,12 @@ def axes_have_their_packages() -> Result:
             problems.append(f"{variant} is unclassified: state its packages or that it needs none")
             continue
         for package in packages:
-            # Per lock file, not concatenated: a package present in some other
-            # image cannot satisfy an axis for the image that runs it.
+            # "Backed somewhere", which is weaker than the property that finally
+            # matters: a package in one image cannot satisfy an axis for the image
+            # that runs it. Pairing each framework image against the axes its
+            # manifests request needs configs/experiment/, and belongs with those
+            # manifests rather than here. Until then this reports which envs have
+            # it so the gap is visible rather than implied.
             envs = [p.parent.name for p, text in locks.items() if f'name = "{package}"' in text]
             if not envs:
                 problems.append(f"{variant} needs {package}, absent from every env")
@@ -593,8 +628,12 @@ def documented_commands_are_runnable() -> Result:
     entry point commands are executed here rather than pattern-matched.
     """
     problems = []
+    found = 0
     for name in ("README.md", "AGENTS.md"):
         text = (REPO / name).read_text()
+        found += len(re.findall(r"uv sync[^\n`]*", text)) + len(
+            re.findall(r"python scripts/env_report\.py[^\n`]*", text)
+        )
         for match in re.finditer(r"uv sync([^\n`]*)", text):
             flags = match.group(1)
             if "--extra compose" not in flags and "--all-extras" not in flags:
@@ -613,10 +652,12 @@ def documented_commands_are_runnable() -> Result:
             if run.returncode != 0:
                 tail = (run.stderr.strip().splitlines() or ["no output"])[-1]
                 problems.append(f"{name}: `{' '.join(command)}` exits {run.returncode}: {tail}")
+    if empty := _nothing_to_check(found, "documented commands in README.md or AGENTS.md"):
+        return Result("doc-commands", False, empty)
     return Result(
         "doc-commands",
         not problems,
-        "documented setup commands install what the tests need"
+        f"{found} documented command(s) install what the tests need and run as written"
         if not problems
         else "; ".join(problems),
     )
