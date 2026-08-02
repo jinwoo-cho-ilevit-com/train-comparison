@@ -510,6 +510,67 @@ def test_a_request_that_bound_two_different_kernels_is_refused():
         )
 
 
+def test_the_top_level_key_does_not_reach_the_sub_configs():
+    """`{"": impl}` asks the parent, and the parent does not pass it on.
+
+    transformers reads each sub-config out of the dict by its own key —
+    `value.get(subconfig_key, current_subconfig_attn)`, `configuration_utils.py`
+    :401-417 — so the towers keep what they had. Reading this as "the parent
+    dispatches to everything" put the request's identity on backbones that stayed on
+    SDPA, and then died on an empty list with a message about two kernels.
+    """
+    config = _qwen3_vl_config({"": "eager"})
+    assert config._attn_implementation == "eager"
+    assert config.text_config._attn_implementation == "sdpa"
+    assert config.vision_config._attn_implementation == "sdpa"
+
+    with pytest.raises(kernels.UnidentifiedKernel, match="none of those keys names a backbone"):
+        kernels.read_fingerprint(
+            _Model(config), axis="attn.name", value="eager", requested={"": "eager"}
+        )
+
+
+def test_a_dict_naming_no_backbone_says_the_request_bound_nothing():
+    """A multimodal dict handed to a text-only checkpoint.
+
+    Qwen3 has no sub-configs, so its only backbone is the parent and the setter
+    drops `text_config` entirely. The refusal has to name that, not report the
+    backbones as disagreeing about a request none of them received.
+    """
+    from transformers import Qwen3Config
+
+    config = Qwen3Config()
+    assert config.sub_configs == {}
+    config._attn_implementation = "sdpa"
+    config._attn_implementation = {"text_config": "eager"}
+    assert config._attn_implementation == "sdpa"
+
+    with pytest.raises(kernels.UnidentifiedKernel, match="none of those keys names a backbone"):
+        kernels.read_fingerprint(
+            _Model(config), axis="attn.name", value="eager", requested={"text_config": "eager"}
+        )
+
+
+def test_the_top_level_key_lands_on_a_model_that_has_no_sub_configs():
+    """The other half of the same setter: with no sub-configs the parent is the only
+    backbone and `""` is the only key that reaches it."""
+    from transformers import Qwen3Config
+
+    config = Qwen3Config()
+    config._attn_implementation = "sdpa"
+    config._attn_implementation = {"": "eager"}
+    assert config._attn_implementation == "eager"
+
+    fingerprint = kernels.read_fingerprint(
+        _Model(config), axis="attn.name", value="eager", requested={"": "eager"}
+    )
+
+    contract.validate_kernel_fingerprint(fingerprint)
+    assert set(fingerprint["backbones"]) == {"qwen3"}
+    assert fingerprint["backbones"]["qwen3"]["requested"] is True
+    assert fingerprint["requested"]["attn_implementation"] == "eager"
+
+
 def test_an_implementation_whose_package_is_absent_cannot_be_identified():
     """`flash_attention_2` with no `flash-attn` wheel names no kernel."""
     assert importlib.util.find_spec("flash_attn") is None
