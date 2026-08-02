@@ -48,6 +48,7 @@ import functools
 import importlib.util
 import sys
 import weakref
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import get_args
 
@@ -78,6 +79,7 @@ from trainbench.embedding import last_token_pool, packed_last_token_pool
 from .test_applied import bench, config_mapping, gemma  # noqa: F401
 
 CPU = torch.device("cpu")
+CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 
 
 @pytest.fixture
@@ -586,44 +588,72 @@ def test_liger_calls_the_entrypoint_for_this_architecture(composed, monkeypatch)
     assert calls == ["apply_liger_kernel_to_qwen3_5"]
 
 
-def test_liger_on_gemma4_is_refused_even_with_the_package_present(composed, monkeypatch):
-    """Liger-Kernel#1186 is open. The architecture is decided before the import, so
-    an image that has liger cannot turn this into a `liger`-labelled gemma-4 run."""
-    install_liger(monkeypatch, liger_stub(entrypoint="apply_liger_kernel_to_gemma4")[0])
+def test_liger_reaches_gemma4_on_a_pin_that_has_the_entrypoint(composed, monkeypatch):
+    """`LIGER_UNSUPPORTED` used to refuse this outright, citing Liger-Kernel#1186,
+    and the pinned wheel says otherwise: liger-kernel 0.8.1 defines
+    `apply_liger_kernel_to_gemma4` and maps `gemma4` onto it. A refusal written
+    from an issue tracker would have kept one of the study's three models out of
+    this axis for the whole campaign."""
+    module, calls = liger_stub(entrypoint="apply_liger_kernel_to_gemma4")
+    install_liger(monkeypatch, module)
     config = gemma(composed, **{"kernel.name": "liger"})
 
-    with pytest.raises(axes.UnappliedAxis, match="1186"):
-        axes.patch(config)
+    assert axes.patch(config) == ["kernel.name"]
+    assert calls == ["apply_liger_kernel_to_gemma4"]
 
 
-def test_liger_on_gemma4_is_refused_for_the_issue_and_not_for_a_missing_package(
-    composed, monkeypatch
-):
-    """The pair that makes the order inside `_patch_liger` observable. With the
-    package present both orders refuse, so the test above passes either way; on an
-    image without liger, an import-first patcher blames the environment and the
-    reader is left thinking gemma-4 would work once the package lands."""
-    install_liger(monkeypatch, None)
+def test_liger_on_a_pin_without_the_entrypoint_names_what_that_pin_has(composed, monkeypatch):
+    """The other side of the same fact: 0.8.0 has gemma-4's *text* entrypoint and
+    not its multimodal one, so which image is running decides this. The version
+    boundary is answered by the installed package rather than by a table, and the
+    refusal has to carry the correction with it."""
+    module, _ = liger_stub(entrypoint="apply_liger_kernel_to_gemma4_text")
+    install_liger(monkeypatch, module)
     config = gemma(composed, **{"kernel.name": "liger"})
 
-    with pytest.raises(axes.UnappliedAxis, match="1186"):
+    with pytest.raises(axes.UnappliedAxis, match=r"apply_liger_kernel_to_gemma4_text") as refusal:
         axes.patch(config)
 
+    assert "has no apply_liger_kernel_to_gemma4()" in str(refusal.value)
 
-def test_liger_records_an_entrypoint_or_a_reason_but_never_both():
-    """`LIGER_UNSUPPORTED` is consulted first, so an entrypoint keyed on an
-    architecture listed there is unreachable — no refusal contradicts it and no
-    test can, and the day the issue closes and the reason is deleted, an unchecked
-    function name ships as the thing to call. The suffix rule is pinned for the
-    same reason: it is the only thing standing between this table and a guess,
-    since the package cannot be imported here to ask."""
-    assert set(axes.LIGER_ENTRYPOINTS) & set(axes.LIGER_UNSUPPORTED) == set()
+
+def test_the_refusal_reads_the_export_list_a_lazy_module_actually_answers(composed, monkeypatch):
+    """`liger_kernel.transformers` is a lazy module: every `apply_liger_kernel_to_*`
+    lives in `if TYPE_CHECKING:` and `__getattr__`, it defines no `__dir__`, and
+    CPython's `dir(module)` returns `__dict__`'s keys. So the refusal built from
+    `dir()` printed `it exports []` — a correction with nothing in it, on the one
+    path that exists to carry one."""
+    lazy = ModuleType("liger_kernel.transformers")
+    lazy.__all__ = [
+        "apply_liger_kernel_to_qwen3_5",
+        "apply_liger_kernel_to_llama",
+        "AutoLigerKernel",
+    ]
+    install_liger(monkeypatch, lazy)
+    config = gemma(composed, **{"kernel.name": "liger"})
+
+    with pytest.raises(axes.UnappliedAxis) as refusal:
+        axes.patch(config)
+
+    assert "['apply_liger_kernel_to_llama', 'apply_liger_kernel_to_qwen3_5']" in str(refusal.value)
+
+
+def test_liger_records_an_entrypoint_for_every_architecture_under_test():
+    """The suffix rule is what stands between this table and a guess, and the
+    coverage assertion is what stops an architecture from quietly dropping out:
+    a missing key reads as `liger` being inapplicable to that model, which is the
+    state the deleted `LIGER_UNSUPPORTED` produced for gemma-4."""
     assert axes.LIGER_ENTRYPOINTS == {
-        arch: f"apply_liger_kernel_to_{arch}" for arch in axes.LIGER_ENTRYPOINTS
+        arch: f"{axes.LIGER_ENTRYPOINT_PREFIX}{arch}" for arch in axes.LIGER_ENTRYPOINTS
     }
+    assert set(axes.LIGER_ENTRYPOINTS) == set(axes.VISION_PARAM_MARKERS)
 
 
 def test_liger_on_an_architecture_with_no_recorded_entrypoint_is_refused(composed, monkeypatch):
+    """Nothing recorded is not the same as unsupported, and the refusal has to say
+    which one it is. The table is emptied of this arch rather than a fourth one
+    invented: `model.arch` is a Literal of exactly the three under test."""
+    monkeypatch.delitem(axes.LIGER_ENTRYPOINTS, "qwen3_vl")
     install_liger(monkeypatch, liger_stub(entrypoint=None)[0])
     config = bench(composed, **{"kernel.name": "liger"})
 
@@ -736,6 +766,30 @@ def test_fla_without_causal_conv1d_is_refused_though_its_classes_would_bind(comp
 
     assert axes._fla_binding() == (True, "")
     with pytest.raises(axes.UnappliedAxis, match="causal_conv1d not installed"):
+        axes.patch(config)
+
+
+def test_fla_without_fla_core_is_refused_though_the_version_check_passes(composed, monkeypatch):
+    """The distribution that answers `importlib.metadata.version` is not the one
+    that ships the code. `flash-linear-attention`'s wheel carries `fla/layers` and
+    `fla/models` and no `fla/__init__.py`; `fla.ops.gated_delta_rule` and
+    `fla.modules.FusedRMSNormGated` — the two symbols transformers imports — are in
+    `fla-core`, which it declares as a dependency and which every env lock pins
+    separately. An image holding only the first answers the version floor and then
+    dies inside `modeling_qwen3_5`'s import, which is a broken image rather than a
+    slow one, and the axis is what has to notice."""
+    fla_environment(monkeypatch)
+    real_version = importlib.metadata.version
+
+    def without_fla_core(distribution):
+        if distribution == axes.FLA_OPS_DISTRIBUTION:
+            raise importlib.metadata.PackageNotFoundError(distribution)
+        return real_version(distribution)
+
+    monkeypatch.setattr(importlib.metadata, "version", without_fla_core)
+    config = qwen35(composed, **{"kernel.name": "fla"})
+
+    with pytest.raises(axes.UnappliedAxis, match="fla-core is not installed"):
         axes.patch(config)
 
 
@@ -961,22 +1015,39 @@ def test_an_fla_below_the_floor_does_not_bind_kernel_none(composed, monkeypatch)
     assert axes.patch(qwen35(composed, **{"kernel.name": "fla"})) == ["kernel.name"]
 
 
-def test_kernels_hub_is_refused_with_the_entrypoints_it_actually_has(composed):
-    """Not "not implemented": transformers turns hub kernels on through
-    `from_pretrained(use_kernels=True)` and `kernelize(model)`, both of which need
-    a model. The refusal names them so the next reader knows this is a call-site
-    question (docs/CONTRACTS.md §2) rather than missing code."""
+def test_kernels_hub_is_dropped_for_both_reasons_and_no_run_can_select_it():
+    """`configs/kernel/` is what a composed run picks from, and the value is not in
+    it any more (PLAN.md decision 6). The schema's Literal still offers it, so a
+    config built straight from the schema still reaches `patch` and still has to be
+    refused — with both reasons, because they hold separately: the call site needs
+    a model, and the native pin `kernels==0.16.0` sits exactly on transformers'
+    exclusive upper bound, which turns hub dispatch into a silent identity
+    decorator wherever it were applied."""
+    assert not (CONFIGS / "kernel" / "kernels_hub.yaml").exists()
+    assert sorted(p.stem for p in (CONFIGS / "kernel").glob("*.yaml")) == ["fla", "liger", "none"]
+
+
+def test_kernels_hub_from_the_schema_is_still_refused_with_both_reasons(composed):
+    """The path `scripts/bench.py::preflight` walks: it is handed a plan whose
+    configs come from the schema rather than from Hydra, so deleting the config
+    file does not put this value out of reach."""
     config = bench(composed, **{"kernel.name": "kernels_hub"})
 
     with pytest.raises(axes.UnappliedAxis) as refusal:
         axes.patch(config)
 
-    # Each of the three is the message doing its job: the two entrypoints that
-    # exist, and the contract that says why neither is reachable from here.
-    # Matching one word of it would pass a message that says "not implemented".
+    # Each of these is the message doing one of its two jobs. Matching one word
+    # would pass a message that says "not implemented", and matching only the first
+    # three would pass one that forgot the pin — which is the reason that survives
+    # if the call site is ever moved.
     message = str(refusal.value)
-    for named in ("from_pretrained(use_kernels=True)", "kernelize(model)", "docs/CONTRACTS.md"):
-        assert named in message
+    for named in (
+        "from_pretrained(use_kernels=True)",
+        "kernelize(model)",
+        "docs/CONTRACTS.md",
+        "kernels==0.16.0",
+    ):
+        assert named in message, named
 
 
 # --- freeze.ple --------------------------------------------------------------
@@ -1826,13 +1897,67 @@ def test_lora_attaches_a_real_adapter_and_reads_back_as_lora(composed):
     assert type(built.model).__module__.startswith("peft"), type(built.model)
 
 
-def test_qlora_is_refused_because_its_quantised_half_is_not_built_here(composed):
-    """Running plain LoRA under a QLoRA label would report the memory of one and
-    the name of the other."""
+def quantised_model() -> torch.nn.Module:
+    """A model as `from_pretrained` returns one under a `BitsAndBytesConfig`.
+
+    The flag rather than real 4-bit weights: bitsandbytes quantises on CUDA and
+    there is none here, so what is under test is the gate rather than the weights.
+    `is_loaded_in_4bit` is one of the two readings `applied._capture_peft` uses to
+    tell `qlora` from `lora`, which is why `_base_is_quantised` uses both.
+    """
+    model = plain_model()
+    model.is_loaded_in_4bit = True
+    return model
+
+
+def test_qlora_attaches_the_adapter_to_a_base_that_arrived_quantised(composed):
+    """The two halves are `load_kwargs`' `BitsAndBytesConfig` and this call, and
+    what this site adds is the check that the first one happened."""
     config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32})
 
-    with pytest.raises(axes.UnappliedAxis, match="4-bit"):
+    built, names = axes.assemble(quantised_model(), config, CPU, framework="native")
+
+    assert "peft.mode" in names
+    assert type(built.model).__module__.startswith("peft")
+    trainable = [n for n, p in built.model.named_parameters() if p.requires_grad]
+    assert trainable and all("lora_" in name for name in trainable), trainable
+
+
+def test_qlora_over_an_unquantised_base_is_refused_at_the_adapter(composed):
+    """The realistic failure: the quantisation is requested in `load_kwargs`, a
+    caller that skipped it gets no error from `from_pretrained`, and plain LoRA
+    would then be measured under the QLoRA label. Weights already materialised in
+    bf16 cannot be quantised here, so refusing is the whole of what this site can
+    do about it."""
+    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32})
+
+    with pytest.raises(axes.UnappliedAxis, match="carries no quantisation"):
         axes.assemble(plain_model(), config, CPU, framework="native")
+
+
+def test_qlora_does_not_run_the_preamble_that_would_turn_on_another_axis(composed, monkeypatch):
+    """`prepare_model_for_kbit_training` is the documented QLoRA preamble and it is
+    deliberately not called: it enables gradient checkpointing by default, which is
+    a separate axis here, and it upcasts the norms to fp32, which
+    `applied._capture_precision` reads as `mixed(bf16,fp32)` against a bf16
+    request. Either one turns a qlora cell into a measurement of something else, so
+    the call is refused rather than left to be noticed."""
+    import peft
+
+    called = []
+    monkeypatch.setattr(
+        peft, "prepare_model_for_kbit_training", lambda *a, **k: called.append(a) or a[0]
+    )
+    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32})
+
+    built, names = axes.assemble(quantised_model(), config, CPU, framework="native")
+
+    assert called == []
+    assert "train.gradient_checkpointing" not in names
+    assert not any(
+        getattr(module, "gradient_checkpointing", False)
+        for _, module in built.model.named_modules()
+    )
 
 
 def test_an_adapter_freezes_the_base_whatever_the_freeze_axes_did(composed):
@@ -1904,16 +2029,230 @@ def test_a_wrapped_model_reports_its_wrapper(composed):
     assert axis(state, "parallel.strategy").applied == "ddp"
 
 
-def test_strategies_that_wrap_or_shard_are_refused(composed):
-    for strategy, match in (
-        ("ddp", "wraps the model"),
-        ("fsdp2", "wraps the model"),
-        ("zero2", "deepspeed.initialize"),
-        ("zero3", "deepspeed.initialize"),
-    ):
-        config = bench(composed, **{"parallel.strategy": strategy})
-        with pytest.raises(axes.UnappliedAxis, match=match):
-            axes.assemble(plain_model(), config, CPU, framework="native")
+def world_of(monkeypatch, size: int | None):
+    """A process group of `size` ranks, or none at all when `size` is None.
+
+    Stubbed rather than started: a real rendezvous would need a second process,
+    and what is under test is which world each strategy accepts.
+    """
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: size is not None)
+    monkeypatch.setattr(dist, "get_world_size", lambda: size)
+
+
+@pytest.mark.parametrize("strategy", ["ddp", "fsdp2", "zero2", "zero3"])
+def test_a_sharding_strategy_without_a_process_group_is_refused(composed, strategy):
+    """Nothing here starts one. A rendezvous invented by the harness would decide
+    the world size the run is measured at, and the world size is the setting."""
+    config = bench(composed, **{"parallel.strategy": strategy})
+
+    with pytest.raises(axes.UnappliedAxis, match="needs an initialised process group"):
+        axes.assemble(plain_model(), config, CPU, framework="native")
+
+
+@pytest.mark.parametrize("strategy", ["ddp", "fsdp2", "zero2", "zero3"])
+def test_a_sharding_strategy_over_one_rank_is_the_single_gpu_run(composed, monkeypatch, strategy):
+    """The break for the test above: a gate that only asked whether a group exists
+    passes under `torchrun --nproc_per_node=1`, and every one of these values then
+    measures one GPU and publishes it under a distributed label. `_gather_with_grad`
+    already refuses `world_size=1` on these grounds; this is that rule for the
+    wrappers."""
+    world_of(monkeypatch, 1)
+    config = bench(composed, **{"parallel.strategy": strategy})
+
+    with pytest.raises(axes.UnappliedAxis, match="world_size=1"):
+        axes.assemble(plain_model(), config, CPU, framework="native")
+
+
+def test_ddp_wraps_the_model_and_reads_back_as_ddp(composed, monkeypatch):
+    """The whole pair in one run: `_parallel` builds the wrapper and
+    `applied._capture_parallel_strategy` finds it by class name. The wrapper is
+    torch's own — a stand-in named `DistributedDataParallel` would satisfy the
+    capture while proving nothing about what this module builds."""
+    world_of(monkeypatch, 2)
+    config = bench(composed, **{"parallel.strategy": "ddp"})
+    monkeypatch.setattr(
+        torch.nn.parallel,
+        "DistributedDataParallel",
+        lambda module, device_ids=None: DistributedDataParallel(module),
+    )
+
+    built, names = axes.assemble(plain_model(), config, CPU, framework="native")
+
+    assert "parallel.strategy" in names
+    assert axis(capture(built, config), "parallel.strategy").applied == "ddp"
+
+
+def test_fsdp2_shards_in_place_and_the_capture_cannot_yet_see_it(composed, monkeypatch):
+    """The axis is applied and the run is then refused, and both halves are real.
+
+    `fully_shard` mutates: the module keeps its identity and gains `FSDPModule` in
+    its MRO under a class renamed `FSDP<original>`
+    (`torch/distributed/fsdp/_fully_shard/_fsdp_init.py:404-430`, torch 2.13.0).
+    Nothing named `FullyShardedDataParallel` exists anywhere in the result, and
+    that is the name `applied.PARALLEL_WRAPPERS` looks for — it is FSDP1's wrapper
+    class. Wrapping with FSDP1 to satisfy the probe would be FSDP1 measured as
+    FSDP2, so this records the gap instead (`.plans/notes/axes.md`).
+    """
+    world_of(monkeypatch, 2)
+    sharded = []
+
+    def fully_shard(module, **kwargs):
+        module.__class__ = type(f"FSDP{type(module).__name__}", (type(module),), {})
+        sharded.append(module)
+        return module
+
+    monkeypatch.setattr("torch.distributed.fsdp.fully_shard", fully_shard)
+    config = bench(composed, **{"parallel.strategy": "fsdp2"})
+
+    built, names = axes.assemble(plain_model(), config, CPU, framework="native")
+
+    assert "parallel.strategy" in names
+    assert sharded and type(built.model).__name__.startswith("FSDP")
+    assert "FullyShardedDataParallel" not in {
+        type(m).__name__ for _, m in built.model.named_modules()
+    }
+    assert axis(capture(built, config), "parallel.strategy").applied != "fsdp2"
+
+
+# --- parallel.strategy=zero2/zero3 and train.offload -------------------------
+#
+# deepspeed is not installed here and is sdist-only in every env lock, so it is
+# built on the pod. What is testable is the config this module hands `initialize`
+# and what it keeps on `Built`; whether a real engine answers the readers
+# `applied.py` calls is 확인 안 함 and is written up in `.plans/notes/axes.md`.
+
+
+class DeepSpeedEngine(torch.nn.Module):
+    """Named for what `applied.PARALLEL_WRAPPERS` matches on, and answering the
+    three readers `applied.zero_stage`/`offload_targets` call."""
+
+    def __init__(self, module, config):
+        super().__init__()
+        self.module = module
+        self.ds_config = config
+
+    def zero_optimization_stage(self):
+        return self.ds_config["zero_optimization"]["stage"]
+
+    def zero_offload_optimizer(self):
+        return self.ds_config["zero_optimization"].get("offload_optimizer")
+
+    def zero_offload_param(self):
+        return self.ds_config["zero_optimization"].get("offload_param")
+
+
+def install_deepspeed(monkeypatch):
+    """A stand-in for `deepspeed`, plus the log of what `initialize` was handed."""
+    calls = []
+
+    def initialize(model=None, optimizer=None, config=None, **kwargs):
+        calls.append({"model": model, "optimizer": optimizer, "config": config})
+        return DeepSpeedEngine(model, config), object(), None, None
+
+    module = ModuleType("deepspeed")
+    module.initialize = initialize
+    monkeypatch.setitem(sys.modules, "deepspeed", module)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "strategy,offload,stage,sections",
+    [
+        ("zero2", "none", 2, {}),
+        ("zero3", "optimizer", 3, {"offload_optimizer": {"device": "cpu"}}),
+        ("zero3", "param", 3, {"offload_param": {"device": "cpu"}}),
+        (
+            "zero3",
+            "both",
+            3,
+            {"offload_optimizer": {"device": "cpu"}, "offload_param": {"device": "cpu"}},
+        ),
+    ],
+)
+def test_zero_hands_deepspeed_the_stage_and_the_offload_sections(
+    composed, monkeypatch, strategy, offload, stage, sections
+):
+    """Both axes are one call. The sections are the two the engine answers about —
+    `zero_offload_optimizer()` and `zero_offload_param()` read
+    `zero_config.offload_optimizer` and `.offload_param` — so the request and the
+    read-back are the same two names."""
+    world_of(monkeypatch, 2)
+    calls = install_deepspeed(monkeypatch)
+    config = bench(composed, **{"parallel.strategy": strategy, "train.offload": offload})
+
+    built, names = axes.assemble(plain_model(), config, CPU, framework="native")
+
+    handed = calls[0]["config"]
+    assert handed["zero_optimization"] == {"stage": stage, **sections}
+    assert handed["train_micro_batch_size_per_gpu"] == config.train.batch_size
+    assert "parallel.strategy" in names
+    assert ("train.offload" in names) == (offload != "none")
+
+    state = capture(built, config)
+    assert axis(state, "parallel.strategy").applied == strategy
+    assert axis(state, "train.offload").applied == offload
+
+
+def test_the_optimizer_on_built_is_the_one_deepspeed_was_given(composed, monkeypatch):
+    """deepspeed returns its own wrapper around it, and recording that would report
+    `optim.name` as the wrapper's class — blocking every ZeRO run on an axis that
+    has nothing to do with ZeRO. The engine on `Built.model` is what carries the
+    ZeRO evidence, so nothing is lost by keeping the algorithm here."""
+    world_of(monkeypatch, 2)
+    calls = install_deepspeed(monkeypatch)
+    config = bench(composed, **{"parallel.strategy": "zero2"})
+
+    built, _ = axes.assemble(plain_model(), config, CPU, framework="native")
+
+    assert built.optimizer is calls[0]["optimizer"]
+    assert axis(capture(built, config), "optim.name").applied == "adamw_unfused"
+
+
+def test_the_dataloader_is_ours_and_not_the_one_deepspeed_would_return(composed, monkeypatch):
+    """`initialize` will build a `DeepSpeedDataLoader` if handed `training_data`,
+    and `applied._capture_dataloader_backend` decides that axis from the loader's
+    class — the run would read back as neither `torch` nor `dali`."""
+    world_of(monkeypatch, 2)
+    calls = install_deepspeed(monkeypatch)
+    config = bench(composed, **{"parallel.strategy": "zero3"})
+    rows = [{"input_ids": torch.arange(4), "attention_mask": torch.ones(4, dtype=torch.long)}]
+
+    built, _ = axes.assemble(plain_model(), config, CPU, framework="native", dataset=rows)
+
+    assert "training_data" not in calls[0]
+    assert isinstance(built.dataloader, torch.utils.data.DataLoader)
+    assert axis(capture(built, config), "dataloader.backend").applied == "torch"
+
+
+def test_offload_without_a_zero_stage_is_refused_rather_than_given_one(composed, monkeypatch):
+    """`offload_optimizer` and `offload_param` are sections of `zero_optimization`,
+    so there is no offload without a stage and no schema field that names one.
+    Picking a stage here would put a setting in the measured path that no config
+    records — and the audit, which composes one group at a time, would then read
+    `train.offload` as fully applicable while every configured cross of it was
+    running at a stage nobody chose."""
+    world_of(monkeypatch, 2)
+    install_deepspeed(monkeypatch)
+    config = bench(composed, **{"train.offload": "both"})
+
+    assert config.parallel.strategy == "single"
+    with pytest.raises(axes.UnappliedAxis, match="needs a ZeRO stage"):
+        axes.assemble(plain_model(), config, CPU, framework="native")
+
+
+def test_zero_without_deepspeed_is_refused_as_an_axis_not_an_import_error(composed, monkeypatch):
+    """`UnappliedAxis` rather than the raw `ImportError`, for the reason
+    `_patch_liger` gives: the audit counts a refusal as the axis declining a value
+    and anything else as a value that broke for an unrelated reason."""
+    world_of(monkeypatch, 2)
+    monkeypatch.setitem(sys.modules, "deepspeed", None)
+    config = bench(composed, **{"parallel.strategy": "zero2"})
+
+    with pytest.raises(axes.UnappliedAxis, match="deepspeed is not importable"):
+        axes.assemble(plain_model(), config, CPU, framework="native")
 
 
 # --- loss.name ---------------------------------------------------------------
@@ -4020,11 +4359,11 @@ def test_muon_is_refused_for_a_model_with_no_matrix_to_orthogonalise(composed):
         axes.assemble(model, muon(composed), CPU, framework="native")
 
 
-def test_adamw_8bit_is_still_refused_and_no_longer_says_muon_is(composed):
-    """The refusal was one message for two values. Narrowing it is half the work of
-    wiring one of them: a message that still names muon would be read by the next
-    lane as muon still being unimplemented."""
-    with pytest.raises(axes.UnappliedAxis) as raised:
+def test_adamw_8bit_off_cuda_is_refused_rather_than_stepped_in_32_bit(composed):
+    """bitsandbytes keeps its state in a CUDA kernel. A 32-bit AdamW built here
+    would step correctly and be published as 8-bit — which is also what
+    `applied._capture_optim` refuses, since it reads this axis off the class."""
+    with pytest.raises(axes.UnappliedAxis, match="device=cpu would step a 32-bit AdamW"):
         axes.assemble(
             plain_model(),
             bench(composed, **{"optim.name": "adamw_8bit"}),
@@ -4032,8 +4371,33 @@ def test_adamw_8bit_is_still_refused_and_no_longer_says_muon_is(composed):
             framework="native",
         )
 
-    assert "adamw_8bit" in str(raised.value)
-    assert "muon" not in str(raised.value)
+
+def test_adamw_8bit_builds_the_bitsandbytes_optimizer_without_optim_bits(composed, monkeypatch):
+    """`optim_bits` is the trap. Its default is 32 and `AdamW8bit` still quantises,
+    because the constructor hardcodes 8 and raises `ValueError` for any other value
+    of that argument — so passing 8 "to be explicit" is the one call that fails
+    (`bitsandbytes/optim/adamw.py:105-123`). The stub raises exactly as the library
+    does, so a version of `_adamw_8bit` that passed it would fail here."""
+    built_with = {}
+
+    class AdamW8bit(torch.optim.AdamW):
+        def __init__(self, params, lr=1e-3, weight_decay=1e-2, optim_bits=32, **kwargs):
+            if optim_bits != 32:
+                raise ValueError("AdamW8bit only supports optim_bits=32")
+            built_with.update({"lr": lr, "weight_decay": weight_decay, **kwargs})
+            super().__init__(params, lr=lr, weight_decay=weight_decay)
+
+    module = ModuleType("bitsandbytes.optim")
+    module.AdamW8bit = AdamW8bit
+    monkeypatch.setitem(sys.modules, "bitsandbytes.optim", module)
+    config = on_cuda(bench(composed, **{"optim.name": "adamw_8bit"}))
+
+    built, names = axes.assemble(plain_model(), config, torch.device("cuda"), framework="native")
+
+    assert "optim.name" in names
+    assert type(built.optimizer).__name__ == "AdamW8bit"
+    assert built_with == {"lr": config.optim.lr, "weight_decay": config.optim.weight_decay}
+    assert axis(capture(built, config), "optim.name").applied == "adamw_8bit"
 
 
 def test_a_muon_optimizer_under_an_adamw_request_stops_the_run(composed):
@@ -4049,6 +4413,166 @@ def test_a_muon_optimizer_under_an_adamw_request_stops_the_run(composed):
     assert axis(state, "optim.name").applied == "muon"
     with pytest.raises(AppliedMismatch, match=r"optim\.name: requested 'adamw_fused'"):
         assert_matches(state, requested_adamw)
+
+
+# --- precision.name ----------------------------------------------------------
+#
+# transformer-engine does not import here: the shim wheel carries the Python
+# surface but the compiled half (`transformer-engine-torch`) is sdist-only and
+# built on the pod. So these run against a stand-in shaped like the pinned
+# release's surface — the two recipe classes, the two availability checks, and
+# `autocast` — and what they pin is which of those this module calls and in which
+# order. Whether an A100 refuses is a hardware fact, not a code one, and it is the
+# gate below that turns it into a refusal instead of a wrong number.
+
+
+def install_transformer_engine(monkeypatch, *, available=True, tuples=True):
+    """A stand-in for the three Transformer Engine modules this axis reads.
+
+    `available` decides what the support checks answer, and `tuples` decides in
+    which of the two shapes — the private `_compute_*_support` pair returns
+    `(bool, str)` and whether the public wrappers do is 확인 안 함, so both are
+    exercised. A `(False, reason)` tuple is truthy, which is exactly how an
+    unsupported device would be read as a supported one.
+    """
+    entered = []
+    recipes = ModuleType("transformer_engine.common.recipe")
+    for name in ("MXFP8BlockScaling", "NVFP4BlockScaling"):
+        setattr(recipes, name, type(name, (), {}))
+    quantization = ModuleType("transformer_engine.pytorch.quantization")
+    answer = (available, "" if available else "compute capability 10.0 or higher required")
+    for name in ("is_mxfp8_available", "is_nvfp4_available"):
+        setattr(quantization, name, lambda answer=answer: answer if tuples else answer[0])
+
+    @contextlib.contextmanager
+    def autocast(enabled=True, recipe=None):
+        entered.append({"enabled": enabled, "recipe": recipe})
+        yield
+
+    pytorch = ModuleType("transformer_engine.pytorch")
+    pytorch.autocast = autocast
+    for name, module in {
+        "transformer_engine.common.recipe": recipes,
+        "transformer_engine.pytorch.quantization": quantization,
+        "transformer_engine.pytorch": pytorch,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return entered
+
+
+@pytest.mark.parametrize(
+    "precision,recipe_class", [("mxfp8", "MXFP8BlockScaling"), ("nvfp4", "NVFP4BlockScaling")]
+)
+def test_an_fp8_recipe_wraps_the_step_and_is_what_the_run_is_read_by(
+    composed, monkeypatch, precision, recipe_class
+):
+    """These recipes keep bf16 parameters and cast inside the step, so the weights
+    cannot say which one ran. `Built.precision_recipe` is the only evidence, which
+    is why `assemble` builds one as well as `step_context`."""
+    entered = install_transformer_engine(monkeypatch)
+    config = bench(composed, **{"precision.name": precision})
+
+    built, names = axes.assemble(plain_model(), config, CPU, framework="native")
+    with axes.step_context(config):
+        pass
+
+    assert "precision.name" in names
+    assert type(built.precision_recipe).__name__ == recipe_class
+    assert type(entered[0]["recipe"]).__name__ == recipe_class
+    assert entered[0]["enabled"] is True
+    assert axis(capture(built, config), "precision.name").applied == precision
+
+
+@pytest.mark.parametrize("tuples", [True, False], ids=["tuple", "bool"])
+@pytest.mark.parametrize("precision", ["mxfp8", "nvfp4"])
+def test_a_device_that_cannot_execute_the_recipe_is_refused(
+    composed, monkeypatch, precision, tuples
+):
+    """The failure this gate exists for. `check_recipe_support` covers MXFP8 and its
+    `elif` chain never mentions NVFP4, so an ungated nvfp4 run on an A100 enters the
+    region without complaint and prints a bf16 number under the fp4 label. Both are
+    gated here instead, and in both answer shapes — `(False, reason)` is truthy, so
+    a gate that read the result as a bool would let every unsupported device
+    through.
+
+    `assemble` does not raise: docs/CONTRACTS.md §2 gives the fp8 decision to
+    `step_context`, and `scripts/bench.py` enters it before the timer. What
+    `assemble` must not do is hand back a recipe, because that is the one thing
+    `applied._capture_precision` would certify the run on.
+    """
+    install_transformer_engine(monkeypatch, available=False, tuples=tuples)
+    config = bench(composed, **{"precision.name": precision})
+
+    built, names = axes.assemble(plain_model(), config, CPU, framework="native")
+
+    assert built.precision_recipe is None
+    assert "precision.name" not in names
+    assert axis(capture(built, config), "precision.name").applied != precision
+    with pytest.raises(axes.UnappliedAxis, match="not executable on this device"):
+        axes.step_context(config)
+
+
+def test_both_fp8_precisions_are_gated_and_neither_is_left_to_transformer_engine():
+    """The table read as a table: a value here with no checker would be entered
+    ungated, and that is the state NVFP4 is in inside Transformer Engine itself."""
+    assert axes.TE_PRECISIONS == {
+        "mxfp8": ("MXFP8BlockScaling", "is_mxfp8_available"),
+        "nvfp4": ("NVFP4BlockScaling", "is_nvfp4_available"),
+    }
+    assert set(axes.TE_PRECISIONS) | {"bf16"} == set(
+        get_args(PrecisionConfig.model_fields["name"].annotation)
+    )
+
+
+def test_a_support_check_that_will_not_answer_is_not_a_device_that_supports_it(
+    composed, monkeypatch
+):
+    """A raising check and a missing one are both "unknown", and unknown has to be
+    a refusal: the alternative is a region entered on a device nobody asked."""
+    install_transformer_engine(monkeypatch)
+    quantization = sys.modules["transformer_engine.pytorch.quantization"]
+    config = bench(composed, **{"precision.name": "nvfp4"})
+
+    def raises():
+        raise RuntimeError("no CUDA device")
+
+    monkeypatch.setattr(quantization, "is_nvfp4_available", raises)
+    with pytest.raises(axes.UnappliedAxis, match="raised RuntimeError"):
+        axes.step_context(config)
+
+    monkeypatch.delattr(quantization, "is_nvfp4_available")
+    with pytest.raises(axes.UnappliedAxis, match="has no is_nvfp4_available"):
+        axes.step_context(config)
+
+
+def test_without_transformer_engine_the_fp8_precisions_are_refused_as_axes(composed):
+    """What this host is, stated rather than stubbed. The refusal is `UnappliedAxis`
+    rather than an ImportError so the audit reads it as the axis declining a value
+    it cannot put into effect, and it names the recipe so a pod record says which
+    of the four call sites gave up and why."""
+    assert importlib.util.find_spec("transformer_engine") is None
+
+    for precision in ("mxfp8", "nvfp4"):
+        config = bench(composed, **{"precision.name": precision})
+        with pytest.raises(axes.UnappliedAxis, match="Transformer Engine recipe") as refusal:
+            axes.step_context(config)
+        assert "not importable here" in str(refusal.value)
+
+
+def test_bf16_still_enters_no_region_and_carries_no_recipe(composed, monkeypatch):
+    """The other half of the pair: a recipe built for every run would put an fp8
+    region around the study's baseline, and `_capture_precision` would then read
+    every bf16 run as the recipe's name."""
+    entered = install_transformer_engine(monkeypatch)
+    config = bench(composed)
+
+    built, names = axes.assemble(plain_model(), config, CPU, framework="native")
+    with axes.step_context(config):
+        pass
+
+    assert built.precision_recipe is None
+    assert "precision.name" not in names
+    assert entered == []
 
 
 # --- the last two to be wired ------------------------------------------------

@@ -1452,9 +1452,12 @@ def test_report_renders_the_refusal_as_a_reason_and_not_as_a_measurement(
     # document can actually draw.
     assert any(line.startswith("| precision-bf16 |") for line in rows_in_tables)
     assert not any(line.startswith("| precision-mxfp8 |") for line in rows_in_tables)
-    # And the reason is in the document, in full.
+    # And the reason is in the document, in full — both halves of the sentence, so
+    # a renderer that printed a category would fail here. The second half used to be
+    # "which is not implemented"; the recipe is implemented now and what is missing
+    # is the package, which is what the refusal says on this host.
     assert "Transformer Engine recipe" in document
-    assert "which is not implemented" in document
+    assert "is not importable here" in document
     assert "지표 없음" in document
 
 
