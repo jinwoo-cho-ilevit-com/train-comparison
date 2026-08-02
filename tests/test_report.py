@@ -13,6 +13,7 @@ exactly how a number goes missing from a report that still renders.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
@@ -20,12 +21,19 @@ from pathlib import Path
 
 import pytest
 
-from trainbench.metrics import summarise
+from trainbench.metrics import summarise, validity
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
 import report  # noqa: E402
+
+# The frozen boundary's own restatement of the training verdict, loaded by path
+# because `tests/contract/` is not a package. It is deliberately a third
+# implementation — what the boundary asserts, rather than what either side
+# happens to do — so it is imported and compared, never merged away.
+CONTRACT_PATH = REPO / "tests" / "contract" / "test_record_report.py"
+RECORD_SAMPLE = REPO / "tests" / "fixtures" / "run_record.sample.json"
 
 BASELINE_LABEL = "baseline-canonical"
 
@@ -752,3 +760,166 @@ def test_probe_only_input_renders_byte_for_byte_as_before(tmp_path):
         baselines=lanes.baselines,
     )
     assert rendered == PROBE_ONLY
+
+
+# --- the training verdict has three definitions -----------------------------
+
+
+def _contract_verdict():
+    """The `record-report` boundary's copy of the rule, executed from its file."""
+    spec = importlib.util.spec_from_file_location("_record_report_boundary", CONTRACT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.training_verdict
+
+
+def _sample(**metrics):
+    payload = json.loads(RECORD_SAMPLE.read_text())
+    payload["metrics"].update(metrics)
+    return payload
+
+
+# One payload per way a run can fail to be training, plus the one that is. Built
+# off the stored sample so every case is a record the producer actually writes.
+VERDICT_CASES = {
+    "trained": (_sample(), True),
+    "no-grad": (_sample(grad_norm=0.0), False),
+    "grad-absent": (_sample(grad_norm=None), False),
+    "frozen": (_sample(trainable_params=0), False),
+    "partly-frozen-full": (_sample(trainable_params=100), False),
+    "loss-flat": (_sample(loss_last=2.8734), False),
+    "loss-absent": (_sample(loss_first=None, loss_last=None), False),
+    "no-peak-on-cuda": (_sample(peak_memory_bytes=0), False),
+}
+
+
+@pytest.mark.parametrize("case", sorted(VERDICT_CASES))
+def test_the_three_training_verdicts_are_one_rule(case):
+    """`training_verdict` is implemented three times — the library the pod applies
+    to its own record, this merge, and the frozen boundary — and nothing compared
+    them. The merge's copy had already drifted: it read `peft.mode` through a
+    `.get` chain that made a record without one pass silently, while the boundary
+    raised on the same payload.
+
+    The verdicts are compared and not the reason strings: the boundary is free to
+    word its refusal differently, and demanding equal prose would fail on an edit
+    that changed nothing about which runs get published.
+    """
+    payload, expected = VERDICT_CASES[case]
+    contract_verdict = _contract_verdict()
+
+    mine = report.training_verdict(payload)
+    theirs = contract_verdict(payload)
+    library = validity.training_verdict(
+        payload["metrics"],
+        peft_mode=payload["config"]["peft"]["mode"],
+        device=payload["device"],
+    )
+
+    assert mine[0] is expected, mine[1]
+    assert theirs[0] is expected, theirs[1]
+    assert library[0] is expected, library[1]
+    assert bool(mine[1]) is not expected
+
+
+def test_a_record_that_cannot_name_its_peft_mode_is_refused_not_passed():
+    """The drift the comparison above found, pinned in the direction it failed.
+    A record with no `config.peft.mode` — a pre-`peft` artifact, or one a
+    framework-owned step filled in — used to reach the speed table as trained,
+    because the merge's own copy turned the missing mode into "no peft check".
+    """
+    payload = _sample()
+    payload["config"].pop("peft")
+
+    trained, reasons = report.training_verdict(payload)
+
+    assert trained is False
+    assert any("peft.mode" in reason for reason in reasons)
+
+
+# --- the deviation threshold comes from the records -------------------------
+
+
+def test_the_declared_tolerance_decides_the_pod_verdicts(tmp_path):
+    """`measurement.baseline_tolerance` existed only in the record: pod validity
+    came from a constant in `report.py`, so a threshold derived on the first pod
+    would have been recorded as `calibrated` beside a table judged at 3%.
+
+    8.1% here is the shape of that campaign — a 6% pod is invalid under the
+    default and valid under the derived number, so the two answers differ.
+    """
+    calibrated = {"baseline_tolerance": 0.081, "baseline_tolerance_status": "calibrated"}
+    baseline_pod(tmp_path, "podA", 1.00, measurement=calibrated)
+    baseline_pod(tmp_path, "podB", 1.00, measurement=calibrated)
+    baseline_pod(tmp_path, "slowpod", 1.06, measurement=calibrated)
+
+    lanes, _, _, rendered = merged(tmp_path)
+    tolerance = report.declared_tolerance(lanes.baselines)
+    verdicts, _, _ = report.baseline_gate(lanes.baselines, lanes.measured, tolerance)
+
+    assert tolerance.value == pytest.approx(0.081)
+    assert tolerance.status == report.TOLERANCE_CALIBRATED
+    assert verdicts["slowpod"].status == report.POD_OK
+    assert "임계값 8.10%" in rendered
+    assert "교정된 임계값이다" in rendered
+    assert "미교정" not in rendered
+
+
+def test_an_uncalibrated_declaration_is_still_judged_and_labelled_uncalibrated(tmp_path):
+    """The control for the test above: `metrics.summarise` writes the schema's
+    default into every record, so the ordinary case declares 3% and says so."""
+    baseline_pod(tmp_path, "podA", 1.00)
+    baseline_pod(tmp_path, "slowpod", 1.06)
+
+    lanes, _, _, rendered = merged(tmp_path)
+    tolerance = report.declared_tolerance(lanes.baselines)
+    verdicts, _, _ = report.baseline_gate(lanes.baselines, lanes.measured, tolerance)
+
+    assert tolerance.value == pytest.approx(report.BASELINE_DEVIATION_LIMIT)
+    assert tolerance.status == "uncalibrated"
+    assert verdicts["slowpod"].status == report.POD_INVALID
+    assert "임계값 3.00%" in rendered
+    assert "미교정 임계값이다" in rendered
+
+
+def test_a_record_from_before_the_field_existed_falls_back_to_the_default(tmp_path):
+    """An artifact with no `metrics.measurement` block is judged at the default
+    rather than left unjudged: the threshold it ran under is the one this file
+    already carried, and refusing the pod would discard a real measurement."""
+    baseline_pod(tmp_path, "podA", 1.00, measurement=None)
+    baseline_pod(tmp_path, "slowpod", 1.06, measurement=None)
+
+    lanes, _, _, _ = merged(tmp_path)
+    tolerance = report.declared_tolerance(lanes.baselines)
+    verdicts, _, _ = report.baseline_gate(lanes.baselines, lanes.measured, tolerance)
+
+    assert tolerance.value == pytest.approx(report.BASELINE_DEVIATION_LIMIT)
+    assert tolerance.status == report.TOLERANCE_UNDECLARED
+    assert verdicts["slowpod"].status == report.POD_INVALID
+
+
+def test_pods_that_declare_different_thresholds_are_judged_by_the_strictest(tmp_path):
+    """Two thresholds in one campaign is not one campaign. Averaging them would
+    admit a pod under a number the other records never declared, so the strictest
+    decides and the spread is printed instead of being resolved silently."""
+    baseline_pod(
+        tmp_path,
+        "podA",
+        1.00,
+        measurement={"baseline_tolerance": 0.081, "baseline_tolerance_status": "calibrated"},
+    )
+    baseline_pod(
+        tmp_path,
+        "slowpod",
+        1.06,
+        measurement={"baseline_tolerance": 0.02, "baseline_tolerance_status": "calibrated"},
+    )
+
+    lanes, _, _, rendered = merged(tmp_path)
+    tolerance = report.declared_tolerance(lanes.baselines)
+    verdicts, _, notes = report.baseline_gate(lanes.baselines, lanes.measured, tolerance)
+
+    assert tolerance.value == pytest.approx(0.02)
+    assert verdicts["slowpod"].status == report.POD_INVALID
+    assert any("서로 다른" in note for note in notes)
+    assert "서로 다른" in rendered

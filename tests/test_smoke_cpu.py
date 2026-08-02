@@ -1518,6 +1518,38 @@ def test_one_unapplicable_setting_refuses_the_whole_plan(tmp_path, config_mappin
     assert bench_entry.preflight(path) == bench_entry.PREFLIGHT_EXIT
 
 
+def test_a_probe_that_declines_an_axis_is_still_started(tmp_path, config_mapping, pod_gpu):  # noqa: F811
+    """A probe pod is launched to answer whether this framework takes this axis,
+    and `applied.ENFORCED_PURPOSES` never held `probe` for that reason.
+    Standing the pod down here published the answer as `결과 없음(기동됨)` — the
+    same cell a pod that booted and died produces — instead of as the refusal it
+    is.
+    """
+    declined = bench(
+        config_mapping, **{"precision.name": "mxfp8", "run.purpose": "probe"}
+    ).model_dump(mode="json")
+    path = plan_file(tmp_path, [plan_item("a", declined)])
+
+    log = io.StringIO()
+    assert bench_entry.preflight(path, stream=log) == 0
+    printed = log.getvalue()
+    assert "declined" in printed
+    assert "REFUSED" not in printed
+
+
+def test_a_probe_on_a_config_this_image_cannot_parse_is_still_refused(tmp_path, pod_gpu):
+    """The other half: a schema the image does not have is not an answer about an
+    axis, it is a setting nothing here can run. That is what the probe branch's
+    preflight was added for — forty container restarts on an A100."""
+    path = plan_file(
+        tmp_path, [plan_item("a", {"run": {"purpose": "probe"}, "unknown_group": {"x": 1}})]
+    )
+
+    log = io.StringIO()
+    assert bench_entry.preflight(path, stream=log) == bench_entry.PREFLIGHT_EXIT
+    assert "REFUSED a:" in log.getvalue()
+
+
 def test_an_empty_plan_is_a_refusal_and_not_a_clean_bill(tmp_path, pod_gpu):
     """Zero settings checked is the state this exists to catch, not the state it
     reports as fine (docs/CONTRACTS.md §6: an empty input is a failure)."""
@@ -2015,13 +2047,18 @@ def test_an_adapter_refusal_is_filed_as_a_result_instead_of_escaping_main(
     how `loader` says so, and `refusing()` caught only `UnappliedAxis` and
     `AppliedMismatch`, so the process died with a traceback, `--out` was never
     written, and docker/entrypoint.sh filed the cell as one nobody attempted.
+
+    The refusal is injected at `loader.refuse_a_build_the_fingerprint_condemns`,
+    the one production reader of the build fingerprint, because that is where a
+    frozen unsloth build actually raises.
     """
     loader = importlib.import_module("trainbench.loader")
 
-    def refuse(framework, fingerprint, context):
+    def refuse(framework, fingerprint, context, *, adapter_attaches_later=False):
+        assert fingerprint["parameter_dtypes"], "the refusal is handed a real fingerprint"
         raise loader.AdapterRefusal(f"{framework} built a model with no trainable parameter")
 
-    monkeypatch.setattr(loader, "_refuse_a_build_the_fingerprint_condemns", refuse)
+    monkeypatch.setattr(loader, "refuse_a_build_the_fingerprint_condemns", refuse)
     config = timing_config(config_mapping, **{"run.purpose": "probe"})
 
     code, record = pod_setting(config, text_only_rows(8))
@@ -2029,8 +2066,9 @@ def test_an_adapter_refusal_is_filed_as_a_result_instead_of_escaping_main(
     assert code == bench_entry.REFUSED_EXIT
     assert record["refusal"]["kind"] == "AdapterRefusal"
     assert record["refusal"]["stage"] == "load_kwargs"
-    # It fired before the model was described, so there is nothing to fingerprint
-    # and the record says nothing rather than null.
+    assert "no trainable parameter" in record["refusal"]["reason"]
+    # It fired inside `describe`, before an `AdapterOut` existed for `refusing()`
+    # to tag, so the record says nothing rather than null.
     assert kernels.RUN_RECORD_KEY not in record
 
 
