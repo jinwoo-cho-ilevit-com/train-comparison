@@ -49,13 +49,35 @@ for every single pod. So the field resets under a pod that the rest of the API
 describes as continuously up, and that reset is the only restart this API will
 ever report. `observe` reads it; nothing else can.
 
-It is also *coarse*, which bounds what may be asked of it. Three healthy running
-pods, read five times twenty-two seconds apart (measured 2026-08-02): the value
-advanced in steps of exactly 29-31 seconds and stood still across a whole poll on
-every one of the three. So a fall is evidence and a *failure to climb* is not —
-"this clock has not moved in twenty seconds" describes a healthy pod here, and a
-liveness test built on it would terminate live pods. Only `restarted`'s fall test
-survives that measurement, and detection lags the restart by up to one refresh.
+It is also *coarse*, and it does not fall monotonically. Those two measurements
+together decide how it may be read. Three healthy running pods, read five times
+twenty-two seconds apart (2026-08-02): the value advanced in steps of exactly
+29-31 seconds and stood still across a whole poll on every one of the three. It is
+served from a cache about half a minute deep, so a *failure to climb* over one
+poll is not evidence — a liveness test built on that would terminate live pods.
+
+And read against a container that was actually cycling (2026-08-02, pod
+xchraazlhvqt6y, ~12s apart while the container restarted):
+
+    RUNNING 0   RUNNING -11   RUNNING -11   RUNNING -9   RUNNING -9
+
+The clock goes *negative* — the cached `now` trails the `startedAt` the newest
+container has just written — and between samples it rises as often as it falls. So
+a test that compares consecutive readings is decided by where the poll happens to
+land: `0 -> -11` fires, `-11 -> -9` does not, and over six minutes of that pod
+nothing fired at all. Comparing against wall time instead takes the timing out of
+it. A container's clock climbs one second per second, so from the first reading
+that carried one, every later reading must report at least that value plus the
+elapsed time, less one cache depth. `outran_its_clock` is that floor;
+`restarted` stays for the fall too large to be cache noise, which fires before the
+floor has had time to rise.
+
+The floor is anchored on the first clock this module *saw*, not on the pod's rental
+age, and that is deliberate. Between renting a pod and starting its container sits
+an image pull — 10-140s across the account's other pods, never measured for this
+repository's multi-gigabyte images — so a launch-anchored floor needs an allowance
+nobody here has measured, and one wide enough to be safe would also detect later
+than this one does.
 """
 
 from __future__ import annotations
@@ -99,13 +121,29 @@ EXITED = "exited"  # RunPod says the container will not run again
 GONE = "gone"  # the API no longer knows this pod
 UNKNOWN = "unknown"  # the API call itself failed; nothing was learned
 
+# How often `runtime.uptimeInSeconds` refreshes, measured 2026-08-02: three healthy
+# pods, five reads twenty-two seconds apart, steps of 29-31s with a full poll of no
+# movement on every one. Both thresholds below are written in terms of it, because
+# both are really the same question — how far the reported clock can sit from the
+# container's real age without anything being wrong.
+CLOCK_REFRESH_SECONDS = 31
+
 # How far `runtime.uptimeInSeconds` may fall between two readings and still be the
-# same container. The field is whole seconds derived from a start timestamp, so
-# two API replicas rounding `now - startedAt` differently can put one second
-# between them; a restart puts the entire life of the dead container between them.
-# Anything in between is not a case this has evidence for, and the cost of the two
-# mistakes is not symmetric — see REASON_RESTARTED.
-UPTIME_JITTER_SECONDS = 1
+# same container. One refresh: two readings can be served from snapshots taken that
+# far apart, so a fall of that size says nothing at all about the container, and
+# the earlier one-second threshold would have read cache noise as a crashloop. A
+# restart puts the entire life of the dead container between the two readings.
+# Smaller falls are not conceded — they are left to the floor below, which does not
+# depend on where the poll lands.
+UPTIME_JITTER_SECONDS = CLOCK_REFRESH_SECONDS
+
+# How far behind wall time a living container's reported clock may fall over a
+# whole watch. Only the *current* reading's staleness can hurt: a stale anchor
+# reports less than the container's real age and so lowers the floor. One refresh
+# is therefore the worst legitimate case, and this is three of them. Unlike a stall
+# test it does not accumulate — a healthy clock that stands still for one poll is
+# still minutes clear of the floor several polls later.
+CLOCK_LAG_ALLOWANCE_SECONDS = 3 * CLOCK_REFRESH_SECONDS
 
 # desiredStatus values that mean the container will not come back.
 TERMINAL_DESIRED_STATUS = frozenset({"TERMINATED", "EXITED"})
@@ -356,26 +394,55 @@ def restarted(previous: int | None, current: int | None) -> bool:
     """Whether these two container clocks belong to two different containers.
 
     A container's uptime only ever climbs while it lives, so a fall is a new
-    container — the single fact this API offers about restarts, the module
-    docstring records how that was established.
+    container. It is the fast test rather than the reliable one: a fall this size
+    is unambiguous the moment it is seen, and whether it is ever seen depends on
+    where the poll lands relative to the restart. `outran_its_clock` is what does
+    not depend on that.
     """
     if previous is None or current is None:
         return False
     return previous - current > UPTIME_JITTER_SECONDS
 
 
+def outran_its_clock(anchor: int | None, elapsed_seconds: float, current: int | None) -> bool:
+    """Whether the pod has been watched longer than its container's clock accounts for.
+
+    `anchor` is the first clock this watch saw and `elapsed_seconds` is the wall
+    time since. A living container's clock climbs one second per second, so it owes
+    the anchor plus everything that has passed, and the only thing that can put it
+    legitimately below that is the cache — one refresh, allowed for three times
+    over. Reporting less than that means the container being clocked is not the one
+    the anchor was taken from.
+
+    This is the rule the observer needed and did not have. Its inputs are one
+    reading and a wall clock, so no poll can land between the restart and the
+    evidence: a container clock reading -11 eight minutes after the clock it was
+    anchored on is a restart on that single reading, and stays one on every reading
+    after it.
+    """
+    if anchor is None or current is None:
+        return False
+    return current + CLOCK_LAG_ALLOWANCE_SECONDS < anchor + elapsed_seconds
+
+
 def observe(
     pod_id: str,
     get_pod: Callable[[str], dict[str, Any] | None] = get,
     previous_uptime: int | None = None,
+    anchor_uptime: int | None = None,
+    since_anchor_seconds: float = 0.0,
 ) -> Reading:
-    """One reading of a pod, judged against the previous reading's container clock.
+    """One reading of a pod, judged against what earlier readings established.
 
-    `previous_uptime` is the only memory here, and it is the caller's: a crashloop
-    is a transition, exactly like completion, and a snapshot cannot name one. Left
-    out, this reads a container on its fortieth start as `running` — which is what
-    the first A100 canary did for ten minutes while the orchestrator waited on a
-    result that was never coming.
+    The memory is the caller's: a crashloop is a transition, exactly like
+    completion, and a snapshot cannot name one. Left out, this reads a container on
+    its fortieth start as `running` — which is what the first A100 canary did for
+    ten minutes while the orchestrator waited on a result that was never coming.
+
+    Two kinds of memory, because the two restart tests need different things.
+    `previous_uptime` is the last reading's clock, for the fall. `anchor_uptime`
+    with the wall time since it was taken is the floor, and it is the one that does
+    not care when the poll lands.
 
     A failed API call returns `unknown` rather than propagating: a transient 502
     from the control plane says nothing about the pod, and treating "we could not
@@ -398,7 +465,9 @@ def observe(
         if runtime is None:
             return Reading(PENDING)
         uptime = container_uptime(runtime)
-        if restarted(previous_uptime, uptime):
+        if restarted(previous_uptime, uptime) or outran_its_clock(
+            anchor_uptime, since_anchor_seconds, uptime
+        ):
             return Reading(RESTARTING, uptime)
         return Reading(RUNNING, uptime)
     except Exception:  # noqa: BLE001 - any transport or shape failure is the same non-answer
@@ -451,12 +520,17 @@ class PodOutcome:
     status: str
     ever_ran: bool
     waited_seconds: float
-    # The container clock behind the last reading. In the ledger it separates the
-    # two pods that both end as `restarted`: one whose container lived seventeen
-    # seconds, and one that ran its plan for forty minutes and was bounced after.
-    # A null here says the API stopped reporting the clock, which is the state in
-    # which restarts cannot be seen at all.
+    # Two container clocks, because a crashloop makes the last one uninformative:
+    # it dates the container that ended the watch, which is seconds old or, when
+    # the cache is behind the restart, negative. `peak_uptime_seconds` dates the
+    # longest-lived container the watch saw, and that is what separates the two
+    # pods that both end as `restarted` — one bouncing every seventeen seconds
+    # without ever finishing, one that ran its plan for forty minutes and was
+    # restarted after publishing it. Neither field says the plan finished; the
+    # uploaded result says that. A null in both says the API stopped reporting the
+    # clock, which is the state in which restarts cannot be seen at all.
     uptime_seconds: int | None = None
+    peak_uptime_seconds: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -466,6 +540,7 @@ class PodOutcome:
             "ever_ran": self.ever_ran,
             "waited_seconds": round(self.waited_seconds, 1),
             "uptime_seconds": self.uptime_seconds,
+            "peak_uptime_seconds": self.peak_uptime_seconds,
         }
 
 
@@ -482,6 +557,14 @@ class _Tracked:
     # it survives a `pending` or `unknown` in between so that a restart hidden
     # behind one failed call is still a fall when the next answer arrives.
     last_uptime: int | None = None
+    # The first clock this watch saw and when, which is what `outran_its_clock`
+    # measures every later reading against. Never re-anchored: the bound it gives
+    # only tightens as the watch runs, and moving it forward onto a reading of the
+    # replacement container is how a crashloop would keep resetting the evidence.
+    anchor_uptime: int | None = None
+    anchor_at: float | None = None
+    # The longest-lived container seen, for the ledger. See PodOutcome.
+    peak_uptime: int | None = None
 
 
 @dataclass
@@ -516,10 +599,18 @@ class PodWatch:
         """One sweep over every watched pod. Finished pods stop being watched."""
         outcomes = []
         for pod_id, state in list(self._tracked.items()):
-            reading = observe(pod_id, self.get_pod, state.last_uptime)
+            now = self.clock()
+            since_anchor = now - state.anchor_at if state.anchor_at is not None else 0.0
+            reading = observe(
+                pod_id, self.get_pod, state.last_uptime, state.anchor_uptime, since_anchor
+            )
             status = reading.status
             if reading.uptime_seconds is not None:
                 state.last_uptime = reading.uptime_seconds
+                if state.anchor_at is None:
+                    state.anchor_uptime, state.anchor_at = reading.uptime_seconds, now
+                if state.peak_uptime is None or reading.uptime_seconds > state.peak_uptime:
+                    state.peak_uptime = reading.uptime_seconds
             if status in (RUNNING, RESTARTING):
                 state.ever_ran = True
             finished = is_finished(status, state.ever_ran)
@@ -536,7 +627,6 @@ class PodWatch:
             else:
                 state.agreed = 0
             state.last_status = status
-            now = self.clock()
             reason = None
             if finished:
                 reason = {
@@ -556,6 +646,7 @@ class PodWatch:
                     ever_ran=state.ever_ran,
                     waited_seconds=now - state.started,
                     uptime_seconds=reading.uptime_seconds,
+                    peak_uptime_seconds=state.peak_uptime,
                 )
             )
             self.forget(pod_id)

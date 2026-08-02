@@ -232,10 +232,17 @@ def test_a_long_healthy_run_is_never_called_a_crashloop():
     assert outcomes[0].waited_seconds > 1000
 
 
-def test_a_second_of_wobble_in_the_container_clock_is_not_a_restart():
-    """Whole seconds off two replicas' `now - startedAt` can disagree by one."""
-    assert pods.observe("p", lambda _: live(199), previous_uptime=200).status == pods.RUNNING
-    assert pods.observe("p", lambda _: live(198), previous_uptime=200).status == pods.RESTARTING
+def test_a_cache_deep_wobble_in_the_container_clock_is_not_a_restart():
+    """The threshold is one refresh of the field, not one second.
+
+    The clock is served from a ~30s cache (measured: three healthy pods, five reads
+    22s apart, steps of 29-31s). Two readings can therefore be answered from
+    snapshots that far apart, and a fall inside one refresh says nothing about the
+    container — at one second it says `restarted`, and the pod is terminated
+    mid-run over cache noise.
+    """
+    assert pods.observe("p", lambda _: live(170), previous_uptime=200).status == pods.RUNNING
+    assert pods.observe("p", lambda _: live(168), previous_uptime=200).status == pods.RESTARTING
 
 
 def test_a_restart_behind_a_failed_call_is_still_a_restart():
@@ -262,6 +269,121 @@ def test_the_outcome_says_how_long_the_container_that_ended_it_had_lived():
     watch.track("p")
     watch.poll()
     assert watch.poll()[0].to_dict()["uptime_seconds"] == 11
+
+
+# --- the clock a cycling container actually reported ---------------------------
+#
+# Read off api.runpod.io on 2026-08-02 while pod xchraazlhvqt6y's container was
+# restarting, one line per read, roughly twelve seconds apart:
+#
+#   05:20:53  RUNNING  uptimeInSeconds = 0
+#   05:21:06  RUNNING  uptimeInSeconds = -11
+#   05:21:18  RUNNING  uptimeInSeconds = -11
+#   05:21:31  RUNNING  uptimeInSeconds = -9
+#   05:21:43  RUNNING  uptimeInSeconds = -9
+#
+# The clock goes negative and it does not fall monotonically, so the rule that
+# compares one reading to the last one is decided by where the poll lands. The
+# orchestrator watched that pod for over six minutes, never terminated it, and it
+# was deleted by hand — the second consecutive real pod that had to be.
+
+CYCLING_CLOCK = [0, -11, -11, -9, -9]
+
+
+def cycling_watch(clock, poll_seconds=12):
+    """A watch over the clock that pod reported, polled the way it was read."""
+    readings = iter([live(CYCLING_CLOCK[k % len(CYCLING_CLOCK)]) for k in range(500)])
+    return pods.PodWatch(
+        timeout_seconds=3600,
+        get_pod=lambda _: next(readings),
+        clock=clock,
+        sleep=clock.advance,
+        poll_seconds=poll_seconds,
+    )
+
+
+def test_no_pair_of_readings_from_the_cycling_pod_is_a_fall():
+    """Why the previous rule could not have fired on this pod, whenever it polled.
+
+    `0 -> -11` is a fall of eleven, which is inside one refresh of a field served
+    from a ~30s cache and therefore not evidence of anything. Every other step
+    rises. There is no poll schedule over this pod that the old rule catches.
+    """
+    steps = list(zip(CYCLING_CLOCK, CYCLING_CLOCK[1:], strict=False))
+    assert [pods.restarted(before, after) for before, after in steps] == [False] * 4
+
+
+def test_a_container_clock_that_never_falls_still_ends_the_watch():
+    """The defect end to end: the same readings, and the pod stops billing."""
+    clock = FakeClock()
+    watch = cycling_watch(clock)
+    watch.track("xchraazlhvqt6y")
+    outcomes = watch.wait_for_any()
+    assert [o.reason for o in outcomes] == [pods.REASON_RESTARTED]
+    assert outcomes[0].status == pods.RESTARTING
+    # Against the 360+ seconds the real observer spent on this pod without ever
+    # deciding anything, and the 3600 it would have been given.
+    assert outcomes[0].waited_seconds < 120
+    assert watch.watching == []
+
+
+def test_the_floor_decides_on_one_reading_and_a_wall_clock():
+    """No second sample, no jitter threshold — and no accusation without the age.
+
+    A negative clock on its own is a container that just came up: the same cache
+    skew puts a *first* container's clock below zero, and terminating on it alone
+    would kill pods at the moment they start running.
+    """
+    read = lambda elapsed: pods.observe(  # noqa: E731
+        "p", lambda _: live(-11), anchor_uptime=0, since_anchor_seconds=elapsed
+    )
+    assert read(8 * 60).status == pods.RESTARTING
+    assert read(0).status == pods.RUNNING
+
+
+def test_a_healthy_pod_whose_clock_is_a_whole_refresh_stale_is_never_terminated():
+    """The floor's other half; without it the test above passes on its own.
+
+    The clock is not read live. It is a snapshot up to one refresh old, so a
+    healthy container under-reports its real age at every single reading for as
+    long as the pod runs — measured at 29-31s steps against 22s polls. A floor
+    that did not allow for that would terminate every pod it watched.
+    """
+    clock = FakeClock()
+    cached = lambda _: live(30 * (int(clock.now + 100) // 30))  # noqa: E731
+    watch = pods.PodWatch(
+        timeout_seconds=100_000,
+        get_pod=cached,
+        clock=clock,
+        sleep=clock.advance,
+        poll_seconds=22,
+    )
+    watch.track("p")
+    for _ in range(200):
+        assert watch.poll() == []
+        clock.advance(22)
+    assert watch.watching == ["p"]
+
+
+def test_the_ledger_separates_a_bounced_run_from_a_container_that_never_ran_one():
+    """Both end as `restarted`; only one of them can have produced a number.
+
+    The last reading cannot tell them apart — the container that ends the watch is
+    seconds old either way, or negative. The longest-lived container the watch saw
+    can, and that is the field the ledger keeps for it.
+    """
+    bounced = watcher({"p": [live(2400), live(2)]})
+    bounced.track("p")
+    bounced.poll()
+    ledger = bounced.poll()[0].to_dict()
+    assert ledger["reason"] == pods.REASON_RESTARTED
+    assert (ledger["uptime_seconds"], ledger["peak_uptime_seconds"]) == (2, 2400)
+
+    clock = FakeClock()
+    crashlooping = cycling_watch(clock)
+    crashlooping.track("xchraazlhvqt6y")
+    # Nothing this pod ever ran reached one second of age.
+    assert crashlooping.wait_for_any()[0].to_dict()["peak_uptime_seconds"] == 0
 
 
 # --- the read has to ask for the clock the tests above are written on -------------
@@ -1187,7 +1309,7 @@ def test_a_bound_token_is_refused_even_when_its_scope_looks_clean(monkeypatch):
 
 def test_no_pod_is_created_for_a_token_that_ignores_the_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(orchestrate, "token_is_bound_to_one_environment", lambda t, p: True)
-    code, created = launch(tmp_path, monkeypatch, ["HF_TOKEN"])
+    code, created, _ = launch(tmp_path, monkeypatch, ["HF_TOKEN"])
     assert code == 2
     assert created == []
 
@@ -1282,7 +1404,7 @@ def test_a_launch_with_no_flag_hands_the_pod_its_own_environment(tmp_path, monke
         orchestrate.pods, "create", lambda spec: created.append(spec) or {"id": "p"}
     )
     monkeypatch.setattr(orchestrate.pods, "terminate", lambda pod_id: None)
-    monkeypatch.setattr(orchestrate.pods, "PodWatch", FakeWatch)
+    monkeypatch.setattr(orchestrate.pods, "PodWatch", fake_watch())
     code = orchestrate.main(
         [
             "--experiment",
@@ -1320,7 +1442,7 @@ def test_the_scope_is_read_from_the_environment_the_pod_is_handed(monkeypatch, t
     monkeypatch.setattr(orchestrate, "image_digest", lambda image: "sha256:" + "ab" * 32)
     monkeypatch.setattr(orchestrate.pods, "create", lambda spec: {"id": "p"})
     monkeypatch.setattr(orchestrate.pods, "terminate", lambda pod_id: None)
-    monkeypatch.setattr(orchestrate.pods, "PodWatch", FakeWatch)
+    monkeypatch.setattr(orchestrate.pods, "PodWatch", fake_watch())
     orchestrate.main(
         [
             "--experiment",
@@ -1340,31 +1462,41 @@ def test_the_scope_is_read_from_the_environment_the_pod_is_handed(monkeypatch, t
 # --- the guard sits on the path to a launch, not beside it ----------------------
 
 
-class FakeWatch:
-    """Every tracked pod finishes on the first wait, so `main`'s loop ends."""
-
-    def __init__(self, timeout_seconds):
-        self.watching = []
-
-    def track(self, pod_id):
-        self.watching.append(pod_id)
-
-    def wait_for_any(self):
-        done, self.watching = self.watching, []
-        return [pods.PodOutcome(p, pods.REASON_EXITED, pods.EXITED, True, 1.0) for p in done]
+def exited(pod_id):
+    return pods.PodOutcome(pod_id, pods.REASON_EXITED, pods.EXITED, True, 1.0)
 
 
-def launch(tmp_path, monkeypatch, reachable):
+def fake_watch(outcome=exited):
+    """A `PodWatch` stand-in: every tracked pod finishes on the first wait, so
+    `main`'s loop ends. `outcome` is how it finished."""
+
+    class FakeWatch:
+        def __init__(self, timeout_seconds):
+            self.watching = []
+
+        def track(self, pod_id):
+            self.watching.append(pod_id)
+
+        def wait_for_any(self):
+            done, self.watching = self.watching, []
+            return [outcome(pod_id) for pod_id in done]
+
+    return FakeWatch
+
+
+def launch(tmp_path, monkeypatch, reachable, outcome=exited):
     """Run the real `main` over one shipped manifest with nothing real behind it."""
     created = []
+    terminated = []
+
     monkeypatch.setattr(orchestrate, "infisical_token", lambda: "pod-token")
     monkeypatch.setattr(orchestrate, "pod_reachable_secret_names", reaching(*reachable))
     monkeypatch.setattr(orchestrate, "image_digest", lambda image: "sha256:" + "ab" * 32)
     monkeypatch.setattr(
         orchestrate.pods, "create", lambda spec: created.append(spec) or {"id": "p"}
     )
-    monkeypatch.setattr(orchestrate.pods, "terminate", lambda pod_id: None)
-    monkeypatch.setattr(orchestrate.pods, "PodWatch", FakeWatch)
+    monkeypatch.setattr(orchestrate.pods, "terminate", terminated.append)
+    monkeypatch.setattr(orchestrate.pods, "PodWatch", fake_watch(outcome))
     code = orchestrate.main(
         [
             "--experiment",
@@ -1376,20 +1508,46 @@ def launch(tmp_path, monkeypatch, reachable):
             str(tmp_path / "orchestrate.json"),
         ]
     )
-    return code, created
+    return code, created, terminated
 
 
 def test_no_pod_is_created_while_the_token_can_read_a_forbidden_secret(tmp_path, monkeypatch):
-    code, created = launch(tmp_path, monkeypatch, ["HF_TOKEN", "RUNPOD_API_KEY"])
+    code, created, _ = launch(tmp_path, monkeypatch, ["HF_TOKEN", "RUNPOD_API_KEY"])
     assert code == 2
     assert created == []
 
 
 def test_a_scoped_token_reaches_the_launch(tmp_path, monkeypatch):
     """The other half: a guard that refuses everything also creates no pod."""
-    code, created = launch(tmp_path, monkeypatch, ["HF_TOKEN"])
+    code, created, _ = launch(tmp_path, monkeypatch, ["HF_TOKEN"])
     assert code == 0
     assert [spec.name for spec in created] == ["trainbench-phase2-loss-gemma4_e2b"]
+
+
+def test_a_cycling_pod_is_terminated_and_the_ledger_says_which_kind_it_was(tmp_path, monkeypatch):
+    """What the orchestrator does once the watch can see it: stop paying for it.
+
+    There is nothing left to wait for. The entrypoint publishes the result before
+    the first restart and `.trainbench-done` makes every later container a no-op,
+    so a pod that keeps coming back only keeps billing. Both clocks reach the
+    ledger, because `restarted` after publishing and `restarted` without ever
+    producing anything are different results.
+    """
+
+    def cycling(pod_id):
+        return pods.PodOutcome(
+            pod_id, pods.REASON_RESTARTED, pods.RESTARTING, True, 84.0, -11, 2400
+        )
+
+    code, _, terminated = launch(tmp_path, monkeypatch, ["HF_TOKEN"], outcome=cycling)
+    assert code == 0
+    assert terminated == ["p"]
+    entry = json.loads((tmp_path / "orchestrate.json").read_text())["experiments"][0]
+    assert entry["outcome"]["reason"] == pods.REASON_RESTARTED
+    assert (entry["outcome"]["uptime_seconds"], entry["outcome"]["peak_uptime_seconds"]) == (
+        -11,
+        2400,
+    )
 
 
 # --- publishing ----------------------------------------------------------------
