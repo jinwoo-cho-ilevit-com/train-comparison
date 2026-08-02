@@ -745,14 +745,14 @@
       "id": "qwen3-vl-query-prompt-may-go-in-twice",
       "axis": "prompt",
       "finding": "gemma-4 레인이 측정 중 발견, 자기 범위 밖 (2026-08-02)",
-      "owner": "미배정",
+      "owner": "packing (wave 2)",
       "verdict": "probe-lane 보고 (2026-08-02)",
       "summary": "Qwen3-VL-Embedding-2B의 쿼리 쪽 프롬프트가 두 번 들어갈 수 있다. `scripts/bench.py:254`가 `config.model.instruction_prompt`(\"Represent the user's input.\")를 `self.prompt`로 두고 `pair_texts`(:318)가 그것을 템플릿 적용 결과 **앞에** 붙인다. 그런데 `trainbench/prompt.py:126-130`은 user 메시지 하나만 넘기므로 체크포인트의 chat_template.jinja가 `messages[0].role == 'system'`을 만족하지 못해 `'<|im_start|>system\\n' + default_system_message + '<|im_end|>\\n'`을 스스로 넣는다 — 그 default_system_message가 같은 문자열이다. 템플릿은 2026-08-02에 Hub에서 직접 읽어 확인했다. 따라서 쿼리 문자열은 `Represent the user's input.<|im_start|>system\\nRepresent the user's input.<|im_end|>...` 모양이 되고, 앞의 사본은 어떤 특수 토큰 밖에 놓인다. **고치지 않고 등록만 한다**: 사실이면 Qwen 두 모델의 모든 측정치가 무엇을 잰 것인지가 바뀌므로 별도 패스가 필요하고, 시퀀스 길이가 바뀌면 tokens/s의 분모도 바뀐다.",
       "closes_when": {
         "criterion": "실제 프로세서로 쿼리 한 행을 토큰화해 \"Represent the user's input.\"에 해당하는 토큰열이 몇 번 나오는지 세고, 1회가 되도록 정하고(프롬프트를 system 메시지로 넘기든 `self.prompt` 접두를 없애든) 그 횟수를 단언하는 테스트를 둘 것. 중복이 아니라고 결론 나면 그 근거를 같은 자리에 기록하고 닫을 것.",
         "command": "실제 Qwen/Qwen3-VL-Embedding-2B 프로세서로 Collate.pair_texts 결과를 토큰화 (GPU 불필요, 체크포인트 다운로드 필요)",
         "expected": "쿼리 1행당 instruction_prompt 토큰열 1회",
-        "observed": "측정 안 함 — 토큰화는 하지 않았다. 확인한 것은 소스 두 곳뿐이다: chat_template.jinja가 system 메시지가 없을 때 default_system_message를 넣는다는 것(Hub에서 직접 읽음), 그리고 pair_texts가 self.prompt를 앞에 붙인다는 것(2026-08-02)."
+        "observed": "쿼리 1행당 2회. 2026-08-03, `AutoProcessor.from_pretrained('Qwen/Qwen3-VL-Embedding-2B')`, transformers 5.14.1, GPU 없이 프로세서만 내려받아 `Collate.pair_texts` 출력을 토큰화했다. instruction_prompt 의 토큰열은 `[65743, 279, 1196, 594, 1946, 13]` (6토큰). 고치기 전 쿼리 1행 `len=30 occurrences=2`, 고친 뒤 `len=24 occurrences=1` — 쿼리 두 행 모두 delta=-6. 체크포인트의 chat_template.jinja 첫 줄이 `{%- set default_system_message = 'Represent the user\\'s input.' -%}` 이고 `messages[0].role != 'system'` 일 때 `'<|im_start|>system\\n' + default_system_message + '<|im_end|>\\n'` 을 스스로 넣는다 — 그것이 configs/model/qwen3_vl_emb_2b.yaml 의 instruction_prompt 와 같은 문자열이라 접두사와 겹쳤다."
       },
       "anchor": {
         "kind": "test",
@@ -761,7 +761,11 @@
           "test_the_query_instruction_prompt_appears_once_in_a_templated_row"
         ]
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-03",
+        "by": "packing (wave 2)",
+        "evidence": "고친 것 — `trainbench/prompt.py::format_prompt` 가 `instruction_prompt` 를 받아 `apply_chat_template` 에 **system 턴으로** 넘긴다. `trainbench/collate.py::Collate._text` 는 그것을 쿼리 쪽에만 건네고, 템플릿 출력 앞에 붙이던 `self.prompt +` 접두는 사라졌다. `prompt_format=raw` 는 템플릿도 default 도 없으므로 지금처럼 행의 머리에 놓는다.\n접두를 그냥 지우지 않은 이유 — 지워도 문자열은 똑같이 옳다(템플릿이 자기 default 로 같은 문장을 넣는다). 그러면 `configs/model/` 을 고쳐도 프롬프트가 안 바뀌는, 선언만 남고 적용되지 않는 축이 된다. system 턴으로 넘기면 config 값이 실제로 들어간 값이 되고, `test_the_instruction_prompt_is_what_the_config_says_and_not_the_template_default` 가 그것을 단언한다.\n검증 — 실 프로세서로 낸 수치는 위 `observed` 그대로다(2026-08-03, 이 워크트리). 앵커 테스트는 네트워크 없이 돌도록 그 템플릿의 default-system 동작만 스텁으로 재현했고, 실 프로세서가 같은 두 문자열을 냈다.\n부수기 증거 — `format_prompt` 의 system 턴 구성을 고치기 전 모양(`return instruction_prompt + processor.apply_chat_template([{user}], ...)`)으로 되돌리고 `uv run pytest tests/test_prompt.py` 를 돌리면 (실행 후 원복):\n    FAILED tests/test_prompt.py::test_the_query_instruction_prompt_appears_once_in_a_templated_row\n      AssertionError: the instruction occurs 2 times in \"Represent the user's input.<|im_start|>system\\nRepresent the user's input.<|im_end|>\\n<|im_start|>user\\nwhat colour is the roof<|im_end|>\\n<|im_start|>assistant\\n\"\n      assert 2 == 1\n    FAILED tests/test_prompt.py::test_the_instruction_prompt_is_what_the_config_says_and_not_the_template_default\n    2 failed, 11 passed\n변이 전에 인터프리터가 잡는 정의를 확인했다: `trainbench/prompt.py 100` (`format_prompt.__code__`).\n시퀀스 길이에 준 변화 — Qwen3-VL-Embedding-2B 의 **쿼리** 행만 6토큰 짧아진다. 이전 Phase 0 의 Qwen 측정치는 이 6토큰을 분모에 포함한 값이고, 앞으로의 값과 직접 비교되지 않는다. positive 행은 바뀌지 않는다.\n닫지 않은 채로 남기는 관측 — 이 체크포인트의 템플릿은 system 턴이 없는 행에도 같은 문장을 넣으므로 **positive 행도 instruction 을 1회 싣는다**(측정: positive `occurrences=1`). `docs/model-spec.md` 의 '쿼리 쪽만 싣는다'는 이 템플릿 아래에서는 성립하지 않는다. 이 레인의 변경으로 생긴 것이 아니고(고치기 전에도 같았다) `docs/model-spec.md` 는 이 레인의 소유가 아니라서 `.plans/notes/packing.md` 로 넘긴다."
+      }
     }
   ]
 }

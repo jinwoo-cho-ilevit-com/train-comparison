@@ -195,7 +195,8 @@ class Collate:
         # The query side carries the model's official instruction prompt; the
         # positive side never does (docs/model-spec.md). It is a constant on one
         # side of the pair, which is also why `tokens` is not a clean comparison
-        # across models — METRIC_DEFINITIONS says so in the result.
+        # across models — METRIC_DEFINITIONS says so in the result. It is handed to
+        # `format_prompt`, never prefixed to its output: see `_text`.
         self.prompt = config.model.instruction_prompt or ""
         # Whether this processor can take pixels at all, read off the processor
         # rather than branched on `model.arch`: a text-only checkpoint returns a
@@ -204,13 +205,18 @@ class Collate:
         # text-only view of an image corpus.
         self.accepts_images = getattr(processor, "image_processor", None) is not None
 
-    def _text(self, raw: str | None, with_image: bool) -> str:
+    def _text(self, raw: str | None, with_image: bool, instruction: str = "") -> str:
         """One side of a pair, in this model's own prompt format.
 
         Both `add_generation_prompt` and `prompt_format` are the config's
         (docs/CONTRACTS.md §5) — with last-token pooling the first decides which
         token becomes the embedding, and the second decides whether there is a chat
         template to pass it to at all. Neither can be defaulted here.
+
+        `instruction` goes through `format_prompt` rather than being concatenated
+        onto its result, which is the whole of the fix for
+        `qwen3-vl-query-prompt-may-go-in-twice`: the Qwen template inserts the same
+        instruction itself when the row carries no system turn.
         """
         text = MMEB_IMAGE_MARKER.sub("", raw or "").strip()
         return format_prompt(
@@ -219,6 +225,7 @@ class Collate:
             with_image=with_image,
             prompt_format=self.config.model.prompt_format,
             add_generation_prompt=self.config.model.add_generation_prompt,
+            instruction_prompt=instruction,
         )
 
     def pair_texts(self, rows: list[dict[str, Any]], *, with_images: bool = True) -> PairTexts:
@@ -260,7 +267,7 @@ class Collate:
             # no placeholder, which is what lets text-only and image rows share a
             # batch: the flat image list below then has exactly as many entries as
             # there are placeholders, in the same order.
-            queries.append(self.prompt + self._text(row.get("qry"), side_images[0]))
+            queries.append(self._text(row.get("qry"), side_images[0], self.prompt))
             positives.append(self._text(row.get("pos_text"), side_images[1]))
             query_counts.append(int(side_images[0]))
             positive_counts.append(int(side_images[1]))
