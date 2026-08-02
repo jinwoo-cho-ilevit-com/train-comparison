@@ -411,7 +411,7 @@ train-comparison/
 │   ├── train/                 # 단일 플래그 knob (batch, seed, checkpointing 등)
 │   ├── experiment/            # orchestrate.py가 읽는 매니페스트. defaults에 없어 합성되지 않음
 │   ├── attn/                  # sdpa, fa2, fa3, fa4, flex
-│   ├── kernel/                # none, liger, fla, kernels_hub
+│   ├── kernel/                # none, liger, fla
 │   ├── precision/             # bf16, mxfp8, nvfp4
 │   ├── compile/               # none, default, max_autotune, regional
 │   ├── optim/                 # adamw_fused, adamw_8bit, muon
@@ -434,6 +434,7 @@ train-comparison/
 │   ├── axes.py                # 축을 켜는 유일한 지점
 │   ├── applied.py             # 켜졌는지 읽는 유일한 지점
 │   ├── kernels.py             # 바인딩된 어텐션 커널의 신원 + 런타임 fetch 차단
+│   ├── loader.py              # 프레임워크 어댑터 레지스트리 + 빌드 지문
 │   ├── pods.py                # RunPod pod 수명주기
 │   ├── metrics/               # 타이밍 런이 보고하는 지표와 그 측정 방법
 │   └── probe/                 # 프레임워크별 적재·1step 검증 어댑터
@@ -451,6 +452,7 @@ train-comparison/
 │   ├── contract/              # 레인 경계 계약 — 어느 레인도 소유하지 않고 팬아웃 전에 쓰인다
 │   ├── fixtures/              # 경계별 대표 페이로드 — 계약의 진실은 산문이 아니라 이 파일이다
 │   ├── conftest.py
+│   ├── test_collate.py
 │   ├── test_config.py
 │   ├── test_applied.py
 │   ├── test_audit.py
@@ -459,6 +461,7 @@ train-comparison/
 │   ├── test_device_seed.py
 │   ├── test_embedding.py
 │   ├── test_kernels.py
+│   ├── test_loader.py
 │   ├── test_metrics.py
 │   ├── test_pods.py
 │   ├── test_probe.py
