@@ -739,6 +739,28 @@
         "by": "team-lead (Phase 0 캠페인 판독)",
         "evidence": "(a) 닫혔다 — 실 파드 발사에서 오케스트레이터의 읽기가 성공했다. Phase 0 18파드 전부 `outcome` null 아님, `unreadable` null (실험 항목·outcome 양쪽 모두 0건). 읽기가 한 번도 실패하지 않았다.\n\n(b)는 실물에서 발동하지 않았다 — 읽기가 실패하지 않았으므로 천장이 발동할 조건이 없었다. 그 절반은 CPU 변이(M3: 천장 분기를 `elif False`로 → `assert 'timeout' == 'unreadable'`)로만 확인됐고 **실물에서는 측정 안 함**이다. 조건부 절반이라 다음 전송 장애 때 답한다.\n\n전송 수정 자체의 라이브 증거 (2026-08-02, pods.get 경유):\n    USER_AGENT=trainbench/1.0  -> {'id':..., 'desiredStatus':'RUNNING', 'runtime':{'uptimeInSeconds':163694}}\n    헤더 제거                  -> RunPod REST POST https://api.runpod.io/graphql -> 403: error code: 1010"
       }
+    },
+    {
+      "id": "qwen3-vl-query-prompt-may-go-in-twice",
+      "axis": "prompt",
+      "finding": "gemma-4 레인이 측정 중 발견, 자기 범위 밖 (2026-08-02)",
+      "owner": "미배정",
+      "verdict": "probe-lane 보고 (2026-08-02)",
+      "summary": "Qwen3-VL-Embedding-2B의 쿼리 쪽 프롬프트가 두 번 들어갈 수 있다. `scripts/bench.py:254`가 `config.model.instruction_prompt`(\"Represent the user's input.\")를 `self.prompt`로 두고 `pair_texts`(:318)가 그것을 템플릿 적용 결과 **앞에** 붙인다. 그런데 `trainbench/prompt.py:126-130`은 user 메시지 하나만 넘기므로 체크포인트의 chat_template.jinja가 `messages[0].role == 'system'`을 만족하지 못해 `'<|im_start|>system\\n' + default_system_message + '<|im_end|>\\n'`을 스스로 넣는다 — 그 default_system_message가 같은 문자열이다. 템플릿은 2026-08-02에 Hub에서 직접 읽어 확인했다. 따라서 쿼리 문자열은 `Represent the user's input.<|im_start|>system\\nRepresent the user's input.<|im_end|>...` 모양이 되고, 앞의 사본은 어떤 특수 토큰 밖에 놓인다. **고치지 않고 등록만 한다**: 사실이면 Qwen 두 모델의 모든 측정치가 무엇을 잰 것인지가 바뀌므로 별도 패스가 필요하고, 시퀀스 길이가 바뀌면 tokens/s의 분모도 바뀐다.",
+      "closes_when": {
+        "criterion": "실제 프로세서로 쿼리 한 행을 토큰화해 \"Represent the user's input.\"에 해당하는 토큰열이 몇 번 나오는지 세고, 1회가 되도록 정하고(프롬프트를 system 메시지로 넘기든 `self.prompt` 접두를 없애든) 그 횟수를 단언하는 테스트를 둘 것. 중복이 아니라고 결론 나면 그 근거를 같은 자리에 기록하고 닫을 것.",
+        "command": "실제 Qwen/Qwen3-VL-Embedding-2B 프로세서로 Collate.pair_texts 결과를 토큰화 (GPU 불필요, 체크포인트 다운로드 필요)",
+        "expected": "쿼리 1행당 instruction_prompt 토큰열 1회",
+        "observed": "측정 안 함 — 토큰화는 하지 않았다. 확인한 것은 소스 두 곳뿐이다: chat_template.jinja가 system 메시지가 없을 때 default_system_message를 넣는다는 것(Hub에서 직접 읽음), 그리고 pair_texts가 self.prompt를 앞에 붙인다는 것(2026-08-02)."
+      },
+      "anchor": {
+        "kind": "test",
+        "file": "tests/test_prompt.py",
+        "names": [
+          "test_the_query_instruction_prompt_appears_once_in_a_templated_row"
+        ]
+      },
+      "closed": null
     }
   ]
 }
