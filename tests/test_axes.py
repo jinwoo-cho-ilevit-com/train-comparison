@@ -1015,39 +1015,35 @@ def test_an_fla_below_the_floor_does_not_bind_kernel_none(composed, monkeypatch)
     assert axes.patch(qwen35(composed, **{"kernel.name": "fla"})) == ["kernel.name"]
 
 
-def test_kernels_hub_is_dropped_for_both_reasons_and_no_run_can_select_it():
-    """`configs/kernel/` is what a composed run picks from, and the value is not in
-    it any more (PLAN.md decision 6). The schema's Literal still offers it, so a
-    config built straight from the schema still reaches `patch` and still has to be
-    refused — with both reasons, because they hold separately: the call site needs
-    a model, and the native pin `kernels==0.16.0` sits exactly on transformers'
-    exclusive upper bound, which turns hub dispatch into a silent identity
-    decorator wherever it were applied."""
+def test_kernels_hub_is_dropped_from_every_place_that_could_still_offer_it():
+    """PLAN.md decision 6, closed on both sides.
+
+    Deleting `configs/kernel/kernels_hub.yaml` alone put the value out of reach of a
+    *composed* run and nothing else: `scripts/bench.py::preflight` is handed configs
+    built straight from the schema, and the Literal kept offering it. So the config
+    file, the schema and the patcher table are asserted together — the two reasons
+    the value is gone (the call site needs a model, and `envs/native`'s
+    `kernels==0.16.0` sits on transformers' exclusive upper bound) hold everywhere,
+    not only where Hydra composes.
+    """
     assert not (CONFIGS / "kernel" / "kernels_hub.yaml").exists()
     assert sorted(p.stem for p in (CONFIGS / "kernel").glob("*.yaml")) == ["fla", "liger", "none"]
+    assert "kernels_hub" not in get_args(KernelConfig.model_fields["name"].annotation)
+    assert "kernels_hub" not in axes.KERNEL_PATCHERS
 
 
-def test_kernels_hub_from_the_schema_is_still_refused_with_both_reasons(composed):
-    """The path `scripts/bench.py::preflight` walks: it is handed a plan whose
-    configs come from the schema rather than from Hydra, so deleting the config
-    file does not put this value out of reach."""
-    config = bench(composed, **{"kernel.name": "kernels_hub"})
+def test_a_kernel_the_schema_no_longer_offers_is_refused_rather_than_a_key_error(composed):
+    """The value is gone from the schema, so nothing composes it — but `patch` is
+    also reachable from a hand-built config (a stale plan JSON on a pod is exactly
+    that). It has to refuse in this module's own vocabulary rather than die on a
+    `KeyError` that reads as a broken axis."""
+    config = bench(composed)
+    object.__setattr__(config.kernel, "name", "kernels_hub")
 
     with pytest.raises(axes.UnappliedAxis) as refusal:
         axes.patch(config)
 
-    # Each of these is the message doing one of its two jobs. Matching one word
-    # would pass a message that says "not implemented", and matching only the first
-    # three would pass one that forgot the pin — which is the reason that survives
-    # if the call site is ever moved.
-    message = str(refusal.value)
-    for named in (
-        "from_pretrained(use_kernels=True)",
-        "kernelize(model)",
-        "docs/CONTRACTS.md",
-        "kernels==0.16.0",
-    ):
-        assert named in message, named
+    assert "KERNEL_PATCHERS" in str(refusal.value)
 
 
 # --- freeze.ple --------------------------------------------------------------
@@ -2085,22 +2081,25 @@ def test_ddp_wraps_the_model_and_reads_back_as_ddp(composed, monkeypatch):
     assert axis(capture(built, config), "parallel.strategy").applied == "ddp"
 
 
-def test_fsdp2_shards_in_place_and_the_capture_cannot_yet_see_it(composed, monkeypatch):
-    """The axis is applied and the run is then refused, and both halves are real.
+def test_fsdp2_shards_in_place_and_the_capture_reads_it_off_the_mro(composed, monkeypatch):
+    """`fully_shard` mutates: the module keeps its identity and gains `FSDPModule`
+    in its MRO under a class renamed `FSDP<original>`
+    (`torch/distributed/fsdp/_fully_shard/_fsdp_init.py:421-430`, torch 2.13.0,
+    read in this worktree's install). The stub reproduces both bases in that order.
 
-    `fully_shard` mutates: the module keeps its identity and gains `FSDPModule` in
-    its MRO under a class renamed `FSDP<original>`
-    (`torch/distributed/fsdp/_fully_shard/_fsdp_init.py:404-430`, torch 2.13.0).
-    Nothing named `FullyShardedDataParallel` exists anywhere in the result, and
-    that is the name `applied.PARALLEL_WRAPPERS` looks for — it is FSDP1's wrapper
-    class. Wrapping with FSDP1 to satisfy the probe would be FSDP1 measured as
-    FSDP2, so this records the gap instead (`.plans/notes/axes.md`).
+    Nothing named `FullyShardedDataParallel` exists anywhere in the result — that
+    is FSDP1's wrapper class, and matching it was how the capture missed FSDP2
+    entirely and would have labelled an FSDP1 run `fsdp2`. What the capture reads
+    now is the MRO, which is what the API guarantees; the class *name* is whatever
+    the checkpoint's class was with a prefix.
     """
+    from torch.distributed.fsdp import FSDPModule
+
     world_of(monkeypatch, 2)
     sharded = []
 
     def fully_shard(module, **kwargs):
-        module.__class__ = type(f"FSDP{type(module).__name__}", (type(module),), {})
+        module.__class__ = type(f"FSDP{type(module).__name__}", (FSDPModule, type(module)), {})
         sharded.append(module)
         return module
 
@@ -2114,7 +2113,24 @@ def test_fsdp2_shards_in_place_and_the_capture_cannot_yet_see_it(composed, monke
     assert "FullyShardedDataParallel" not in {
         type(m).__name__ for _, m in built.model.named_modules()
     }
-    assert axis(capture(built, config), "parallel.strategy").applied != "fsdp2"
+    assert axis(capture(built, config), "parallel.strategy").applied == "fsdp2"
+
+
+def test_fsdp1s_wrapper_is_named_rather_than_reported_as_the_axis_value(composed):
+    """FSDP1 and FSDP2 shard differently and this study measures one of them. A
+    model that arrived through the old API is given a name no setting carries, so
+    `assert_matches` stops it — the table used to map this class straight onto
+    `fsdp2`, which would have published FSDP1's step time under FSDP2's label."""
+
+    class FullyShardedDataParallel(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+    built = Built(model=FullyShardedDataParallel(plain_model()))
+    config = bench(composed, **{"parallel.strategy": "fsdp2"})
+
+    assert axis(capture(built, config), "parallel.strategy").applied == "fsdp1"
 
 
 # --- parallel.strategy=zero2/zero3 and train.offload -------------------------
@@ -4628,3 +4644,125 @@ def test_a_quality_run_is_enforced_exactly_like_a_timing_run(composed):
 
     with pytest.raises(AppliedMismatch, match="purpose=quality"):
         assert_matches(state, config)
+
+
+# --- the adapter's two demands on this module --------------------------------
+#
+# `trainbench/loader.py` states two things it needs and enters neither itself:
+# the axes its framework computes inside its own training step, and the numeric
+# regime that framework trains in. Both arrive through `assemble`/`step_context`
+# because docs/CONTRACTS.md §2 fixes those as the sites, and until this wave
+# nothing carried either one across.
+
+
+def test_an_adapter_can_declare_the_axes_it_owns_and_capture_marks_them(composed):
+    """tevatron's `DenseModel.forward` computes the loss and the cross-device
+    gather itself (decision 5), so those two axes are not ours to read back. The
+    declaration comes off the object the adapter returned — `assemble` puts it on
+    `Built` — and `capture` turns it into the third axis state rather than into a
+    mismatch that would refuse every tevatron cell."""
+    config = bench(composed)
+
+    built, _ = axes.assemble(
+        plain_model(),
+        config,
+        CPU,
+        framework="tevatron",
+        owned_axes={"loss.name": "DenseModel.forward computes it"},
+    )
+
+    assert "loss.name" in built.owned_axes
+    state = capture(built, config)
+    owned = axis(state, "loss.name")
+    assert owned.state == "framework_owned"
+    assert owned.owner == "tevatron"
+    # Never a certification: an owned axis carries no value, or an adapter would be
+    # certifying itself for having declined to look.
+    assert owned.applied is None
+    # And an enforced run is not refused *over this axis*. Other axes on this CPU
+    # host still disagree, which is what the message is read for rather than the
+    # exception type — the whole failure being fixed here is `loss.name` alone
+    # stopping every tevatron timing run.
+    with pytest.raises(AppliedMismatch) as refusal:
+        assert_matches(state, config)
+    assert "loss.name" not in str(refusal.value)
+
+
+def test_an_adapter_cannot_own_an_axis_the_boundary_does_not_allow(composed):
+    """`FRAMEWORK_OWNABLE` is what bounds the disclaimer. Passing the declaration
+    through `assemble` must not become a way around it — an adapter free to own
+    `optim.name` could own everything, and capture would certify a run by not
+    looking at it."""
+    config = bench(composed)
+
+    built, _ = axes.assemble(
+        plain_model(),
+        config,
+        CPU,
+        framework="tevatron",
+        owned_axes={"optim.name": "not the adapter's to claim"},
+    )
+
+    claimed = axis(capture(built, config), "optim.name")
+    assert claimed.state != "framework_owned"
+    assert claimed.owner is None
+
+
+def test_the_context_a_framework_requires_is_established_and_really_on(composed):
+    """axolotl loads `embed_tokens`/`lm_head` in fp32 beside a bf16 body and needs
+    `torch.autocast` for the matmul between them (decision 1). The adapter states
+    the requirement and never opens its own `with`; this is the site that enters
+    it. Asserted through `torch.is_autocast_enabled`, not through the returned
+    object's type — `torch.autocast` constructs happily and then disables itself."""
+    required = SimpleNamespace(
+        kind="autocast", device_type="cpu", dtype="bfloat16", reason="axolotl trains in autocast"
+    )
+
+    assert not torch.is_autocast_enabled("cpu")
+    with axes.step_context(bench(composed), required):
+        assert torch.is_autocast_enabled("cpu")
+        assert torch.get_autocast_dtype("cpu") == torch.bfloat16
+    assert not torch.is_autocast_enabled("cpu")
+
+
+def test_a_required_context_for_a_device_this_run_is_not_on_is_refused(composed):
+    """`torch.autocast(device_type="cuda")` on a host with no CUDA warns and sets
+    `enabled=False` (`torch/amp/autocast_mode.py`), so the step would be measured
+    outside the framework's own regime under the framework's own label. Refusing is
+    the only outcome that does not publish that."""
+    required = SimpleNamespace(
+        kind="autocast", device_type="cuda", dtype="bfloat16", reason="axolotl trains in autocast"
+    )
+
+    with pytest.raises(axes.UnappliedAxis, match="cuda autocast"):
+        axes.step_context(bench(composed), required)
+
+
+def test_a_kind_this_site_cannot_establish_is_refused_by_name(composed):
+    """The contract fixes the set of kinds an adapter may ask for; this table is
+    the other half. A kind admitted there and missing here would be a contract
+    promising a region nothing enters."""
+    required = SimpleNamespace(
+        kind="graph_capture", device_type="cpu", dtype="bfloat16", reason="invented"
+    )
+
+    with pytest.raises(axes.UnappliedAxis, match="STEP_CONTEXT_ESTABLISHERS"):
+        axes.step_context(bench(composed), required)
+
+
+def test_an_fp8_recipe_and_a_required_context_cannot_both_be_in_effect(composed):
+    """Two answers to what precision the step runs in. Nesting them would report an
+    fp8 number for a step that also ran under bf16 autocast, and the axis would
+    still read back as applied because the recipe object exists either way.
+
+    Decided on the requested precision rather than on whether the recipe can be
+    built, which is what makes it reachable on a host with no Transformer Engine —
+    asking the recipe first put this branch behind an import that fails here.
+    """
+    required = SimpleNamespace(
+        kind="autocast", device_type="cpu", dtype="bfloat16", reason="axolotl trains in autocast"
+    )
+    config = bench(composed, **{"precision.name": "mxfp8"})
+
+    with pytest.raises(axes.UnappliedAxis, match="two regimes"):
+        axes.step_context(config, required)

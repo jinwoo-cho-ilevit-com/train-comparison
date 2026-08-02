@@ -171,7 +171,7 @@ class AttnConfig(Strict):
 
 
 class KernelConfig(Strict):
-    name: Literal["none", "liger", "fla", "kernels_hub"] = Axis()
+    name: Literal["none", "liger", "fla"] = Axis()
 
 
 class PrecisionConfig(Strict):
@@ -314,8 +314,9 @@ class RunConfig(Strict):
     # probe   : Phase 0 load-and-one-step check.
     purpose: Literal["timing", "profile", "quality", "probe"]
     profiler: bool = False
-    trackio_project: str
-    trackio_space_id: str | None = None
+    # No experiment-tracking fields. Results are JSON written by
+    # `trainbench/record.py`, and a tracker that reaches the network during a
+    # measured step perturbs the thing being measured (PLAN.md decision 3).
     # The output directory is Hydra's (`hydra.run.dir`); duplicating it here would
     # give two sources of truth. Read it at runtime via config.output_dir().
 

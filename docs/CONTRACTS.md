@@ -161,7 +161,7 @@ forward를 감싼다. 갈 곳 없는 축은 검증되지 않는 어딘가에서 
 
 | 호출 지점 | 담는 축 |
 |---|---|
-| `patch` | `kernel.name` (liger/fla/kernels_hub) |
+| `patch` | `kernel.name` (liger/fla) |
 | `load_kwargs` | `attn.name`, (qlora 양자화 config, precision의 적재 dtype) |
 | `assemble` -> 모델 | `freeze.vision_tower`, `freeze.ple`, `compile.mode`, `peft.mode`, `train.gradient_checkpointing`, `precision.name`의 모듈 교체(torchao) |
 | `assemble` -> 옵티마이저 | `optim.name`, `train.offload` |
@@ -169,9 +169,21 @@ forward를 감싼다. 갈 곳 없는 축은 검증되지 않는 어딘가에서 
 | `assemble` -> 손실 | `loss.name`, `parallel.cross_device_negatives` |
 | `assemble` -> 공동 초기화 | `parallel.strategy` (FSDP2/DDP는 모델 래핑, ZeRO는 모델+옵티마이저+로더 동시) |
 | `assemble` -> `framework` 인자 | `framework.name` |
-| `step_context` | `precision.name`의 fp8 autocast |
+| `step_context` | `precision.name`의 fp8 autocast, 그리고 어댑터의 `required_step_context` |
 
 빠진 축이 없다. D가 이 표에서 벗어나는 축을 만나면 그것은 계약 변경이다.
+
+`step_context`는 축 하나가 아니라 **정밀도 컨텍스트를 세우는 유일한 자리**다. 프레임워크가
+상류에서 이미 다른 수치 체제로 학습하면(axolotl 은 `embed_tokens`/`lm_head` 를 fp32 로 두고
+나머지를 bf16 으로 적재하므로 `torch.autocast` 없이는 matmul 이 죽는다) 어댑터는
+`AdapterOut.required_step_context` 로 **요구만** 하고 자기 `with` 를 열지 않는다.
+`axes.step_context(config, required)` 가 그것을 세운다 — `scripts/bench.py` 가 넘긴다.
+둘이 동시에 요구되면 거부한다: fp8 recipe 와 bf16 autocast 는 같은 질문에 대한 두 답이고,
+겹쳐 켜면 한 라벨 아래 두 체제로 잰 숫자가 된다.
+
+그 결과 **native(순수 bf16)와 axolotl(autocast)은 다른 수치 체제에서 비교된다.** 이 사실은
+`documented_entry_point.differs` 와 `required_step_context` 양쪽에 남고, 결과를 읽는 쪽이
+프레임워크 차이로 오해하지 않도록 결과에 실려야 한다.
 
 `framework.name`은 훅이 적용하는 것이 아니라 **어댑터가 자기 이름을 리터럴로 넘겨서**
 결정된다. `IMPLEMENTED`에 있지만 거짓 등재가 아니다 — 그 리터럴을 쓴 파일이 곧 어느

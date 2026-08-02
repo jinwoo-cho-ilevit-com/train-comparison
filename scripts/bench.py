@@ -46,7 +46,7 @@ from trainbench.collate import Encode, build_collate, load_pairs
 from trainbench.config import load_bench_config, to_bench_config
 from trainbench.config_schema import BenchConfig, axis_knobs
 from trainbench.device import get_device
-from trainbench.embedding import align_padding_side, packed_last_token_pool
+from trainbench.embedding import packed_last_token_pool
 from trainbench.probe import steps
 from trainbench.record import build_record, write_json
 from trainbench.seed import set_seed
@@ -63,6 +63,12 @@ REFUSED_EXIT = 3
 # and declined, this one is a pod that measured nothing at all, and the pod log is
 # where both are read.
 PREFLIGHT_EXIT = 4
+
+# Exit code for a run the memory ceiling stopped partway through. Distinct from
+# REFUSED_EXIT because the two are read differently in the pod log: that one is a
+# setting declined before it measured anything, this one is a setting that was
+# measured until the device ran out. Both write a result file.
+OOM_EXIT = 5
 
 # The GPUs this image's compiled kernels cover, written into the image by
 # `docker/Dockerfile.framework` beside the `FLASH_ATTN_CUDA_ARCHS` /
@@ -140,7 +146,13 @@ def to_device(tensors: dict[str, Any], device: torch.device, dtype: torch.dtype)
     return moved
 
 
-def train(built: Any, loader: Any, config: BenchConfig, device: torch.device) -> dict[str, Any]:
+def train(
+    built: Any,
+    loader: Any,
+    config: BenchConfig,
+    device: torch.device,
+    required_context: Any = None,
+) -> dict[str, Any]:
     """The measured loop.
 
     **One step = fetch + transfer + forward + backward + optimizer step, all inside
@@ -153,10 +165,22 @@ def train(built: Any, loader: Any, config: BenchConfig, device: torch.device) ->
     construction, and PLAN.md's dataloader-bottleneck check — a prerequisite for
     Phase 2 — cannot be performed at all.
 
-    Every step goes inside `axes.step_context(config)`. The fp8 recipes wrap the
-    forward pass, so a loop that applied them anywhere else would report an fp8
-    number for a step that never entered the recipe — and the capture probe would
-    still find the swapped modules and call it a match.
+    Every step goes inside `axes.step_context(config, required_context)`. The fp8
+    recipes wrap the forward pass, so a loop that applied them anywhere else would
+    report an fp8 number for a step that never entered the recipe — and the capture
+    probe would still find the swapped modules and call it a match.
+    `required_context` is the framework's own regime (axolotl trains under
+    `torch.autocast(bfloat16)`); it enters at the same site and never at the
+    adapter's, so there is one place a precision context is established.
+
+    **`optimizer.zero_grad` opens the step rather than closing it.** Each timed
+    window still holds exactly one zero_grad, one accumulation and one optimizer
+    step, so the window is unchanged in content; what changes is that the final
+    step's gradients survive the loop. `metrics.gradient_norm` and
+    `metrics.parameter_counts` are read there, outside the timer and before
+    anything wipes them — read after a zero_grad they are a confident zero, which
+    is the exact value they exist to distinguish, and read inside the timer they
+    would put a float64 reduction over every parameter into the measurement.
 
     Nothing inside the window reads a device tensor into Python. `float(loss)` is
     `.item()`, a blocking device-to-host copy, and putting it after `backward()`
@@ -204,7 +228,10 @@ def train(built: Any, loader: Any, config: BenchConfig, device: torch.device) ->
             "the knob would name one thing while the run measured another."
         )
     built.model.train()
-    timer = metrics.StepTimer(device)
+    # The instrument the run declared, not this file's choice of clock. It refuses
+    # rather than falls back: `cuda_event` off CUDA would report a wall-clock number
+    # under a device-measurement label.
+    timer = metrics.build_timer(device, config.measurement.instrument)
     total = config.train.steps
     discard = config.train.warmup_discard_steps
     grad_accum = config.train.grad_accum
@@ -231,7 +258,11 @@ def train(built: Any, loader: Any, config: BenchConfig, device: torch.device) ->
         if step == discard:
             metrics.reset_peak_memory(device)
         measured = step >= discard
-        with timer, axes.step_context(config):
+        with timer, axes.step_context(config, required_context):
+            # Opens the step: see the docstring. The gradients this clears are the
+            # previous step's, and the last step's are left standing for the
+            # validity read below.
+            built.optimizer.zero_grad(set_to_none=True)
             for _ in range(grad_accum):
                 # `grad_accum` distinct micro-batches, not the same one N times.
                 # Feeding one batch repeatedly gives identical sequence lengths,
@@ -293,24 +324,39 @@ def train(built: Any, loader: Any, config: BenchConfig, device: torch.device) ->
                     for name in counted:
                         counted[name] += getattr(micro, name)
             built.optimizer.step()
-            built.optimizer.zero_grad(set_to_none=True)
 
-    kept = max(1, len(timer.durations) - discard)
+    # Outside the timer, before anything clears the gradients. Without these the
+    # `record-report` validity gate is true of the fixture and of nothing else: a
+    # run over a fully frozen graph produces a finite loss and a full set of step
+    # times, and three cells of the 2026-08-02 campaign were published that way.
+    validity = metrics.parameter_counts(built.model)
+    validity["grad_norm"] = metrics.gradient_norm(built.model)
+
+    durations = timer.durations
+    kept = max(1, len(durations) - discard)
     summary = metrics.summarise(
-        timer.durations,
+        durations,
         discard=discard,
         rows_per_step=counted["rows"] / kept,
         tokens_per_step=counted["tokens"] / kept,
+        # The other candidate denominator, named rather than left in
+        # `extra_counts`: which of the two divides the step time reverses the
+        # ranking of the `dataloader.packing` axis, and `summarise` refuses a
+        # config whose declared denominator this run never counted.
+        padded_tokens_per_step=counted["padded_tokens"] / kept,
         peak_bytes=metrics.peak_memory_bytes(device),
         extra_counts={
-            name: counted[name] / kept
-            for name in ("samples", "padded_tokens", "images", "images_dropped")
+            name: counted[name] / kept for name in ("samples", "images", "images_dropped")
         },
         totals={
             "images_read_total": counted["images"],
             "images_dropped_total": counted["images_dropped"],
         },
+        # Carries `measurement` and `profiled` into the summary from the run's own
+        # declaration instead of leaving the harness's former constants implicit.
+        config=config,
     )
+    summary.update(validity)
     # Converted here, outside the timed window: this is the device sync the loop
     # exists to keep out of the measurement.
     summary["loss_first"] = float(first_loss) if first_loss is not None else None
@@ -440,46 +486,35 @@ class Binding(NamedTuple):
     documented_entry_point: Any = None
 
 
-def native_binding(config: BenchConfig, device: torch.device) -> Binding:
-    """The transformers path, which is what every framework fell back to before.
-
-    Kept byte-for-byte as it ran inline in `build_run` so that the six frameworks
-    opening up cannot change what `framework=native` measures.
-    """
-    from transformers import AutoModel, AutoProcessor
-
-    processor = AutoProcessor.from_pretrained(config.model.hf_id, revision=config.model.revision)
-    align_padding_side(processor, config.model.padding_side)
-    with refusing("load_kwargs"):
-        load_kwargs = axes.load_kwargs(config)
-    model = AutoModel.from_pretrained(
-        config.model.hf_id,
-        revision=config.model.revision,
-        dtype=steps.dtype_for(device),
-        **load_kwargs,
-    )
-    model.to(device)
-    return Binding(framework="native", model=model, processor=processor)
-
-
 def load_framework(config: BenchConfig, device: torch.device) -> Binding:
     """The model and processor `config.framework.name` asks for.
 
-    `trainbench.loader` is the adapters lane's single entry point and does not
-    exist yet; until it does, every framework is served by the native path, which
-    is the state `_capture_framework` already reports honestly. The name that
-    reaches `assemble` comes from the binding either way, so a run under an adapter
-    is labelled by what built it rather than by this file's opinion.
+    `trainbench.loader` is the single entry point every framework is served
+    through, and it is imported by name rather than at module scope so that this
+    file stays loadable by path (docker/entrypoint.sh's preflight stand-in).
+
+    There is no transformers fallback here any more. There used to be one, from
+    when `loader.py` did not exist; keeping it left two definitions of the native
+    build — `trainbench/probe/native.py::load` is the other and the maintained one
+    — and turned a `loader.py` missing from an image into a quiet change of which
+    code path produced the number, rather than the packaging failure it is.
+
+    The name that reaches `assemble` comes from the binding, so a run under an
+    adapter is labelled by what built it rather than by this file's opinion.
     """
-    try:
-        loader = importlib.import_module("trainbench.loader")
-    except ModuleNotFoundError:
-        return native_binding(config, device)
+    loader = importlib.import_module("trainbench.loader")
     return loader.load(config, device)
 
 
-def build_run(config: BenchConfig, device: torch.device) -> tuple[Any, list[str], AppliedState]:
+def build_run(
+    config: BenchConfig, device: torch.device
+) -> tuple[Any, list[str], AppliedState, Binding]:
     """Everything between the resolved config and the first measured step.
+
+    The binding comes back out because the measured loop needs one thing off it
+    that `Built` cannot carry: `required_step_context` is what the *framework*
+    demands of the step, not what this harness constructed, and `axes.step_context`
+    has to be handed it on every step.
 
     Split out of `main` so that the refusals can be caught around a region that
     *stops* at `assert_matches`. The measured loop is deliberately outside it: an
@@ -489,7 +524,13 @@ def build_run(config: BenchConfig, device: torch.device) -> tuple[Any, list[str]
     """
     with refusing("patch"):
         axes.patch(config)
-    binding = load_framework(config, device)
+    with refusing("load_kwargs"):
+        # `native_binding` tags its own `axes.load_kwargs` call, but an adapter's
+        # does not go through it — `trainbench.loader` calls `axes.load_kwargs`
+        # itself, outside that block. Without this the `UnappliedAxis` a refused
+        # `peft.mode=qlora` raises would leave `main`'s broad `except` instead of
+        # `refusal_record`, and the setting would produce no result file at all.
+        binding = load_framework(config, device)
     model, processor = binding.model, binding.processor
 
     dataset = load_pairs(config)
@@ -501,7 +542,16 @@ def build_run(config: BenchConfig, device: torch.device) -> tuple[Any, list[str]
             # inside the timed step under a pretokenized label.
             dataset = axes.pretokenize(dataset, Encode(processor, config))
         built, applied = axes.assemble(
-            model, config, device, framework=binding.framework, dataset=dataset
+            model,
+            config,
+            device,
+            framework=binding.framework,
+            dataset=dataset,
+            # The adapter's declaration, not the config's request: `applied._owned`
+            # exempts these axes from the capture, and letting `framework=tevatron`
+            # grant that exemption would let a request excuse the cell least likely
+            # to have applied the axis.
+            owned_axes=binding.owned_axes or {},
         )
     with refusing("step_context"):
         # The fifth call site, and the only one the measured loop enters. Called
@@ -512,7 +562,7 @@ def build_run(config: BenchConfig, device: torch.device) -> tuple[Any, list[str]
         # to call twice because it is a factory: it either raises or returns a
         # fresh context manager. A future recipe that made construction expensive
         # or stateful would have to move this to a cheaper precondition check.
-        axes.step_context(config)
+        axes.step_context(config, binding.required_step_context)
     # `assemble` has no collate argument, so the loader it builds carries either
     # torch's default one or `axes.PackedCollate`, and this is the only place to
     # replace it. What goes in declares `axis_packing`, which is what
@@ -528,7 +578,7 @@ def build_run(config: BenchConfig, device: torch.device) -> tuple[Any, list[str]
     # `main` writes to the result file and then exits non-zero on.
     with refusing("assert_matches", state):
         assert_matches(state, config)
-    return built, applied, state
+    return built, applied, state, binding
 
 
 def device_arch(capability: tuple[int, int]) -> str:
@@ -746,7 +796,7 @@ def main(argv: list[str] | None = None) -> int:
     set_seed(config.train.seed, deterministic=config.train.deterministic, warn_only=True)
 
     try:
-        built, applied, state = build_run(config, device)
+        built, applied, state, binding = build_run(config, device)
     except RefusedSetting as refused:
         # A result file, and a non-zero exit. The sweep in docker/entrypoint.sh
         # publishes whatever `--out` holds with `--mode result` and counts this
@@ -762,21 +812,42 @@ def main(argv: list[str] | None = None) -> int:
     # refuses `run.profiler=true` for `purpose=timing`; this is where the other
     # purposes act on it, and the trace is written next to the result rather than
     # merged into it so no reported number can come from a profiled step.
-    if config.run.profiler:
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-            if device.type == "cuda"
-            else [torch.profiler.ProfilerActivity.CPU],
-        ) as profile:
-            summary = train(built, built.dataloader, config, device)
-        trace = args.out.with_suffix(".trace.json")
-        profile.export_chrome_trace(str(trace))
-        summary["profiled"] = True
-        summary["trace_path"] = str(trace)
-        print(f"wrote {trace}")
-    else:
-        summary = train(built, built.dataloader, config, device)
-        summary["profiled"] = False
+    required = binding.required_step_context
+    try:
+        if config.run.profiler:
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ]
+                if device.type == "cuda"
+                else [torch.profiler.ProfilerActivity.CPU],
+            ) as profile:
+                summary = train(built, built.dataloader, config, device, required)
+            trace = args.out.with_suffix(".trace.json")
+            profile.export_chrome_trace(str(trace))
+            summary["trace_path"] = str(trace)
+            print(f"wrote {trace}")
+        else:
+            summary = train(built, built.dataloader, config, device, required)
+    except BaseException as exc:  # noqa: BLE001 - re-raised unless it is the memory ceiling
+        if not metrics.is_oom(exc):
+            raise
+        # A result file, and no `metrics` block. The memory ceiling is an answer to
+        # this study's question — this combination does not fit at this batch size
+        # on this device — and a record without it falls through report.py's cell
+        # logic and renders as a combination nobody attempted.
+        record = build_record(
+            config,
+            device,
+            applied=state,
+            applied_axes=applied,
+            **metrics.oom_status(exc, peak_bytes=metrics.peak_memory_bytes(device)),
+        )
+        write_json(args.out, record)
+        print(record["status"], file=sys.stderr)
+        print(f"wrote {args.out}")
+        return OOM_EXIT
     record = build_record(config, device, applied=state, metrics=summary, applied_axes=applied)
     write_json(args.out, record)
 

@@ -1501,10 +1501,12 @@ def test_a_plan_whose_settings_can_all_be_applied_passes(tmp_path, config_mappin
 
 
 def test_one_unapplicable_setting_refuses_the_whole_plan(tmp_path, config_mapping, pod_gpu):  # noqa: F811
-    """`kernels_hub` is refused on every host: transformers turns hub kernels on in
-    two places, neither of which is this call site (`axes._patch_kernels_hub`)."""
+    """`precision=mxfp8` is refused on every host this study runs on: the recipe
+    needs Transformer Engine, which is absent here, and needs compute capability
+    10.x, which the A100 pods do not have. `preflight` reaches it through
+    `axes.step_context`."""
     good = bench(config_mapping).model_dump(mode="json")
-    bad = bench(config_mapping, **{"kernel.name": "kernels_hub"}).model_dump(mode="json")
+    bad = bench(config_mapping, **{"precision.name": "mxfp8"}).model_dump(mode="json")
     path = plan_file(tmp_path, [plan_item("a", good), plan_item("b", bad)])
     assert bench_entry.preflight(path) == bench_entry.PREFLIGHT_EXIT
 
@@ -1613,10 +1615,195 @@ def test_a_pod_wrong_in_both_ways_is_told_both(tmp_path, config_mapping, monkeyp
     """One pod log naming the GPU and the setting is worth more than two relaunches."""
     monkeypatch.setenv(bench_entry.CUDA_ARCHS_ENV, "80;90;100")
     monkeypatch.setattr(bench_entry, "current_gpu_arch", lambda: "120")
-    bad = bench(config_mapping, **{"kernel.name": "kernels_hub"}).model_dump(mode="json")
+    bad = bench(config_mapping, **{"precision.name": "mxfp8"}).model_dump(mode="json")
     path = plan_file(tmp_path, [plan_item("a", bad)])
     log = io.StringIO()
     assert bench_entry.preflight(path, stream=log) == bench_entry.PREFLIGHT_EXIT
     printed = log.getvalue()
     assert "this pod's GPU" in printed
-    assert "kernels_hub" in printed
+    assert "mxfp8" in printed
+
+
+# --- what the adapter says, reaching the run ---------------------------------
+#
+# `trainbench/loader.py` declares two things `scripts/bench.py` has to carry
+# across: the axes the framework computes inside its own step, and the numeric
+# regime it trains in. Both were declared on one side and read by nobody, so a
+# tevatron cell had `loss.name` undetermined and every axolotl step ran outside
+# autocast. These exercise the wiring end to end through `main()`, not the two
+# ends separately — that is how it stayed open through three lanes.
+
+
+def adapter_binding(monkeypatch, **declared):
+    """Run `main()` against a binding that declares what a real adapter would.
+
+    Built on top of the real `load_framework` so the model and processor are the
+    stubbed ones and only the declarations differ; the point under test is what
+    `build_run` does with the fields, not what any framework loads.
+    """
+    original = bench_entry.load_framework
+
+    def patched(config, device):
+        loaded = original(config, device)
+        # By field name, which is also an assertion: `Binding` and `AdapterOut`
+        # carry the same eight, and the contract fixes them.
+        carried = {name: getattr(loaded, name) for name in bench_entry.Binding._fields}
+        return bench_entry.Binding(**carried | declared)
+
+    monkeypatch.setattr(bench_entry, "load_framework", patched)
+
+
+def test_a_probe_record_carries_the_gradient_norm_and_the_parameter_counts(
+    pod_setting,
+    config_mapping,  # noqa: F811
+):
+    """The validity gate the `record-report` boundary applies has to be true of a
+    run, not only of a fixture.
+
+    A finite loss and a full set of step times are exactly what a fully frozen
+    graph produces — three cells of the 2026-08-02 campaign were published that
+    way. `metrics.gradient_norm` and `metrics.parameter_counts` are the reads that
+    tell the two apart, and until this wave nothing called them from the measured
+    loop, so every real record failed the gate its own contract declares.
+
+    A positive norm is the assertion. Reading the gradients after
+    `optimizer.zero_grad` gives a confident zero, which is the one value this
+    number exists to distinguish.
+
+    `batch_size=4` and not the fixture's 2: a two-row batch is one query and one
+    document, InfoNCE over a 1x1 logit matrix is exactly zero, and so is its
+    gradient. Measured here — the first version of this test read 0.0 and it was
+    the data, not the wiring. A gate asserting a positive norm on that batch would
+    be unsatisfiable for a reason nothing in the record could name.
+    """
+    config = timing_config(config_mapping, **{"run.purpose": "probe", "train.batch_size": 4})
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == 0
+    metrics_block = record["metrics"]
+    assert metrics_block["grad_norm"] > 0
+    assert metrics_block["trainable_params"] == metrics_block["total_params"] > 0
+    assert metrics_block["params_with_grad"] > 0
+    # The declared denominator, and the block that says how the figure was made.
+    # `summarise` refuses a config whose denominator this run never counted.
+    assert metrics_block["measurement"]["declared"] is True
+    assert metrics_block["padded_tokens_per_step"] > 0
+    assert metrics_block["profiled"] is False
+
+
+def test_the_axes_an_adapter_owns_reach_the_record_instead_of_being_undetermined(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """tevatron's `DenseModel.forward` computes the loss and the cross-device
+    gather itself (decision 5). The adapter declares that on `AdapterOut`; nothing
+    passed the declaration to `axes.assemble`, so `Built.owned_axes` stayed empty,
+    `loss.name` came back undetermined and `assert_matches` refused every timing
+    run of that cell.
+    """
+    adapter_binding(
+        monkeypatch,
+        framework="tevatron",
+        owned_axes={
+            "loss.name": "DenseModel.forward computes it",
+            "parallel.cross_device_negatives": "DenseModel.forward gathers",
+        },
+    )
+    # The config still requests `framework=native`, and that is deliberate: the
+    # binding says tevatron, and ownership has to follow the object the adapter
+    # returned rather than the request. If it followed the request, writing
+    # `framework=tevatron` in a config would exempt a cell from the axes it was
+    # least likely to apply.
+    #
+    # `purpose=probe`: this CPU host mismatches `optim.name` and `precision.name`
+    # for reasons that have nothing to do with ownership, and an enforced purpose
+    # would refuse the run before the question here could be asked. What the
+    # ownership has to survive is `capture`, which runs either way.
+    config = timing_config(config_mapping, **{"run.purpose": "probe"})
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == 0, record
+    assert record["applied"]["framework_owned"] == [
+        "loss.name",
+        "parallel.cross_device_negatives",
+    ]
+    owned = {a["axis"]: a for a in record["applied"]["axes"]}
+    assert owned["loss.name"]["owner"] == "tevatron"
+    # Ownership is a declaration that nobody looked, never a certification.
+    assert owned["loss.name"]["applied"] is None
+    assert owned["loss.name"]["matches"] is False
+
+
+def test_the_context_an_adapter_requires_is_entered_by_the_measured_step(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """axolotl loads `embed_tokens`/`lm_head` in fp32 beside a bf16 body, so its
+    step runs under `torch.autocast` upstream (decision 1). The contract forbids
+    the adapter from opening its own `with`, and `axes.step_context` had no
+    parameter to receive the requirement — so the declaration existed and no step
+    ever entered the region.
+
+    Asserted from inside the model's forward: that is the only place that can say
+    the region was live when the work happened.
+    """
+    seen = []
+
+    class AutocastWatchingEmbedder(TinyEmbedder):
+        def forward(self, input_ids, attention_mask=None, **kwargs):
+            seen.append(torch.is_autocast_enabled("cpu"))
+            return super().forward(input_ids, attention_mask, **kwargs)
+
+    adapter_binding(
+        monkeypatch,
+        model=AutocastWatchingEmbedder(),
+        required_step_context=SimpleNamespace(
+            kind="autocast",
+            device_type="cpu",
+            dtype="bfloat16",
+            reason="axolotl trains under torch.autocast(bfloat16)",
+        ),
+    )
+    config = timing_config(config_mapping, **{"run.purpose": "probe"})
+
+    code, _ = pod_setting(config, text_only_rows(8))
+
+    assert code == 0
+    assert seen and all(seen), "every measured forward has to run inside the region"
+
+
+def test_the_memory_ceiling_in_the_measured_loop_is_a_result_and_not_a_crash(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """OOM is a fifth outcome, not a slow one.
+
+    "This combination does not fit at this batch size on this device" answers the
+    study's question; a process that died with no `--out` does not, and
+    docker/entrypoint.sh files it as a combination nobody attempted. So the record
+    is written, stamped `oom`, and carries **no** `metrics` block — a metrics block
+    asserts that a measured window completed, and this one did not.
+
+    Narrow on purpose: only around the measured loop. An OOM during construction
+    still leaves no result (the test above pins that), because that is a different
+    finding and belongs to a different lane's design.
+    """
+    config = timing_config(config_mapping, **{"run.purpose": "probe"})
+
+    def out_of_memory(*_args, **_kwargs):
+        raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    monkeypatch.setattr(bench_entry, "train", out_of_memory)
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == bench_entry.OOM_EXIT
+    assert code != bench_entry.REFUSED_EXIT, "declined and ran-out-of-memory are read apart"
+    assert record["status"] == "oom"
+    assert record["oom"]["error_type"] == "OutOfMemoryError"
+    assert "metrics" not in record
