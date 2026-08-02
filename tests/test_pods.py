@@ -1238,6 +1238,50 @@ def test_two_models_may_run_the_same_axis_on_their_own_pods():
     )
 
 
+def test_the_axis_split_guard_sees_the_framework_the_pod_actually_runs():
+    """`framework` reaches a run through `plan_runs`, not through `overrides`, so a
+    guard reading the manifest's own lists was structurally unable to see it. Phase 0
+    tore that axis six ways per model and nothing said a word."""
+    exp = measuring("a")
+    assert "framework" in orchestrate.axes_touched(exp)
+    assert orchestrate.axes_touched(exp)["framework"] == ["framework=native"]
+    # The same strings `plan_runs` prepends, so the two cannot drift apart.
+    baselines = orchestrate.load_baselines(orchestrate.BASELINES_PATH)
+    own = orchestrate.own_runs(orchestrate.plan_runs(loss_sweep_experiment(), baselines))
+    assert set(orchestrate.pod_overrides(loss_sweep_experiment())) <= set(own[0].overrides)
+
+
+def test_the_axis_split_guard_names_the_framework_axis_instead_of_staying_silent():
+    """Allowed across pods — each value is its own image — and reported for it."""
+    six = [measuring(name, framework=name) for name in sorted(orchestrate.IMAGE_SUFFIX)]
+    orchestrate.check_axis_not_split(six)
+    notes = orchestrate.cross_pod_notes(six)
+    assert len(notes) == 1
+    assert "gemma4_e2b x framework" in notes[0]
+    assert f"across {len(six)} pod(s)" in notes[0]
+
+
+def test_the_axis_split_guard_still_refuses_a_real_split_beside_the_framework_one():
+    """The exception is one group wide. A `loss` torn across two pods is still a
+    torn axis even though those pods also differ in framework."""
+    with pytest.raises(orchestrate.ManifestError, match="loss"):
+        orchestrate.check_axis_not_split(
+            [
+                measuring("a", framework="native", overrides=["loss=mnrl"]),
+                measuring("b", framework="tevatron", overrides=["loss=cached_mnrl"]),
+            ]
+        )
+
+
+def test_the_shipped_campaign_records_its_cross_pod_axis_in_the_ledger(tmp_path):
+    """The console scrolls past; the ledger is what a merge reads afterwards."""
+    out = tmp_path / "ledger.json"
+    assert orchestrate.main(["--experiment", "phase0-*", "--dry-run", "--out", str(out)]) == 0
+    notes = json.loads(out.read_text())["cross_pod_axes"]
+    assert notes, "eighteen probe pods split `framework` three ways and the ledger says nothing"
+    assert all("framework" in note for note in notes)
+
+
 def test_a_manifest_whose_declared_axis_is_not_the_one_it_moves_is_refused(tmp_path):
     path = manifest(
         tmp_path,
@@ -2412,6 +2456,42 @@ if entry["error"] or args.out.stem in os.environ.get("FAKE_BENCH_FAIL", "").spli
 args.out.write_text(json.dumps({"status": "ok", "config": payload}))
 '''
 
+FAKE_VERIFY_ENV = '''\
+"""A stand-in for scripts/verify_env.py, which needs a checkpoint this host has not.
+
+Records that it ran and writes a probe result. What is under test around it is
+whether the entrypoint reached it at all, which is a question about the branch and
+not about what the probe then finds.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", type=Path)
+parser.add_argument("--out", type=Path)
+args = parser.parse_args()
+
+config = json.loads(args.config.read_text())
+with open(os.environ["FAKE_BENCH_LOG"], "a") as handle:
+    handle.write(json.dumps({"verify_env": config}) + "\\n")
+args.out.write_text(
+    json.dumps(
+        {
+            "probe": {
+                "framework": config["framework"]["name"],
+                "model": config["model"]["name"],
+                "all_ok": True,
+                "unexpected_passes": [],
+                "checks": [{"name": "load", "ok": True, "expected_failure": False}],
+            }
+        }
+    )
+)
+'''
+
 FAKE_HUB = '''\
 """A Hub that records where a file was asked to go, and moves nothing."""
 
@@ -2442,7 +2522,7 @@ sys.path.insert(0, "__HUB__")
 runpy.run_path("__PUBLISH__", run_name="__main__")
 '''
 
-Sweep = namedtuple("Sweep", "proc bench preflight uploads calls")
+Sweep = namedtuple("Sweep", "proc bench preflight uploads calls verify")
 
 RESULT_FILE = f"/{publish_result.RESULT_NAME}"
 
@@ -2514,6 +2594,7 @@ def sweep_pod(
     hub.mkdir()
     (hub / "huggingface_hub.py").write_text(FAKE_HUB)
     (scripts / "bench.py").write_text(FAKE_BENCH.replace("__REPO__", str(REPO)))
+    (scripts / "verify_env.py").write_text(FAKE_VERIFY_ENV)
     (scripts / "publish_result.py").write_text(
         PUBLISH_SHIM.replace("__HUB__", str(hub)).replace(
             "__PUBLISH__", str(REPO / "scripts" / "publish_result.py")
@@ -2548,10 +2629,11 @@ def sweep_pod(
     # log; a caller asking about one of them should never have to sift the other out.
     return Sweep(
         proc,
-        [entry for entry in logged if "preflight" not in entry],
-        [entry for entry in logged if "preflight" in entry],
+        [e for e in logged if "preflight" not in e and "verify_env" not in e],
+        [e for e in logged if "preflight" in e],
         read_records(hub_log),
         calls,
+        [e for e in logged if "verify_env" in e],
     )
 
 
@@ -2736,6 +2818,71 @@ def test_a_gpu_the_image_does_cover_is_not_in_the_way(tmp_path):
     sweep = sweep_pod(tmp_path, plan, gpu_arch="100")
     assert len(sweep.bench) == len(plan)
     assert "GPU is sm_100, which the image covers OK" in sweep.proc.stdout
+
+
+# --- the preflight on the probe branch -------------------------------------------
+#
+# The branch that skipped it is the branch the first A100 canary ran on: the image
+# carries a snapshot of this repository's code (`COPY trainbench`), so an image built
+# before a schema change refuses the orchestrator's config in both directions —
+# nine unknown fields in, two required fields missing — and the container restarted
+# forty times at seventeen-second intervals for twelve minutes of A100 billing.
+
+
+def probe_config(**over):
+    """A resolved probe config, composed the way the orchestrator composes one."""
+    config = orchestrate.resolved_config(
+        ["framework=native", "model=gemma4_e2b", "run=probe", "data.limit=8", "train.batch_size=8"]
+    )
+    config.update(over)
+    return config
+
+
+def probe_pod(tmp_path, config, plan=None, **kwargs):
+    return sweep_pod(
+        tmp_path, plan if plan is not None else [], purpose="probe", config=config, **kwargs
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_pod_whose_image_predates_the_config_it_is_handed_does_not_measure(tmp_path):
+    """`BenchConfig` forbids unknown fields, so a config from a newer schema is
+    refused by the image's own pydantic — which is the canary's failure exactly.
+    Before this the refusal happened inside verify_env.py, once per restart."""
+    stale = probe_config()
+    stale["data"] = {**stale["data"], "image_token_budget": 4}
+    sweep = probe_pod(tmp_path, stale)
+
+    assert sweep.preflight != [], "the probe branch never reached the preflight"
+    assert sweep.verify == [], "verify_env.py ran on a config this image cannot parse"
+    assert "preflight REFUSED" in sweep.proc.stdout
+    # Exit 0, as everywhere in this file: the orchestrator cannot read the code and
+    # a non-zero exit makes the pod look broken instead of informative.
+    # And the pod is still on record, saying why, rather than looking unlaunched.
+    bodies = list(published_results(sweep).values())
+    assert [body["status"] for body in bodies] == ["no_result"]
+    assert "preflight refused" in bodies[0]["probe"]["checks"][0]["error"]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_the_preflight_probe_branch_lets_a_current_config_reach_verify_env(tmp_path):
+    """The other half. A check that refuses everything measures nothing either."""
+    sweep = probe_pod(tmp_path, probe_config())
+
+    assert sweep.preflight != []
+    assert [entry["verify_env"]["model"]["name"] for entry in sweep.verify] == ["gemma4_e2b"]
+    assert sweep.proc.returncode == 0, sweep.proc.stderr
+    bodies = list(published_results(sweep).values())
+    assert bodies and bodies[0]["probe"]["checks"][0]["ok"] is True
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_the_preflight_probe_branch_checks_one_setting_even_with_no_plan(tmp_path):
+    """A probe pod is sent a one-item plan, but the check must not go quiet if it
+    arrives empty: `preflight` reads zero settings as "none refused", which is the
+    vacuous pass this repository has shipped before."""
+    sweep = probe_pod(tmp_path, probe_config())
+    assert "preflight: all 1 setting(s) can run" in sweep.proc.stdout
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")

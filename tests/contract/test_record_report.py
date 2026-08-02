@@ -603,11 +603,6 @@ def test_the_producer_stamps_the_identity():
     assert isinstance(produced[IDENTITY_FIELD], float) and produced[IDENTITY_FIELD] > 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-b: `report.load_artifacts` falls back to `path.stat().st_mtime`, "
-    "which is the download time in a clean clone and not campaign order",
-)
 def test_an_artifact_without_the_identity_is_refused_rather_than_dated_by_its_file(tmp_path):
     write(tmp_path, probe_record(3, recorded_at=_DELETE), pod="pod-a")
     artifacts, skipped = report.load_artifacts(tmp_path)
@@ -615,11 +610,6 @@ def test_an_artifact_without_the_identity_is_refused_rather_than_dated_by_its_fi
     assert skipped and IDENTITY_FIELD in skipped[0]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-d/lane-b: nothing between the record and the table reads "
-    "`grad_norm` or `trainable_params`, so a frozen graph is published as a speed",
-)
 def test_a_run_that_trained_nothing_is_not_published_as_a_speed_result(tmp_path):
     frozen = record(
         metrics={
@@ -641,11 +631,6 @@ def test_a_run_that_trained_nothing_is_not_published_as_a_speed_result(tmp_path)
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-b: an OOM record carries no metrics and no probe, so `report.cell` "
-    "falls through to `launch_state` and renders the combination as never attempted",
-)
 def test_oom_is_its_own_result_category(tmp_path):
     write(tmp_path, record(status=STATUS_OOM, metrics=_DELETE), pod="pod-a")
     cell = matrix_cell(merged(tmp_path), "tevatron", "qwen3_5_0_8b")
@@ -659,11 +644,6 @@ def test_oom_is_its_own_result_category(tmp_path):
     assert STATUS_OOM in cell.lower()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-b: `report.render_measurements` tables every unprofiled run "
-    "together, so transformers 5.5.0 and 5.14.1 are ranked side by side",
-)
 def test_two_stacks_are_never_ranked_in_one_table(tmp_path):
     write(tmp_path, record(), pod="pod-a", label="on-5-14")
     write(
@@ -682,11 +662,6 @@ def test_two_stacks_are_never_ranked_in_one_table(tmp_path):
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-b/lane-c: `scripts/report.py` never reads `applied`, so a cell "
-    "missing an axis to its framework looks like a cell that ran it",
-)
 def test_an_axis_the_framework_owns_is_visible_in_the_report(tmp_path):
     write(tmp_path, record(), pod="pod-a", label="canonical")
     document = merged(tmp_path)
