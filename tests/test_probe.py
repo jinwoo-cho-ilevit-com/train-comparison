@@ -343,31 +343,97 @@ class _Tokenizer:
         self.padding_side = padding_side
 
 
-def test_padding_side_alignment_fails_loudly_when_the_checkpoint_disagrees():
+def _checkpoint_declares(monkeypatch, side, source="tokenizer_config.json"):
+    """Stand in for the hub read. What the checkpoint declares is the input to the
+    comparison under test; downloading it here would test huggingface_hub."""
+    from trainbench.probe import steps
+
+    monkeypatch.setattr(
+        steps,
+        "checkpoint_padding_side",
+        lambda hf_id, revision=None: {"padding_side": side, "source": source},
+    )
+
+
+def test_padding_side_alignment_fails_loudly_when_the_checkpoint_disagrees(monkeypatch):
     """`config.model.padding_side` used to be a claim nothing checked: with the
     processor padding the other way, both pooling branches returned a PAD
     embedding without an exception or a warning."""
     from trainbench.probe.steps import padding_side_alignment
 
+    _checkpoint_declares(monkeypatch, "left")
     processor = _Processor(torch.tensor([[1]]), padding_side="left")
 
     with pytest.raises(ValueError, match="model-spec"):
-        padding_side_alignment(processor, "right")
+        padding_side_alignment(processor, "right", "org/model")
     # Forced anyway: the check is what makes the disagreement loud, and the checks
     # that run after it still have to pool a real token.
     assert processor.padding_side == "right"
 
 
-def test_padding_side_alignment_passes_when_they_agree():
+def test_padding_side_alignment_passes_when_they_agree(monkeypatch):
     from trainbench.probe.steps import padding_side_alignment
 
+    _checkpoint_declares(monkeypatch, "left")
     processor = _Processor(torch.tensor([[1]]), padding_side="left")
     processor.tokenizer = _Tokenizer("left")
 
-    detail = padding_side_alignment(processor, "left")
+    detail = padding_side_alignment(processor, "left", "org/model")
 
     assert detail["disagreed"] == []
     assert detail["declared_before"] == {"tokenizer": "left", "processor": "left"}
+    assert detail["framework_forced"] == []
+
+
+def test_a_framework_forcing_the_padding_side_is_not_the_spec_going_stale(monkeypatch):
+    """unsloth sets `padding_side = "left"` at the end of `from_pretrained`
+    whatever the checkpoint says (unsloth 2026.7.6 models/vision.py:1716-1718).
+    Grading the object it returned sent both Qwen cells of the 2026-08-02 campaign
+    to the support matrix as "docs/model-spec.yaml no longer matches this
+    checkpoint" — while `native` read `right` off the same two checkpoints, which
+    is what the spec says. The framework's decision has to be recorded, not
+    charged to the spec."""
+    from trainbench.probe.steps import padding_side_alignment
+
+    _checkpoint_declares(monkeypatch, "right")
+    processor = _Processor(torch.tensor([[1]]), padding_side="left")
+    processor.tokenizer = _Tokenizer("left")
+
+    detail = padding_side_alignment(processor, "right", "Qwen/Qwen3-VL-Embedding-2B")
+
+    assert detail["checkpoint_padding_side"] == "right"
+    assert detail["framework_forced"] == ["processor", "tokenizer"]
+    assert processor.padding_side == "right"
+
+
+def test_the_padding_side_check_reads_the_file_the_spec_names(monkeypatch, tmp_path):
+    """`docs/model-spec.yaml` gives `tokenizer_config.json` as the source of
+    `padding_side`, and a checkpoint that names no key is `right` by transformers'
+    default — which is the entry the spec carries for qwen3_vl_emb_2b."""
+    import huggingface_hub
+
+    from trainbench.probe import steps
+
+    written = tmp_path / "tokenizer_config.json"
+
+    def _download(hf_id, filename, revision=None):
+        assert filename == "tokenizer_config.json"
+        return str(written)
+
+    # The real attribute, not a name on `steps`: the import is inside the function,
+    # so rebinding it anywhere else leaves the download in place.
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _download)
+
+    written.write_text(json.dumps({"padding_side": "left"}))
+    assert steps.checkpoint_padding_side("org/model") == {
+        "padding_side": "left",
+        "source": "tokenizer_config.json",
+    }
+
+    written.write_text(json.dumps({"model_max_length": 8192}))
+    absent = steps.checkpoint_padding_side("org/model")
+    assert absent["padding_side"] == steps.TRANSFORMERS_DEFAULT_PADDING_SIDE == "right"
+    assert "names none" in absent["source"]
 
 
 class _Encoder(torch.nn.Module):

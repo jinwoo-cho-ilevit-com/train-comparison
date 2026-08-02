@@ -72,7 +72,10 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     side = config.model.padding_side
 
     report.run(
-        "padding_side_alignment", lambda: steps.padding_side_alignment(loaded["processor"], side)
+        "padding_side_alignment",
+        lambda: steps.padding_side_alignment(
+            loaded["processor"], side, config.model.hf_id, config.model.revision
+        ),
     )
 
     if report.run(

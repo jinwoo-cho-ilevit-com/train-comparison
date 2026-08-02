@@ -985,6 +985,12 @@ class ProbeReport:
 결함이 드러나는 유일한 모델이다. 코드가 `arch`로 분기하면 그 사실이 pooling 코드를
 읽는 사람 눈에 보이지 않는다.
 
+`padding_side_alignment`가 이 값을 대조하는 상대는 **체크포인트의
+`tokenizer_config.json`**이지 프레임워크가 돌려준 객체가 아니다. 위 표의 `source`가
+가리키는 파일이 그것이고, 적재 후 프레임워크가 옮겨놓은 값은 체크포인트에 대한
+근거가 아니다 — unsloth는 `from_pretrained` 끝에서 무조건 left로 바꾼다. 프레임워크가
+옮긴 사실은 `framework_forced`로 기록되고 실패로 채점되지 않는다.
+
 `attn.impl`은 **config에 없다.** `attn.name`에서 `ATTN_IMPL`로 유도된다. 둘을 따로
 적을 수 있으면 `name: fa3 / impl: sdpa`가 가능해지고, 그 런은 fa3로 라벨링된 채
 applied.py에서 sdpa-요청 sdpa-적용으로 **일치 판정**을 받는다.

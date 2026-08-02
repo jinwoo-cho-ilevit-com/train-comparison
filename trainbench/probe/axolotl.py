@@ -92,7 +92,12 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     tokenized: dict[str, torch.Tensor] = {}
     side = config.model.padding_side
 
-    report.run("padding_side_alignment", lambda: steps.padding_side_alignment(tokenizer, side))
+    report.run(
+        "padding_side_alignment",
+        lambda: steps.padding_side_alignment(
+            tokenizer, side, config.model.hf_id, config.model.revision
+        ),
+    )
 
     if report.run("text_tokenize", lambda: steps.tokenize_text(tokenizer, device, tokenized, side))[
         0

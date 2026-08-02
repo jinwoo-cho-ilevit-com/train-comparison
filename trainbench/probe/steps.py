@@ -7,6 +7,8 @@ matrix comparable.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -111,20 +113,67 @@ def _verified(state: applied.AppliedState, config: BenchConfig) -> dict[str, Any
     return state.to_dict()
 
 
-def padding_side_alignment(processor: Any, padding_side: str) -> dict[str, Any]:
-    """Force the tokeniser onto the configured padding side, and fail if it had to.
+# transformers' default when a checkpoint names no padding_side. It is not a
+# guess: docs/model-spec.yaml records exactly this reasoning for qwen3_vl_emb_2b,
+# whose tokenizer_config.json has no such key.
+TRANSFORMERS_DEFAULT_PADDING_SIDE = "right"
 
-    Alignment happens first so that whatever runs after this check pools a real
-    token either way; the raise is what makes the disagreement loud. A checkpoint
-    that pads differently from `docs/model-spec.yaml` is a spec that has gone
-    stale, and the run is the only place that can notice.
+
+def checkpoint_padding_side(hf_id: str, revision: str | None = None) -> dict[str, Any]:
+    """Which side the checkpoint itself declares, read from the file the spec cites.
+
+    `docs/model-spec.yaml` names `tokenizer_config.json` as the source of
+    `padding_side` for all three models, so that is what the audited value has to
+    be compared against. It is a cache hit in any probe: whatever loaded the model
+    downloaded this file first.
+    """
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(hf_id, "tokenizer_config.json", revision=revision)
+    declared = json.loads(Path(path).read_text()).get("padding_side")
+    if declared is None:
+        return {
+            "padding_side": TRANSFORMERS_DEFAULT_PADDING_SIDE,
+            "source": "transformers default; tokenizer_config.json names none",
+        }
+    return {"padding_side": str(declared), "source": "tokenizer_config.json"}
+
+
+def padding_side_alignment(
+    processor: Any, padding_side: str, hf_id: str, revision: str | None = None
+) -> dict[str, Any]:
+    """Force the tokeniser onto the configured padding side, and say who disagreed.
+
+    Two unrelated disagreements used to be one failure. The one this check exists
+    for is the spec going stale — the checkpoint padding differently from
+    `docs/model-spec.yaml`, which only a run can notice. A framework moving the
+    side *after* the load is not that, and grading it as that is what filed three
+    unsloth cells of the 2026-08-02 campaign as spec drift: unsloth sets
+    `padding_side = "left"` unconditionally at the end of `from_pretrained`
+    (unsloth 2026.7.6 models/vision.py:1716-1718), while `native` read `right` off
+    the same two checkpoints, which is what the spec says.
+
+    So the raise compares the checkpoint's own declaration, and what the loaded
+    object declared is recorded next to it under `framework_forced` rather than
+    graded. Alignment still runs first, and unconditionally: whatever comes after
+    this check pools a real token either way, and a processor that has no
+    padding_side to align is answered without reaching for the network.
     """
     detail = align_padding_side(processor, padding_side)
-    if detail["disagreed"]:
+    checkpoint = checkpoint_padding_side(hf_id, revision)
+    detail["checkpoint_padding_side"] = checkpoint["padding_side"]
+    detail["checkpoint_source"] = checkpoint["source"]
+    detail["framework_forced"] = sorted(
+        name
+        for name, value in detail["declared_before"].items()
+        if value != checkpoint["padding_side"]
+    )
+    if checkpoint["padding_side"] != padding_side:
         raise ValueError(
-            f"{detail['disagreed']} declared padding_side {detail['declared_before']} but "
-            f"config.model.padding_side is {padding_side!r}; it has been forced onto the "
-            "configured side, and docs/model-spec.yaml no longer matches this checkpoint."
+            f"{hf_id} declares padding_side {checkpoint['padding_side']!r} in "
+            f"{checkpoint['source']} but config.model.padding_side is {padding_side!r}; "
+            "it has been forced onto the configured side, and docs/model-spec.yaml no "
+            "longer matches this checkpoint."
         )
     return detail
 
