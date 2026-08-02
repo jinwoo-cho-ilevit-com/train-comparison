@@ -150,3 +150,33 @@ Green does not mean reproducible. Wave 0's gate reported 102 passed while
 `configs/data/` was untracked, so it held only in the checkout that happened to
 have those files on disk; a clean clone could not compose a config at all. When a
 check passes, confirm it had something to examine.
+
+**Read the pinned source before asserting framework behaviour.** Every probe
+failure the first Phase 0 campaign found (2026-08-02, 18 A100 pods) had its
+answer sitting in an already-locked wheel nobody had opened. axolotl's own
+order is `prepare_plugins -> validate_config -> normalize_config`
+(`axolotl/cli/config.py`), while `trainbench/probe/axolotl.py` skipped
+validation and called `normalize_config` first — its docstring claimed to
+follow the project's own docs — and produced `TypeError: unsupported operand
+type(s) for //: 'NoneType' and 'NoneType'` on all three models.
+`FastVisionModel.from_pretrained` defaults `full_finetuning=False`
+(`unsloth/models/loader.py`) and the chain ends in `requires_grad_(False)` on
+every non-LoRA parameter; three cells backpropagated through a fully frozen
+graph — `params_with_grad=0`, `trainable_params=0` — and `infonce_backward`
+passed anyway, because `enable_input_require_grads()` keeps the graph
+differentiable through the embedding output. `google/gemma-4-E2B` is a base
+checkpoint with no `chat_template.jinja` — only the `-it` variant has one —
+and three frameworks failed identically on `apply_chat_template`, a fact one
+Hub file listing would have shown. Probes written from what usually works do
+not survive contact with pinned versions; the fixes researched this way
+landed on the first pod run, ms_swift went 0/3 to 3/3 and native's gemma-4
+cell opened.
+
+**Do not relay a number you did not produce.** A lane reported the audit at
+`12/15` while the tree was actually at `11/15` (`plan-files` was red on two
+undeclared files), and that number went straight into a status report
+unchecked. The same shape produced a quoted test count read off a tree that
+held another lane's uncommitted work. Re-run the gate yourself before quoting
+it — if a claim cannot be checked in the session that makes it, write
+"확인 안 함" instead of the number, the same rule this file already applies to
+"측정 안 함" for measurements.
