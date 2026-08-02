@@ -98,13 +98,15 @@ IMPLEMENTED: frozenset[str]                            # 실제로 적용 가능
 def patch(config) -> list[str]                         # 모델 생성 "이전"
 def load_kwargs(config) -> dict                        # from_pretrained kwargs
 def assemble(model, config, device, framework, dataset=None) -> tuple[Built, list[str]]
-def step_context(config) -> AbstractContextManager     # 스텝을 감싸는 컨텍스트
+def step_context(config, required=None) -> AbstractContextManager  # 스텝을 감싸는 컨텍스트
 class UnappliedAxis(RuntimeError)                      # 구현 없음 -> 기본값 대체 금지
 
 # applied.py — 켜졌는지 읽는 유일한 지점
 @dataclass(frozen=True)
 class Built:                          # 런이 만든 것. 축은 모델에만 있지 않다
     model / optimizer / dataloader / loss_fn / framework
+    precision_recipe     # 스텝 안에서 캐스팅하는 정밀도. dtype 으로는 영원히 미확인
+    owned_axes           # 어댑터가 스스로 계산하는 축. 멤버십만 읽는다
 
 @dataclass(frozen=True)
 class AxisState:
@@ -112,17 +114,28 @@ class AxisState:
     requested: str
     applied: str | None  # None = 확인 불가
     detail: dict
+    owner: str | None    # 이 축을 대신 계산한 어댑터. config 가 아니라 Built.owned_axes 에서
+    @property
+    def state -> str     # AXIS_STATES: "applied" / "framework_owned" / "undetermined"
 
 @dataclass(frozen=True)
 class AppliedState:
     axes: tuple[AxisState, ...]
     def mismatched(self) -> list[AxisState]
     def undetermined(self) -> list[AxisState]
+    def framework_owned(self) -> list[AxisState]
     def missing(self) -> list[str]        # 스키마에 있는데 상태에 없는 축
+    # to_dict() 는 all_determined / all_matched 옆에 최상위 framework_owned 키를 싣는다
 
 def capture(built: Built, config: BenchConfig) -> AppliedState
 def assert_matches(state: AppliedState, config: BenchConfig) -> None  # AppliedMismatch
 ```
+
+`owner` 는 `FRAMEWORK_OWNABLE`(`loss.name`, `parallel.cross_device_negatives`) 안에서만
+`state` 를 바꾼다. 그 재검사가 `AxisState.state` 안에 있는 이유는, 손으로 조립한 상태가
+경계가 허용한 적 없는 축을 면제해 버리는 것을 막기 위해서다. `framework.name` 은 그
+목록에 **일부러 없다** — 어느 프레임워크가 돌았는지의 증거이고, 그것을 면제할 수 있는
+어댑터는 그 아래 전부를 면제할 수 있다.
 
 **호출 지점 4개를 Wave 0에서 고정하는 이유**: 이걸 호출할 하네스(`scripts/bench.py`)는
 Wave 3에 다른 레인이 만든다. 형태가 없으면 축을 추가하는 레인과 하네스를 짓는 레인이
@@ -241,6 +254,29 @@ freeze 축이 "얼림"인지 "peft가 얼린 것에 더해 얼림"인지는 축�
 `freeze.*` capture가 peft가 얼린 것을 기준선으로 잡고 그 위의 차분을 재는 것이다.**
 D는 축을 구현하기 전에 이걸 정하고 들어간다. PLE 파라미터 판별은 `axes.ple_parameters` 하나뿐이다 — native.py가 갖고
 있던 두 번째 정의는 제거했다(이미 죽은 `altup` 조건으로 드리프트해 있었다).
+
+### 경계 규칙의 구현이 둘인 이유 — 지우지 않는다
+
+`tests/contract/` 의 계약 파일은 **import 없이** 샘플 JSON 만 검증한다. 그래서 런타임에
+살아 있는 객체를 같은 규칙으로 검증하는 두 번째 구현이 필요하고, 지금 두 자리에 있다.
+사본이 아니라 **같은 판정을 내는 두 구현**이며, 그것을 테스트가 증명한다. 이 문단이
+없으면 다음 레인이 중복으로 읽고 한쪽을 지운다.
+
+| 경계 | 계약 쪽 | 런타임 쪽 | 둘이 같다는 증거 |
+|---|---|---|---|
+| `kernel-provenance` | `tests/contract/test_kernel_provenance.py::validate_kernel_fingerprint` | `trainbench/kernels.py::validate_fingerprint` | `tests/test_kernels.py -k agrees_with_contract` |
+| `loader-bench` | `tests/contract/test_loader_bench.py` 의 fixture 검증 | `trainbench/loader.py` 의 `__post_init__` 들 + `_refuse_a_build_the_fingerprint_condemns` | `tests/test_loader.py::test_a_live_adapter_out_passes_the_frozen_contract_validator` |
+
+`kernel-provenance` payload 가 앉는 자리는 build fingerprint 의
+`BUILD_FINGERPRINT_KEY`(`"attention"`) 블록 하나뿐이다. 어댑터는 그 자리에
+`kernels.read_fingerprint(...)` 의 반환값을 그대로 싣고 **검증을 한 번 더 두지 않는다** —
+그 함수가 반환 전에 스스로 검증한다.
+
+`AGENTS.md` 의 "런마다 torch/framework 버전을 기록한다"는 커널에 대해 부족하다.
+`flash-attn` 이 없는 환경에서 `flash_attention_2` 요청은 Hub 저장소 이름으로 바뀌고
+그 커널은 런 시작 중에 내려받아진다. 같은 버전이 다른 커널을 바인딩할 수 있으므로 런
+레코드에 남아야 하는 것은 **repo + revision** 이고, revision 을 못 읽으면 거부다.
+근거와 인용은 `docs/methodology.md §11`.
 
 ---
 

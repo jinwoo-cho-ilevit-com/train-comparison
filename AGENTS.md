@@ -21,6 +21,27 @@ Secrets come from Infisical. Wrap every command:
 - Test: `infisical run --env=dev -- uv run pytest`
 - lint/format: `uv run ruff check && uv run ruff format --check`
 - Config-path check: `infisical run --env=dev -- uv run python scripts/env_report.py device=cpu model=qwen3_5_0_8b framework=native data.limit=4 train.batch_size=4`
+- Run: `infisical run --env=dev -- uv run python scripts/orchestrate.py --experiment 'phase0-*'`
+  `--experiment` globs manifest names under `configs/experiment` and defaults to *all* of
+  them, so the flag is what stands between one phase and the whole campaign's pod-hours.
+  `--dry-run` prints the plan and launches nothing.
+- Report: `uv run python scripts/report.py --results <dir> --ledger <the orchestrator's --out>`
+  Results live in the HF results repo (`--result-repo`, default
+  `jinwoo-cho/trainbench-results`), not on disk — download them first. Artifacts that
+  carry no `recorded_at` are refused and named on stderr rather than dated by their own
+  file clock, so a directory of pre-`recorded_at` artifacts reports as empty instead of as
+  this campaign's numbers. Pass `--ledger` as well: without it a pod that launched and
+  uploaded nothing is indistinguishable from a combination nobody tried.
+- One setting: `uv run python scripts/bench.py --config <resolved>.json --out result.json`
+  It takes a *resolved* config JSON, composed by `scripts/compose_config.py` — the pod
+  never composes, because Hydra's antlr4 pin cannot coexist with axolotl in one image.
+  One setting per process: a sweep is the pod re-running this file, not a loop inside it.
+
+The last three are documented but **not executed by `doc-commands`** — that check runs the
+Setup line and the Config-path check line, and nothing else. Launching a pod from a gate
+would spend money; the other two need artifacts this host does not have.
+`tests/test_audit.py::test_the_documented_commands_doc_commands_never_runs_are_named_here`
+pins that scope so the check's own wording is not read as covering them.
 
 `train.batch_size` moves with `data.limit`: a batch wider than the sample makes
 InfoNCE compare a row against itself, and the schema refuses to start such a run.

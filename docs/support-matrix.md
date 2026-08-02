@@ -125,8 +125,12 @@ Tevatron 2.0인지도 확인 대상이다.
 | accelerate | 1.14.0 |
 | peft | 0.20.0 |
 | hydra-core | 1.3.4 |
-| trackio | 0.34.0 |
 | pydantic | 2.13.4 |
+
+`trackio` 는 이 표에서 빠졌다 — 결정 3 으로 스키마·config 에서 제거했다. 측정 중
+네트워크 I/O 가 교란이고, 구현하려면 env lock 6종 전부에 넣고 이미지를 다시 빌드해야
+했다. 루트 `pyproject.toml` 의 `tracking` extra 제거는 lock 재해석과 함께 움직이므로
+통합자 몫으로 남아 있다(`.plans/notes/integrate.md`).
 
 ### 패키지 소스 주의
 
@@ -501,7 +505,6 @@ transformers가 예외도 경고도 아닌 **로그 한 줄만 남기고** 느�
 | `attn/fa2,fa3,fa4` | `flash-attn>=2.8` | native | 축 sweep이 native에서 돈다 |
 | `kernel/fla` | `flash-linear-attention`, `causal-conv1d>=1.6` | **6개 전부** | GDN 무음 fallback 제거 (위 예외) |
 | `kernel/liger` | `liger-kernel>=0.6` | native | axolotl에만 전이 의존으로 있었다 |
-| `kernel/kernels_hub` | `kernels>=0.10` | native | 위와 같음 |
 | `precision/mxfp8,nvfp4` | `transformer-engine[core-cu13,pytorch]>=2.17` | native | extras 필수, 아래 참조 |
 | `optim/adamw_8bit`, `peft/qlora` | `bitsandbytes>=0.48` | native | 6개 중 2개에만 있었고 native는 아니었다 |
 | `optim/muon` | `pytorch-optimizer>=3.10` | native | |
@@ -1056,12 +1059,19 @@ sentence-transformers.`였다. 즉 **프레임워크의 거부가 아니라 배�
 
 ### 초록이지만 그대로 믿으면 안 되는 것
 
-- **`axes_verified`는 `all_matched: false`여도 통과한다.** 실측된 불일치 둘:
-  `kernel.name`은 `none`을 요청했는데 `qwen3_5_0_8b` 칸 전부(native, ms_swift,
-  axolotl, unsloth, sentence_transformers)에서 `fla`가 적용됐고,
-  `precision.name`은 `bf16`을 요청했는데 axolotl 3칸과 unsloth 3칸에서
-  `mixed(bf16,fp32)`가 적용됐다. Phase 0의 판정은 바꾸지 않지만 뒤 단계의
-  교란 요인으로 이미 보인다.
+- **`axes_verified`는 이제 `all_matched: false`를 거부한다.** 불일치는 결과에 그대로
+  남고(`applied.axes`), 실패 메시지가 축마다 요청/적용을 이름으로 적는다. 위에 실측된
+  불일치 둘 — `kernel.name`이 `none` 요청에 `fla` 적용, `precision.name`이 `bf16`
+  요청에 `mixed(bf16,fp32)` 적용 — 은 사실 그대로 남고, 바뀐 것은 그것이 통과로
+  읽히지 않는다는 점이다. `kernel.name`의 불일치에는 그것이 이미지에 구속된
+  것인지(`environment-bound`)가 함께 적힌다 — `axes._environment_bound_kernel`이 읽는
+  값이다. **다른 축에는 그 구별이 없다.** `precision.name`의 `mixed(bf16,fp32)`가
+  axolotl의 fp32 유지 정책인지 잘못된 적재인지는 여기서 읽을 수 없고, 읽을 수 없는
+  것을 environment-bound로 부르지 않는다.
+- **CPU 호스트에서는 모든 probe 칸이 이 체크에서 빨개진다.** `steps.dtype_for`가 CUDA
+  밖에서 fp32를 주는데 `configs/precision/`에 fp32 값이 없고, fused AdamW 커널은 CUDA
+  전용인데 `configs/optim/`에 unfused AdamW 값이 없다. 파드에서 초록이 되는지는
+  **확인 안 함**.
 - **unsloth의 `padding_side_alignment`가 초록인 것은 불일치가 없다는 뜻이 아니다.**
   Qwen 두 칸의 detail이 `disagreed: [processor, tokenizer]`,
   `framework_forced: [processor, tokenizer]`를 기록한다. unsloth는 left로 오고
@@ -1081,8 +1091,98 @@ hf download jinwoo-cho/trainbench-results --repo-type dataset --local-dir <dir>
 uv run python scripts/report.py --results <stage> --ledger outputs/orchestrate-phase0-rerun.json
 ```
 
-복사 단계를 빼면 어느 캠페인이 선택될지는 mtime이 정한다(위 "어느 캠페인의
-아티팩트인지부터 확인했다").
+복사 단계는 여전히 필요하지만, 이유가 바뀌었다. `report.py`는 더 이상 mtime으로
+캠페인을 고르지 않는다 — `recorded_at`이 없는 아티팩트를 **거부하고 stderr에 이름을
+적는다**. 결과 저장소에 있는 그 필드 이전의 아티팩트들은 이제 조용히 섞이는 대신
+건너뛰어지므로, 복사를 빼면 옛 수치가 실리는 것이 아니라 칸이 비어 보인다.
+
+---
+
+## 이 표를 나란히 읽으면 안 되는 자리 (2026-08-03, wave 3 통합)
+
+세 결정이 이 문서를 읽는 방식을 바꾼다. 셋 다 코드에 이미 들어가 있고, 여기 적는 것은
+표가 침묵하는 부분이다.
+
+### 결정 4 — 스택이 다른 칸은 나란히 놓지 않는다
+
+해석 스택이 칸마다 다르다: transformers 5.5.0(unsloth) / 5.12.1(ms_swift) /
+5.14.1(나머지), torch 2.11.0 / 2.12.1 / 2.13.0. 공유 lockfile이 버전을 하나로 강제하고
+`hydra-core` ↔ axolotl 의 antlr4 정확 고정은 해소 불가라, 한 환경에 여섯을 넣는 것은
+확정적으로 불가능하다. 그래서 **`report.py`가 같은 스택끼리만 줄을 세운다.** 한 표에
+전부 넣고 버전을 열로 두는 안은 기각했다 — 독자는 순위를 먼저 읽고 각주를 나중에
+읽는다. 스택을 못 읽은 레코드는 `스택 미상`으로 따로 선다.
+
+**따라서 이 문서의 자동 생성 표에서 세로로 이웃한 두 칸이 비교 가능하다는 보장은
+없다.** 비교 가능한 묶음은 `report.py`가 스택별로 나눠 낸 것뿐이다.
+
+### 결정 5 의 대가 — ablation 그리드가 프레임워크마다 들쭉날쭉하다
+
+프레임워크의 학습 스텝을 그대로 잰다(베이스 인코더만 꺼내 공통 루프에 태우면 프레임워크가
+아니라 우리 루프를 재게 된다). 그 대가가 **모든 칸이 같은 축을 갖지 않는다**는 것이다.
+
+`tevatron` 칸이 그 유일한 실례다. `DenseModel.forward`가 인코딩·풀링·정규화·스코어링·
+InfoNCE·분산 게더를 한 호출 안에서 전부 하므로, 그 칸에서는 하네스의 손실이 아예 돌지
+않는다. 두 축이 프레임워크 소유로 기록된다:
+
+| 축 | tevatron 칸에서 | 다른 다섯 칸에서 |
+|---|---|---|
+| `loss.name` | 프레임워크 소유. `state="framework_owned"`, 값은 비어 있다 | 하네스가 적용하고 되읽는다 |
+| `parallel.cross_device_negatives` | 프레임워크 소유. `is_ddp`일 때 같은 forward가 게더한다 | 하네스가 적용하고 되읽는다 |
+
+`framework_owned`는 `undetermined`와 **다른 상태**다. 후자는 "아무도 읽지 않았다"이고
+런을 막는다. 전자는 "다른 코드가 정했고 그 사실이 기록됐다"이며 런을 막지 않는다. 둘을
+한 상태로 뭉개면 tevatron 칸이 통째로 측정 불가가 되거나, 반대로 읽히지 않은 축이 통과한다.
+그래서 결과 JSON은 `all_determined` / `all_matched` 옆에 최상위 `framework_owned` 키를
+따로 싣는다.
+
+**이 그리드에서 `loss` 축 ablation은 다섯 칸에서만 의미가 있다.** tevatron 열의 그 자리를
+빈칸이 아니라 "해당 없음"으로 읽어야 한다.
+
+### 결정 6 — `kernel=kernels_hub` 축 값을 버렸다
+
+`kernel` 그룹은 `none` / `liger` / `fla` 셋이다. 버린 이유가 **둘이고 서로 독립이다** —
+하나가 해소돼도 다른 하나가 남는다.
+
+1. 진입점 둘(`from_pretrained(use_kernels=True)`, `integrations.hub_kernels.kernelize(model)`)이
+   **모델 객체를 요구**하는데 `axes.patch`는 모델 생성 **전에** 돈다. 적용 지점을 뒤로
+   옮기는 것은 "kernel/attn은 모델 생성 전에만 바꿀 수 있다"는 설계 전제를 깨는 것이라
+   기각했다(`docs/CONTRACTS.md §2`).
+2. `envs/native`가 `kernels==0.16.0`을 핀하는데 transformers 5.14.1의 창은
+   `0.15.2 <= v < 0.16.0`으로 상한 배타적이다. `is_kernels_available()`이 False가 되고
+   `use_kernel_forward_from_hub`가 **조용히 항등 데코레이터**가 된다
+   (`.plans/research/axis-libraries.md §3.1-3.2`).
+
+`trainbench/axes.py`의 `KERNEL_MODULE_ROOTS["kernels"]`는 **남겼다.** 그 표는 적용 표가
+아니라 되읽기 표이고, 어댑터가 스스로 hub dispatch를 켜면 모델은 여전히 `kernels` 패키지의
+클래스로 만들어진다. 행을 지우면 그것이 `none`으로 읽혀 `kernel=none` 요청과
+**일치해버린다** — 지금은 `assert_matches`가 그 런을 막는다.
+
+### 어댑터 여섯의 진입점 대조 — 여섯 중 0이 프레임워크의 학습 진입점을 쓴다
+
+`trainbench/loader.py::ADAPTERS`의 `documented_entry_point`를 그대로 옮긴 것이다.
+`differs`는 두 진입점 문자열이 다른지를 계약이 스스로 검사한 결과다.
+
+| 어댑터 | 프레임워크가 문서화한 학습 진입점 | 하네스가 쓰는 것 | `differs` |
+|---|---|---|---|
+| native | 없음 — transformers 는 LM head 없는 임베딩 모델의 학습 진입점을 문서화하지 않는다 | `AutoModel.from_pretrained` + 손으로 쓴 루프 | `false` |
+| unsloth | `FastVisionModel.from_pretrained` → `for_training(model)` → TRL `SFTTrainer` | `from_pretrained(full_finetuning=...)` + 하네스 루프. `for_training()` 도 `SFTTrainer` 도 안 쓴다 | `true` |
+| ms_swift | `cli_main` → `TrainerFactory 'embedding'` → `EmbeddingTrainer` + `loss_map['infonce']` | `get_model_processor` + 하네스 루프 | `true` |
+| sentence_transformers | `SentenceTransformerTrainer.compute_loss` — 모델 forward 를 부르는 것은 Trainer 가 아니라 손실 객체다 | `SentenceTransformer(...)` + 하네스 루프. trainer 도 ST 손실 클래스도 안 쓴다 | `true` |
+| tevatron | `EncoderModel.forward(query=, passage=)` — 인코딩부터 게더까지 한 호출 | **그 forward 자체**를 하네스 타이머로 돌린다. 손실과 cross-device negatives 는 프레임워크 소유로 기록 | `true` |
+| axolotl | `axolotl.cli.main` → `axolotl.train:train` → `setup_trainer` → HF Trainer 하위클래스, accelerate 로 기동 | `ModelLoader(cfg, tokenizer).load()` + `axes.step_context` 안의 하네스 루프. trainer 도 Accelerator 도 없다 | `true` |
+
+**여섯 중 프레임워크의 문서화된 학습 진입점을 그대로 타는 칸은 없다.** native 의
+`differs=false` 는 "같은 것을 쓴다"가 아니라 "프레임워크가 문서화한 것이 없어서 하네스
+자신이 기준 경로"라는 뜻이고, tevatron 은 문서화된 forward 를 쓰지만 그 위의 trainer 를
+쓰지 않아 `true` 다. 그래서 이 벤치마크가 재는 것은 "프레임워크를 문서대로 썼을 때의
+속도"가 아니라 **"프레임워크가 만든 모델·스텝을 같은 하네스로 돌렸을 때의 속도"** 다.
+그 구별이 결과를 읽는 조건이다.
+
+axolotl 칸에는 하나가 더 붙는다. `required_step_context`(autocast, cuda, bfloat16)로
+`embed_tokens`/`lm_head` 를 fp32 로 둔 채 bf16 본체와 matmul 하게 만든다(결정 1). 따라서
+**native(순수 bf16)와 axolotl(autocast)은 다른 수치 체제에서 비교된다.** 그 사실은
+`documented_entry_point.differs` 와 `required_step_context` 양쪽에 남는다. autocast 를
+켠 axolotl 과 끄고 잰 axolotl 의 속도 차는 **측정 안 함** — 이 호스트에 CUDA 가 없다.
 
 ---
 
