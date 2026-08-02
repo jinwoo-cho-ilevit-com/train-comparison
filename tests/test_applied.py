@@ -415,6 +415,46 @@ def test_a_run_that_built_no_optimizer_is_undetermined(config_mapping):
     assert axis(state, "optim.name").detail["reason"] == "no optimizer was built"
 
 
+def optimizer_named(class_name: str, groups):
+    """An optimizer of a class with this exact name. The class name is how capture
+    recognises an optimizer from a package that does not install on every host."""
+    instance = type(class_name, (), {})()
+    instance.param_groups = list(groups)
+    instance.state = {}
+    return instance
+
+
+def test_an_optimizer_class_the_table_does_not_name_is_undetermined(config_mapping):
+    """Deriving the value from the class name is a second mapping into this axis's
+    vocabulary, and it reaches past the Newton-Schulz reading, which knows one exact
+    spelling: a class named `MUON` spelt the requested value without a single param
+    group being looked at, so an optimizer whose orthogonalised side is empty could
+    publish its number as Muon's."""
+    config = bench(config_mapping, **{"optim.name": "muon"})
+    optimizer = optimizer_named("MUON", [{"params": [torch.nn.Parameter(torch.zeros(2, 2))]}])
+
+    state = capture(built(optimizer=optimizer), config)
+
+    assert axis(state, "optim.name").applied is None
+    assert not axis(state, "optim.name").matches
+    assert "MUON" in axis(state, "optim.name").detail["reason"]
+    with pytest.raises(AppliedMismatch, match="optim.name"):
+        assert_matches(state, config)
+
+
+def test_a_muon_that_orthogonalises_is_named_by_the_table(config_mapping):
+    """The other half of the same guard: `OPTIM_CLASS_AXIS['Muon']` is the only way
+    to this value, so deleting that row has to stop certifying a real Muon run."""
+    config = bench(config_mapping, **{"optim.name": "muon"})
+    groups = [{"params": [torch.nn.Parameter(torch.zeros(2, 2))], "use_muon": True}]
+
+    state = capture(built(optimizer=optimizer_named("Muon", groups)), config)
+
+    assert axis(state, "optim.name").applied == "muon"
+    assert axis(state, "optim.name").matches
+    assert axis(state, "optim.name").detail["newton_schulz_tensors"] == 1
+
+
 def test_the_loss_axis_is_read_off_the_loss_that_was_built(config_mapping):
     """GradCache is the case this exists for: plain in-batch negatives must not be
     able to report a cached_mnrl speedup for work that was never done."""
@@ -632,6 +672,82 @@ def test_a_model_with_no_floating_point_weights_is_undetermined(config_mapping):
 
     assert precision.applied is None
     assert precision.detail["base"] == {}
+
+
+def recipe_model(dtype=torch.bfloat16, vision_dtype=None):
+    """A model whose modules a recipe package defined, which is what an fp8 run
+    has and what this host cannot build for real."""
+    model = bf16_model(dtype, vision_dtype)
+    model.language_model = _RecipeLinear(2, 2).to(dtype)
+    model.visual = _RecipeLinear(2, 2).to(vision_dtype or dtype)
+    return model
+
+
+def mxfp8_recipe():
+    return type("MXFP8BlockScaling", (), {})()
+
+
+def test_an_fp8_run_whose_model_agrees_with_the_recipe_is_certified(config_mapping):
+    """The value has to stay reachable: the refusals below are worth nothing if the
+    axis simply cannot be certified any more."""
+    config = bench(config_mapping, **{"precision.name": "mxfp8"})
+
+    state = capture(Built(model=recipe_model(), precision_recipe=mxfp8_recipe()), config)
+    precision = axis(state, "precision.name")
+
+    assert precision.applied == "mxfp8"
+    assert precision.matches
+    assert precision.detail["recipe_modules"] == ["transformer_engine"]
+
+
+def test_a_recipe_does_not_certify_a_half_converted_model(config_mapping):
+    """Everything this probe reads off the weights used to be skipped whenever a
+    recipe was on `Built` — and `axes.assemble` puts one there from the same config
+    the state is checked against, so an fp8 request certified whatever model it was
+    handed. A tower left in fp32 is neither precision under a recipe either."""
+    config = bench(config_mapping, **{"precision.name": "mxfp8"})
+    model = recipe_model(vision_dtype=torch.float32)
+
+    state = capture(Built(model=model, precision_recipe=mxfp8_recipe()), config)
+    precision = axis(state, "precision.name")
+
+    assert precision.applied is None
+    assert precision.detail["base"] == {"bf16": 2, "fp32": 2}
+    with pytest.raises(AppliedMismatch, match="precision.name"):
+        assert_matches(state, config)
+
+
+def test_a_recipe_over_fp32_weights_is_the_wrong_machine_not_an_fp8_run(config_mapping):
+    """`dtype_for` returns fp32 off CUDA, so the ordinary way this goes wrong is a
+    model loaded on a host that cannot run the recipe at all — and the recipe object
+    is on `Built` regardless, because the request is what built it."""
+    config = bench(config_mapping, **{"precision.name": "mxfp8"})
+
+    state = capture(
+        Built(model=recipe_model(torch.float32), precision_recipe=mxfp8_recipe()), config
+    )
+    precision = axis(state, "precision.name")
+
+    assert precision.applied is None
+    assert "fp32" in precision.detail["reason"]
+    with pytest.raises(AppliedMismatch, match="precision.name"):
+        assert_matches(state, config)
+
+
+def test_a_recipe_that_replaced_no_module_is_not_read_as_an_fp8_run(config_mapping):
+    """`axes._apply_to_model` replaces no module, so the recipe arrives over a tree
+    of plain torch classes. Reading the recipe's class name there returns the
+    request — the module scan is the model's own word against it."""
+    config = bench(config_mapping, **{"precision.name": "mxfp8"})
+
+    state = capture(Built(model=bf16_model(), precision_recipe=mxfp8_recipe()), config)
+    precision = axis(state, "precision.name")
+
+    assert precision.applied is None
+    assert precision.detail["recipe_modules"] == []
+    assert "transformer_engine" in precision.detail["reason"]
+    with pytest.raises(AppliedMismatch, match="precision.name"):
+        assert_matches(state, config)
 
 
 # --- train.offload ------------------------------------------------------------
