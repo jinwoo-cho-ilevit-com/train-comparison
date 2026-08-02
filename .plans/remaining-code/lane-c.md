@@ -61,6 +61,11 @@ ablation 그리드가 프레임워크마다 들쭉날쭉해지는 것이 결정 
 - 축 소유권 상태가 표현된다 — 미구현 / 적용됨 / **프레임워크 소유** 셋, 그리고 각각이 결과
   레코드에서 구분된다
   → `uv run pytest tests/contract/test_applied_axes.py`
+- 계약이 아무것도 미루지 않는다 — 경계가 건 `xfail` 마커 21개가 전부 사라진다. 마커가
+  남아 있으면 계약 테스트가 초록이어도 **아무것도 증명하지 않는다**
+  → `infisical run --env=dev -- uv run pytest tests/contract/test_applied_axes.py --runxfail -k the_contract_defers_nothing`
+  (오늘 exit 1, 21개를 이름으로 열거. `-k`가 필수다 — 파일 전체에 `--runxfail`을 걸면
+  이미 아는 실패 21개를 벗겨낼 뿐 "마커가 없다"는 판정하지 못한다)
 - 매핑을 "요청을 그대로 돌려주기"로 바꾸면 테스트가 죽는다 (capture가 공허해지는 것을 막는
   검사가 있어야 한다)
   → 변이 출력 그대로 인용
