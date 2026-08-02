@@ -1,0 +1,323 @@
+{
+  "boundary": "collate-metrics",
+  "frozen_at_commit": "0604684",
+  "payload_type": "MicroBatch",
+  "produced_by": "the collate side (lane-f) -- trainbench/collate.py, today scripts/bench.py",
+  "consumed_by": "the measurement side (lane-d) -- the measured loop and trainbench/metrics/",
+  "owned_by": "neither lane; change it only by agreement, and the contract test is what makes the change loud",
+  "how_the_payloads_were_produced": "the four collates on this repo's rows below, through a deterministic stand-in processor (word ids = 3 + sum(ord(c)) % 997, pad id 0). The processor is a stub because it is the external dependency; the collates are real. tests/contract/test_collate_metrics.py rebuilds these and compares.",
+  "rows": [
+    {
+      "qry": "what is a red panda",
+      "pos_text": "the red panda is a small mammal",
+      "qry_image": "img-a"
+    },
+    {
+      "qry": "capital of france",
+      "pos_text": "paris",
+      "pos_image": "img-b"
+    },
+    {
+      "qry": "photo of a dog",
+      "pos_text": "a dog on grass",
+      "qry_image": "img-c"
+    },
+    {
+      "qry": "how tall is everest",
+      "pos_text": "eight thousand eight hundred forty nine metres"
+    }
+  ],
+  "pad_id": 0,
+  "max_seq_len": 64,
+  "packing_boundary_keys": [
+    "cu_seqlens",
+    "seq_lengths"
+  ],
+  "tensors_may_add": [
+    "cu_seq_lens_q",
+    "cu_seq_lens_k",
+    "max_length_q",
+    "max_length_k"
+  ],
+  "fields": [
+    {
+      "name": "tensors",
+      "type": "mapping[str, tensor]",
+      "unit": "model keyword arguments",
+      "required": true,
+      "meaning": "exactly what goes to model(**tensors), keyed by the model's own kwarg names. No accounting number and no packing boundary may appear here: the model would reject them, and a count that travelled inside tensors would be moved to the device and read back inside the timed window."
+    },
+    {
+      "name": "tokens",
+      "type": "int",
+      "unit": "token",
+      "required": true,
+      "meaning": "REAL tokens: the ones the model does work on. Padding is excluded. This is the numerator the harness divides by measured seconds; it is never a framework's own tokens/sec and never padded_tokens."
+    },
+    {
+      "name": "padded_tokens",
+      "type": "int",
+      "unit": "token",
+      "required": true,
+      "meaning": "every token SLOT in the batch, padding included -- input_ids.numel(). Reported beside tokens so the padding fraction is visible; the packing axis reverses rank depending on which of the two is used as the denominator, so neither field may stand in for the other."
+    },
+    {
+      "name": "rows",
+      "type": "int",
+      "unit": "sequence",
+      "required": true,
+      "meaning": "how many SEQUENCES the batch stands for -- 2 per pair, queries then positives. This is not tensors['input_ids'].shape[0]: a packed batch is one tensor row holding every sequence, and there rows comes from the packing boundaries."
+    },
+    {
+      "name": "samples",
+      "type": "int",
+      "unit": "dataset row",
+      "required": true,
+      "meaning": "how many dataset rows (query/positive pairs) the batch drew. rows == 2 * samples for every collate here. Distinct from rows because packing and pairing both make them differ, and in-batch negatives make the sequence count part of the objective."
+    },
+    {
+      "name": "images",
+      "type": "int",
+      "unit": "image",
+      "required": true,
+      "meaning": "images actually handed to the processor and paid for in the forward pass."
+    },
+    {
+      "name": "images_dropped",
+      "type": "int",
+      "unit": "image",
+      "required": true,
+      "meaning": "images present in the rows that this batch could not carry -- a text-only processor, or a packed/pretokenized path that carries ids only. Non-zero means the run measured a text-only view of an image corpus and the result has to say so."
+    },
+    {
+      "name": "cu_seqlens",
+      "type": "int32 tensor | null",
+      "unit": "cumulative token offset",
+      "required": false,
+      "default": null,
+      "meaning": "the packing boundary: a 1-D vector of rows+1 cumulative REAL-token offsets, starting at 0 and ending at tokens. Present if and only if the batch is packed. null is what tells the step to pool the padded way, so an absent-but-packed batch would be pooled at the wrong positions."
+    },
+    {
+      "name": "images_per_row",
+      "type": "tuple[int] | null",
+      "unit": "image per sequence",
+      "required": false,
+      "default": null,
+      "meaning": "how many of the flat pixel batch each of the rows sequences contributed, in batch order; len == rows and sum == images. null means no batch of this shape carries pixels at all, which is not the same as a tuple of zeros (this batch happened to carry none) -- the splitter refuses on null rather than assuming."
+    }
+  ],
+  "invariants": [
+    "tokens <= padded_tokens",
+    "padded_tokens == number of token slots in tensors['input_ids']",
+    "tokens == tensors['attention_mask'].sum() when the batch carries a mask",
+    "tokens == padded_tokens when the batch carries no mask (packed: no padding by construction)",
+    "rows == tensors['input_ids'].shape[0] when not packed",
+    "rows == cu_seqlens.numel() - 1 when packed",
+    "rows == 2 * samples (queries first, then positives)",
+    "cu_seqlens is not null if and only if the batch is packed",
+    "cu_seqlens[0] == 0, strictly increasing, cu_seqlens[-1] == tokens",
+    "images_per_row is null, or len(images_per_row) == rows and sum(images_per_row) == images",
+    "no key of tensors is an accounting field name or a packing boundary name",
+    "every accounting field is an int, never a rate: the payload carries counters and the measurement side computes tokens/sec from them",
+    "of the varlen kwargs in tensors_may_add, either all four are present or none are (transformers takes the fast path only when all four are non-None)"
+  ],
+  "payloads": {
+    "padded_multimodal": {
+      "collate": "Collate, processor that accepts images",
+      "packed": false,
+      "payload": {
+        "tensors": {
+          "input_ids": {
+            "dtype": "int64",
+            "shape": [8, 7],
+            "values": [
+              [79, 223, 100, 318, 519, 0, 0],
+              [737, 216, 626, 0, 0, 0, 0],
+              [197, 216, 100, 317, 0, 0, 0],
+              [337, 432, 223, 769, 0, 0, 0],
+              [324, 318, 519, 223, 100, 540, 632],
+              [186, 0, 0, 0, 0, 0, 0],
+              [100, 317, 224, 547, 0, 0, 0],
+              [532, 873, 532, 749, 567, 429, 659]
+            ]
+          },
+          "attention_mask": {
+            "dtype": "int64",
+            "shape": [8, 7],
+            "values": [
+              [1, 1, 1, 1, 1, 0, 0],
+              [1, 1, 1, 0, 0, 0, 0],
+              [1, 1, 1, 1, 0, 0, 0],
+              [1, 1, 1, 1, 0, 0, 0],
+              [1, 1, 1, 1, 1, 1, 1],
+              [1, 0, 0, 0, 0, 0, 0],
+              [1, 1, 1, 1, 0, 0, 0],
+              [1, 1, 1, 1, 1, 1, 1]
+            ]
+          },
+          "pixel_values": {
+            "dtype": "float32",
+            "shape": [3, 2],
+            "values": [
+              [5.0, 1.0],
+              [5.0, 1.0],
+              [5.0, 1.0]
+            ]
+          }
+        },
+        "tokens": 35,
+        "padded_tokens": 56,
+        "rows": 8,
+        "samples": 4,
+        "images": 3,
+        "images_dropped": 0,
+        "cu_seqlens": null,
+        "images_per_row": [1, 0, 1, 0, 0, 1, 0, 0]
+      }
+    },
+    "padded_text_only": {
+      "collate": "Collate, text-only processor -- every image is counted as dropped",
+      "packed": false,
+      "payload": {
+        "tensors": {
+          "input_ids": {
+            "dtype": "int64",
+            "shape": [8, 7],
+            "values": [
+              [439, 223, 100, 318, 519, 0, 0],
+              [737, 216, 626, 0, 0, 0, 0],
+              [557, 216, 100, 317, 0, 0, 0],
+              [337, 432, 223, 769, 0, 0, 0],
+              [324, 318, 519, 223, 100, 540, 632],
+              [546, 0, 0, 0, 0, 0, 0],
+              [100, 317, 224, 547, 0, 0, 0],
+              [532, 873, 532, 749, 567, 429, 659]
+            ]
+          },
+          "attention_mask": {
+            "dtype": "int64",
+            "shape": [8, 7],
+            "values": [
+              [1, 1, 1, 1, 1, 0, 0],
+              [1, 1, 1, 0, 0, 0, 0],
+              [1, 1, 1, 1, 0, 0, 0],
+              [1, 1, 1, 1, 0, 0, 0],
+              [1, 1, 1, 1, 1, 1, 1],
+              [1, 0, 0, 0, 0, 0, 0],
+              [1, 1, 1, 1, 0, 0, 0],
+              [1, 1, 1, 1, 1, 1, 1]
+            ]
+          }
+        },
+        "tokens": 35,
+        "padded_tokens": 56,
+        "rows": 8,
+        "samples": 4,
+        "images": 0,
+        "images_dropped": 3,
+        "cu_seqlens": null,
+        "images_per_row": [0, 0, 0, 0, 0, 0, 0, 0]
+      }
+    },
+    "packed": {
+      "collate": "PackedBatches over PackedCollate (dataloader.packing=true)",
+      "packed": true,
+      "payload": {
+        "tensors": {
+          "input_ids": {
+            "dtype": "int64",
+            "shape": [1, 35],
+            "values": [
+              [439, 223, 100, 318, 519, 737, 216, 626, 557, 216, 100, 317, 337, 432, 223, 769, 324, 318, 519, 223, 100, 540, 632, 546, 100, 317, 224, 547, 532, 873, 532, 749, 567, 429, 659]
+            ]
+          },
+          "position_ids": {
+            "dtype": "int64",
+            "shape": [1, 35],
+            "values": [
+              [0, 1, 2, 3, 4, 0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 0, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6]
+            ]
+          }
+        },
+        "tokens": 35,
+        "padded_tokens": 35,
+        "rows": 8,
+        "samples": 4,
+        "images": 0,
+        "images_dropped": 3,
+        "cu_seqlens": {
+          "dtype": "int32",
+          "shape": [9],
+          "values": [0, 5, 8, 12, 16, 23, 24, 28, 35]
+        },
+        "images_per_row": null
+      }
+    },
+    "pretokenized_padded": {
+      "collate": "PretokenizedCollate over Encode'd rows (dataloader.pretokenize=true)",
+      "packed": false,
+      "encoded_rows": [
+        {
+          "input_ids": [439, 223, 100, 318, 519],
+          "positive_input_ids": [324, 318, 519, 223, 100, 540, 632],
+          "images_dropped": 1
+        },
+        {
+          "input_ids": [737, 216, 626],
+          "positive_input_ids": [546],
+          "images_dropped": 1
+        },
+        {
+          "input_ids": [557, 216, 100, 317],
+          "positive_input_ids": [100, 317, 224, 547],
+          "images_dropped": 1
+        },
+        {
+          "input_ids": [337, 432, 223, 769],
+          "positive_input_ids": [532, 873, 532, 749, 567, 429, 659],
+          "images_dropped": 0
+        }
+      ],
+      "payload": {
+        "tensors": {
+          "input_ids": {
+            "dtype": "int64",
+            "shape": [8, 7],
+            "values": [
+              [0, 0, 439, 223, 100, 318, 519],
+              [0, 0, 0, 0, 737, 216, 626],
+              [0, 0, 0, 557, 216, 100, 317],
+              [0, 0, 0, 337, 432, 223, 769],
+              [324, 318, 519, 223, 100, 540, 632],
+              [0, 0, 0, 0, 0, 0, 546],
+              [0, 0, 0, 100, 317, 224, 547],
+              [532, 873, 532, 749, 567, 429, 659]
+            ]
+          },
+          "attention_mask": {
+            "dtype": "int64",
+            "shape": [8, 7],
+            "values": [
+              [0, 0, 1, 1, 1, 1, 1],
+              [0, 0, 0, 0, 1, 1, 1],
+              [0, 0, 0, 1, 1, 1, 1],
+              [0, 0, 0, 1, 1, 1, 1],
+              [1, 1, 1, 1, 1, 1, 1],
+              [0, 0, 0, 0, 0, 0, 1],
+              [0, 0, 0, 1, 1, 1, 1],
+              [1, 1, 1, 1, 1, 1, 1]
+            ]
+          }
+        },
+        "tokens": 35,
+        "padded_tokens": 56,
+        "rows": 8,
+        "samples": 4,
+        "images": 0,
+        "images_dropped": 3,
+        "cu_seqlens": null,
+        "images_per_row": null
+      }
+    }
+  }
+}
