@@ -1428,6 +1428,15 @@ def test_report_renders_the_refusal_as_a_reason_and_not_as_a_measurement(
             "step_seconds_p95": 0.6,
             "steps_measured": 4,
             "samples_per_second": 8.0,
+            # The training-validity gate `report.py` applies before it ranks a run.
+            # Without these the control is a record that cannot say it trained, and
+            # the report keeps it out of the table for that reason instead of the
+            # refusal this test is about.
+            "grad_norm": 1.5,
+            "trainable_params": 219,
+            "total_params": 219,
+            "loss_first": 2.9,
+            "loss_last": 2.4,
         }
     }
     document = merged_document(

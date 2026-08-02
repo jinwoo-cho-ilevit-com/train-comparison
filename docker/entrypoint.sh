@@ -17,6 +17,7 @@ set -uo pipefail
 RESULT_DIR="${TRAINBENCH_RESULT_DIR:-/workspace/result}"
 CONFIG_PATH="${RESULT_DIR}/resolved_config.json"
 PLAN_PATH="${RESULT_DIR}/resolved_plan.json"
+PROBE_PLAN_PATH="${RESULT_DIR}/probe_plan.json"
 RESULT_PATH="${RESULT_DIR}/result.json"
 REPO_DIR="${TRAINBENCH_REPO_DIR:-/workspace/train-comparison}"
 # Always bounded. A pod with no deadline bills until a human notices, which is the
@@ -186,15 +187,58 @@ if (( env_dir_usable == 0 )); then
     exit 2
 fi
 
+# Why a run produced nothing, when the reason is not the run's own exit code. Read
+# by the publish block, so a refusal reaches the results repo as itself.
+run_note=""
+
 purpose="${TRAINBENCH_PURPOSE:-probe}"
 echo "== run (purpose=${purpose}, deadline ${DEADLINE_SECONDS}s) =="
 if [[ "${purpose}" == "probe" ]]; then
-    run_with_secrets timeout --signal=TERM --kill-after="${KILL_GRACE_SECONDS}" \
-        "${DEADLINE_SECONDS}" \
-        "${PYTHON[@]}" "${REPO_DIR}/scripts/verify_env.py" \
-        --config "${CONFIG_PATH}" \
-        --out "${RESULT_PATH}"
-    run_status=$?
+    # The probe goes through the same preflight as a measuring pod. It is the pod's
+    # own image that has to accept the config it was handed, and nothing on the audit
+    # host can answer that: the code is baked into the image (`COPY trainbench`), so an
+    # image built before a schema change refuses the orchestrator's config in both
+    # directions. The first A100 canary spent twelve minutes restarting on that,
+    # forty times at seventeen-second intervals, and the probe branch was the branch
+    # that skipped this check.
+    #
+    # The plan the orchestrator sent, wrapped when it did not send one: preflight's
+    # subject is a list of settings, and reading zero of them as "none refused" is
+    # the vacuous pass this repository has shipped before.
+    "${PYTHON[@]}" - "${CONFIG_PATH}" "${PLAN_PATH}" "${PROBE_PLAN_PATH}" \
+        "${TRAINBENCH_EXPERIMENT:-probe}" <<'PY'
+import json
+import sys
+
+config_path, plan_path, out_path, name = sys.argv[1:5]
+config = json.load(open(config_path))
+try:
+    plan = json.load(open(plan_path))
+except (OSError, ValueError):
+    plan = []
+if not isinstance(plan, list) or not plan:
+    plan = [{"name": name, "role": "experiment", "overrides": [], "config": config}]
+with open(out_path, "w") as handle:
+    json.dump(plan, handle)
+PY
+    echo "-- preflight"
+    "${PYTHON[@]}" "${REPO_DIR}/scripts/bench.py" --preflight "${PROBE_PLAN_PATH}"
+    preflight_status=$?
+    if (( preflight_status != 0 )); then
+        # Not run, and said so. A probe that cannot compose its own config would
+        # otherwise crash inside verify_env.py once per container restart.
+        run_status=${preflight_status}
+        run_note="preflight refused this pod's config (exit ${run_status}); the image's own"
+        run_note="${run_note} schema and the config it was handed do not agree, so nothing ran"
+        echo "-- probe not started: ${run_note}" >&2
+    else
+        run_with_secrets timeout --signal=TERM --kill-after="${KILL_GRACE_SECONDS}" \
+            "${DEADLINE_SECONDS}" \
+            "${PYTHON[@]}" "${REPO_DIR}/scripts/verify_env.py" \
+            --config "${CONFIG_PATH}" \
+            --out "${RESULT_PATH}"
+        run_status=$?
+    fi
 elif [[ "${purpose}" == "timing" || "${purpose}" == "profile" || "${purpose}" == "quality" ]]; then
     # One process per setting, not a loop inside bench.py. A process that already
     # ran a setting carries its autotune cache, compiled graphs and allocator
@@ -319,7 +363,7 @@ elif [[ -s "${RESULT_PATH}" ]]; then
     publish "${CONFIG_PATH}" --mode result --result "${RESULT_PATH}" || true
 else
     publish "${CONFIG_PATH}" --mode fallback --result "${RESULT_PATH}" \
-        --reason "no result file after the run (exit ${run_status})" || true
+        --reason "${run_note:-no result file after the run (exit ${run_status})}" || true
 fi
 
 echo "run exited ${run_status}"

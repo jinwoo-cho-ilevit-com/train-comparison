@@ -14,6 +14,7 @@ exactly how a number goes missing from a report that still renders.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,23 @@ sys.path.insert(0, str(REPO / "scripts"))
 import report  # noqa: E402
 
 BASELINE_LABEL = "baseline-canonical"
+
+# When the campaign these fixtures belong to ran. Every producer stamps
+# `recorded_at` (`record.build_record`, `publish_result.provenance`) and the merge
+# refuses an artifact without one, so a fixture that omitted it would be testing a
+# record no pod writes.
+RECORDED_AT = 1785974400.0
+
+# What says a run trained, as `report.training_verdict` asks it. Carried by every
+# fixture that reports figures, because a run whose gate fields are absent is not
+# published as a speed and its rows would then be missing from the table under test.
+TRAINED = {
+    "grad_norm": 1.8437,
+    "trainable_params": 219,
+    "total_params": 219,
+    "loss_first": 2.8734,
+    "loss_last": 2.4102,
+}
 
 
 def timing_metrics(step_seconds: float, *, discard: int = 2, dropped: float = 0.0, **over):
@@ -50,22 +68,26 @@ def timing_metrics(step_seconds: float, *, discard: int = 2, dropped: float = 0.
         totals={"images_read_total": 40, "images_dropped_total": int(dropped * 10)},
     )
     summary["profiled"] = False
+    summary.update(TRAINED)
     summary.update(over)
     return summary
 
 
-def timing_payload(framework, model, pod, metrics=None, purpose="timing"):
+def timing_payload(framework, model, pod, metrics=None, purpose="timing", **over):
     payload = {
         "config": {
             "framework": {"name": framework},
             "model": {"name": model},
             "run": {"purpose": purpose},
+            "peft": {"mode": "full"},
         },
+        "recorded_at": RECORDED_AT,
         "host": {"runpod_pod_id": pod},
         "packages": {"torch": "2.9.0", "transformers": "4.57.0"},
     }
     if metrics is not None:
         payload["metrics"] = metrics
+    payload.update(over)
     return payload
 
 
@@ -82,7 +104,7 @@ def probe_payload(framework, model, checks, recorded_at=1.0, **extra):
     }
 
 
-def write(root, framework, model, pod, payload, label=None, name=report.RESULT_NAME):
+def write(root, framework, model, pod, payload, label=None, name=report.RESULT_NAME, mtime=None):
     """One artifact where `publish_result` would have put it."""
     directory = root / "results" / framework / model / pod
     if label is not None:
@@ -90,6 +112,8 @@ def write(root, framework, model, pod, payload, label=None, name=report.RESULT_N
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / name
     path.write_text(json.dumps(payload))
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
     return path
 
 
@@ -119,6 +143,81 @@ def baseline_pod(root, pod, step_seconds, **kwargs):
         timing_payload("native", "qwen3_5_0_8b", pod, timing_metrics(step_seconds, **kwargs)),
         label=BASELINE_LABEL,
     )
+
+
+# --- which campaign an artifact belongs to ---------------------------------
+
+
+def test_the_current_campaign_is_picked_by_the_recorded_identity_not_the_file_clock(tmp_path):
+    """Measured: none of the forty artifacts in the results repo carry `recorded_at`,
+    and a clean clone downloads them in one go — so the file clock ordered eight of
+    eighteen cells by the previous campaign. Here the *older* campaign is given the
+    *newer* mtime, which is the same coin's worse face."""
+    write(
+        tmp_path,
+        "native",
+        "gemma4_e2b",
+        "pod-previous-campaign",
+        probe_payload(
+            "native",
+            "gemma4_e2b",
+            [{"name": f"c{i}", "ok": True} for i in range(3)],
+            recorded_at=RECORDED_AT - 30 * 86400,
+        ),
+        mtime=2_000_000_000,
+    )
+    write(
+        tmp_path,
+        "native",
+        "gemma4_e2b",
+        "pod-this-campaign",
+        probe_payload(
+            "native",
+            "gemma4_e2b",
+            [{"name": f"c{i}", "ok": True} for i in range(7)],
+            recorded_at=RECORDED_AT,
+        ),
+        mtime=1_000_000_000,
+    )
+    _, chosen, _, rendered = merged(tmp_path)
+    assert chosen[("native", "gemma4_e2b")].pod == "pod-this-campaign"
+    assert "OK (7 checks)" in rendered
+
+
+def test_equal_timestamps_no_longer_decide_which_artifact_wins(tmp_path):
+    """The reproduction condition: one download, so every mtime is the same and the
+    only thing left that can order two artifacts is what each run recorded."""
+    for pod, checks, recorded in (("a", 3, RECORDED_AT - 86400), ("b", 7, RECORDED_AT)):
+        write(
+            tmp_path,
+            "native",
+            "gemma4_e2b",
+            pod,
+            probe_payload(
+                "native",
+                "gemma4_e2b",
+                [{"name": f"c{i}", "ok": True} for i in range(checks)],
+                recorded_at=recorded,
+            ),
+            mtime=1_700_000_000,
+        )
+    artifacts, skipped = report.load_artifacts(tmp_path)
+    assert skipped == []
+    ordered = sorted(artifacts, key=lambda a: a.timestamp)
+    assert [len(report.checks_of(a)) for a in ordered] == [3, 7]
+    assert ordered[0].timestamp != ordered[1].timestamp
+
+
+def test_an_artifact_that_cannot_say_when_it_ran_is_named_rather_than_dated(tmp_path):
+    """Refused, not stamped with its own mtime: every producer here writes the field,
+    so a file without it is not something this campaign published."""
+    payload = probe_payload("native", "gemma4_e2b", [{"name": "load", "ok": True}])
+    del payload["recorded_at"]
+    write(tmp_path, "native", "gemma4_e2b", "podA", payload)
+    artifacts, skipped = report.load_artifacts(tmp_path)
+    assert artifacts == []
+    assert len(skipped) == 1
+    assert "recorded_at" in skipped[0]
 
 
 # --- the timing lane -------------------------------------------------------
@@ -307,6 +406,50 @@ def test_a_combination_measured_but_never_probed_does_not_read_as_untried(tmp_pa
     # Not 미시도: a run trained on this combination, so loading is not in question.
     assert "측정 1건(probe 없음" in row
     assert report.NOT_ATTEMPTED not in row.split("|")[-2]
+
+
+# --- one ranking per resolved stack ----------------------------------------
+
+
+def stacked(root, pod, label, torch_version, transformers_version):
+    payload = timing_payload("native", "gemma4_e2b", pod, timing_metrics(0.5))
+    payload["packages"] = {"torch": torch_version, "transformers": transformers_version}
+    return write(root, "native", "gemma4_e2b", pod, payload, label=label)
+
+
+def test_two_stacks_do_not_share_a_ranking_table(tmp_path):
+    """The six images cannot be unified (transformers 5.14.1 / 5.12.1 / 5.5.0), so a
+    single table would put the image in the ranking and present it as a result."""
+    stacked(tmp_path, "podA", "on-5-14", "2.13.0", "5.14.1")
+    stacked(tmp_path, "podB", "on-5-5", "2.11.0", "5.5.0")
+    _, _, _, rendered = merged(tmp_path)
+
+    assert "해석 스택: torch 2.13.0 + transformers 5.14.1" in rendered
+    assert "해석 스택: torch 2.11.0 + transformers 5.5.0" in rendered
+    blocks, current = [], []
+    for line in rendered.splitlines():
+        if line.startswith("|"):
+            current.append(line)
+        elif current:
+            blocks.append("\n".join(current))
+            current = []
+    assert blocks
+    assert not any("| on-5-14 |" in b and "| on-5-5 |" in b for b in blocks)
+
+
+def test_a_stack_the_record_cannot_name_is_ranked_with_nobody(tmp_path):
+    """A missing `packages` entry is a finding, not a licence to guess which of the
+    six images produced the number."""
+    payload = timing_payload("native", "gemma4_e2b", "podA", timing_metrics(0.5))
+    del payload["packages"]["transformers"]
+    write(tmp_path, "native", "gemma4_e2b", "podA", payload, label="nameless")
+    stacked(tmp_path, "podB", "named", "2.13.0", "5.14.1")
+    _, _, _, rendered = merged(tmp_path)
+
+    assert f"해석 스택: {report.STACK_UNKNOWN}" in rendered
+    section = rendered.index(f"해석 스택: {report.STACK_UNKNOWN}")
+    assert rendered.index("| nameless |") > section
+    assert rendered.index("| named |") < section
 
 
 # --- the baseline gate -----------------------------------------------------

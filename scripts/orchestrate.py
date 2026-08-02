@@ -127,6 +127,13 @@ SELF_KILL_MARGIN_SECONDS = 120
 ROLE_BASELINE = "baseline"
 ROLE_EXPERIMENT = "experiment"
 
+# The one config group whose values cannot share a pod: each framework is its own
+# image, and an image is what a pod runs. `check_axis_not_split` therefore allows
+# it across pods — and says so, because an axis compared across hosts in silence is
+# the thing that guard exists to prevent. Phase 0 split it eighteen ways per model
+# and nothing said a word.
+CROSS_POD_GROUP = "framework"
+
 
 class ManifestError(ValueError):
     """An experiment definition that cannot be trusted to describe a pod."""
@@ -269,19 +276,36 @@ def axis_moved_by(override: str) -> str | None:
     return key if any(knob.startswith(f"{key}.") for knob in knobs) else None
 
 
+def pod_overrides(exp: Experiment) -> list[str]:
+    """The overrides `plan_runs` puts in front of every run this pod executes.
+
+    Shared with `axes_touched` rather than spelled out twice: `framework` is an
+    ablation axis and it arrives here, not through `overrides`, so a guard reading
+    only the manifest's own lists could not see the axis the pod is defined by.
+    """
+    return [f"framework={exp.framework}", f"model={exp.model}", f"run={exp.purpose}"]
+
+
 def axes_touched(exp: Experiment) -> dict[str, list[str]]:
     """Every axis this manifest moves, and the override that shows it.
 
-    Both the overrides fixed for the whole pod and the ones swept per setting: a
-    value pinned on one pod and a different value pinned on another is the same
-    cross-host comparison as a sweep torn in half, and reads as neither.
+    Three sources, because a pod's settings arrive by three routes: the identity
+    overrides `plan_runs` prepends, the overrides fixed for the whole pod, and the
+    ones swept per setting. A value pinned on one pod and a different value pinned
+    on another is the same cross-host comparison as a sweep torn in half, and
+    reads as neither.
     """
     found: dict[str, list[str]] = {}
     swept = [override for extra in exp.settings.values() for override in extra]
-    for override in [*exp.overrides, *swept]:
+    for override in [*pod_overrides(exp), *exp.overrides, *swept]:
         if axis := axis_moved_by(override):
             found.setdefault(axis, []).append(override)
     return found
+
+
+def is_cross_pod_group(axis: str) -> bool:
+    """Whether this axis is compared across pods by construction rather than by mistake."""
+    return axis == CROSS_POD_GROUP or axis.startswith(f"{CROSS_POD_GROUP}.")
 
 
 def load_baselines(path: Path) -> dict[str, list[str]]:
@@ -304,6 +328,43 @@ def load_experiments(directory: Path = MANIFEST_DIR) -> list[Experiment]:
     return experiments
 
 
+def split_axes(experiments: list[Experiment]) -> dict[tuple[str, str], dict[str, list[str]]]:
+    """Every (model, axis) that more than one pod moves, with the evidence per pod."""
+    seen: dict[tuple[str, str], dict[str, list[str]]] = {}
+    for exp in experiments:
+        touched = axes_touched(exp)
+        if exp.axis:
+            touched.setdefault(exp.axis, ["declared"])
+        for axis, evidence in touched.items():
+            seen.setdefault((exp.model, axis), {})[exp.name] = evidence
+    return {key: owners for key, owners in seen.items() if len(owners) > 1}
+
+
+def _split_detail(split: dict[tuple[str, str], dict[str, list[str]]]) -> str:
+    return "; ".join(
+        f"{model} x {axis} split across "
+        + ", ".join(f"{name} ({', '.join(why)})" for name, why in sorted(owners.items()))
+        for (model, axis), owners in sorted(split.items())
+    )
+
+
+def cross_pod_notes(experiments: list[Experiment]) -> list[str]:
+    """The axes `check_axis_not_split` allows across pods, named one by one.
+
+    Only `framework` is here, and only because each of its values is a different
+    image. Saying it is the whole point: Phase 0 compared six frameworks per model
+    across eighteen hosts and the guard that exists to catch a cross-host
+    comparison was structurally unable to see the one the campaign was made of.
+    """
+    return [
+        f"{model} x {axis} is compared across {len(owners)} pod(s) by construction "
+        f"({', '.join(sorted(owners))}); each value is its own image, so the "
+        "canonical baseline is the only thing making these hosts comparable"
+        for (model, axis), owners in sorted(split_axes(experiments).items())
+        if is_cross_pod_group(axis)
+    ]
+
+
 def check_axis_not_split(experiments: list[Experiment]) -> None:
     """No axis may be compared across two pods for the same model.
 
@@ -317,22 +378,21 @@ def check_axis_not_split(experiments: list[Experiment]) -> None:
     `settings`, so two pods each pinning one value of the same axis in
     `overrides` — one `loss=mnrl`, one `loss=cached_mnrl` — declared nothing,
     collided with nothing, and ran half a comparison each on a different host.
+
+    `framework` is the declared exception rather than a hole: its values are six
+    images and an image cannot be shared. It is allowed through here and reported
+    by `cross_pod_notes`, which is the half that was missing — the guard used to
+    be blind to it because `framework` reaches a run through `pod_overrides`.
     """
-    seen: dict[tuple[str, str], dict[str, list[str]]] = {}
-    for exp in experiments:
-        touched = axes_touched(exp)
-        if exp.axis:
-            touched.setdefault(exp.axis, ["declared"])
-        for axis, evidence in touched.items():
-            seen.setdefault((exp.model, axis), {})[exp.name] = evidence
-    split = {key: owners for key, owners in seen.items() if len(owners) > 1}
-    if split:
-        detail = "; ".join(
-            f"{model} x {axis} split across "
-            + ", ".join(f"{name} ({', '.join(why)})" for name, why in sorted(owners.items()))
-            for (model, axis), owners in sorted(split.items())
+    refused = {
+        key: owners
+        for key, owners in split_axes(experiments).items()
+        if not is_cross_pod_group(key[1])
+    }
+    if refused:
+        raise ManifestError(
+            f"an axis is split across pods, which invalidates it: {_split_detail(refused)}"
         )
-        raise ManifestError(f"an axis is split across pods, which invalidates it: {detail}")
 
 
 def check_one_baseline_one_gpu(experiments: list[Experiment]) -> None:
@@ -410,8 +470,7 @@ def plan_runs(exp: Experiment, baselines: dict[str, list[str]]) -> list[Run]:
                 config=resolved_config(list(overrides)),
             )
         )
-    base = [f"framework={exp.framework}", f"model={exp.model}", f"run={exp.purpose}"]
-    base += exp.overrides
+    base = [*pod_overrides(exp), *exp.overrides]
     if not exp.settings:
         own = [
             Run(
@@ -788,12 +847,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    # Written into the ledger as well as printed: the console scrolls past and the
+    # ledger is what a merge reads months later, which is when "was this axis
+    # compared across hosts" stops being obvious.
+    cross_pod = cross_pod_notes(experiments)
+    for note in cross_pod:
+        console.print(f"[yellow]cross-pod axis[/yellow] {note}")
+
     ledger: dict[str, Any] = {
         "started_at": time.time(),
         "git_commit": git["commit"],
         "git_dirty": git["dirty"],
         "registry": args.registry,
         "tag": args.tag,
+        "cross_pod_axes": cross_pod,
         "experiments": [],
     }
     digests: dict[str, str | None] = {}

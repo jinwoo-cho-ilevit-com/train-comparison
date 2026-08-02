@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import sys
 from dataclasses import dataclass
@@ -58,6 +59,23 @@ NO_RESULT = "결과 없음(기동됨)"
 LAUNCH_FAILED = "기동 실패"
 UNSUPPORTED = "미지원(문서화됨)"
 NO_METRICS = "지표 없음"
+OOM = "OOM(메모리 한계)"
+NOT_TRAINED = "학습하지 않은 런"
+
+# The record field naming the campaign an artifact belongs to. `record.build_record`
+# and `publish_result.provenance` both stamp it, so an artifact without one is not
+# something this repository produced and its position in time is unknown.
+IDENTITY_FIELD = "recorded_at"
+
+# A run that hit the memory ceiling. It is a result — the setting does not fit on
+# this GPU — and it is neither "slow", "unsupported" nor "never attempted".
+STATUS_OOM = "oom"
+
+# The record's own summary of which axes its framework took over. The vocabulary
+# belongs to the `applied-axes` boundary; this file only reads it back.
+FRAMEWORK_OWNED_KEY = "framework_owned"
+
+STACK_UNKNOWN = "스택 미상"
 
 # Purposes that exist to produce numbers. `probe` is absent: it answers whether a
 # combination loads, which is the matrix's question and not this one.
@@ -111,6 +129,11 @@ class Artifact:
     @property
     def produced_result(self) -> bool:
         return self.kind == "result" and self.payload.get("status") != "no_result"
+
+    @property
+    def oom(self) -> bool:
+        """Whether the run ended at the memory ceiling rather than producing figures."""
+        return str(self.payload.get("status") or "").lower() == STATUS_OOM
 
     @property
     def graded_here(self) -> bool:
@@ -200,11 +223,28 @@ def _combination(payload: dict[str, Any]) -> tuple[str, str]:
     return framework, model
 
 
+def recorded_identity(payload: dict[str, Any]) -> float | None:
+    """The clock the run itself read, or None if the record does not carry one.
+
+    Never `path.stat().st_mtime`. A clean clone downloads every artifact in one
+    go, so the file clock is the download and not campaign order: with the forty
+    artifacts in the results repo carrying no `recorded_at`, eight of eighteen
+    cells selected the previous campaign's file.
+    """
+    value = payload.get(IDENTITY_FIELD)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and value > 0 else None
+
+
 def load_artifacts(results_dir: Path) -> tuple[list[Artifact], list[str]]:
     """Every readable artifact, plus the files that could not be read.
 
     An unparseable file is reported and stepped over. A pod that vanished
-    mid-upload must not take the other seventeen results down with it.
+    mid-upload must not take the other seventeen results down with it. A file
+    that cannot say when it was recorded is refused the same way — every producer
+    here stamps it (`record.build_record`, `publish_result.provenance`), so one
+    without it is not this campaign's and dating it by its own mtime is a guess.
     """
     artifacts, skipped = [], []
     for path in sorted(results_dir.rglob("*.json")):
@@ -221,6 +261,13 @@ def load_artifacts(results_dir: Path) -> tuple[list[Artifact], list[str]]:
         if not isinstance(payload, dict):
             skipped.append(f"{shown}: not a JSON object")
             continue
+        timestamp = recorded_identity(payload)
+        if timestamp is None:
+            skipped.append(
+                f"{shown}: no `{IDENTITY_FIELD}`; the file's own clock is the download "
+                "time in a clean clone, not the campaign this artifact belongs to"
+            )
+            continue
         framework, model = _combination(payload)
         artifacts.append(
             Artifact(
@@ -229,10 +276,7 @@ def load_artifacts(results_dir: Path) -> tuple[list[Artifact], list[str]]:
                 kind="result" if path.name == RESULT_NAME else "started",
                 framework=framework,
                 model=model,
-                # `recorded_at` exists on records this repo generates; run records
-                # written by the probe carry no clock, so the file's own mtime is
-                # the fallback. Both only ever order artifacts against each other.
-                timestamp=float(payload.get("recorded_at") or path.stat().st_mtime),
+                timestamp=timestamp,
             )
         )
     return artifacts, skipped
@@ -335,6 +379,99 @@ def checks_of(artifact: Artifact | None) -> list[dict[str, Any]]:
     if artifact is None:
         return []
     return (artifact.payload.get("probe") or {}).get("checks") or []
+
+
+def training_verdict(payload: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Whether this record is a measurement of training, and why not when it is not.
+
+    Three unsloth cells passed `infonce_backward` with `params_with_grad=0` and
+    `trainable_params=0`: a fully frozen graph stays differentiable through the
+    embedding output, so `loss.backward()` returns normally and the step time
+    that comes out is the cost of a forward pass. Nothing between the record and
+    this table read those fields, so that number was publishable as a speed.
+    """
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, dict):
+        return False, ["no `metrics`: nothing was reported to check"]
+    reasons = []
+
+    grad_norm = metrics.get("grad_norm")
+    if isinstance(grad_norm, bool) or not isinstance(grad_norm, (int, float)):
+        reasons.append("`grad_norm` is absent")
+    elif not math.isfinite(grad_norm) or grad_norm <= 0:
+        reasons.append(f"`grad_norm`={grad_norm}: the backward reached no parameter")
+
+    trainable = metrics.get("trainable_params")
+    total = metrics.get("total_params")
+    mode = ((payload.get("config") or {}).get("peft") or {}).get("mode")
+    if isinstance(trainable, bool) or not isinstance(trainable, int) or trainable <= 0:
+        reasons.append(f"`trainable_params`={trainable!r}: this model cannot learn")
+    elif isinstance(total, int) and not isinstance(total, bool):
+        if mode == "full" and trainable != total:
+            reasons.append(
+                f"peft.mode=full but {trainable} of {total} parameter tensors train; "
+                "a full finetune that froze part of the model is a different workload"
+            )
+        if mode in ("lora", "qlora") and trainable >= total:
+            reasons.append(
+                f"peft.mode={mode} but {trainable} of {total} parameter tensors train; "
+                "the adapter did not narrow anything"
+            )
+
+    first, last = metrics.get("loss_first"), metrics.get("loss_last")
+    if not isinstance(first, (int, float)) or not isinstance(last, (int, float)):
+        reasons.append("`loss_first`/`loss_last` are absent")
+    elif not (math.isfinite(first) and math.isfinite(last)):
+        reasons.append(f"loss is not finite: {first} -> {last}")
+    elif last >= first:
+        reasons.append(f"loss did not fall: {first} -> {last}")
+
+    if str(payload.get("device", "")).startswith("cuda"):
+        peak = metrics.get("peak_memory_bytes")
+        if isinstance(peak, bool) or not isinstance(peak, int) or peak <= 0:
+            reasons.append(f"`peak_memory_bytes`={peak!r} on a CUDA run")
+
+    return not reasons, reasons
+
+
+def stack_of(artifact: Artifact) -> tuple[str, str] | None:
+    """The two packages that differ across the six framework images, or None.
+
+    Measured: native / sentence_transformers / tevatron / axolotl are on
+    transformers 5.14.1 + torch 2.13.0, ms_swift on 5.12.1, unsloth on 5.5.0 +
+    torch 2.11.0, and the uv conflict that produced that split is documented as
+    unresolvable. A record that cannot name its stack is not ranked against one
+    that can.
+    """
+    packages = artifact.payload.get("packages") or {}
+    torch_version = packages.get("torch")
+    transformers_version = packages.get("transformers")
+    if not torch_version or not transformers_version:
+        return None
+    return str(torch_version), str(transformers_version)
+
+
+def stack_label(key: tuple[str, str] | None) -> str:
+    if key is None:
+        return STACK_UNKNOWN
+    return f"torch {key[0]} + transformers {key[1]}"
+
+
+def owned_axes(artifact: Artifact) -> list[dict[str, Any]]:
+    """The axes this run's framework took over, as the record itself named them.
+
+    Read through `applied.framework_owned` rather than by matching a state
+    string: the vocabulary belongs to the `applied-axes` boundary and this file
+    renders whatever it finds there.
+    """
+    applied = artifact.payload.get("applied")
+    if not isinstance(applied, dict):
+        return []
+    names = applied.get(FRAMEWORK_OWNED_KEY)
+    if not isinstance(names, list):
+        return []
+    by_axis = {a.get("axis"): a for a in applied.get("axes") or [] if isinstance(a, dict)}
+    return [by_axis.get(name) or {"axis": name} for name in names]
 
 
 @dataclass(frozen=True)
@@ -442,16 +579,26 @@ def baseline_gate(
     return verdicts, reference, notes
 
 
-def _measured_cell(measured: list[Artifact], verdicts: dict[str, PodVerdict]) -> str:
-    """What a cell says when timing ran on it but no probe ever did.
+def _measured_cell(
+    reported: list[Artifact], oom: list[Artifact], verdicts: dict[str, PodVerdict]
+) -> str:
+    """What a cell says when measuring ran on it but no probe ever did.
 
     Loading is not in question once a run trained on the combination, so the cell
-    does not read as untried. It carries no verdict of its own: what those runs
-    cost is the measurement table's subject, and the pod's standing is the gate's.
+    does not read as untried. The pod's standing and the training-validity gate
+    are counted rather than folded in: a cell reading `측정 3건` while all three
+    were frozen graphs is the same collapse as reading them as never attempted.
     """
-    invalid = sum(1 for a in measured if not verdicts.get(a.pod, _UNKNOWN_POD).usable)
-    suffix = f", 파드 판정 미통과 {invalid}건" if invalid else ""
-    return f"측정 {len(measured)}건(probe 없음{suffix})"
+    parts = []
+    if reported:
+        invalid = sum(1 for a in reported if not verdicts.get(a.pod, _UNKNOWN_POD).usable)
+        untrained = sum(1 for a in reported if not training_verdict(a.payload)[0])
+        suffix = f", 파드 판정 미통과 {invalid}건" if invalid else ""
+        suffix += f", 학습 미확인 {untrained}건" if untrained else ""
+        parts.append(f"측정 {len(reported)}건(probe 없음{suffix})")
+    if oom:
+        parts.append(f"{OOM} {len(oom)}건")
+    return ", ".join(parts)
 
 
 def cell(
@@ -464,10 +611,14 @@ def cell(
     verdicts = verdicts or {}
     # Only a run that reported figures says the combination trained. A measuring
     # run that produced none is a spent pod-hour, and the ledger's "launched,
-    # produced nothing" is the honest answer for the cell.
-    reported = [a for a in measured or [] if a.metrics]
-    if reported and (artifact is None or not artifact.produced_result or not checks_of(artifact)):
-        return _measured_cell(reported, verdicts)
+    # produced nothing" is the honest answer for the cell. An OOM is the one
+    # exception: it reports no figures and is still an answer about the setting.
+    oom = [a for a in measured or [] if a.oom]
+    reported = [a for a in measured or [] if a.metrics and not a.oom]
+    if (reported or oom) and (
+        artifact is None or not artifact.produced_result or not checks_of(artifact)
+    ):
+        return _measured_cell(reported, oom, verdicts)
     if artifact is None:
         return launch_state(launched)
     if not artifact.produced_result:
@@ -521,87 +672,126 @@ def _verdict_cell(verdict: PodVerdict) -> str:
     return f"{verdict.status} (편차 {verdict.deviation * 100:.2f}%)"
 
 
-def render_measurements(measured: list[Artifact], verdicts: dict[str, PodVerdict]) -> list[str]:
-    """The figures a timing run produced, and what is missing from the ones that did not.
+def _figure_table(rows: list[Artifact], verdicts: dict[str, PodVerdict]) -> list[str]:
+    out = [
+        "",
+        "| 런 | 파드 | 프레임워크 x 모델 | 목적 | step p50 (s) | p95 (s) | mean (s) "
+        "| samples/s | tokens/s | peak mem (GiB) | steps 계측/폐기/측정 | 파드 판정 |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for artifact in rows:
+        metrics = artifact.metrics or {}
+        verdict = verdicts.get(artifact.pod, _UNKNOWN_POD)
+        out.append(
+            f"| {artifact.run_name} | {artifact.pod} | "
+            f"{artifact.framework} x {artifact.model} | {artifact.purpose} | "
+            f"{_number(metrics.get('step_seconds_p50'), '.4f')} | "
+            f"{_number(metrics.get('step_seconds_p95'), '.4f')} | "
+            f"{_number(metrics.get('step_seconds_mean'), '.4f')} | "
+            f"{_number(metrics.get('samples_per_second'), '.2f')} | "
+            f"{_number(metrics.get('tokens_per_second'), '.1f')} | "
+            f"{_gib(metrics.get('peak_memory_bytes'))} | "
+            f"{metrics.get('steps_timed', '-')}/{metrics.get('steps_discarded', '-')}"
+            f"/{metrics.get('steps_measured', '-')} | "
+            f"{_verdict_cell(verdict)} |"
+        )
+    return out
 
-    Profiled runs are tabled apart. AGENTS.md forbids reporting a number measured
-    with the profiler on, and a `profiled` column in the same table is an opt-in
-    to noticing — a reader comparing two rows is reading the numbers, not the
-    flags beside them.
+
+def _counts_table(rows: list[Artifact]) -> list[str]:
+    out = [
+        "",
+        "| 런 | 파드 | rows/step | padded tokens/step | tokens/step | images/step "
+        "| images dropped/step | images dropped 합계 | MFU |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for artifact in rows:
+        metrics = artifact.metrics or {}
+        out.append(
+            f"| {artifact.run_name} | {artifact.pod} | "
+            f"{_number(metrics.get('rows_per_step'), '.1f')} | "
+            f"{_number(metrics.get('padded_tokens_per_step'), '.1f')} | "
+            f"{_number(metrics.get('tokens_per_step'), '.1f')} | "
+            f"{_number(metrics.get('images_per_step'), '.2f')} | "
+            f"{_number(metrics.get('images_dropped_per_step'), '.2f')} | "
+            f"{metrics.get('images_dropped_total', '-')} | "
+            f"{metrics.get('mfu') if metrics.get('mfu') is not None else '없음'} |"
+        )
+    reasons = sorted(
+        {str(a.metrics.get("mfu_reason")) for a in rows if (a.metrics or {}).get("mfu") is None}
+        - {"None"}
+    )
+    return out + [f"\nMFU가 비어 있는 이유: {reason}" for reason in reasons]
+
+
+def by_stack(rows: list[Artifact]) -> list[tuple[tuple[str, str] | None, list[Artifact]]]:
+    """The runs grouped by the stack they were measured on, unknown stacks last."""
+    grouped: dict[tuple[str, str] | None, list[Artifact]] = {}
+    for artifact in rows:
+        grouped.setdefault(stack_of(artifact), []).append(artifact)
+    return sorted(grouped.items(), key=lambda item: (item[0] is None, item[0] or ()))
+
+
+def _ranked_by_stack(
+    rows: list[Artifact], verdicts: dict[str, PodVerdict], tables: bool = True
+) -> list[str]:
+    """One ranking per stack, never one ranking across stacks.
+
+    The six images cannot be unified (transformers 5.14.1 / 5.12.1 / 5.5.0, torch
+    2.13.0 / 2.12.1 / 2.11.0) and the uv conflict behind that is documented as
+    unresolvable. A single table puts the image in the ranking and presents it as
+    a result; the heading between the tables is what stops a reader comparing
+    across them without meeting the stack first.
+    """
+    lines: list[str] = []
+    for key, group in by_stack(rows):
+        lines += ["", f"##### 해석 스택: {stack_label(key)}"]
+        if key is None:
+            lines += [
+                "",
+                "이 런들은 `packages.torch`/`packages.transformers`를 싣지 않아 어느 스택에서 "
+                "잰 것인지 레코드가 답하지 못한다. 다른 스택과 같은 순위표에 넣지 않는다.",
+            ]
+        lines += _figure_table(group, verdicts)
+        if tables:
+            lines += _counts_table(group)
+    return lines
+
+
+def render_measurements(measured: list[Artifact], verdicts: dict[str, PodVerdict]) -> list[str]:
+    """The figures a measuring run produced, and what is missing from the ones that did not.
+
+    Four things leave the comparable ranking, each because putting it in makes a
+    number mean something it does not: a profiled step (inflated by an unmeasured
+    amount), a run that did not train, an OOM, and a run on another stack.
     """
     if not measured:
         return []
     ordered = sorted(measured, key=lambda a: (a.pod, a.run_name, a.path))
-    timed = [a for a in ordered if a.metrics and not a.metrics.get("profiled")]
-    profiled = [a for a in ordered if a.metrics and a.metrics.get("profiled")]
-    barren = [a for a in ordered if not a.metrics]
+    oom = [a for a in ordered if a.oom]
+    rest = [a for a in ordered if not a.oom]
+    figured = [a for a in rest if a.metrics]
+    barren = [a for a in rest if not a.metrics]
+    untrained = [(a, training_verdict(a.payload)[1]) for a in figured]
+    untrained = [(a, why) for a, why in untrained if why]
+    trained = [a for a in figured if not training_verdict(a.payload)[1]]
+    timed = [a for a in trained if not a.metrics.get("profiled")]
+    profiled = [a for a in trained if a.metrics.get("profiled")]
 
     lines = [
         "",
         "### 측정 결과",
         "",
         f"측정 목적(`{'`/`'.join(sorted(MEASURING_PURPOSES))}`) 런 {len(ordered)}건 중 "
-        f"수치를 낸 것 {len(timed) + len(profiled)}건, `{NO_METRICS}` {len(barren)}건. "
+        f"수치를 낸 것 {len(figured)}건, `{NO_METRICS}` {len(barren)}건, "
+        f"`{OOM}` {len(oom)}건, `{NOT_TRAINED}` {len(untrained)}건. "
         "각 수치가 무엇을 센 것인지는 아래 '지표 정의'에 있다.",
     ]
 
-    def table(rows: list[Artifact]) -> list[str]:
-        out = [
-            "",
-            "| 런 | 파드 | 프레임워크 x 모델 | 목적 | step p50 (s) | p95 (s) | mean (s) "
-            "| samples/s | tokens/s | peak mem (GiB) | steps 계측/폐기/측정 | 파드 판정 |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|",
-        ]
-        for artifact in rows:
-            metrics = artifact.metrics or {}
-            verdict = verdicts.get(artifact.pod, _UNKNOWN_POD)
-            out.append(
-                f"| {artifact.run_name} | {artifact.pod} | "
-                f"{artifact.framework} x {artifact.model} | {artifact.purpose} | "
-                f"{_number(metrics.get('step_seconds_p50'), '.4f')} | "
-                f"{_number(metrics.get('step_seconds_p95'), '.4f')} | "
-                f"{_number(metrics.get('step_seconds_mean'), '.4f')} | "
-                f"{_number(metrics.get('samples_per_second'), '.2f')} | "
-                f"{_number(metrics.get('tokens_per_second'), '.1f')} | "
-                f"{_gib(metrics.get('peak_memory_bytes'))} | "
-                f"{metrics.get('steps_timed', '-')}/{metrics.get('steps_discarded', '-')}"
-                f"/{metrics.get('steps_measured', '-')} | "
-                f"{_verdict_cell(verdict)} |"
-            )
-        return out
-
     if timed:
-        lines += table(timed)
-        lines += [
-            "",
-            "| 런 | 파드 | rows/step | padded tokens/step | tokens/step | images/step "
-            "| images dropped/step | images dropped 합계 | MFU |",
-            "|---|---|---|---|---|---|---|---|---|",
-        ]
-        for artifact in timed:
-            metrics = artifact.metrics or {}
-            lines.append(
-                f"| {artifact.run_name} | {artifact.pod} | "
-                f"{_number(metrics.get('rows_per_step'), '.1f')} | "
-                f"{_number(metrics.get('padded_tokens_per_step'), '.1f')} | "
-                f"{_number(metrics.get('tokens_per_step'), '.1f')} | "
-                f"{_number(metrics.get('images_per_step'), '.2f')} | "
-                f"{_number(metrics.get('images_dropped_per_step'), '.2f')} | "
-                f"{metrics.get('images_dropped_total', '-')} | "
-                f"{metrics.get('mfu') if metrics.get('mfu') is not None else '없음'} |"
-            )
-        reasons = sorted(
-            {
-                str(a.metrics.get("mfu_reason"))
-                for a in timed
-                if (a.metrics or {}).get("mfu") is None
-            }
-            - {"None"}
-        )
-        for reason in reasons:
-            lines.append(f"\nMFU가 비어 있는 이유: {reason}")
+        lines += _ranked_by_stack(timed, verdicts)
 
-    dropped = [a for a in timed + profiled if (a.metrics or {}).get("images_dropped_total")]
+    dropped = [a for a in trained if (a.metrics or {}).get("images_dropped_total")]
     if dropped:
         lines += [
             "",
@@ -629,7 +819,38 @@ def render_measurements(measured: list[Artifact], verdicts: dict[str, PodVerdict
             "iteration time을 얼마나 부풀리는지는 **측정 안 함**(docs/methodology.md)이므로 "
             "보정도 불가능하다. 아래는 커널 분해용 기록이며 위 표의 수치와 같은 축에 놓을 수 없다.",
         ]
-        lines += table(profiled)
+        lines += _ranked_by_stack(profiled, verdicts, tables=False)
+
+    if untrained:
+        lines += [
+            "",
+            f"#### {NOT_TRAINED} — 속도 결과로 인용하지 않는다",
+            "",
+            "`grad_norm`·`trainable_params`·loss가 이 런이 학습했다고 말하지 않는다. 전 "
+            "파라미터가 얼어 있어도 임베딩 출력을 통해 backward는 정상 종료하므로, 이런 런의 "
+            "step 시간은 학습이 아니라 forward 한 번의 비용이다. **수치를 렌더하지 않는다.**",
+            "",
+        ]
+        for artifact, why in untrained:
+            lines.append(
+                f"- **{artifact.run_name}** ({artifact.pod}, {artifact.framework} x "
+                f"{artifact.model}) — {'; '.join(why)}"
+            )
+
+    if oom:
+        lines += [
+            "",
+            f"#### {OOM} — 결과의 한 범주이지 결과의 부재가 아니다",
+            "",
+            "메모리 상한에 닿아 끝난 런이다. 이 설정이 이 GPU에 들어가지 않는다는 답이므로, "
+            "`미시도`로도 `미지원`으로도 렌더하지 않는다.",
+            "",
+        ]
+        for artifact in oom:
+            lines.append(
+                f"- **{artifact.run_name}** ({artifact.pod}, {artifact.framework} x "
+                f"{artifact.model}, {artifact.purpose}) — `{artifact.path}`"
+            )
 
     if barren:
         lines += [
@@ -748,6 +969,41 @@ def render_metric_definitions(measured: list[Artifact]) -> list[str]:
     return lines
 
 
+def render_owned_axes(artifacts: list[Artifact]) -> list[str]:
+    """The axes a run handed to its framework, so a cell that lost one says so.
+
+    Measuring the framework's own training step is what makes the comparison a
+    comparison of frameworks (PLAN.md 결정 5), and its price is that the ablation
+    grid is ragged: on a tevatron cell, `loss.name` and
+    `parallel.cross_device_negatives` are not this harness's to apply. A report
+    that does not show it renders such a cell exactly like one that ran the axis.
+    """
+    rows = [(a, owned_axes(a)) for a in sorted(artifacts, key=lambda a: (a.pod, a.run_name))]
+    rows = [(a, axes) for a, axes in rows if axes]
+    if not rows:
+        return []
+    lines = [
+        "",
+        "### 프레임워크 소유 축 — 이 런이 돌린 축이 아니다",
+        "",
+        "프레임워크가 학습 스텝 안에서 직접 처리해 이 하네스가 적용하지도 되읽지도 못한 축이다. "
+        "같은 표의 다른 런과 **같은 ablation 그리드를 돈 것이 아니다.** 순위표가 아니므로 "
+        "표로 렌더하지 않는다 — 여기 적힌 것은 수치가 아니라 그 수치가 답하지 않는 축이다.",
+        "",
+    ]
+    for artifact, axes in rows:
+        lines.append(
+            f"- **{artifact.run_name}** ({artifact.pod}, {artifact.framework} x {artifact.model})"
+        )
+        for axis in axes:
+            reason = (axis.get("detail") or {}).get("reason") or "이유 미기록"
+            lines.append(
+                f"  - `{axis.get('axis')}` — 상태 `{axis.get('state') or '-'}`, "
+                f"소유 {axis.get('owner') or '-'}: {reason}"
+            )
+    return lines
+
+
 def render(
     chosen: dict[tuple[str, str], Artifact],
     ledger: dict[tuple[str, str], list[dict[str, Any]]],
@@ -843,6 +1099,7 @@ def render(
 
     lines += render_measurements(measured, verdicts)
     lines += render_baseline_gate(verdicts, reference, gate_notes)
+    lines += render_owned_axes(measured + baselines + list(chosen.values()))
     lines += render_metric_definitions(measured + baselines)
 
     if duplicates or skipped:

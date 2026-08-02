@@ -1011,16 +1011,20 @@ def report(metrics: dict[str, Any], violations: Sequence[str], blockers: Sequenc
 @hydra.main(version_base=None, config_path=CONFIG_DIR, config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
     config, _ = resolve(cfg)
-    data = config.data
+    # Read through `config.data` rather than a local alias. The alias was shorter and
+    # it made every knob it touched invisible to `config-consumed`, which follows the
+    # attribute chain — so `data.subset_rows` and `data.push_subset` were reported as
+    # settings nothing reads while the run was reading them.
+    #
     # effective_rows, not subset_rows: `data.limit` is how convention 04 asks for a
     # small sample, and a stage that ignores it cannot be smoke-tested.
-    requested = data.effective_rows
+    requested = config.data.effective_rows
 
     for warning in corrupt_pins(data_config_pins()):
         console.print(f"[bold yellow]still pinned to a corrupt subset:[/bold yellow] {warning}")
 
-    console.print(f"counting rows in {data.source_repo}")
-    counts = config_row_counts(data.source_repo)
+    console.print(f"counting rows in {config.data.source_repo}")
+    counts = config_row_counts(config.data.source_repo)
     quota = proportional_quota(counts, requested)
 
     console.print(f"sampling {requested} rows across {len(quota)} configs")
@@ -1038,7 +1042,7 @@ def main(cfg: DictConfig) -> None:
 
     metrics = subset_metrics(rows_by_config)
     violations = quality_violations(metrics, quota, taken)
-    blockers = push_blockers(quota, data)
+    blockers = push_blockers(quota, config.data)
     report(metrics, violations, blockers)
 
     git = git_state()
@@ -1055,20 +1059,20 @@ def main(cfg: DictConfig) -> None:
         "git_commit": git["commit"],
         "git_dirty": git["dirty"],
         "git_source": git["source"],
-        "config": data.model_dump(mode="json"),
+        "config": config.data.model_dump(mode="json"),
         # datasets decides the shuffle and the image encoding, pillow decodes, and
         # pyarrow writes the shards. A subset is not reproducible across changes in
         # any of them, so the versions are part of the record.
         "packages": package_versions(),
-        "source_repo": data.source_repo,
-        "source_revision": data.source_revision,
-        "subset_repo": data.repo_id,
+        "source_repo": config.data.source_repo,
+        "source_revision": config.data.source_revision,
+        "subset_repo": config.data.repo_id,
         "subset_revision": None,
         "pushed": False,
-        "sample_seed": data.sample_seed,
+        "sample_seed": config.data.sample_seed,
         "requested_rows": requested,
-        "subset_rows": data.subset_rows,
-        "limit": data.limit,
+        "subset_rows": config.data.subset_rows,
+        "limit": config.data.limit,
         "upstream_row_counts": counts,
         "quota": quota,
         "taken": taken,
@@ -1109,15 +1113,15 @@ def main(cfg: DictConfig) -> None:
             f"draw is damaged and will not be pushed: {len(violations)} quality "
             f"violations (see {path})"
         )
-    if blockers and data.push_subset:
+    if blockers and config.data.push_subset:
         raise SystemExit(f"refusing to push: {len(blockers)} push blockers (see {path})")
-    if not data.push_subset:
+    if not config.data.push_subset:
         console.print("[yellow]not pushed (data.push_subset=false)[/yellow]")
         return
 
     from datasets import DatasetDict
 
-    console.print(f"pushing to {data.repo_id}")
+    console.print(f"pushing to {config.data.repo_id}")
     # Pushed as a DatasetDict, not a bare Dataset. `Dataset.push_to_hub` onto a repo
     # that already carries a card keeps the card's existing `dataset_info`
     # (datasets/arrow_dataset.py, `info_to_dump = repo_info`), so a repush declares
@@ -1125,7 +1129,7 @@ def main(cfg: DictConfig) -> None:
     # defect D1's four-column card and could not be loaded at all. DatasetDict passes
     # `remove_other_splits=True`, which takes the branch that rebuilds features.
     commit = DatasetDict({SUBSET_SPLIT: build_dataset(rows_by_config)}).push_to_hub(
-        data.repo_id, private=True
+        config.data.repo_id, private=True
     )
     revision = getattr(commit, "oid", None) or str(commit)
     manifest |= {"subset_revision": revision, "pushed": True}
@@ -1142,7 +1146,7 @@ def main(cfg: DictConfig) -> None:
     gc.collect()
 
     console.print("verifying the pushed revision")
-    problems = verify_pushed(data, revision, metrics)
+    problems = verify_pushed(config.data, revision, metrics)
     manifest |= {"artifact_verified": not problems, "artifact_problems": problems}
     write_json(path, manifest)
     if problems:
