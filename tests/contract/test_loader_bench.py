@@ -567,12 +567,6 @@ def test_loader_serves_every_framework_through_one_entry_point() -> None:
     assert {f.name for f in dataclass_fields(loader.AdapterOut)} == ADAPTER_OUT_FIELDS
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='lane-d: scripts/bench.py:936 passes framework="native" as a literal at '
-    "0604684, so no framework but native can produce a number. Delete this marker when "
-    "it does not; do not weaken the assertions.",
-)
 def test_bench_takes_the_framework_name_from_the_adapter() -> None:
     tree = ast.parse((REPO_ROOT / "scripts" / "bench.py").read_text(encoding="utf-8"))
     literals = [

@@ -597,11 +597,6 @@ def test_every_axis_carries_its_state_and_framework_owned_is_not_a_mismatch():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-d: `record.build_record` writes no `recorded_at`, so 0 of the 40 "
-    "artifacts in the results repo carry one",
-)
 def test_the_producer_stamps_the_identity():
     produced = build_record(composed_config(), torch.device("cpu"))
     assert IDENTITY_FIELD in produced

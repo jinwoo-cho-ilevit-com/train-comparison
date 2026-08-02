@@ -31,7 +31,7 @@ from typing import Any
 import pytest
 import torch
 
-from trainbench import axes
+from trainbench import axes, collate
 from trainbench.applied import AppliedMismatch, Built, assert_matches, capture
 
 from .conftest import REPO_ROOT
@@ -185,9 +185,9 @@ def padded_batches(samples: int, count: int, length: int = 6):
         )
 
 
-def micro_batch(samples: int, length: int = 6, offset: int = 0) -> bench_entry.MicroBatch:
+def micro_batch(samples: int, length: int = 6, offset: int = 0) -> collate.MicroBatch:
     ids = torch.randint(1, 60, (samples * 2, length)) + offset % 3
-    return bench_entry.MicroBatch(
+    return collate.MicroBatch(
         tensors={"input_ids": ids, "attention_mask": torch.ones_like(ids)},
         tokens=int(ids.numel()),
         padded_tokens=int(ids.numel()),
@@ -241,7 +241,7 @@ def assembled_loss(config, dataset=None) -> Any:
         config,
         CPU,
         framework="native",
-        dataset=bench_entry.PairDataset(rows(4)) if dataset is None else dataset,
+        dataset=collate.PairDataset(rows(4)) if dataset is None else dataset,
     )
     return built.loss_fn
 
@@ -267,7 +267,7 @@ def built_with(
 
 def text_only(count: int = 4):
     """The dataset `loss=cached_mnrl` is applicable to."""
-    return bench_entry.PairDataset(text_only_rows(count))
+    return collate.PairDataset(text_only_rows(count))
 
 
 # --- the measured loop -------------------------------------------------------
@@ -681,8 +681,8 @@ def test_the_collate_counts_every_row_s_images_against_the_placeholders_it_wrote
     config = axis_config(config_mapping)
     pairs = rows(2, qry_image=True) + rows(2, qry_image=True, pos_image=True, text="cd")
 
-    micro = bench_entry.Collate(processor, config)(pairs)
-    texts = bench_entry.Collate(processor, config).pair_texts(pairs).texts
+    micro = collate.Collate(processor, config)(pairs)
+    texts = collate.Collate(processor, config).pair_texts(pairs).texts
 
     assert micro.images_per_row == tuple(text.count("<img>") for text in texts)
     assert len(micro.images_per_row) == micro.rows
@@ -716,7 +716,7 @@ def test_the_processor_is_handed_one_image_list_per_row(config_mapping):  # noqa
     config = axis_config(config_mapping)
     pairs = rows(2, qry_image=True) + rows(2, qry_image=True, pos_image=True, text="cd")
 
-    micro = bench_entry.Collate(processor, config)(pairs)
+    micro = collate.Collate(processor, config)(pairs)
 
     assert [len(group) for group in processor.images] == list(micro.images_per_row)
     assert len(processor.images) == micro.rows
@@ -755,7 +755,7 @@ def test_the_collate_builds_rows_for_a_checkpoint_with_no_chat_template(config_m
         },
     )
 
-    built = bench_entry.Collate(processor, config).pair_texts(rows(1, qry_image=True))
+    built = collate.Collate(processor, config).pair_texts(rows(1, qry_image=True))
 
     # The MMEB marker is gone, the model's own placeholder leads the query, and the
     # text-only positive carries none.
@@ -770,7 +770,7 @@ def test_a_dropped_image_is_not_counted_as_one_the_row_still_carries(config_mapp
     config = axis_config(config_mapping)
     pairs = rows(2, qry_image=True, pos_image=True)
 
-    micro = bench_entry.Collate(FakeProcessor(accepts_images=False), config)(pairs)
+    micro = collate.Collate(FakeProcessor(accepts_images=False), config)(pairs)
 
     assert micro.images_dropped == 4
     assert micro.images_per_row == (0, 0, 0, 0)
@@ -794,7 +794,7 @@ def test_the_pieces_a_real_batch_splits_into_carry_their_own_rows_pixels(config_
     config = gradcache_config(config_mapping, **{"train.batch_size": 4, "loss.mini_batch": 4})
     pairs = rows(2, qry_image=True) + rows(2, qry_image=True, pos_image=True, text="cd")
 
-    micro = bench_entry.build_collate(FakeProcessor(), config)(pairs)
+    micro = collate.build_collate(FakeProcessor(), config)(pairs)
     pieces = axes._split_rows(micro.tensors, config.loss.mini_batch, micro.images_per_row)
 
     assert micro.images_per_row == (1, 1, 1, 1, 0, 0, 1, 1)
@@ -867,9 +867,7 @@ def test_the_collate_puts_queries_first_and_positives_second(probe_config):
     """`info_nce` splits pooled embeddings at the midpoint; a collate that
     interleaved them would pair every query with the wrong positive and still
     produce a loss that goes down."""
-    batch = bench_entry.Collate(FakeProcessor(accepts_images=False), probe_config)(
-        rows(2, text="ab")
-    )
+    batch = collate.Collate(FakeProcessor(accepts_images=False), probe_config)(rows(2, text="ab"))
 
     lengths = [int(mask.sum()) for mask in batch.tensors["attention_mask"]]
     prompt = len(probe_config.model.instruction_prompt or "")
@@ -895,20 +893,20 @@ def test_the_collate_returns_cpu_tensors_and_survives_a_worker(probe_config):
     cannot falsify. What it can check is the two things that make the transfer
     impossible to reintroduce: the collate is never handed a device, and it is a
     picklable module-level object rather than a closure."""
-    collate = bench_entry.Collate(FakeProcessor(), probe_config)
-    batch = collate(rows(2, qry_image=True))
+    collate_fn = collate.Collate(FakeProcessor(), probe_config)
+    batch = collate_fn(rows(2, qry_image=True))
 
-    assert "device" not in inspect.signature(bench_entry.Collate.__init__).parameters
+    assert "device" not in inspect.signature(collate.Collate.__init__).parameters
     assert all(value.device.type == "cpu" for value in batch.tensors.values())
-    assert isinstance(pickle.loads(pickle.dumps(collate)), bench_entry.Collate)
+    assert isinstance(pickle.loads(pickle.dumps(collate_fn)), collate.Collate)
 
 
 def test_the_collate_builds_image_and_text_only_rows_in_one_batch(probe_config):
     """16 of the 20 pinned configs carry `qry_image` and 7 carry `pos_image`, so a
     batch drawn from the subset holds both kinds of row at once."""
-    collate = bench_entry.Collate(FakeProcessor(), probe_config)
+    collate_fn = collate.Collate(FakeProcessor(), probe_config)
 
-    batch = collate(rows(1, qry_image=True, pos_image=True) + rows(1))
+    batch = collate_fn(rows(1, qry_image=True, pos_image=True) + rows(1))
 
     # One query image and one positive image, and the flat list follows the text
     # order — queries then positives — because processors consume images in the
@@ -927,9 +925,9 @@ def test_a_processor_that_cannot_take_images_reports_how_many_it_dropped(probe_c
     """A text-only checkpoint reading an image corpus is a real configuration in
     this study, and the number it did not read has to be in the result rather than
     inferred from the model name."""
-    collate = bench_entry.Collate(FakeProcessor(accepts_images=False), probe_config)
+    collate_fn = collate.Collate(FakeProcessor(accepts_images=False), probe_config)
 
-    batch = collate(rows(2, qry_image=True, pos_image=True))
+    batch = collate_fn(rows(2, qry_image=True, pos_image=True))
 
     assert batch.images == 0
     assert batch.images_dropped == 4
@@ -941,11 +939,11 @@ def test_an_image_batch_over_max_seq_len_is_refused_rather_than_truncated(config
     the forward pass then dies on N image features against fewer image tokens. A
     text-only batch truncates normally; this one cannot."""
     config = bench(config_mapping, **{"run.purpose": "probe", "data.max_seq_len": 8})
-    collate = bench_entry.Collate(FakeProcessor(), config)
+    collate_fn = collate.Collate(FakeProcessor(), config)
 
-    assert int(collate(rows(2, text="x" * 40)).tensors["input_ids"].shape[1]) == 8
+    assert int(collate_fn(rows(2, text="x" * 40)).tensors["input_ids"].shape[1]) == 8
     with pytest.raises(RuntimeError, match="over data.max_seq_len"):
-        collate(rows(2, qry_image=True, text="x" * 40))
+        collate_fn(rows(2, qry_image=True, text="x" * 40))
 
 
 # --- what the capture probes are allowed to say about this harness -----------
@@ -956,9 +954,9 @@ def loader_this_harness_builds(config, processor=None):
     over the loader's default."""
     model = TinyEmbedder()
     built, _ = axes.assemble(
-        model, config, CPU, framework="native", dataset=bench_entry.PairDataset(rows(4))
+        model, config, CPU, framework="native", dataset=collate.PairDataset(rows(4))
     )
-    built.dataloader.collate_fn = bench_entry.Collate(processor or FakeProcessor(), config)
+    built.dataloader.collate_fn = collate.Collate(processor or FakeProcessor(), config)
     return built
 
 
@@ -1041,11 +1039,11 @@ def axis_config(config_mapping, **dataloader):  # noqa: F811
 
 def harness_loader(config, processor, source=None):
     """`main()`'s construction for whatever this config's dataloader axes say."""
-    dataset = bench_entry.PairDataset(rows(8, qry_image=True)) if source is None else source
+    dataset = collate.PairDataset(rows(8, qry_image=True)) if source is None else source
     if config.dataloader.pretokenize:
-        dataset = axes.pretokenize(dataset, bench_entry.Encode(processor, config))
+        dataset = axes.pretokenize(dataset, collate.Encode(processor, config))
     built, _ = axes.assemble(TinyEmbedder(), config, CPU, framework="native", dataset=dataset)
-    built.dataloader.collate_fn = bench_entry.build_collate(processor, config)
+    built.dataloader.collate_fn = collate.build_collate(processor, config)
     return built
 
 
@@ -1056,12 +1054,12 @@ def test_a_packed_run_certifies_packing_from_the_class_that_owns_it(config_mappi
     config = axis_config(config_mapping, packing=True)
     built = harness_loader(config, FakeProcessor())
 
-    collate = built.dataloader.collate_fn
-    assert isinstance(collate.packed, axes.PackedCollate)
+    collate_fn = built.dataloader.collate_fn
+    assert isinstance(collate_fn.packed, axes.PackedCollate)
     # Not a class attribute of the wrapper: two declarations is how one of them
     # drifts into a label the run did not earn.
-    assert "axis_packing" not in vars(bench_entry.PackedBatches)
-    assert collate.axis_packing is axes.PackedCollate.axis_packing
+    assert "axis_packing" not in vars(collate.PackedBatches)
+    assert collate_fn.axis_packing is axes.PackedCollate.axis_packing
 
     axis = {a.axis: a for a in capture(built, config).axes}["dataloader.packing"]
     assert axis.determined, axis.detail
@@ -1076,9 +1074,9 @@ def test_a_packed_batch_keeps_queries_first_so_the_pairing_survives(config_mappi
     processor = FakeProcessor()
     pairs = rows(2, qry_image=True)
 
-    micro = bench_entry.build_collate(processor, config)(pairs)
+    micro = collate.build_collate(processor, config)(pairs)
 
-    texts = bench_entry.Collate(processor, config).pair_texts(pairs, with_images=False).texts
+    texts = collate.Collate(processor, config).pair_texts(pairs, with_images=False).texts
     expected = [len(text) for text in texts]
     lengths = (micro.cu_seqlens[1:] - micro.cu_seqlens[:-1]).tolist()
     assert lengths == expected
@@ -1243,9 +1241,7 @@ def pod_setting(tmp_path, monkeypatch, stub_checkpoint):
     out = tmp_path / "result.json"
 
     def run(config, rows_for_run):
-        monkeypatch.setattr(
-            bench_entry, "load_pairs", lambda _: bench_entry.PairDataset(rows_for_run)
-        )
+        monkeypatch.setattr(bench_entry, "load_pairs", lambda _: collate.PairDataset(rows_for_run))
         config_path = tmp_path / "resolved_config.json"
         config_path.write_text(json.dumps(config.model_dump(mode="json")))
         code = bench_entry.main(["--config", str(config_path), "--out", str(out)])
