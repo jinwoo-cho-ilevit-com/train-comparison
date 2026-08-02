@@ -854,6 +854,236 @@ docs/model-spec.md 결정 5, 형식 값은 `model.prompt_format`이다.
 `ms_swift`/`unsloth`의 gemma-4 칸은 이 체크 하나만 막고 있던 것이 아닐 수 있다 —
 이 수정이 여는 것은 이 실패까지이고, 그 뒤에 무엇이 있는지는 미측정이다.
 
+## 2차 Phase 0 캠페인 (2026-08-02, A100 18 pod, 커밋 `3ebcade`)
+
+18개 pod 전부 결과를 올렸고(`outputs/orchestrate-phase0-rerun.json`, 18/18에
+`pod_id`, `unreadable` 0), 아래 표는 그 18개 아티팩트만으로 만들었다. Phase 0은
+**적재 여부만** 답한다. 속도·메모리·커널에 대해서는 아무것도 말하지 않는다.
+
+### 어느 캠페인의 아티팩트인지부터 확인했다
+
+결과 저장소 `jinwoo-cho/trainbench-results`에는 지금 pod 디렉터리 40개가 있다
+(`results/<framework>/<model>/<pod_id>/`). 캠페인이 둘 섞이면 매트릭스는 없느니만
+못하므로, 각 아티팩트의 `git_commit`을 원장의 `git_commit`과 대조해 분류했다.
+
+| `git_commit` | pod 디렉터리 | 정체 |
+|---|---|---|
+| `3ebcade7` | 18 | 이번 캠페인. 원장의 `pod_id` 18개와 정확히 일치 |
+| `7ede7d7e` | 19 | 1차 캠페인 |
+| `a9dcc540` / `15320e7b` / `59d5908` | 각 1 | 단발 검증 pod |
+
+**`report.py`의 `newest_per_combination`에 맡기면 안 된다.** 이 규칙의 최종
+정렬키는 `timestamp`인데, 40개 `result.json` 중 `recorded_at`을 실은 것이
+**0건**이라 `load_artifacts`가 파일의 로컬 mtime으로 대체한다. mtime은 pod이
+올린 시각이 아니라 내려받은 시각이다. 실측: 모든 아티팩트의 timestamp를 동일하게
+두고 같은 선택 규칙을 돌리면 18칸 중 **8칸이 1차 캠페인 아티팩트를 고른다**
+(`axolotl x qwen3_vl_emb_2b`, `ms_swift x gemma4_e2b`,
+`sentence_transformers x qwen3_5_0_8b`, `tevatron` 3칸, `unsloth x gemma4_e2b`,
+`unsloth x qwen3_vl_emb_2b`). 한 번에 새로 받아오면 mtime이 전부 같아지므로,
+이번에 우연히 맞은 것은 재현되지 않는다.
+
+그래서 원장의 `pod_id` 18개에 해당하는 디렉터리만 별도 디렉터리로 복사하고
+(복사할 때 각 `result.json`의 `git_commit`이 원장의 것과 같은지 단언한다),
+그 디렉터리를 `--results`로 넘겼다. 아래 생성 구역이 "결과 18건, 아티팩트 18건"인
+것이 그 결과다.
+
+`report.py`가 원장을 결과 선별에 쓰지 않는 것(현재는 `launch_state`에만 쓴다)은
+이 문서가 고칠 수 있는 범위 밖이다. **미해결로 남긴다.**
+
+### 칸별 판정 — 1차와 나란히
+
+체크 개수는 프레임워크마다 다르다(프로브가 프레임워크마다 다른 것을 묻는다). 같은
+프레임워크의 1차/2차만 비교 가능하다.
+
+| 칸 | 1차 (`7ede7d7e`) | 2차 (`3ebcade`) | 이동 |
+|---|---|---|---|
+| native x qwen3_vl_emb_2b | OK 12/12 | OK 12/12 | 유지 |
+| native x qwen3_5_0_8b | OK 12/12 | OK 12/12 | 유지 |
+| native x gemma4_e2b | FAIL 2건 (`visual_tokens`, `multimodal_embed_forward`) | OK 13/13 | **열림** |
+| unsloth x qwen3_vl_emb_2b | FAIL `padding_side_alignment` | OK 9/9 | **열림** |
+| unsloth x qwen3_5_0_8b | FAIL `padding_side_alignment` | OK 9/9 | **열림** |
+| unsloth x gemma4_e2b | FAIL `visual_tokens` | OK 9/9 | **열림** |
+| ms_swift x qwen3_vl_emb_2b | FAIL `get_model_processor` | OK 10/10 | **열림** |
+| ms_swift x qwen3_5_0_8b | FAIL `get_model_processor` | OK 10/10 | **열림** |
+| ms_swift x gemma4_e2b | FAIL `visual_tokens` | OK 10/10 | **열림** |
+| sentence_transformers x 3종 | OK 9/9 | OK 9/9 | 유지 |
+| tevatron x qwen3_vl_emb_2b | FAIL `dense_model_load` (ModuleNotFoundError) | FAIL `dense_model_load` (AttributeError) | **더 깊어짐** |
+| tevatron x qwen3_5_0_8b | 같음 | 같음 | **더 깊어짐** |
+| tevatron x gemma4_e2b | 같음 | 같음 | **더 깊어짐** |
+| axolotl x qwen3_vl_emb_2b | FAIL `model_loader_load` (TypeError), 체크 4개 | FAIL `infonce_backward` (RuntimeError), 체크 8개 | **더 깊어짐** |
+| axolotl x qwen3_5_0_8b | 같음 | 같음 | **더 깊어짐** |
+| axolotl x gemma4_e2b | 같음 | 같음 | **더 깊어짐** |
+
+18칸 중 7칸이 열렸고(native x gemma4_e2b, unsloth 3칸, ms_swift 3칸), 5칸은
+1차에서도 초록이었으며(native 2칸, sentence_transformers 3칸), 나머지 6칸은
+같은 이름이 아닌 **다른 실패로 이동했다**. 남은 두 프레임워크를 "여전히 실패"로
+세면 무엇이 바뀌었는지가 지워진다.
+
+**tevatron은 세 모델 전부다.** Qwen 두 개가 아니라 gemma-4까지 같은 자리에서 같은
+방식으로 죽는다(`'Gemma4Config' object has no attribute 'pad_token_id'`).
+
+### 실패 2종 — 무엇이 어디까지 갔는가
+
+**tevatron / `dense_model_load` — AttributeError, 3칸 전부.** 핀 고정된 상류
+소스(`texttron/tevatron@dd06310`, `src/tevatron/retriever/modeling/encoder.py`)에서
+`DenseModel.load`는 다음 순서다.
+
+```
+166  base_model = cls.TRANSFORMER_CLS.from_pretrained(model_name_or_path, **hf_kwargs)
+167  if base_model.config.pad_token_id is None:
+168      base_model.config.pad_token_id = 0
+```
+
+1차에서는 8행의 `from peft import ...`에서 죽어 체크포인트를 건드리지도 못했다.
+2차에서는 166행이 통과했다 — 즉 **가중치는 적재됐고** 167행에서 죽는다.
+transformers 5.14.1의 합성 config(`Gemma4Config` / `Qwen3_5Config` /
+`Qwen3VLConfig`)는 `pad_token_id`를 최상위에 두지 않아 속성 접근 자체가 예외다.
+상류가 `getattr(..., None)`이 아니라 직접 접근을 쓴 것이 원인이며, 이 저장소가
+의존성으로 고칠 수 있는 종류가 아니다.
+
+`infonce_backward`는 `skipped: model did not load`로 기록된다. 나머지 세 체크
+(`processor_load`, `padding_side_alignment`, `text_tokenize`)는 조기 반환으로
+**등록조차 되지 않는다** — tevatron 칸의 "5 checks"는 native의 12-13과 분모가 다르다.
+
+**axolotl / `infonce_backward` — RuntimeError, 3칸 전부.**
+`expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`.
+1차에서는 `model_loader_load`가 `TypeError: unsupported operand type(s) for //`로
+죽어 체크가 4개뿐이었다. 2차에서는 적재·축 검증·패딩·토크나이즈까지 8개 중 7개가
+통과하고 **역전파 한 스텝에서** 죽는다. 같은 실행의 `axes_verified`가
+`precision.name`을 `mixed(bf16,fp32)`(요청은 `bf16`)로 기록한다 — 이 칸의 모델이
+fp32와 bf16 파라미터를 섞어 들고 있다는 뜻이고, dtype 불일치와 같은 방향의 관측이다.
+다만 **인과는 미확인**이다.
+
+### `trainable_params` — 프레임워크 전체
+
+`steps.infonce_backward`가 세는 것은 파라미터 **텐서 개수**이지 원소 수가 아니다
+("아무것도 학습하지 않았는가"에 답하는 단위). `params_with_grad`는 이 스텝에서
+실제로 grad가 닿은 텐서 수인데, 프로브의 배치는 텍스트 전용이므로 비전 타워가
+빠지는 것이 정상이다 — `params_with_grad < trainable_params`는 결함이 아니다.
+
+| 프레임워크 | qwen3_vl_emb_2b | qwen3_5_0_8b | gemma4_e2b |
+|---|---|---|---|
+| native | 625 / 625 (grad 310) | 473 / 473 (grad 320) | 988 / 988 (grad 505) |
+| unsloth | 625 / 625 (grad 310) | 473 / 473 (grad 320) | 1048 / 1048 (grad 505) |
+| ms_swift | 625 / 625 (grad 310) | 473 / 473 (grad 320) | 988 / 988 (grad 505) |
+| sentence_transformers | 기록 없음 (grad 310) | 기록 없음 (grad 320) | 기록 없음 (grad 505) |
+| tevatron | 없음 (모델 미적재) | 없음 | 없음 |
+| axolotl | 없음 (체크 실패) | 없음 | 없음 |
+
+표기는 `trainable_params / total_params`.
+
+**이번 캠페인의 가장 중요한 숫자는 unsloth 세 칸이다.** 1차에서 세 칸 모두
+`params_with_grad=0`, `trainable_params=0`으로 완전히 얼어붙은 그래프를
+역전파하면서 `infonce_backward`가 통과했다. 2차에서는 세 칸 모두
+`fast_vision_model_load`가 `full_finetuning: true`를 기록하고 학습 가능 텐서가
+1048 / 473 / 625다. 새 가드가 붉게 만든 것이 아니라, **고쳐져서 통과했다.**
+
+unsloth의 gemma-4만 텐서 수가 1048로 native·ms_swift의 988보다 60개 많다. unsloth의
+패치가 텐서를 추가한다는 뜻이며, 그 이상은 **측정 안 함**이다.
+
+### 이 가드가 덮지 않는 곳 — sentence_transformers
+
+`sentence_transformers` 프로브는 `steps.infonce_backward`를 거치지 않고
+자체 `_backward`를 쓴다(`trainbench/probe/sentence_transformers.py`). 그 함수는
+`params_with_grad`만 반환하고 `trainable_params`를 세지도, 0인지 확인하지도 않는다.
+**즉 unsloth를 잡아낸 가드가 이 프레임워크에는 없다.** 이번 세 칸의
+`params_with_grad`는 310 / 320 / 505로 0이 아니니 실제로 학습은 일어났지만,
+0이었다면 그대로 초록으로 지나갔을 것이다. **미해결로 남긴다.**
+
+### 1차의 실패는 "미지원"이 아니라 배포판 누락이었다
+
+1차에서 등급 대상 체크가 실패한 칸 중 **5칸**의 원인은 조합이 지원되지 않아서가
+아니라 이미지에 배포판이 없어서였다. 매트릭스를 "미지원"으로 읽으면 안 된다.
+
+| 1차 실패 | 칸 | 없던 배포판 |
+|---|---|---|
+| `dense_model_load` ModuleNotFoundError | tevatron x 3종 | `peft` |
+| `get_model_processor` PackageNotFoundError | ms_swift x qwen3_vl_emb_2b, qwen3_5_0_8b | `qwen_vl_utils` |
+
+여기에 unsloth 3칸의 `fast_sentence_transformer_accepts_vlm`이 별도로 붙는다 —
+아래 "문서화된 한계가 아니었다" 참조. 등급 대상 실패는 아니었으므로 5칸과 따로 센다.
+
+**tevatron: 상류가 선언하지 않는다.** 핀 고정된 `setup.py`의 `install_requires`는
+`transformers>=4.10.0`, `datasets>=1.1.3` **둘뿐인데**, `encoder.py`는 8행에서
+`from peft import LoraConfig, TaskType, get_peft_model, PeftModel`를 모듈 최상단에서
+한다. 그래서 `envs/tevatron/pyproject.toml`이 `peft>=0.20`을 대신 선언한다.
+`accelerate`는 따로 선언하지 않아도 `peft`의 의존성으로 따라 들어온다(lock 기준
+1.14.0, pod 기록도 1.14.0). 같은 이유를 다시 캐지 않도록 여기에 남긴다.
+
+**ms-swift: Qwen3.5(텍스트 전용)가 VL 경로로 적재된다.** 핀 고정된 소스
+(`ms-swift 4.4.2`, `swift/model/models/qwen.py`)에서
+`class Qwen3_5Loader(Qwen3VLLoader)`이고, `MLLMModelType.qwen3_5`로 등록되며
+`requires=['transformers>=5.0.0.dev', 'qwen_vl_utils>=0.0.14', 'decord']`다.
+`Qwen3VLLoader._check_qwen_vl_utils`가 `require_version('qwen_vl_utils>=0.0.14')`를
+잡히지 않는 곳에서 호출하는 것이 1차의 `PackageNotFoundError`였다. 이것은 의존성
+메모가 아니라 **프레임워크의 구조적 사실이고, 뒤 단계의 처리량 교란 요인 후보다.**
+
+교란 요인은 ms-swift만의 것이 아니다. 이번 캠페인에서 `qwen3_5_0_8b`를 적재한 칸은
+전부 VL 경로를 탔다 — native는 `visual_tokens`가 이미지당 196 토큰으로 통과하고
+`multimodal_embed_forward`도 통과한다(`seq_len` 209), unsloth·ms_swift는 프로세서가
+`Qwen3VLProcessor`다. 이 체크포인트를 "텍스트 전용"으로 부르는 것은 config 수준에서
+이미 성립하지 않는다.
+
+**`decord`는 경고이지 실패가 아니다.** `envs/ms-swift/uv.lock`에 `decord`는 없고
+(0건), 그럼에도 ms_swift 세 칸이 10/10으로 통과했다. 상류 코드가 그 이유를 말한다 —
+`swift/model/model_meta.py`의 `ModelMeta.check_requires`는 `require_version`의
+`ImportError`를 삼키고 `Please install the package: ...`를 `logger.warning`으로만
+남긴다. `_check_qwen_vl_utils`와 달리 게이트가 아니다.
+
+**unsloth: `sentence-transformers`는 상류 extra에서 왔다.** `unsloth[huggingface]`를
+고르면 그 배포판 하나가 추가되고 새로운 제약은 생기지 않는다(`envs/unsloth/uv.lock`,
+5.6.1). `FastSentenceTransformer`가 그것 없이는 import되지 않는다.
+
+### 문서화된 한계가 아니었다 — unsloth 3칸의 예상 실패가 통과했다
+
+`fast_sentence_transformer_accepts_vlm`은 `expected_failure=True`로 등록된
+체크다. 1차에서 세 칸 모두 "예상대로 실패"했는데, 실패 내용은
+`ImportError: Unsloth: To use FastSentenceTransformer, you must install
+sentence-transformers.`였다. 즉 **프레임워크의 거부가 아니라 배포판 부재를
+확인하고 있었다.** 배포판이 들어온 2차에서는 세 칸 모두 통과했고
+(`accepted: true`, `model_class: SentenceTransformer`), 생성 구역이
+"지원 매트릭스가 틀렸다"로 표시한다.
+
+두 가지를 넘겨짚으면 안 된다.
+
+- 위 매트릭스의 unsloth 칸은 `OK (9 checks, 문서화된 한계 1건)`로 렌더된다.
+  그 "한계 1건"이 바로 **통과해버린** 체크다. 표만 읽으면 한계가 유지된 것으로
+  읽힌다 — 바로 아래 절이 반대를 말한다.
+- 프로브는 `FastSentenceTransformer.from_pretrained(hf_id, for_inference=True)`를
+  호출한다. 통과가 말하는 것은 **추론 경로의 생성이 되더라**까지다. 학습 스텝이
+  그 경로로 도는지, 1.8-3.3배 임베딩 가속이 이 연구의 모델에 적용되는지는
+  **측정 안 함**이다.
+
+### 초록이지만 그대로 믿으면 안 되는 것
+
+- **`axes_verified`는 `all_matched: false`여도 통과한다.** 실측된 불일치 둘:
+  `kernel.name`은 `none`을 요청했는데 `qwen3_5_0_8b` 칸 전부(native, ms_swift,
+  axolotl, unsloth, sentence_transformers)에서 `fla`가 적용됐고,
+  `precision.name`은 `bf16`을 요청했는데 axolotl 3칸과 unsloth 3칸에서
+  `mixed(bf16,fp32)`가 적용됐다. Phase 0의 판정은 바꾸지 않지만 뒤 단계의
+  교란 요인으로 이미 보인다.
+- **unsloth의 `padding_side_alignment`가 초록인 것은 불일치가 없다는 뜻이 아니다.**
+  Qwen 두 칸의 detail이 `disagreed: [processor, tokenizer]`,
+  `framework_forced: [processor, tokenizer]`를 기록한다. unsloth는 left로 오고
+  체크포인트는 right이며 프로브가 right로 강제한다. 1차에서는 이 강제가 실패였고,
+  지금은 "감지하고 교정했다"가 초록이다.
+- **tevatron의 `framework_version`이 `version: "unknown"`으로 통과한다.** 버전이
+  결과에 보여야 한다는 규칙(AGENTS.md)에 이 칸은 답하지 못한다.
+- **해석 스택이 칸마다 다르다.** transformers는 5.5.0(unsloth) / 5.12.1(ms_swift) /
+  5.14.1(나머지), torch는 2.11.0 / 2.12.1 / 2.13.0으로 갈린다. 적재 여부만 묻는
+  Phase 0에서는 감수하지만, 처리량을 비교할 때는 프레임워크 차이와 분리되지 않는다.
+
+### 재현
+
+```
+hf download jinwoo-cho/trainbench-results --repo-type dataset --local-dir <dir>
+# 원장의 pod_id 18개에 해당하는 results/<fw>/<model>/<pod>/ 만 <stage>/results/ 로 복사
+uv run python scripts/report.py --results <stage> --ledger outputs/orchestrate-phase0-rerun.json
+```
+
+복사 단계를 빼면 어느 캠페인이 선택될지는 mtime이 정한다(위 "어느 캠페인의
+아티팩트인지부터 확인했다").
+
 ---
 
 여기부터 아래는 `scripts/report.py`가 생성한다. 아직 pod 결과가 없으면 비어 있다.
@@ -866,12 +1096,20 @@ docs/model-spec.md 결정 5, 형식 값은 `model.prompt_format`이다.
 
 | | qwen3_vl_emb_2b | qwen3_5_0_8b | gemma4_e2b |
 |---|---|---|---|
-| native | OK (12 checks) | OK (12 checks) | FAIL visual_tokens (ValueError) |
-| unsloth | FAIL padding_side_alignment (ValueError) | FAIL padding_side_alignment (ValueError) | FAIL visual_tokens (ValueError) |
-| ms_swift | FAIL get_model_processor (PackageNotFoundError) | FAIL get_model_processor (PackageNotFoundError) | FAIL visual_tokens (ValueError) |
+| native | OK (12 checks) | OK (12 checks) | OK (13 checks) |
+| unsloth | OK (9 checks, 문서화된 한계 1건) | OK (9 checks, 문서화된 한계 1건) | OK (9 checks, 문서화된 한계 1건) |
+| ms_swift | OK (10 checks) | OK (10 checks) | OK (10 checks) |
 | sentence_transformers | OK (9 checks) | OK (9 checks) | OK (9 checks) |
-| tevatron | FAIL dense_model_load (ModuleNotFoundError) | FAIL dense_model_load (ModuleNotFoundError) | FAIL dense_model_load (ModuleNotFoundError) |
-| axolotl | FAIL model_loader_load (TypeError) | FAIL model_loader_load (TypeError) | FAIL model_loader_load (TypeError) |
+| tevatron | FAIL dense_model_load (AttributeError) | FAIL dense_model_load (AttributeError) | FAIL dense_model_load (AttributeError) |
+| axolotl | FAIL infonce_backward (RuntimeError) | FAIL infonce_backward (RuntimeError) | FAIL infonce_backward (RuntimeError) |
+
+### 지원 매트릭스가 틀렸다 — 실패할 것으로 표시한 체크가 통과했다
+
+문서화된 한계가 사라졌다는 뜻이므로, 해당 셀의 근거를 다시 확인해야 한다.
+
+- **unsloth x gemma4_e2b** — fast_sentence_transformer_accepts_vlm
+- **unsloth x qwen3_5_0_8b** — fast_sentence_transformer_accepts_vlm
+- **unsloth x qwen3_vl_emb_2b** — fast_sentence_transformer_accepts_vlm
 
 ### 실행 환경별 해석 버전
 
@@ -898,76 +1136,42 @@ docs/model-spec.md 결정 5, 형식 값은 `model.prompt_format`이다.
 
 ### 실패 상세
 
-- **axolotl x gemma4_e2b / model_loader_load** — TypeError
-  - `unsupported operand type(s) for //: 'NoneType' and 'NoneType'`
-- **axolotl x gemma4_e2b / infonce_backward** — Skipped
-  - `skipped: model did not load`
-- **axolotl x qwen3_5_0_8b / model_loader_load** — TypeError
-  - `unsupported operand type(s) for //: 'NoneType' and 'NoneType'`
-- **axolotl x qwen3_5_0_8b / infonce_backward** — Skipped
-  - `skipped: model did not load`
-- **axolotl x qwen3_vl_emb_2b / model_loader_load** — TypeError
-  - `unsupported operand type(s) for //: 'NoneType' and 'NoneType'`
-- **axolotl x qwen3_vl_emb_2b / infonce_backward** — Skipped
-  - `skipped: model did not load`
-- **ms_swift x gemma4_e2b / visual_tokens** — ValueError
-  - `Cannot use apply_chat_template because this processor does not have a chat template.`
-- **ms_swift x qwen3_5_0_8b / get_model_processor** — PackageNotFoundError
-  - `No package metadata was found for The 'qwen_vl_utils>=0.0.14' distribution was not found and is required by this application.`
-- **ms_swift x qwen3_5_0_8b / infonce_backward** — Skipped
-  - `skipped: model did not load`
-- **ms_swift x qwen3_vl_emb_2b / get_model_processor** — PackageNotFoundError
-  - `No package metadata was found for The 'qwen_vl_utils>=0.0.14' distribution was not found and is required by this application.`
-- **ms_swift x qwen3_vl_emb_2b / infonce_backward** — Skipped
-  - `skipped: model did not load`
-- **native x gemma4_e2b / visual_tokens** — ValueError
-  - `Cannot use apply_chat_template because this processor does not have a chat template.`
-- **native x gemma4_e2b / multimodal_embed_forward** — ValueError
-  - `Cannot use apply_chat_template because this processor does not have a chat template.`
-- **tevatron x gemma4_e2b / dense_model_load** — ModuleNotFoundError
-  - `No module named 'peft'`
+- **axolotl x gemma4_e2b / infonce_backward** — RuntimeError
+  - `expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`
+- **axolotl x qwen3_5_0_8b / infonce_backward** — RuntimeError
+  - `expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`
+- **axolotl x qwen3_vl_emb_2b / infonce_backward** — RuntimeError
+  - `expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`
+- **tevatron x gemma4_e2b / dense_model_load** — AttributeError
+  - `'Gemma4Config' object has no attribute 'pad_token_id'`
 - **tevatron x gemma4_e2b / infonce_backward** — Skipped
   - `skipped: model did not load`
-- **tevatron x qwen3_5_0_8b / dense_model_load** — ModuleNotFoundError
-  - `No module named 'peft'`
+- **tevatron x qwen3_5_0_8b / dense_model_load** — AttributeError
+  - `'Qwen3_5Config' object has no attribute 'pad_token_id'`
 - **tevatron x qwen3_5_0_8b / infonce_backward** — Skipped
   - `skipped: model did not load`
-- **tevatron x qwen3_vl_emb_2b / dense_model_load** — ModuleNotFoundError
-  - `No module named 'peft'`
+- **tevatron x qwen3_vl_emb_2b / dense_model_load** — AttributeError
+  - `'Qwen3VLConfig' object has no attribute 'pad_token_id'`
 - **tevatron x qwen3_vl_emb_2b / infonce_backward** — Skipped
   - `skipped: model did not load`
-- **unsloth x gemma4_e2b / visual_tokens** — ValueError
-  - `Cannot use apply_chat_template because this processor does not have a chat template.`
-- **unsloth x qwen3_5_0_8b / padding_side_alignment** — ValueError
-  - `['processor', 'tokenizer'] declared padding_side {'tokenizer': 'left', 'processor': 'left'} but config.model.padding_side is 'right'; it has been forced onto the configured side, a`
-- **unsloth x qwen3_vl_emb_2b / padding_side_alignment** — ValueError
-  - `['processor', 'tokenizer'] declared padding_side {'tokenizer': 'left', 'processor': 'left'} but config.model.padding_side is 'right'; it has been forced onto the configured side, a`
 
 ### 병합에서 제외한 파일
 
-- 중복: axolotl x gemma4_e2b: ignored results/axolotl/gemma4_e2b/re17q5hfpr2qdd/started.json
-- 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/pjn3jrv0dy59ql/started.json
-- 중복: axolotl x qwen3_vl_emb_2b: ignored results/axolotl/qwen3_vl_emb_2b/117ldk6qywwda3/started.json
-- 중복: ms_swift x gemma4_e2b: ignored results/ms_swift/gemma4_e2b/106pq7lep4ndot/started.json
-- 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/rz2t3hjjctb9ir/started.json
-- 중복: ms_swift x qwen3_vl_emb_2b: ignored results/ms_swift/qwen3_vl_emb_2b/ngvpq0n6jwehzk/started.json
-- 중복: native x gemma4_e2b: ignored results/native/gemma4_e2b/oegus80eth8r75/started.json
-- 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/o7lrjq7e02enqv/started.json
-- 중복: native x qwen3_vl_emb_2b: ignored results/native/qwen3_vl_emb_2b/cs5m0fd2lmcmn8/started.json
-- 중복: sentence_transformers x gemma4_e2b: ignored results/sentence_transformers/gemma4_e2b/p3ffx6xcg05ksv/started.json
-- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/ctsn3ky63mvul0/result.json
-- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/3tmi4ht24hs5uz/result.json
-- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/2i0ptlkcc5621p/result.json
-- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/1jscf6cxmjz72y/result.json
-- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/ctsn3ky63mvul0/started.json
-- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/2i0ptlkcc5621p/started.json
-- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/1jscf6cxmjz72y/started.json
-- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/xchraazlhvqt6y/started.json
-- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/3tmi4ht24hs5uz/started.json
-- 중복: sentence_transformers x qwen3_vl_emb_2b: ignored results/sentence_transformers/qwen3_vl_emb_2b/zz21apdq19z46i/started.json
-- 중복: tevatron x gemma4_e2b: ignored results/tevatron/gemma4_e2b/dh4m30ex41frn1/started.json
-- 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/n3r8t21c0clle3/started.json
-- 중복: tevatron x qwen3_vl_emb_2b: ignored results/tevatron/qwen3_vl_emb_2b/6kg59vfo5dbfpe/started.json
-- 중복: unsloth x gemma4_e2b: ignored results/unsloth/gemma4_e2b/32plsncjtkxzvv/started.json
-- 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/yh32nxs19wlqv2/started.json
-- 중복: unsloth x qwen3_vl_emb_2b: ignored results/unsloth/qwen3_vl_emb_2b/n75371z1ll7tz0/started.json
+- 중복: axolotl x gemma4_e2b: ignored results/axolotl/gemma4_e2b/96ykbqpg8zhv4k/started.json
+- 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/5zjp3w6lt56d4j/started.json
+- 중복: axolotl x qwen3_vl_emb_2b: ignored results/axolotl/qwen3_vl_emb_2b/twkpqbpknu9v9w/started.json
+- 중복: ms_swift x gemma4_e2b: ignored results/ms_swift/gemma4_e2b/lfwess4lnnkdba/started.json
+- 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/bjdyt8s8l7eb0r/started.json
+- 중복: ms_swift x qwen3_vl_emb_2b: ignored results/ms_swift/qwen3_vl_emb_2b/92grvnmui311st/started.json
+- 중복: native x gemma4_e2b: ignored results/native/gemma4_e2b/n2lsusgmhk45xw/started.json
+- 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/k9wkyvgstvnq2x/started.json
+- 중복: native x qwen3_vl_emb_2b: ignored results/native/qwen3_vl_emb_2b/cjv20cvy38c84m/started.json
+- 중복: sentence_transformers x gemma4_e2b: ignored results/sentence_transformers/gemma4_e2b/dkjq8um6a26b29/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/98as4en2an38rs/started.json
+- 중복: sentence_transformers x qwen3_vl_emb_2b: ignored results/sentence_transformers/qwen3_vl_emb_2b/adsvsynn0j2pct/started.json
+- 중복: tevatron x gemma4_e2b: ignored results/tevatron/gemma4_e2b/j0i8cqmakhz6bk/started.json
+- 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/wwo36vlg1onptz/started.json
+- 중복: tevatron x qwen3_vl_emb_2b: ignored results/tevatron/qwen3_vl_emb_2b/poo9rswlunjkj5/started.json
+- 중복: unsloth x gemma4_e2b: ignored results/unsloth/gemma4_e2b/xlz4cbame1awm4/started.json
+- 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/hjqfwu95965l8p/started.json
+- 중복: unsloth x qwen3_vl_emb_2b: ignored results/unsloth/qwen3_vl_emb_2b/vfamxhetm6flkp/started.json
