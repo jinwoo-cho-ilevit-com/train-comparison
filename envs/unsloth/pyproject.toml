@@ -7,7 +7,11 @@ version = "0.1.0"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "trainbench",
-    "unsloth>=2026.7",
+    # The extra, not a bare `sentence-transformers`: FastSentenceTransformer refuses
+    # to import without it, and unsloth already declares it there. Every other name
+    # in that extra is a duplicate of unsloth's base requirements at the same or a
+    # looser bound, so selecting it adds one distribution and no new constraint.
+    "unsloth[huggingface]>=2026.7",
     # Qwen3.5's Gated DeltaNet path, not an ablation axis. transformers falls back
     # to a slow torch implementation with only a log line when these are missing
     # (docs/support-matrix.md), and 75% of that model's layers are GDN. Every env

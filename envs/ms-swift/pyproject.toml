@@ -8,6 +8,11 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "trainbench",
     "ms-swift>=4.4",
+    # ms-swift declares this nowhere, not even in its `all` extra, yet
+    # Qwen3VLLoader._check_qwen_vl_utils raises require_version('qwen_vl_utils>=0.0.14')
+    # before loading. Qwen3.5 is registered as an MLLM type on that same loader, so
+    # the text model needs it too. `decord` in the registry only warns.
+    "qwen-vl-utils>=0.0.14",
     # Qwen3.5's Gated DeltaNet path, not an ablation axis. See envs/unsloth.
     "flash-linear-attention>=0.5",
     "causal-conv1d>=1.6",

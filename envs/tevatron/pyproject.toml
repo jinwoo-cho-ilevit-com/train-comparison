@@ -8,6 +8,11 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "trainbench",
     "tevatron @ git+https://github.com/texttron/tevatron.git",
+    # tevatron's setup.py declares only transformers+datasets, but
+    # retriever/modeling/encoder.py imports peft at module level, so every model
+    # load fails. Floor matches trainbench's `native` extra; that extra is not
+    # installed here because the framework picks its own modelling stack.
+    "peft>=0.20",
     # Qwen3.5's Gated DeltaNet path, not an ablation axis. See envs/unsloth.
     "flash-linear-attention>=0.5",
     "causal-conv1d>=1.6",
