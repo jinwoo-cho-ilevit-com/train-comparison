@@ -76,15 +76,22 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
         # Uses the shared info_nce rather than ST's loss class so the loss is
         # identical across frameworks; comparing frameworks under different loss
         # implementations would not be a framework comparison.
+        #
+        # The step is ST's own — it pools inside its module, so `steps.encode` is
+        # not the path here — but the evidence it has to produce is the same one,
+        # which is why the counting and the refusal are `steps.training_step_evidence`.
+        # This path used to return `params_with_grad` alone: the guard that caught
+        # three frozen unsloth cells was not on it, and a fully frozen model here
+        # would have passed. `BaseModel` is an `nn.Sequential` (sentence-transformers
+        # 5.6.1 base/model.py:50), so `model.parameters()` reaches the backbone and
+        # any adapter inside it, which is what those counts are of.
         features = model.tokenize(texts)
         features = {k: v.to(device) if hasattr(v, "to") else v for k, v in features.items()}
         pooled = model(features)["sentence_embedding"]
         half = pooled.shape[0] // 2
         loss = info_nce(pooled[:half], pooled[half:], config.loss.temperature)
         loss.backward()
-        with_grad = sum(1 for p in model.parameters() if p.requires_grad and p.grad is not None)
-        model.zero_grad(set_to_none=True)
-        return {"loss": float(loss.detach()), "params_with_grad": with_grad}
+        return steps.training_step_evidence(model, loss)
 
     report.run("mnrl_backward", _backward)
 
