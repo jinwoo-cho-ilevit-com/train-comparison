@@ -24,7 +24,7 @@
 
 `scripts/report.py:235`:
 
-```python
+```text
 timestamp=float(payload.get("recorded_at") or path.stat().st_mtime)
 ```
 
