@@ -93,7 +93,7 @@
         "determined": true,
         "matches": false,
         "requested": "mnrl",
-        "state": "framework-owned"
+        "state": "framework_owned"
       },
       {
         "applied": "adamw_fused",
@@ -113,7 +113,7 @@
         "determined": true,
         "matches": false,
         "requested": false,
-        "state": "framework-owned"
+        "state": "framework_owned"
       },
       {
         "applied": "single",

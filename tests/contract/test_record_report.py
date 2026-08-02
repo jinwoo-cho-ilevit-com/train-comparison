@@ -28,7 +28,7 @@ unpinned:
    / 5.12.1 / 5.5.0). `report.py` ranks only cells sharing a stack, so the stack
    key has to be mechanically derivable from the record.
 
-Also carried: per-axis states including `framework-owned` (the vocabulary is
+Also carried: per-axis states including `framework_owned` (the vocabulary is
 owned by the `applied-axes` boundary; this one pins that the record carries it),
 and the scope a figure is true within - a framework's speed ratio inverts with
 sequence length and GPU count.
@@ -138,7 +138,7 @@ STATUS_OOM = "oom"  # the run hit the memory ceiling - a result, not an absence
 
 # The axis-ownership state that says an axis is not ours to apply on this cell
 # (tevatron's DenseModel.forward owns the loss and the cross-device gather).
-FRAMEWORK_OWNED = "framework-owned"
+FRAMEWORK_OWNED = "framework_owned"
 
 _DELETE = object()
 
