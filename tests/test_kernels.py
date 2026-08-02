@@ -271,7 +271,7 @@ def test_isolation_agrees_with_contract_on_every_stored_sample():
 # --- completion condition 3: packing is refused where no mask is built --------
 
 
-def test_packing_is_refused_when_the_mask_is_not_registered():
+def test_packing_is_refused_when_mask_registered_is_false():
     with pytest.raises(kernels.UnsafePacking) as refusal:
         kernels.assert_packing_is_isolated(_sample(UNREGISTERED))
 
@@ -291,7 +291,7 @@ def test_packing_is_allowed_when_every_backbone_is_mask_registered():
         kernels.assert_packing_is_isolated(_sample(name))
 
 
-def test_packing_refusal_reads_the_backbones_not_the_resolved_flag():
+def test_packing_refusal_reads_mask_registered_per_backbone():
     """One unregistered tower loses isolation for the whole forward.
 
     `resolved.mask_registered` describes the towers that got the request. A
@@ -306,7 +306,7 @@ def test_packing_refusal_reads_the_backbones_not_the_resolved_flag():
         kernels.assert_packing_is_isolated(fingerprint)
 
 
-def test_the_mask_registry_this_module_reads_is_the_one_that_decides():
+def test_mask_registered_is_read_from_the_registry_that_decides_mask_creation():
     from transformers.masking_utils import AttentionMaskInterface
 
     module, _, attribute = kernels.MASK_REGISTRY.rpartition(".")
@@ -553,6 +553,25 @@ def test_the_fingerprint_survives_the_run_record_writer(tmp_path):
 
     assert reloaded == record
     kernels.validate_fingerprint(reloaded[kernels.RUN_RECORD_KEY][kernels.BUILD_FINGERPRINT_KEY])
+
+
+def test_the_documented_selectors_reach_the_refusal_they_name():
+    """`.plans/remaining-code/kernels.md` runs this file through three `-k` filters.
+
+    Caught in the act: `-k mask_registered` originally matched only
+    `..._is_allowed_when_every_backbone_is_mask_registered`, so disabling the
+    refusal outright left that selector green. A selector that reaches only the
+    permissive half of a rule is an empty check with a name.
+    """
+    names = [name for name in globals() if name.startswith("test_")]
+    for selector, must_include in (
+        ("agrees_with_contract", "test_the_runtime_validator_agrees_with_contract"),
+        ("mask_registered", "test_packing_is_refused_when_mask_registered_is_false"),
+        ("no_runtime_fetch", "test_no_runtime_fetch_reports_an_unset_environment"),
+    ):
+        selected = [name for name in names if selector in name]
+        assert len(selected) >= 2, (selector, selected)
+        assert must_include in selected, (selector, selected)
 
 
 def test_this_gate_is_looking_at_the_module_it_claims_to():
