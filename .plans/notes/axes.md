@@ -118,6 +118,33 @@ stage 를 지정하는 스키마 필드는 `parallel.strategy` 하나뿐이다. 
 
 ---
 
+## 3b. `axis-values` 는 파일 그룹의 빈 적용 지점을 **더 좋게** 읽는다 — 실측
+
+브리프가 요구한 "적용 지점을 비우면 감사가 그 값을 이름으로 지목한다" 를 이 레인이 건드린
+세 지점에 각각 해봤다. 결과가 셋 다 다르고, 그 차이가 이 체크의 분해능이다.
+(이 워크트리, `scripts/audit_plan.py --only axis-values`, 커밋 1156e35 기준. 기준선은
+`36/52 ... 3 group(s) offering one usable value: kernel 1/3, precision 1/3, train.offload 1/4`.)
+
+| 비운 곳 | 감사 출력 | 판정 |
+|---|---|---|
+| `_deepspeed` → `return model, []` | `38/52 ... 6 value(s) failed for another reason: train.offload/both on text-only data (AppliedMismatch: requested 'both', read back 'none' ...)` 외 5건 | **잡는다.** 값 여섯을 이름으로 지목하고 count 가 3→9 로 grew |
+| `_precision_recipe` → `return None` | `38/52 ... 2 group(s) offering one usable value: kernel 1/3, train.offload 1/4` | **거꾸로 잡는다.** precision 이 1/3 → 3/3 으로 올라가 inert 목록에서 빠진다. count 3→2 shrank 로 BLOCK 되기는 하지만, 읽는 사람에게는 축이 좋아진 것으로 보인다 |
+| `_parallel` → `return model, ["parallel.strategy"]` | `38/52 ... 3 group(s) ... kernel 1/3, precision 1/3, train.offload 1/4` | **못 잡는다.** parallel 이 2/6 → 4/6 으로 오르고 inert 목록도 count(3)도 그대로다. `0 grew, 0 shrank` |
+
+이유는 `axis-values` 가 그룹당 **적용 가능성**을 세고, 되읽기(`verify=`)는 `flag_knob_values()`
+가 돌려주는 점 표기 knob(`train.*`)에만 건다는 것이다(`audit_plan.py:1738-1748`). 파일 그룹의
+적용 지점을 `raise` 가 아니라 `return`/`None` 으로 비우면 아무것도 거부되지 않으므로 값이
+**더 많이** 적용 가능해진다. `PackedCollate.__call__` 에 `raise` 를 넣었을 때 수가 내려간
+선례는 raise 였기 때문이지 체크가 빈 적용 지점을 보기 때문이 아니다.
+
+요청: `attempt(..., verify=...)` 를 파일 그룹에도 걸 수 있는 그룹부터 걸어 달라.
+`_Tiny` 스텁이 답할 수 있는 축이어야 하므로 전부는 안 되지만, 최소한 `parallel`(래퍼 클래스로
+읽힌다)과 `peft`(`peft_config` 로 읽힌다)는 답한다. `precision` 과 `kernel` 은
+`nn.Linear` 하나짜리 스텁으로는 답하지 못하므로 이 체크로는 원리적으로 못 본다 —
+그 둘의 증거는 `tests/test_axes.py` 뿐이다.
+
+---
+
 ## 4. `axis-values` 의 단일값 그룹 셋이 왜 남았는가 — 셋 다 이유가 다르다
 
 **이 구별을 뭉개면 `HAZARDS.md §3` 의 "note 가 blocker 를 가린" 모양이 된다.**
