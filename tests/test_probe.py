@@ -560,6 +560,111 @@ def test_the_same_refusal_does_not_read_as_a_framework_that_cannot_load(
         assert checks[name].error_type != "Skipped", checks[name].error
 
 
+def _fake_axolotl(monkeypatch, loaded):
+    """A miniature of axolotl 0.18.0 keeping the four behaviours the probe trips on.
+
+    Not a stub that says yes: `DictDefault` answers None for a missing key
+    (utils/dict.py:12), `normalize_config` divides `batch_size //
+    micro_batch_size` before anything has filled them (utils/config/__init__.py:200-203),
+    `validate_config` is what puts defaults on all of them and refuses a cfg
+    missing `learning_rate`, an empty `datasets` or fewer than two of the three
+    batch keys (utils/schemas/training.py:71-82, utils/schemas/config.py:339-348,
+    utils/schemas/validation.py:219-225), and the loader compares
+    `context_parallel_size` against 1 (loaders/patch_manager.py:336), which only
+    validation supplies.
+    """
+
+    class DictDefault(dict):
+        def __missing__(self, key):
+            return None
+
+        def __getattr__(self, key):
+            return self[key]
+
+        def __setattr__(self, key, value):
+            self[key] = value
+
+        def to_dict(self):
+            return dict(self)
+
+    def normalize_config(cfg):
+        cfg.gradient_accumulation_steps = cfg.gradient_accumulation_steps or (
+            cfg.batch_size // cfg.micro_batch_size
+        )
+        cfg.batch_size = cfg.batch_size or cfg.micro_batch_size * cfg.gradient_accumulation_steps
+
+    def validate_config(cfg):
+        if cfg.learning_rate is None:
+            raise ValueError("learning_rate: Field required")
+        if not cfg.datasets:
+            raise ValueError("datasets: List should have at least 1 item after validation")
+        keys = ("micro_batch_size", "gradient_accumulation_steps", "batch_size")
+        if sum(1 for key in keys if cfg[key]) < 2:
+            raise ValueError(f"At least two of {', '.join(keys)} must be set")
+        cfg.context_parallel_size = 1
+        return cfg
+
+    class ModelLoader:
+        def __init__(self, cfg, tokenizer):
+            self.cfg = cfg
+
+        def load(self):
+            if self.cfg.context_parallel_size > 1:
+                raise RuntimeError("unreachable with a validated cfg")
+            loaded["cfg"] = dict(self.cfg)
+            model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+            model.config = types.SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+            return model, None
+
+    root = types.ModuleType("axolotl")
+    root.__version__ = "0.0-stub"
+    modules = {
+        "axolotl": root,
+        "axolotl.loaders": types.ModuleType("axolotl.loaders"),
+        "axolotl.loaders.model": types.ModuleType("axolotl.loaders.model"),
+        "axolotl.loaders.tokenizer": types.ModuleType("axolotl.loaders.tokenizer"),
+        "axolotl.utils": types.ModuleType("axolotl.utils"),
+        "axolotl.utils.config": types.ModuleType("axolotl.utils.config"),
+        "axolotl.utils.dict": types.ModuleType("axolotl.utils.dict"),
+    }
+    modules["axolotl.loaders.model"].ModelLoader = ModelLoader
+    modules["axolotl.loaders.tokenizer"].load_tokenizer = lambda cfg: _Tokenizer("right")
+    modules["axolotl.utils.config"].normalize_config = normalize_config
+    modules["axolotl.utils.config"].validate_config = validate_config
+    modules["axolotl.utils.config"].prepare_plugins = lambda cfg: None
+    modules["axolotl.utils.dict"].DictDefault = DictDefault
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+def test_the_axolotl_probe_hands_it_a_config_it_accepts(config_mapping, monkeypatch):
+    """The probe called `normalize_config` before `validate_config` and never
+    called validation at all, so every axolotl cell of the 2026-08-02 campaign
+    died on `None // None` before a checkpoint was touched — a support matrix
+    saying axolotl cannot load these models, measured against a config axolotl was
+    never given.
+
+    Patching the two batch keys by hand is not the fix and this asserts why: only
+    validation fills `context_parallel_size`, which the loader compares against 1.
+    """
+    loaded: dict[str, object] = {}
+    _fake_axolotl(monkeypatch, loaded)
+    mapping = json.loads(json.dumps(config_mapping))
+    mapping["framework"]["name"] = "axolotl"
+
+    report = run_probe(to_bench_config(mapping), get_device("cpu"))
+    check = next(c for c in report.checks if c.name == "model_loader_load")
+
+    assert check.ok, check.error
+    cfg = loaded["cfg"]
+    # Every required key traced to this study's config rather than invented.
+    config = to_bench_config(mapping)
+    assert cfg["micro_batch_size"] == config.train.batch_size
+    assert cfg["gradient_accumulation_steps"] == config.train.grad_accum
+    assert cfg["learning_rate"] == config.optim.lr
+    assert [d["path"] for d in cfg["datasets"]] == [config.data.repo_id]
+
+
 def test_the_load_axes_reach_from_pretrained_when_they_are_not_refused(config_mapping, monkeypatch):
     """The break for the test above. Recording the refusal is worth nothing if the
     kwargs stopped reaching the loader on the way — a `load_kwargs` helper that
