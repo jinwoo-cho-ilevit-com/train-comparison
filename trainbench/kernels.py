@@ -480,6 +480,11 @@ def open_fetch_doors(
     as well as the environment is the point: both variables below are read once,
     at import, into a module global, so a process that already imported
     transformers keeps the value it read no matter what is set afterwards.
+
+    An imported module that does not carry the name is a door, not a closed one.
+    `CACHED_FETCH_SWITCHES` is read off one version of each library and the six pod
+    images do not share versions; a renamed global read as absent would leave the
+    live switch untouched and report the process as closed.
     """
     env = os.environ if environ is None else environ
     loaded = sys.modules if modules is None else modules
@@ -492,7 +497,14 @@ def open_fetch_doors(
         module = loaded.get(module_name)
         if module is None:
             continue
-        got = getattr(module, attribute, want)
+        if not hasattr(module, attribute):
+            doors.append(
+                f"{module_name}.{attribute} is absent from the imported module — this check "
+                "reads the switch by name, so the installed version renamed or dropped it and "
+                "whatever it uses instead is still whatever it was"
+            )
+            continue
+        got = getattr(module, attribute)
         if got != want:
             doors.append(
                 f"{module_name}.{attribute}={got!r}, want {want!r} — cached at import, so the "
@@ -510,6 +522,10 @@ def forbid_runtime_kernel_fetch(
     Reading training data off a network volume and downloading a kernel mid-run are
     the same contamination: the measurement stops being of the pipeline. Call this
     before the model is built.
+
+    A name the imported module does not already carry is left alone. Creating it
+    would close nothing — the library reads its own global, not this one — while
+    making the door this function just reported disappear from the next reading.
     """
     env = os.environ if environ is None else environ
     loaded = sys.modules if modules is None else modules
@@ -517,7 +533,7 @@ def forbid_runtime_kernel_fetch(
     env.update(RUNTIME_FETCH_ENV)
     for module_name, attribute, want in CACHED_FETCH_SWITCHES:
         module = loaded.get(module_name)
-        if module is not None:
+        if module is not None and hasattr(module, attribute):
             setattr(module, attribute, want)
     return was_open
 

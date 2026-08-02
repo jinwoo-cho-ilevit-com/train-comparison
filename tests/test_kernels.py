@@ -389,6 +389,69 @@ def test_no_runtime_fetch_ignores_modules_that_were_never_imported():
     assert kernels.open_fetch_doors(_closed_env(), {}) == []
 
 
+def test_every_cached_switch_names_a_global_the_installed_library_carries():
+    """The vacuum this table can fall into.
+
+    The doors are read by name, so a library that renames its global leaves the live
+    switch untouched while the check reports the process closed. Every other test in
+    this section plants the names on a `types.ModuleType` and can never notice; this
+    one imports the real modules. The six pod images do not share transformers
+    versions (5.5.0, 5.12.1, 5.14.1), which is what makes the name a moving target.
+    """
+    checked = []
+    for module_name, attribute, _want in kernels.CACHED_FETCH_SWITCHES:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            # The only entry allowed to be absent, and only because the package is.
+            assert module_name == "kernels.layer.globals", module_name
+            assert importlib.util.find_spec("kernels") is None
+            continue
+        assert hasattr(module, attribute), (module_name, attribute)
+        checked.append(f"{module_name}.{attribute}")
+
+    assert checked == [
+        "transformers.integrations.hub_kernels._TRANSFORMERS_USE_HUB_KERNELS",
+        "transformers.integrations.hub_kernels._kernels_enabled",
+        "huggingface_hub.constants.HF_HUB_OFFLINE",
+    ]
+
+
+def test_no_runtime_fetch_reads_a_switch_the_module_does_not_carry_as_open():
+    """A renamed global: the module is imported, the name is gone, the live switch is
+    on. `getattr(module, attribute, want)` answered with `want` and called it closed."""
+    renamed = types.ModuleType("transformers.integrations.hub_kernels")
+    renamed.USE_HUB_KERNELS = "YES"
+    renamed.kernels_enabled = True
+    modules = {"transformers.integrations.hub_kernels": renamed}
+
+    doors = kernels.open_fetch_doors(_closed_env(), modules)
+
+    assert len(doors) == 2
+    assert all("is absent from the imported module" in door for door in doors)
+    with pytest.raises(kernels.RuntimeKernelFetch, match="is absent from the imported module"):
+        kernels.assert_no_runtime_kernel_fetch(_closed_env(), modules)
+
+
+def test_no_runtime_fetch_does_not_fabricate_a_switch_the_module_never_had():
+    """Creating the name closes nothing — the library reads its own global — and it
+    would make the door vanish from every reading after this one."""
+    renamed = types.ModuleType("transformers.integrations.hub_kernels")
+    renamed.USE_HUB_KERNELS = "YES"
+    renamed.kernels_enabled = True
+    modules = {"transformers.integrations.hub_kernels": renamed}
+    env: dict[str, str] = {}
+
+    was_open = kernels.forbid_runtime_kernel_fetch(env, modules)
+
+    assert len(was_open) == 4
+    assert not hasattr(renamed, "_TRANSFORMERS_USE_HUB_KERNELS")
+    assert not hasattr(renamed, "_kernels_enabled")
+    assert (renamed.USE_HUB_KERNELS, renamed.kernels_enabled) == ("YES", True)
+    with pytest.raises(kernels.RuntimeKernelFetch, match="is absent from the imported module"):
+        kernels.assert_no_runtime_kernel_fetch(env, modules)
+
+
 def test_no_runtime_fetch_by_environment_alone_does_not_close_the_flash_attention_rewrite():
     """`USE_HUB_KERNELS` is not on the path that rewrites fa2 to a repo id.
 
