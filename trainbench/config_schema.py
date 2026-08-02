@@ -21,6 +21,12 @@ MAX_AUTOTUNE_MIN_WARMUP_STEPS = 20
 # because `git rev-parse --short` output is what gets pasted in practice.
 COMMIT_SHA = re.compile(r"[0-9a-f]{7,40}")
 
+# Deviation from the canonical baseline that invalidates a pod, and the default
+# of `measurement.baseline_tolerance`. Uncalibrated: AGENTS.md carries this number
+# without a source. `scripts/report.py` decides pod validity with its own copy;
+# until it reads this one, the schema refuses any other value.
+BASELINE_DEVIATION_LIMIT = 0.03
+
 # Subset revisions that must never be trained on again, with the reason a run
 # that recorded one has to be discarded. Named rather than deleted from the Hub:
 # results already exist that record this revision, and which corpus they were
@@ -256,6 +262,10 @@ class MeasurementConfig(Strict):
     behaved as if it had, written down so a run records them; what this study
     should use is a question a pod answers after measuring the noise floor.
     `baseline_tolerance_calibrated` is how a reader tells the two apart.
+
+    A field whose consumer is not written yet is pinned to its default by
+    `_no_knob_is_declared_ahead_of_the_code_that_would_apply_it`, so that the
+    block this config lands in never reads as applied while nothing applied it.
     """
 
     # MLPerf repeats its Small-LLM finetuning benchmark at least ten times. One
@@ -279,7 +289,7 @@ class MeasurementConfig(Strict):
     # `dataloader.packing` axis differently. Declared rather than assumed.
     throughput_denominator: Literal["tokens", "padded_tokens"] = "tokens"
     # Deviation from the canonical baseline that invalidates a pod.
-    baseline_tolerance: float = Field(default=0.03, gt=0.0)
+    baseline_tolerance: float = Field(default=BASELINE_DEVIATION_LIMIT, gt=0.0)
     # False means the number above is the one AGENTS.md carries without a source.
     # It travels into the result so a reader is not left to assume it was derived.
     baseline_tolerance_calibrated: bool = False
@@ -303,6 +313,50 @@ class MeasurementConfig(Strict):
                 f"measurement.trim_fraction={self.trim_fraction} is set under "
                 f"aggregate={self.aggregate}, which does not trim; the knob would be "
                 "recorded as applied while changing nothing."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _no_knob_is_declared_ahead_of_the_code_that_would_apply_it(self) -> MeasurementConfig:
+        """The rule above, applied to the fields whose consumer does not exist yet.
+
+        Every field here lands in `metrics.summarise`'s `measurement` block, which
+        a reader takes as how the figure beside it was produced. Four of them are
+        read by nothing, so any value but the one the harness already behaves as if
+        it had would be recorded as applied while changing nothing. Each refusal
+        names what has to land before the value becomes declarable; deleting the
+        refusal is then a one-line part of landing it.
+        """
+        if self.repeats != 1:
+            raise ValueError(
+                f"measurement.repeats={self.repeats} but scripts/bench.py runs one "
+                "measured window per process and has no repeat loop; the record would "
+                "carry a repeat count nothing repeated, beside a `step_seconds_stdev` "
+                "that is the spread within one run."
+            )
+        if self.seed_policy != "fixed":
+            raise ValueError(
+                f"measurement.seed_policy={self.seed_policy} needs repeats > 1 to mean "
+                "anything, and no repeat loop draws the seeds `metrics.repeat_seeds` "
+                "would produce; the record would name a sampling policy nothing sampled."
+            )
+        if self.throughput_denominator != "tokens":
+            raise ValueError(
+                f"measurement.throughput_denominator={self.throughput_denominator} but "
+                "scripts/report.py ranks on `tokens_per_second` unconditionally and "
+                "renders no padded-token rate; the declared denominator and the "
+                "published one would differ with nothing in the report saying so."
+            )
+        if (
+            self.baseline_tolerance != BASELINE_DEVIATION_LIMIT
+            or self.baseline_tolerance_calibrated
+        ):
+            raise ValueError(
+                f"measurement.baseline_tolerance={self.baseline_tolerance} "
+                f"(calibrated={self.baseline_tolerance_calibrated}) but pod validity is "
+                "decided by scripts/report.py's own BASELINE_DEVIATION_LIMIT; a record "
+                "claiming a calibrated threshold would sit beside a table that used "
+                f"{BASELINE_DEVIATION_LIMIT}."
             )
         return self
 
@@ -341,7 +395,8 @@ class BenchConfig(Strict):
     # Defaulted rather than composed: there is no `configs/measurement/` group
     # yet, and creating one needs `configs/config.yaml` and the audit's group
     # tables, both of which belong to the integration wave (.plans/notes/measure.md).
-    # Every field is overridable as `+measurement.<field>=...` in the meantime.
+    # Every field with a consumer is overridable as `+measurement.<field>=...` in
+    # the meantime; the rest are pinned to their defaults by the schema.
     measurement: MeasurementConfig = MeasurementConfig()
 
     @model_validator(mode="after")

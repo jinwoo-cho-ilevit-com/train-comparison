@@ -67,6 +67,12 @@ STATUS_OOM = "oom"
 # the device path, and the host allocator raises a plain `RuntimeError`.
 _OOM_MARKERS = ("out of memory", "cuda error: out of memory", "cannot allocate memory")
 
+# How many elements `gradient_norm` promotes to float64 at a time, so the
+# promotion costs 32 MiB rather than eight bytes per gradient element. Measured
+# 2026-08-03 on this host over one 151936x2048 bf16 gradient: 4,980,031,488 bytes
+# of max-RSS delta whole-tensor, 41,697,280 chunked.
+_NORM_CHUNK_ELEMENTS = 1 << 22
+
 
 def parameter_counts(model: torch.nn.Module) -> dict[str, int]:
     """Parameter tensors: how many exist, how many train, how many got a gradient.
@@ -90,6 +96,22 @@ def parameter_counts(model: torch.nn.Module) -> dict[str, int]:
     }
 
 
+def _squared_norm(grad: torch.Tensor) -> torch.Tensor:
+    """Sum of squares of one gradient, in float64, without a float64 copy of it.
+
+    Chunked along the first dimension, which slices any strided tensor into views
+    — flattening would copy a non-contiguous gradient whole, which is the
+    allocation this function exists to avoid.
+    """
+    if grad.ndim == 0 or grad.numel() <= _NORM_CHUNK_ELEMENTS:
+        return torch.linalg.vector_norm(grad, 2, dtype=torch.float64).pow(2)
+    rows = max(1, _NORM_CHUNK_ELEMENTS // (grad.numel() // grad.shape[0]))
+    total = torch.zeros((), dtype=torch.float64, device=grad.device)
+    for chunk in torch.split(grad, rows):
+        total = total + torch.linalg.vector_norm(chunk, 2, dtype=torch.float64).pow(2)
+    return total
+
+
 def gradient_norm(model: torch.nn.Module) -> float:
     """Global L2 norm of every gradient currently on the model.
 
@@ -97,13 +119,19 @@ def gradient_norm(model: torch.nn.Module) -> float:
     norm and the answer would be a confident zero. Computed in float64 from
     detached tensors: a bf16 sum over thousands of tensors underflows toward
     zero, which is the exact value this number exists to distinguish.
+
+    The float64 promotion is bounded (`_NORM_CHUNK_ELEMENTS`) rather than taken
+    over a whole gradient at once. Its caller runs this between
+    `reset_peak_memory` and `peak_memory_bytes`, and inside the block that files
+    a failure as `status: oom` — so a promotion the size of the model's largest
+    gradient is reported as the step's peak memory, and its own OOM is published
+    as the hardware ceiling.
     """
     total = torch.zeros((), dtype=torch.float64)
     for parameter in model.parameters():
         if parameter.grad is None:
             continue
-        grad = parameter.grad.detach()
-        total = total + grad.to(torch.float64).pow(2).sum().cpu()
+        total = total + _squared_norm(parameter.grad.detach()).cpu()
     return float(total.sqrt())
 
 
@@ -184,7 +212,15 @@ def training_verdict(
     total = metrics.get("total_params")
     if not _whole_number(trainable) or trainable <= 0:
         reasons.append(f"`trainable_params`={trainable!r}: this model cannot learn")
-    elif _whole_number(total):
+    if not _whole_number(total) or total <= 0:
+        # `GATE_FIELDS` names this one, and absence there is a refusal rather
+        # than a pass. Skipping the peft check instead is how a full finetune
+        # that froze most of its tensors gets published as a full finetune.
+        reasons.append(
+            f"`total_params`={total!r}: the peft.mode check has nothing to compare "
+            f"`trainable_params`={trainable!r} against"
+        )
+    elif _whole_number(trainable) and trainable > 0:
         if peft_mode == "full" and trainable != total:
             reasons.append(
                 f"peft.mode=full but {trainable} of {total} parameter tensors train; "

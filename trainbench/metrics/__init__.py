@@ -277,7 +277,9 @@ def summarise(
     `extra_counts` because it is the other candidate denominator, not an
     incidental count: which of the two divides the step time reverses the
     ranking of the `dataloader.packing` axis, so the choice is declared in
-    `config.measurement.throughput_denominator` and both counts are carried.
+    `config.measurement.throughput_denominator` and both counts are carried. The
+    schema pins that field to `tokens` until a report renders the other rate, so
+    the denominator named here is the one the published tables ranked on.
 
     `extra_counts` gets the same per-step/per-second treatment under its own
     names, and `totals` is merged verbatim for figures that are not rates.
