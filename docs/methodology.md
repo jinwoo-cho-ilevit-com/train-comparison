@@ -459,6 +459,13 @@ time을 기록한다. 그때까지 이 축에 대해 어떤 수치도 쓰지 않
 되어 런이 선다. 이것은 **패치 전에 지어진 모듈**을 잡지, 라이브러리가 애초에 손대지
 않는 부분을 잡지 않는다. 두 가지는 다른 상태이고, 뒤쪽이 여기서 미측정으로 남는 쪽이다.
 
+간극의 원인 하나는 **멀티모달의 백본별 어텐션**이다. `attn_implementation`은
+서브컨피그마다 따로 설정되고 요청에서 빠진 백본은 이전 값을 유지한다
+(`transformers/configuration_utils.py:403`). 세 모델이 전부 멀티모달이므로 텍스트
+타워만 바뀐 빌드가 정상 결과이고, 그때 물어야 할 것은 "모듈 몇 개가 갈렸는가"가 아니라
+"어느 타워가 요청을 받았는가"다. 뒤쪽은 `trainbench/kernels.py`의 지문이 백본별로
+기록한다(§11). 앞쪽은 여전히 **측정 안 함**이고, 두 질문을 하나의 임계값으로 묶지 않는다.
+
 ### 오늘의 이미지 세트에서 이 구멍이 열리지 않는 이유 — 우연이 아니라 세 개의 거부
 
 | 아키텍처 | `kernel=liger` | 근거 |
@@ -492,50 +499,81 @@ fla 없는 Qwen3.5 이미지가 생기거나, #1186이 닫히거나 — 같은 �
 전부 **2026-08-02에 이 체크아웃에서 코드를 읽어 확인한 구조적 사실**이고, 시간이나
 처리량 수치는 하나도 없다 — 이 호스트에 GPU가 없다.
 
-### 10.1 varlen 커널이 없다 — pack은 어텐션에게 한 개의 긴 시퀀스다
+### 10.1 시퀀스 격리는 라이브러리가 만든다 — 이 저장소는 입력만 준다
 
-`axes.PackedCollate.__call__`이 만든 `cu_seqlens`/`seq_lengths`는
-`scripts/bench.py::PackedBatches.__call__`이 `axes.PACKED_BOUNDARY_KEYS`로 배치에서
-빼내고, 그 뒤로는 `embedding.packed_last_token_pool`에만 간다. 모델이 받는 것은
-`input_ids`와 `position_ids` 둘뿐이다. 이 저장소에는 varlen 커널을 호출하는 코드가
-없고, `flash_attn`은 이 체크아웃에 설치돼 있지 않다
-(`importlib.util.find_spec("flash_attn") is None`, macOS, 2026-08-02).
+transformers 5.14.1은 `position_ids`가 시퀀스마다 0에서 다시 시작하면 블록 대각
+격리를 **스스로 만든다.** 경계는 연속한 두 `position_id`의 차가 1이 아닌 자리이고
+(`transformers/masking_utils.py:735`), 그렇게 얻은 시퀀스 인덱스가 causal 마스크와
+AND된다(`masking_utils.py:182`, 결합은 `:972`). "저장소에 블록 대각 마스크를 만드는
+코드가 없다"는 관찰은 맞았지만 "따라서 격리가 없다"는 결론은 틀렸다.
 
-`attn=sdpa`에서 pack은 길이 `total` 한 행이므로 어텐션 비용은 `total²`에 비례한다.
-같은 토큰을 `B`행 x `L`로 패딩한 배치는 `B·L²`이므로, 같은 토큰 수에서 pack 쪽이
-`B`배다. **이것은 배치 모양에서 나오는 계산이지 측정이 아니다.** pack이 스텝 시간을
-실제로 얼마나 바꾸는지는 **측정 안 함**.
+전제는 셋이고 전부 `masking_utils.py:861` 한 줄에 있다 — `position_ids`가 있을 것,
+`attention_mask`가 `None`일 것, `past_key_values`가 `None`일 것. 2D 패딩 마스크를
+하나라도 넘기면(all-ones여도) 패킹 감지가 통째로 꺼진다.
 
-`attn=fa2/fa3/fa4`에서 transformers 5.14.1이 `position_ids`로부터 시퀀스 경계를
-유도하는 경로를 타는지는 **확인하지 못했다** — flash-attn이 없어 그 코드가 이
-체크아웃에서 실행되지 않는다. 확인 전까지 packing 수치를 varlen 커널의 수치로 읽지
-않는다.
+`axes.PackedCollate.__call__`(`trainbench/axes.py:1405`)이 내는 dict의 키는
+`input_ids`/`position_ids`/`cu_seqlens`/`seq_lengths` 넷이고 `attention_mask`가 없다.
+`position_ids`는 시퀀스마다 `torch.arange(...)`이고, 학습 forward에는 캐시가 없다.
+세 전제를 모두 만족한다.
 
-**닫는 방법**: 첫 GPU 파드에서 (a) 같은 데이터·같은 배치 토큰 수로 packing on/off를
-같은 pod에서 재고, (b) `attn=fa2` 런에서 어텐션이 경계를 보았는지를 10.2의 비교로
-확정한다.
+증거는 저장소 안에서 실행된다:
+`tests/contract/test_kernel_provenance.py::test_an_unregistered_implementation_drops_the_packed_sequence_mask`
+가 2/3/1 토큰짜리 pack에 대해 `create_causal_mask`가 돌려준 마스크를 기대 블록 대각
+행렬과 그대로 비교한다.
 
-### 10.2 시퀀스 격리는 검증된 적이 없다
+**아키텍처마다 답이 다르다.**
 
-packing이 옳으려면 한 pack 안의 시퀀스가 서로의 문맥이 되지 않아야 한다. 이 저장소가
-그 방향으로 하는 일은 `position_ids`를 시퀀스마다 0에서 다시 시작시키는 것 하나뿐이다.
-블록 대각 어텐션 마스크를 만드는 코드가 없고, 격리를 검사하는 테스트도 없다.
+| 모델 | 텍스트 레이어 타입 | pack 격리 |
+|---|---|---|
+| qwen3_vl | full_attention 하나 | 자동 (`models/qwen3_vl/modeling_qwen3_vl.py:809`) |
+| gemma4 | full + sliding | 둘 다 자동 (`models/gemma4/modeling_gemma4.py:1707`) |
+| qwen3_5 | full + linear_attention | full만 자동. **linear은 아니다** |
 
-따라서 경계 정보가 어텐션에 도달하지 않는 구성(`attn=sdpa`)에서는 causal 모델의 뒤
-시퀀스가 앞 시퀀스를 문맥으로 읽는다. 그 pack의 임베딩은 같은 행들을 패딩해 얻은
-임베딩과 다른 값이며, 그 차이의 크기는 **측정 안 함**.
+Qwen3.5의 Gated DeltaNet 레이어(`config.layer_types`가 `linear_attention`으로 표시한
+층)는 `position_ids`를 보지 않는다. chunked 커널은 `kwargs["cu_seq_lens_q"]`를
+(`models/qwen3_5/modeling_qwen3_5.py:549`), causal conv는 `kwargs["seq_idx"]`를
+(`:498`) 읽고, 그 레이어가 받는 마스크는 `create_recurrent_attention_mask`
+(`masking_utils.py:1447`)가 만든 2D 패딩 마스크라 패킹 정보가 한 글자도 없다.
+그리고 `trainbench/collate.py:429`가 `axes.PACKED_BOUNDARY_KEYS`로 `cu_seqlens`와
+`seq_lengths`를 모델에 넘기기 전에 배치에서 빼낸다. **즉 오늘 Qwen3.5 + packing 런은
+linear 레이어에서 격리 없이 돈다** — 예외도 경고도 없다. 그 배선은 packing 레인의
+몫이고, 그때까지 Qwen3.5의 packing 수치는 다른 계산의 수치다.
 
-**닫는 방법**: 실제 체크포인트로 같은 행들을 (a) 패딩 배치와 (b) pack으로 인코딩해
-임베딩을 비교한다. 일치하지 않으면 격리가 없는 것이고, 그때 packing 수치는 다른 계산의
-수치다. 이 비교에 학습은 필요 없다 — forward 한 번이면 되므로 GPU 파드의 첫 probe
-런에서 같이 받을 수 있다.
+### 10.2 sdpa + packing은 마스크를 물리적으로 만든다 — 실측 268,435,456 bytes
+
+패킹이 감지되면 `allow_is_causal_skip`이 False로 내려가고(`masking_utils.py:974`),
+`sdpa_mask`의 skip 분기(`:496`)를 지나 `(batch, 1, q_len, kv_len)` bool 마스크가
+실제로 할당된다(`:388`). 이 체크아웃에서 잰 값(2026-08-02, CPU):
+`total=16384`(8행 x 2048 상당)에서 `(1, 1, 16384, 16384)` bool =
+**268,435,456 bytes**. packing을 켜는 순간 sdpa 경로에 없던 메모리이며, forward당 한
+번 만들어 모든 레이어가 공유하므로 레이어 수와 무관하다.
+
+fa2/fa3/fa4는 4D를 만들지 않는다. varlen 커널이 `cu_seqlens`로 같은 격리를 만든다
+(`modeling_flash_attention_utils.py:765` 이하). **그러므로 packing이 `attn=fa2`를
+선호하는 이유는 정확성이 아니라 메모리다.**
+
+두 경로의 경계 유도 규칙이 다르다: sdpa는 "차가 1이 아닌 자리"
+(`masking_utils.py:735`), FA는 "`position_id`가 0인 자리"
+(`modeling_flash_attention_utils.py:477`). `PackedCollate`처럼 모든 시퀀스가 0에서
+시작하면 둘이 일치하고, 0에서 시작하지 않는 시퀀스가 섞이면 서로 다른 경계를 본다.
+
+**측정 안 함**: pack이 스텝 시간을 얼마나 바꾸는지, 그리고 위 268,435,456 bytes가
+피크 메모리를 얼마나 올리는지 — 할당 크기는 피크 증가분이 아니다.
+
+**확인 안 함** (첫 GPU 파드가 답한다):
+
+- fa2 varlen 경로가 실제로 도는가. `flash_attn`도 `kernels`도 이 체크아웃에 없다
+  (`importlib.util.find_spec` 둘 다 `None`, macOS, 2026-08-02)
+- `fa3`/`fa4`가 `envs/native`에서 적재되는가
+- transformers 5.5.0(unsloth)과 5.12.1(ms_swift)에 `find_packed_sequence_indices`가
+  있는가 — 위 인용은 전부 5.14.1 원문이고, 프레임워크마다 스택이 다르다
 
 ### 10.3 풀링 테스트가 증명하는 것은 인덱스 산술이다
 
 `tests/test_axes.py::test_pooling_a_packed_batch_matches_pooling_the_same_rows_padded`은
 hidden_states를 `torch.arange`로 만들어 넣는다. 즉 두 풀링 함수가 **같은 위치**를
-고른다는 것을 증명하고, 모델이 그 위치에 무엇을 넣는지는 다루지 않는다. 10.2가 열려
-있는 한 "같은 위치"는 "같은 임베딩"이 아니다.
+고른다는 것을 증명하고, 모델이 그 위치에 무엇을 넣는지는 다루지 않는다. 10.1의 linear
+레이어 구멍이 열려 있는 한 Qwen3.5에서 "같은 위치"는 "같은 임베딩"이 아니다.
 
 ### 10.4 packing과 pretokenize는 이미지를 버린다 — 경고이지 차단이 아니다
 
@@ -559,6 +597,42 @@ query image or positive"를 기록한다. 그러므로 `dataloader.packing` 또�
 **닫는 방법**: 같은 pod에서 `dataloader=torch`와 `dataloader=torch_pretokenized`를
 연속으로 재고, 두 런의 `tokens_per_step`이 같은지부터 확인한다(다르면 비교 대상이
 아니다).
+
+## 11. 커널 신원 — 버전은 커널을 지목하지 않는다
+
+`AGENTS.md`의 "런마다 resolved torch/framework 버전을 기록한다"로는 부족하다. 같은
+버전이 다른 커널을 바인딩할 수 있다.
+
+**신원은 repo + revision이다.** `flash-attn` 패키지가 없는 환경에서
+`attn_implementation="flash_attention_2"`는 실패하지 않는다. `kernels`가 설치돼 있으면
+요청이 Hub 저장소 이름으로 바뀌고(`transformers/modeling_flash_attention_utils.py:65`,
+`transformers/modeling_utils.py:2003`) 그 커널은 **런 시작 중에 내려받아진다.** 이미지
+digest를 고정해도 커널은 고정되지 않는다. `trainbench/kernels.py::read_fingerprint`가
+빌드된 모델에서 그 신원을 되읽고, revision을 얻지 못하면 패키지 버전으로 대체하지 않고
+거부한다. 요청이 아니라 빌드가 답한다는 점이 핵심이다.
+
+**마스크 등록은 별개의 사실이다.** `AttentionMaskInterface._global_mapping`에 없는
+이름은 마스크 생성을 통째로 건너뛰고 어텐션 레이어에 `attention_mask=None`이 간다
+(`masking_utils.py:826`, 반환은 `:939`). 어텐션을 등록해도 마스크는 등록되지 않으며,
+위 rewrite가 만든 repo id 문자열도 그 표에 없다. 미등록 + packing은 10.1의 격리가
+조용히 사라지는 상태이므로 `kernels.assert_packing_is_isolated`가 그 조합을 거부한다.
+그리고 등록 여부는 이름의 성질이 아니라 바인딩 후의 상태다 — 같은 문자열이 커널을 받기
+전에는 미등록, 받은 뒤에는 등록일 수 있다.
+
+**측정 중 커널 fetch는 §3의 네트워크 볼륨과 같은 오염이다.** `USE_HUB_KERNELS`와
+`HF_HUB_OFFLINE`은 import 시점에 한 번만 읽혀 모듈 전역에 캐시된다
+(`transformers/integrations/hub_kernels.py:57-58`, `huggingface_hub/constants.py:202`)
+— transformers를 이미 import한 프로세스에서 변수를 바꾸는 것은 아무 효과가 없다.
+`kernels.forbid_runtime_kernel_fetch`가 변수와 캐시된 전역을 함께 닫고,
+`assert_no_runtime_kernel_fetch`가 열린 문이 하나라도 있으면 런을 세운다.
+
+`USE_HUB_KERNELS`만으로는 위 rewrite가 닫히지 않는다 — 그 분기의 조건은
+`is_kernels_available()` 하나뿐이다(`modeling_utils.py:1997-2002`). 닫는 것은
+`HF_HUB_OFFLINE`이고, 그러면 다운로드가 fetch 대신 예외가 된다.
+
+**확인 안 함**: 오프라인 파드에서 fa2 요청이 실제로 내는 예외, 그리고 그 런의 최종
+`config._attn_implementation` 문자열이 `"flash_attention_2"`인지
+`"kernels-community/flash-attn2"`인지. 이 호스트에는 `kernels`도 `flash_attn`도 없다.
 
 ## 재현 조건 — 게이트 통과와 재현 가능은 다르다
 

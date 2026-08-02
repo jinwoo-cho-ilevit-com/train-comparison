@@ -1,0 +1,19 @@
+# kernels 레인 — 패키지 요구 (통합자 전용 파일에 대한 요청)
+
+새 런타임 의존은 없다. trainbench/kernels.py 는 transformers 만 import 한다.
+
+envs/native 에 대한 요청 하나:
+
+  kernels == 0.16.0 은 transformers 5.14.1 이 거부한다.
+
+근거는 .plans/research/axis-libraries.md §3.1 이 원문으로 확정했다 —
+transformers/utils/import_utils.py 의 KERNELS_MAX_VERSION 이 "0.16.0" 이고 비교가
+상한 배타적(`<`)이라 핀이 정확히 창 밖이다. 이 호스트에서는 kernels 가 아예 설치되지
+않아(marker sys_platform == 'linux') 실행으로 확인하지 못했다: 확인 안 함.
+
+영향은 두 가지다. is_kernels_available() 이 False 면 kernel=kernels_hub 가 조용히
+no-op 이 되고, flash_attention_2 요청의 Hub fallback(modeling_utils.py:1997-2002)도
+켜지지 않아 fa2 축이 sdpa/eager 로 폴백한다.
+
+해소는 kernels 를 >=0.15.2,<0.16.0 으로 내리거나 창이 넓어진 transformers 로 올리는
+것이고, 둘 다 envs/native/uv.lock 을 다시 푸는 일이라 통합자 몫이다.
