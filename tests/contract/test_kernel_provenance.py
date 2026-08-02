@@ -7,6 +7,11 @@ where it is unsafe. Two lanes can each pass their own tests while holding opposi
 assumptions about what crosses between them, so the payload lives in
 `tests/fixtures/kernel_fingerprint.sample.json` and the rules live here.
 
+This payload is the only place either fact lives. "Which implementation bound" and
+"is its mask function registered" are also the questions the `loader-bench`
+fingerprint used to answer in its own vocabulary; it now carries this object
+instead, and the test below reads that fixture so the two cannot drift.
+
 Three properties of transformers 5.14.1 are why this payload has the fields it has.
 Each is asserted below against the installed package rather than quoted:
 
@@ -43,12 +48,18 @@ import torch
 
 FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "kernel_fingerprint.sample.json"
 
-# Where the payload travels. Lane-g returns it inside the build fingerprint under
-# BUILD_FINGERPRINT_KEY; the run record carries that fingerprint under
-# RUN_RECORD_KEY. Both are string keys in a JSON document, which is the only thing
-# that survives the pod the run happened on.
-BUILD_FINGERPRINT_KEY = "kernel"
+# Where the payload travels. The build fingerprint is the `fingerprint` object of
+# lane-g's adapter payload — the same object the `loader-bench` boundary freezes,
+# not a second one — and this payload is its BUILD_FINGERPRINT_KEY block. The run
+# record carries that fingerprint under RUN_RECORD_KEY. Both are string keys in a
+# JSON document, which is the only thing that survives the pod the run happened on.
+#
+# The key is `attention` rather than `kernel` because `kernel.name` is a different
+# axis (liger/fla/kernels_hub); this payload's own `requested.axis` is `attn.name`,
+# and one name for two axes is how a reader ends up reading the wrong one.
+BUILD_FINGERPRINT_KEY = "attention"
 RUN_RECORD_KEY = "build_fingerprint"
+ADAPTER_SAMPLE = FIXTURE.parent / "adapter_out.sample.json"
 
 # The registry whose membership decides whether a mask gets built. Named in the
 # payload because there are two registries and only one of them answers this
@@ -513,3 +524,24 @@ def test_the_fingerprint_survives_the_run_record_writer(tmp_path, samples):
 
     assert reloaded == record
     validate_kernel_fingerprint(reloaded[RUN_RECORD_KEY][BUILD_FINGERPRINT_KEY])
+
+
+def test_the_two_fixtures_that_carry_this_payload_agree_with_it():
+    """`loader-bench` and `record-report` store this object; neither restates it.
+
+    Both boundaries used to describe the bound kernel in their own words, which is
+    two vocabularies for one fact and a drift nobody would notice until a merge.
+    Reading their fixtures here is what keeps the description single.
+    """
+    adapters = json.loads(ADAPTER_SAMPLE.read_text())["adapters"]
+    assert adapters, "the adapter sample names no framework"
+    for name, payload in adapters.items():
+        fingerprint = payload["fingerprint"]
+        assert BUILD_FINGERPRINT_KEY in fingerprint, (
+            f"{name}'s build fingerprint carries no {BUILD_FINGERPRINT_KEY!r}, so the "
+            "kernel that bound is not recorded for that framework"
+        )
+        validate_kernel_fingerprint(fingerprint[BUILD_FINGERPRINT_KEY])
+
+    record = json.loads((FIXTURE.parent / "run_record.sample.json").read_text())
+    validate_kernel_fingerprint(record[RUN_RECORD_KEY][BUILD_FINGERPRINT_KEY])
