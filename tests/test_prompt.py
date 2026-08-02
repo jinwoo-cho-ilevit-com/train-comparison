@@ -10,11 +10,16 @@ placeholder.
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 import pytest
 
 from trainbench.prompt import chat_template_of, format_prompt, verify_prompt_format
+
+# The instruction `configs/model/qwen3_vl_emb_2b.yaml` declares, which is also the
+# string `Qwen/Qwen3-VL-Embedding-2B`'s own template defaults to.
+QWEN_INSTRUCTION = "Represent the user's input."
 
 
 class _Templated:
@@ -24,11 +29,65 @@ class _Templated:
     image_token = "<|image_pad|>"
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-        content = messages[0]["content"]
+        content = messages[-1]["content"]
         blocks = "".join(
             "<img>" if block["type"] == "image" else block["text"] for block in content
         )
         return f"<user>{blocks}{'<gen>' if add_generation_prompt else ''}"
+
+
+class _QwenTemplated:
+    """`Qwen/Qwen3-VL-Embedding-2B`'s template, in the one behaviour that matters here.
+
+    Read off `chat_template.jinja` on the Hub (2026-08-03): it opens with
+    `set default_system_message = 'Represent the user\\'s input.'` and, when the
+    first message is not a system turn, emits
+    `'<|im_start|>system\\n' + default_system_message + '<|im_end|>\\n'` before the
+    user turn. A row that brings its own system turn gets that content instead.
+
+    Stubbed rather than downloaded so this test needs no network; the real
+    processor produced the same two strings in the run quoted below.
+    """
+
+    chat_template = "{{ messages }}"
+    image_token = "<|image_pad|>"
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        if messages[0]["role"] == "system":
+            system = "".join(block["text"] for block in messages[0]["content"])
+        else:
+            system = QWEN_INSTRUCTION
+        body = "".join(
+            "<|vision_start|><|image_pad|><|vision_end|>"
+            if block["type"] == "image"
+            else block["text"]
+            for block in messages[-1]["content"]
+        )
+        return (
+            f"<|im_start|>system\n{system}<|im_end|>\n"
+            f"<|im_start|>user\n{body}<|im_end|>\n"
+            f"{'<|im_start|>assistant\n' if add_generation_prompt else ''}"
+        )
+
+
+def _tokenize(text: str) -> list[str]:
+    """Words, punctuation and special tokens as separate tokens.
+
+    The question this file has to answer is how many times the instruction's *token
+    sequence* occurs, not how many times its characters do, so the count below is
+    taken over tokens. A real tokenizer would need the checkpoint; this one splits
+    the same boundaries for the strings under test.
+    """
+    return re.findall(r"<\|[^|]+\|>|\w+|[^\s\w]", text)
+
+
+def _occurrences(text: str, needle: str) -> int:
+    haystack, sought = _tokenize(text), _tokenize(needle)
+    return sum(
+        1
+        for start in range(len(haystack) - len(sought) + 1)
+        if haystack[start : start + len(sought)] == sought
+    )
 
 
 class _Bare:
@@ -154,3 +213,89 @@ def test_an_unknown_prompt_format_is_refused():
     """A typo in configs/model/ must not fall through to one of the two branches."""
     with pytest.raises(ValueError, match="must be one of"):
         verify_prompt_format(_Templated(), "chatml")
+
+
+def test_the_query_instruction_prompt_appears_once_in_a_templated_row():
+    """`qwen3-vl-query-prompt-may-go-in-twice`, decided by tokenising.
+
+    Measured 2026-08-03, `AutoProcessor.from_pretrained('Qwen/Qwen3-VL-Embedding-2B')`,
+    transformers 5.14.1, on `Collate.pair_texts` output. The instruction's token
+    sequence is `[65743, 279, 1196, 594, 1946, 13]`:
+
+        before  len=30  occurrences=2
+        after   len=24  occurrences=1   delta=-6
+
+    Two, because the collate prefixed the instruction to the template's output and
+    the template inserted its own `default_system_message` — the same string — for
+    a row that carried no system turn. Handing it in as that system turn is what
+    makes it one, and keeps the config field the thing that decides the text.
+    """
+    templated = format_prompt(
+        _QwenTemplated(),
+        "what colour is the roof",
+        with_image=False,
+        prompt_format="chat_template",
+        add_generation_prompt=True,
+        instruction_prompt=QWEN_INSTRUCTION,
+    )
+
+    assert _occurrences(templated, QWEN_INSTRUCTION) == 1, (
+        f"the instruction occurs {_occurrences(templated, QWEN_INSTRUCTION)} times in "
+        f"{templated!r}. Twice is the measured pre-fix state: prefixing it to the "
+        "template's output leaves the template free to insert its own identical default, "
+        "and every Qwen tokens/s figure then carries a denominator six tokens too large."
+    )
+    assert templated.startswith(f"<|im_start|>system\n{QWEN_INSTRUCTION}<|im_end|>")
+
+
+def test_the_instruction_prompt_is_what_the_config_says_and_not_the_template_default():
+    """Deleting the prefix alone would pass the test above and mean nothing.
+
+    The template supplies the same instruction on its own, so a row would still read
+    correctly while `configs/model/` had stopped deciding anything. The config value
+    has to be the one that lands.
+    """
+    templated = format_prompt(
+        _QwenTemplated(),
+        "q",
+        with_image=False,
+        prompt_format="chat_template",
+        add_generation_prompt=False,
+        instruction_prompt="Encode this query for retrieval.",
+    )
+
+    assert "Encode this query for retrieval." in templated
+    assert QWEN_INSTRUCTION not in templated, (
+        "the template's own default survived a config that asked for something else, so "
+        "model.instruction_prompt is a label rather than an input"
+    )
+
+
+def test_a_row_with_no_instruction_prompt_sends_no_system_turn():
+    """Two of the three models declare none (`instruction_prompt: null`), and an
+    empty system turn is not the same row as no system turn."""
+    templated = format_prompt(
+        _Templated(),
+        "q",
+        with_image=False,
+        prompt_format="chat_template",
+        add_generation_prompt=False,
+    )
+
+    assert templated == "<user>q"
+
+
+def test_a_raw_row_carries_the_instruction_ahead_of_the_placeholder():
+    """`raw` has no template to hold a system turn, so the instruction is the head
+    of the row — and it cannot collide with a default that does not exist."""
+    assert (
+        format_prompt(
+            _Bare(),
+            "describe the picture",
+            with_image=True,
+            prompt_format="raw",
+            add_generation_prompt=False,
+            instruction_prompt="Represent the image.",
+        )
+        == "Represent the image.<|image|>describe the picture"
+    )

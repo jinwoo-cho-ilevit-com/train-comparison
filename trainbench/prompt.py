@@ -104,11 +104,27 @@ def format_prompt(
     with_image: bool,
     prompt_format: str,
     add_generation_prompt: bool,
+    instruction_prompt: str = "",
 ) -> str:
     """One side of a pair, in this model's own prompt format.
 
     The image placeholder comes first in both formats, so what differs between them
     is the role and turn markers around it and nothing about the pixels.
+
+    `instruction_prompt` is `config.model.instruction_prompt`, and it goes **into**
+    the template as a system turn rather than in front of the template's output.
+    Measured 2026-08-03 against `Qwen/Qwen3-VL-Embedding-2B` (the only checkpoint
+    that declares one): its `chat_template.jinja` opens with
+    `set default_system_message = 'Represent the user\\'s input.'` and emits
+    `'<|im_start|>system\\n' + default_system_message + '<|im_end|>\\n'` whenever
+    `messages[0].role != 'system'` — the same string the config declares. Prefixing
+    it therefore put the instruction in twice, once outside every special token:
+    30 tokens for a query row, 24 with this fix.
+
+    Passing it as a system turn rather than deleting the prefix is what keeps the
+    config field load-bearing. Deleting it would leave the instruction in the row,
+    supplied by the template's own default, and editing `configs/model/` would then
+    change nothing about the prompt that was measured.
     """
     verify_prompt_format(processor, prompt_format)
     if prompt_format == RAW:
@@ -118,13 +134,22 @@ def format_prompt(
                 "template to append a generation prompt to; with last-token pooling that "
                 "would silently be a different embedding than the value asks for."
             )
-        return f"{image_placeholder(processor)}{text}" if with_image else text
+        # No template, so no system turn to put it in and no default to collide
+        # with: the instruction is simply the head of the row.
+        body = f"{image_placeholder(processor)}{text}" if with_image else text
+        return f"{instruction_prompt}{body}"
 
     content: list[dict[str, Any]] = [{"type": "text", "text": text}]
     if with_image:
         content.insert(0, {"type": "image"})
+    messages: list[dict[str, Any]] = []
+    if instruction_prompt:
+        messages.append(
+            {"role": "system", "content": [{"type": "text", "text": instruction_prompt}]}
+        )
+    messages.append({"role": "user", "content": content})
     return processor.apply_chat_template(
-        [{"role": "user", "content": content}],
+        messages,
         tokenize=False,
         add_generation_prompt=add_generation_prompt,
     )

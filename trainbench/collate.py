@@ -29,6 +29,14 @@ from trainbench.prompt import format_prompt
 # belongs.
 MMEB_IMAGE_MARKER = re.compile(r"<\|image_\d+\|>")
 
+# The pack's boundaries under the names `model(**tensors)` reads them by. They are
+# `TransformersKwargs` members (`transformers/utils/generic.py:800-839`) and the
+# only keys a collate may add to `tensors`
+# (`tests/fixtures/microbatch.sample.json:tensors_may_add`). The two spellings in
+# `axes.PACKED_BOUNDARY_KEYS` carry the same boundaries and the model does reject
+# those, which is why they are lifted out and these put in.
+VARLEN_KWARGS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+
 
 class MicroBatch(NamedTuple):
     """One collated micro-batch, plus what it contained.
@@ -195,7 +203,8 @@ class Collate:
         # The query side carries the model's official instruction prompt; the
         # positive side never does (docs/model-spec.md). It is a constant on one
         # side of the pair, which is also why `tokens` is not a clean comparison
-        # across models — METRIC_DEFINITIONS says so in the result.
+        # across models — METRIC_DEFINITIONS says so in the result. It is handed to
+        # `format_prompt`, never prefixed to its output: see `_text`.
         self.prompt = config.model.instruction_prompt or ""
         # Whether this processor can take pixels at all, read off the processor
         # rather than branched on `model.arch`: a text-only checkpoint returns a
@@ -204,13 +213,18 @@ class Collate:
         # text-only view of an image corpus.
         self.accepts_images = getattr(processor, "image_processor", None) is not None
 
-    def _text(self, raw: str | None, with_image: bool) -> str:
+    def _text(self, raw: str | None, with_image: bool, instruction: str = "") -> str:
         """One side of a pair, in this model's own prompt format.
 
         Both `add_generation_prompt` and `prompt_format` are the config's
         (docs/CONTRACTS.md §5) — with last-token pooling the first decides which
         token becomes the embedding, and the second decides whether there is a chat
         template to pass it to at all. Neither can be defaulted here.
+
+        `instruction` goes through `format_prompt` rather than being concatenated
+        onto its result, which is the whole of the fix for
+        `qwen3-vl-query-prompt-may-go-in-twice`: the Qwen template inserts the same
+        instruction itself when the row carries no system turn.
         """
         text = MMEB_IMAGE_MARKER.sub("", raw or "").strip()
         return format_prompt(
@@ -219,6 +233,7 @@ class Collate:
             with_image=with_image,
             prompt_format=self.config.model.prompt_format,
             add_generation_prompt=self.config.model.add_generation_prompt,
+            instruction_prompt=instruction,
         )
 
     def pair_texts(self, rows: list[dict[str, Any]], *, with_images: bool = True) -> PairTexts:
@@ -260,7 +275,7 @@ class Collate:
             # no placeholder, which is what lets text-only and image rows share a
             # batch: the flat image list below then has exactly as many entries as
             # there are placeholders, in the same order.
-            queries.append(self.prompt + self._text(row.get("qry"), side_images[0]))
+            queries.append(self._text(row.get("qry"), side_images[0], self.prompt))
             positives.append(self._text(row.get("pos_text"), side_images[1]))
             query_counts.append(int(side_images[0]))
             positive_counts.append(int(side_images[1]))
@@ -400,7 +415,9 @@ class PackedBatches:
     returns bare tensors, and the measured loop needs to know how many samples,
     tokens and images that batch stood for. The boundary vectors are lifted out of
     the batch here rather than in the step, so what stays in `tensors` is exactly
-    what `model(**tensors)` takes.
+    what `model(**tensors)` takes — and put back under the names the model does
+    read them by (`varlen_kwargs`), which is the only place a pack's boundaries
+    reach attention.
 
     `axis_packing` is **read off the wrapped collate**, never declared again. A
     second declaration is a second answer to the question
@@ -428,6 +445,7 @@ class PackedBatches:
         batch = self.packed(rows)
         boundaries = {key: batch.pop(key) for key in axes.PACKED_BOUNDARY_KEYS}
         total = int(batch["input_ids"].numel())
+        batch.update(varlen_kwargs(boundaries["cu_seqlens"], boundaries["seq_lengths"]))
         return MicroBatch(
             tensors=batch,
             tokens=total,
@@ -438,6 +456,50 @@ class PackedBatches:
             images_dropped=dropped,
             cu_seqlens=boundaries["cu_seqlens"],
         )
+
+
+def varlen_kwargs(cu_seqlens: torch.Tensor, seq_lengths: torch.Tensor) -> dict[str, Any]:
+    """The pack's boundaries, in the four names transformers takes varlen on.
+
+    `modeling_flash_attention_utils.py:761-763` is the gate:
+
+        is_fa_with_varlen_kwargs = all(
+            kwarg is not None
+            for kwarg in (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k)
+        )
+
+    All four or none — a partial set leaves that `all(...)` false, the pack runs as
+    one dense sequence, and the run still reports `dataloader.packing=True`. That is
+    why they are built together here rather than assigned key by key at the call
+    site, and why the boundary's fixture states the same rule as an invariant.
+
+    **`arch=qwen3_5` is what this is for.** `qwen3_vl` and `gemma4` get their
+    isolation from `position_ids` alone: `masking_utils.py:858-868` derives the
+    packed-sequence mask from it whenever no 2D mask and no cache are passed, which
+    a packed batch satisfies. Qwen3.5 alternates full_attention with
+    linear_attention, and `Qwen3_5GatedDeltaNet.forward` never receives
+    `position_ids` — it reads `kwargs.get("cu_seq_lens_q")`
+    (`modeling_qwen3_5.py:538-550`) and scans the whole pack as a single sequence
+    when that is None, silently. Emitted for every packed batch and not for that
+    arch alone, because the boundaries are the same either way and an arch switch
+    here would be a second place a pack's isolation could be lost by editing a
+    config field that names no attention.
+
+    The conv half of that arch is **not** closed here: `causal_conv1d_fn` takes
+    `seq_idx` (`modeling_qwen3_5.py:492-499`) and convolves across boundaries
+    without it. `seq_idx` is not among the keys the collate-metrics fixture allows
+    in `tensors`, so it is a boundary request rather than a line of code.
+
+    `max_length_*` stay Python ints. `to_device` passes non-tensors through
+    untouched, so a 0-dim tensor here would be a host-to-device round trip inside
+    the timed window for a number that only bounds a kernel launch.
+    """
+    return {
+        "cu_seq_lens_q": cu_seqlens,
+        "cu_seq_lens_k": cu_seqlens,
+        "max_length_q": int(seq_lengths.max()),
+        "max_length_k": int(seq_lengths.max()),
+    }
 
 
 class PretokenizedCollate:

@@ -96,10 +96,15 @@ class FakeProcessor:
         self.tokenize_calls = 0
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-        content = messages[0]["content"]
-        images = "".join("<img>" for block in content if block["type"] == "image")
-        text = "".join(block["text"] for block in content if block["type"] == "text")
-        return f"{images}{text}{'<gen>' if add_generation_prompt else ''}"
+        # Every turn, not just the first: `model.instruction_prompt` reaches the
+        # template as a system turn ahead of the user one, and a stub that rendered
+        # `messages[0]` alone would drop whichever of the two came second.
+        rendered = ""
+        for message in messages:
+            content = message["content"]
+            rendered += "".join("<img>" for block in content if block["type"] == "image")
+            rendered += "".join(block["text"] for block in content if block["type"] == "text")
+        return f"{rendered}{'<gen>' if add_generation_prompt else ''}"
 
     def __call__(
         self,
