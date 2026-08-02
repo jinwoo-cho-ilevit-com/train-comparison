@@ -528,11 +528,8 @@
           "test_a_pod_whose_image_predates_the_config_it_is_handed_does_not_measure"
         ]
       },
-      "closed": {
-        "date": "2026-08-03",
-        "by": "report 레인 (wave 1)",
-        "evidence": "`docker/entrypoint.sh`의 probe 갈래가 timing 갈래와 같은 preflight를 탄다. 파드는 자기 이미지에 구워진 `scripts/bench.py`로 자기 계획의 config를 `BenchConfig`에 통과시키고, 거부되면 `verify_env.py`를 부르지 않은 채 fallback 레코드만 올린다. 계획이 비어 오면 `CONFIG_PATH`를 한 항목짜리 계획으로 감싸므로 검사 대상이 0개가 되는 통과는 생기지 않는다.\n\n실행한 것 (이 워크트리, 실제 entrypoint.sh + 실제 preflight, GPU와 fla만 스텁):\n    infisical run --env=dev -- uv run pytest tests/test_pods.py -q -k 'preflight_probe or image_predates'\n    -> 3 passed, 191 deselected\n앵커 `test_a_pod_whose_image_predates_the_config_it_is_handed_does_not_measure`는 카나리와 같은 모양을 먹인다 — 이미지 스키마가 모르는 필드(`data.image_token_budget`)를 실은 probe config. 결과: preflight REFUSED, `verify_env` 호출 0회, 결과 저장소에는 `status: no_result` 레코드 1건과 'preflight refused' 사유.\n\n부수기 (1건, 발화 확인 후 원복): `preflight_status=$?` -> `preflight_status=0`\n    FAILED tests/test_pods.py::test_a_pod_whose_image_predates_the_config_it_is_handed_does_not_measure\n    E  AssertionError: verify_env.py ran on a config this image cannot parse\n    -> 1 failed, 2 passed\n\n**파드로 확인하지 못한 것**: A100 파드는 이 세션에서 띄우지 않았다. `closes_when.command`가 지정한 phase0-native-qwen3_5_0_8b probe 1대는 **실행 안 함**이며, 실 이미지 안에서 preflight가 발화하는지는 다음 발사가 보여야 한다. 여기서 닫는 근거는 '검사가 파드 쪽으로 옮겨졌고 그 갈래를 타는 것이 실행으로 확인됐다'까지다."
-      }
+      "closed": null,
+      "anchor_changed": "2026-08-03, 통합 단계(리뷰어)가 report 레인의 닫기를 되돌렸다. 앵커 test_a_pod_whose_image_predates_the_config_it_is_handed_does_not_measure 는 이제 tests/test_pods.py:2848 에 실재하고 변이로 발화까지 확인됐다 — 2026-08-02 에 닫기를 막았던 두 이유(앵커 부재, 파드 미관측) 중 앞의 것은 해소됐다. 그러나 closes_when.criterion 이 자기 문장으로 '랩톱 쪽 게이트로는 답할 수 없다' 고 적고 command 가 A100 파드 1대를 지정하는데 이 세션은 파드를 띄우지 않았다. 레인 자신이 근거에 '파드로 확인하지 못한 것: A100 파드는 이 세션에서 띄우지 않았다' 고 적고 리뷰어가 되돌릴 수 있다고 밝혔다. 같은 항목을 CPU 근거로 닫으려다 게이트에 잡힌 선례가 1a7b7c7 이다. 남은 것은 다음 발사에서 실 이미지 안의 preflight 가 발화하는지 하나뿐이다. 되돌린 근거(레인이 실행한 것 그대로): `docker/entrypoint.sh`의 probe 갈래가 timing 갈래와 같은 preflight를 탄다. 파드는 자기 이미지에 구워진 `scripts/bench.py`로 자기 계획의 config를 `BenchConfig`에 통과시키고, 거부되면 `verify_env.py`를 부르지 않은 채 fallback 레코드만 올린다. 계획이 비어 오면 `CONFIG_PATH`를 한 항목짜리 계획으로 감싸므로 검사 대상이 0개가 되는 통과는 생기지 않는다.\n\n실행한 것 (이 워크트리, 실제 entrypoint.sh + 실제 preflight, GPU와 fla만 스텁):\n    infisical run --env=dev -- uv run pytest tests/test_pods.py -q -k 'preflight_"
     },
     {
       "id": "observe-reads-a-crashloop-as-a-healthy-run",

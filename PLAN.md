@@ -433,6 +433,7 @@ train-comparison/
 │   ├── prompt.py              # 모델의 prompt_format을 읽는 유일한 지점
 │   ├── axes.py                # 축을 켜는 유일한 지점
 │   ├── applied.py             # 켜졌는지 읽는 유일한 지점
+│   ├── kernels.py             # 바인딩된 어텐션 커널의 신원 + 런타임 fetch 차단
 │   ├── pods.py                # RunPod pod 수명주기
 │   ├── metrics/               # 타이밍 런이 보고하는 지표와 그 측정 방법
 │   └── probe/                 # 프레임워크별 적재·1step 검증 어댑터
@@ -457,6 +458,7 @@ train-comparison/
 │   ├── test_data.py
 │   ├── test_device_seed.py
 │   ├── test_embedding.py
+│   ├── test_kernels.py
 │   ├── test_metrics.py
 │   ├── test_pods.py
 │   ├── test_probe.py
