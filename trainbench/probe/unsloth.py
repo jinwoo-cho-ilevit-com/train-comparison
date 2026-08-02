@@ -19,9 +19,33 @@ from trainbench.probe import steps
 from trainbench.probe.types import ProbeReport
 
 
+def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any]) -> tuple[Any, Any]:
+    """`full_finetuning` is not optional here.
+
+    Its default is False, and with 4bit, 8bit and full all off unsloth switches to
+    "16bit LoRA" and exports UNSLOTH_ENABLE_FULL_FINETUNING=0; `post_patch_model`
+    then hands that to unsloth_zoo's `prepare_model_for_training`, which freezes
+    every parameter whose name has no LoRA marker. Under `peft.mode=full` nothing
+    attaches LoRA, so the whole model comes back frozen (unsloth 2026.7.6
+    models/vision.py:1164-1187, 2094-2129; unsloth_zoo 2026.7.7
+    training_utils.py:383).
+
+    `load_kwargs` has nowhere to go: `FastVisionModel.from_pretrained` owns the
+    call and takes its own keywords, so the axis is left unapplied and the capture
+    side reports the mismatch rather than a guessed keyword succeeding.
+    """
+    from unsloth import FastVisionModel
+
+    return FastVisionModel.from_pretrained(
+        config.model.hf_id,
+        load_in_4bit=config.peft.mode == "qlora",
+        full_finetuning=config.peft.mode == "full",
+        dtype=steps.dtype_for(device),
+    )
+
+
 def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     import unsloth
-    from unsloth import FastVisionModel
 
     report.add_version(unsloth)
     steps.patch_axes(config, report)
@@ -30,27 +54,16 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     loaded: dict[str, Any] = {}
 
     def _load() -> dict[str, Any]:
-        # `full_finetuning` is not optional here. Its default is False, and with
-        # 4bit, 8bit and full all off unsloth switches to "16bit LoRA" and exports
-        # UNSLOTH_ENABLE_FULL_FINETUNING=0; `post_patch_model` then hands that to
-        # unsloth_zoo's `prepare_model_for_training`, which freezes every parameter
-        # whose name has no LoRA marker. Under `peft.mode=full` nothing attaches
-        # LoRA, so the whole model comes back frozen (unsloth 2026.7.6
-        # models/vision.py:1164-1187, 2094-2129; unsloth_zoo 2026.7.7
-        # training_utils.py:383).
-        full = config.peft.mode == "full"
-        model, processor = FastVisionModel.from_pretrained(
-            hf_id,
-            load_in_4bit=config.peft.mode == "qlora",
-            full_finetuning=full,
-            dtype=steps.dtype_for(device),
-        )
+        # `load` above, which is also what a timing run takes: two copies of
+        # `full_finetuning=` would drift, and a campaign that trained zero
+        # parameters is what that costs.
+        model, processor = load(config, device, {})
         loaded["model"] = model
         loaded["processor"] = processor
         return {
             "model_class": type(model).__name__,
             "processor_class": type(processor).__name__,
-            "full_finetuning": full,
+            "full_finetuning": config.peft.mode == "full",
         }
 
     if not report.run("fast_vision_model_load", _load)[0]:

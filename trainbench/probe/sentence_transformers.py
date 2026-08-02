@@ -24,9 +24,27 @@ from trainbench.probe.fixtures import PROBE_PAIRS
 from trainbench.probe.types import ProbeReport
 
 
+def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any]) -> tuple[Any, Any]:
+    """The build `trainbench/loader.py` takes for a timing run.
+
+    `model_kwargs` is forwarded to `AutoModel.from_pretrained` on the torch
+    backend, so this is one of the two paths where a load-time axis can be
+    honoured. The model is its own processor: ST tokenises inside its first
+    module rather than through a separate object.
+    """
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(
+        config.model.hf_id,
+        device=str(device),
+        revision=config.model.revision,
+        model_kwargs=load_kwargs,
+    )
+    return model, model
+
+
 def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     import sentence_transformers
-    from sentence_transformers import SentenceTransformer
 
     report.add_version(sentence_transformers)
     steps.patch_axes(config, report)
@@ -39,16 +57,9 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     loaded: dict[str, Any] = {}
 
     def _load() -> dict[str, Any]:
-        # `model_kwargs` is forwarded to `AutoModel.from_pretrained` on the torch
-        # backend (SentenceTransformer.__init__), so this is the one framework
-        # path where the load-time axes can be honoured rather than left to read
-        # back as a mismatch.
-        model = SentenceTransformer(
-            config.model.hf_id,
-            device=str(device),
-            revision=config.model.revision,
-            model_kwargs=load_kwargs,
-        )
+        # `load` above, so the probe and a timing run cannot build two different
+        # models out of the same config.
+        model, _ = load(config, device, load_kwargs)
         loaded["model"] = model
         return {
             "modules": [type(m).__name__ for m in model],

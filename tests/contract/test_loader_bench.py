@@ -555,11 +555,6 @@ def test_owned_axes_name_axes_the_schema_still_has(adapters: dict[str, Any]) -> 
 # red until the marker is deleted. Do not weaken the assertion instead.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-g: trainbench/loader.py does not exist at 0604684. Delete this marker "
-    "when it does; do not weaken the assertions.",
-)
 def test_loader_serves_every_framework_through_one_entry_point() -> None:
     loader = importlib.import_module("trainbench.loader")
     assert set(loader.ADAPTERS) == FRAMEWORKS

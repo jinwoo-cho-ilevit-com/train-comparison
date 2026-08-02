@@ -22,6 +22,16 @@ from trainbench.probe import steps
 from trainbench.probe.types import ProbeReport
 
 
+def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any]) -> tuple[Any, Any]:
+    """`get_model_processor` owns the `from_pretrained` call, so `load_kwargs` has
+    nowhere to go here and is left unapplied rather than guessed at a keyword."""
+    from swift import get_model_processor
+
+    model, processor = get_model_processor(config.model.hf_id)
+    model.to(device)
+    return model, processor
+
+
 def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     import swift
 
@@ -31,9 +41,9 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     loaded: dict[str, Any] = {}
 
     def _load() -> dict[str, Any]:
-        from swift import get_model_processor
-
-        model, processor = get_model_processor(config.model.hf_id)
+        # `load` above is the one definition of this call, so a timing run and this
+        # probe cannot end up loading two different models.
+        model, processor = load(config, device, {})
         loaded["model"] = model
         loaded["processor"] = processor
         return {"model_class": type(model).__name__, "processor_class": type(processor).__name__}
@@ -43,7 +53,6 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
         return
 
     model, processor = loaded["model"], loaded["processor"]
-    model.to(device)
     model = steps.verify_axes(model, config, device, "ms_swift", report)
 
     def _template() -> dict[str, Any]:
