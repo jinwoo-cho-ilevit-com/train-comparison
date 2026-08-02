@@ -555,7 +555,11 @@
           "test_a_healthy_pod_whose_clock_is_a_whole_refresh_stale_is_never_terminated"
         ]
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "team-lead (Phase 0 캠페인 판독)",
+        "evidence": "Phase 0 캠페인 18파드 전부가 스스로 끝났다. 손으로 지운 파드 0대 — 이 항목이 열려 있던 동안 세 대를 손으로 지웠다.\n\n`outputs/orchestrate-phase0.json` 실측:\n    18 experiments, outcome null 0건, reason 전부 restarted\n    peak_uptime_seconds null 0건, 범위 -5 ~ 164\n    unreadable 0건\n\n기준이 요구한 `reason: restarted` + null 아닌 `peak_uptime_seconds` + 수동 삭제 불필요, 셋 다 충족.\n\n선행 단독 검증 (파드 2i0ptlkcc5621p, 7ede7d7):\n    reason=restarted  peak_uptime_seconds=101  uptime_seconds=-3\n    unreadable=null   waited_seconds=308.5\n    파드 로그: announce 1회, \"this pod already ran its plan and published it\"\n101초는 probe를 완주한 첫 컨테이너의 수명이고, -3은 감지 시점의 재시작된 컨테이너 값이다.\n\n`peak_uptime_seconds`가 설계 의도대로 갈라놓는다는 것도 캠페인이 보여줬다 — 초 단위로 죽는 조합(tevatron/axolotl/ms_swift)은 -5~12, 실제로 일한 조합(sentence_transformers/native/unsloth x qwen3_5)은 132/136/164.\n\n세 번의 실패는 전부 판정 규칙이 아니라 판정에 이르는 경로였다: (1) 읽기가 시계를 요청하지 않음, (2) 시계가 음수·비단조, (3) 읽기가 403. 셋을 차례로 닫고 나서야 규칙이 처음으로 실제 입력을 받았다."
+      }
     },
     {
       "id": "a-restarted-container-reruns-and-republishes-the-pods-plan",
@@ -730,7 +734,11 @@
           "test_the_ledger_says_it_cannot_see_a_pod_while_that_is_still_true"
         ]
       },
-      "closed": null
+      "closed": {
+        "date": "2026-08-02",
+        "by": "team-lead (Phase 0 캠페인 판독)",
+        "evidence": "(a) 닫혔다 — 실 파드 발사에서 오케스트레이터의 읽기가 성공했다. Phase 0 18파드 전부 `outcome` null 아님, `unreadable` null (실험 항목·outcome 양쪽 모두 0건). 읽기가 한 번도 실패하지 않았다.\n\n(b)는 실물에서 발동하지 않았다 — 읽기가 실패하지 않았으므로 천장이 발동할 조건이 없었다. 그 절반은 CPU 변이(M3: 천장 분기를 `elif False`로 → `assert 'timeout' == 'unreadable'`)로만 확인됐고 **실물에서는 측정 안 함**이다. 조건부 절반이라 다음 전송 장애 때 답한다.\n\n전송 수정 자체의 라이브 증거 (2026-08-02, pods.get 경유):\n    USER_AGENT=trainbench/1.0  -> {'id':..., 'desiredStatus':'RUNNING', 'runtime':{'uptimeInSeconds':163694}}\n    헤더 제거                  -> RunPod REST POST https://api.runpod.io/graphql -> 403: error code: 1010"
+      }
     }
   ]
 }

@@ -813,3 +813,115 @@ env별 lock에서 휠이 없어 소스에서 빌드되는 패키지(2026-08-02, 
 여기부터 아래는 `scripts/report.py`가 생성한다. 아직 pod 결과가 없으면 비어 있다.
 
 <!-- generated: probe results -->
+
+## 모델 x 프레임워크 적재 검증 (자동 생성)
+
+결과 18건, 아티팩트 18건. `미시도`는 pod을 띄운 적이 없는 조합, `결과 없음(기동됨)`는 띄웠으나 결과 파일이 올라오지 않은 조합, `미지원(문서화됨)`는 모든 체크가 문서화된 한계였던 조합이다.
+
+| | qwen3_vl_emb_2b | qwen3_5_0_8b | gemma4_e2b |
+|---|---|---|---|
+| native | OK (12 checks) | OK (12 checks) | FAIL visual_tokens (ValueError) |
+| unsloth | FAIL padding_side_alignment (ValueError) | FAIL padding_side_alignment (ValueError) | FAIL visual_tokens (ValueError) |
+| ms_swift | FAIL get_model_processor (PackageNotFoundError) | FAIL get_model_processor (PackageNotFoundError) | FAIL visual_tokens (ValueError) |
+| sentence_transformers | OK (9 checks) | OK (9 checks) | OK (9 checks) |
+| tevatron | FAIL dense_model_load (ModuleNotFoundError) | FAIL dense_model_load (ModuleNotFoundError) | FAIL dense_model_load (ModuleNotFoundError) |
+| axolotl | FAIL model_loader_load (TypeError) | FAIL model_loader_load (TypeError) | FAIL model_loader_load (TypeError) |
+
+### 실행 환경별 해석 버전
+
+| 조합 | torch | transformers | 프레임워크 |
+|---|---|---|---|
+| axolotl x gemma4_e2b | 2.12.1+cu130 | 5.14.1 | 0.18.0 |
+| axolotl x qwen3_5_0_8b | 2.12.1+cu130 | 5.14.1 | 0.18.0 |
+| axolotl x qwen3_vl_emb_2b | 2.12.1+cu130 | 5.14.1 | 0.18.0 |
+| ms_swift x gemma4_e2b | 2.13.0+cu130 | 5.12.1 | 4.4.2 |
+| ms_swift x qwen3_5_0_8b | 2.13.0+cu130 | 5.12.1 | 4.4.2 |
+| ms_swift x qwen3_vl_emb_2b | 2.13.0+cu130 | 5.12.1 | 4.4.2 |
+| native x gemma4_e2b | 2.13.0+cu130 | 5.14.1 | - |
+| native x qwen3_5_0_8b | 2.13.0+cu130 | 5.14.1 | - |
+| native x qwen3_vl_emb_2b | 2.13.0+cu130 | 5.14.1 | - |
+| sentence_transformers x gemma4_e2b | 2.13.0+cu130 | 5.14.1 | 5.6.1 |
+| sentence_transformers x qwen3_5_0_8b | 2.13.0+cu130 | 5.14.1 | 5.6.1 |
+| sentence_transformers x qwen3_vl_emb_2b | 2.13.0+cu130 | 5.14.1 | 5.6.1 |
+| tevatron x gemma4_e2b | 2.13.0+cu130 | 5.14.1 | unknown |
+| tevatron x qwen3_5_0_8b | 2.13.0+cu130 | 5.14.1 | unknown |
+| tevatron x qwen3_vl_emb_2b | 2.13.0+cu130 | 5.14.1 | unknown |
+| unsloth x gemma4_e2b | 2.11.0+cu130 | 5.5.0 | 2026.7.6 |
+| unsloth x qwen3_5_0_8b | 2.11.0+cu130 | 5.5.0 | 2026.7.6 |
+| unsloth x qwen3_vl_emb_2b | 2.11.0+cu130 | 5.5.0 | 2026.7.6 |
+
+### 실패 상세
+
+- **axolotl x gemma4_e2b / model_loader_load** — TypeError
+  - `unsupported operand type(s) for //: 'NoneType' and 'NoneType'`
+- **axolotl x gemma4_e2b / infonce_backward** — Skipped
+  - `skipped: model did not load`
+- **axolotl x qwen3_5_0_8b / model_loader_load** — TypeError
+  - `unsupported operand type(s) for //: 'NoneType' and 'NoneType'`
+- **axolotl x qwen3_5_0_8b / infonce_backward** — Skipped
+  - `skipped: model did not load`
+- **axolotl x qwen3_vl_emb_2b / model_loader_load** — TypeError
+  - `unsupported operand type(s) for //: 'NoneType' and 'NoneType'`
+- **axolotl x qwen3_vl_emb_2b / infonce_backward** — Skipped
+  - `skipped: model did not load`
+- **ms_swift x gemma4_e2b / visual_tokens** — ValueError
+  - `Cannot use apply_chat_template because this processor does not have a chat template.`
+- **ms_swift x qwen3_5_0_8b / get_model_processor** — PackageNotFoundError
+  - `No package metadata was found for The 'qwen_vl_utils>=0.0.14' distribution was not found and is required by this application.`
+- **ms_swift x qwen3_5_0_8b / infonce_backward** — Skipped
+  - `skipped: model did not load`
+- **ms_swift x qwen3_vl_emb_2b / get_model_processor** — PackageNotFoundError
+  - `No package metadata was found for The 'qwen_vl_utils>=0.0.14' distribution was not found and is required by this application.`
+- **ms_swift x qwen3_vl_emb_2b / infonce_backward** — Skipped
+  - `skipped: model did not load`
+- **native x gemma4_e2b / visual_tokens** — ValueError
+  - `Cannot use apply_chat_template because this processor does not have a chat template.`
+- **native x gemma4_e2b / multimodal_embed_forward** — ValueError
+  - `Cannot use apply_chat_template because this processor does not have a chat template.`
+- **tevatron x gemma4_e2b / dense_model_load** — ModuleNotFoundError
+  - `No module named 'peft'`
+- **tevatron x gemma4_e2b / infonce_backward** — Skipped
+  - `skipped: model did not load`
+- **tevatron x qwen3_5_0_8b / dense_model_load** — ModuleNotFoundError
+  - `No module named 'peft'`
+- **tevatron x qwen3_5_0_8b / infonce_backward** — Skipped
+  - `skipped: model did not load`
+- **tevatron x qwen3_vl_emb_2b / dense_model_load** — ModuleNotFoundError
+  - `No module named 'peft'`
+- **tevatron x qwen3_vl_emb_2b / infonce_backward** — Skipped
+  - `skipped: model did not load`
+- **unsloth x gemma4_e2b / visual_tokens** — ValueError
+  - `Cannot use apply_chat_template because this processor does not have a chat template.`
+- **unsloth x qwen3_5_0_8b / padding_side_alignment** — ValueError
+  - `['processor', 'tokenizer'] declared padding_side {'tokenizer': 'left', 'processor': 'left'} but config.model.padding_side is 'right'; it has been forced onto the configured side, a`
+- **unsloth x qwen3_vl_emb_2b / padding_side_alignment** — ValueError
+  - `['processor', 'tokenizer'] declared padding_side {'tokenizer': 'left', 'processor': 'left'} but config.model.padding_side is 'right'; it has been forced onto the configured side, a`
+
+### 병합에서 제외한 파일
+
+- 중복: axolotl x gemma4_e2b: ignored results/axolotl/gemma4_e2b/re17q5hfpr2qdd/started.json
+- 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/pjn3jrv0dy59ql/started.json
+- 중복: axolotl x qwen3_vl_emb_2b: ignored results/axolotl/qwen3_vl_emb_2b/117ldk6qywwda3/started.json
+- 중복: ms_swift x gemma4_e2b: ignored results/ms_swift/gemma4_e2b/106pq7lep4ndot/started.json
+- 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/rz2t3hjjctb9ir/started.json
+- 중복: ms_swift x qwen3_vl_emb_2b: ignored results/ms_swift/qwen3_vl_emb_2b/ngvpq0n6jwehzk/started.json
+- 중복: native x gemma4_e2b: ignored results/native/gemma4_e2b/oegus80eth8r75/started.json
+- 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/o7lrjq7e02enqv/started.json
+- 중복: native x qwen3_vl_emb_2b: ignored results/native/qwen3_vl_emb_2b/cs5m0fd2lmcmn8/started.json
+- 중복: sentence_transformers x gemma4_e2b: ignored results/sentence_transformers/gemma4_e2b/p3ffx6xcg05ksv/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/ctsn3ky63mvul0/result.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/3tmi4ht24hs5uz/result.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/2i0ptlkcc5621p/result.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/1jscf6cxmjz72y/result.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/ctsn3ky63mvul0/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/2i0ptlkcc5621p/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/1jscf6cxmjz72y/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/xchraazlhvqt6y/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/3tmi4ht24hs5uz/started.json
+- 중복: sentence_transformers x qwen3_vl_emb_2b: ignored results/sentence_transformers/qwen3_vl_emb_2b/zz21apdq19z46i/started.json
+- 중복: tevatron x gemma4_e2b: ignored results/tevatron/gemma4_e2b/dh4m30ex41frn1/started.json
+- 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/n3r8t21c0clle3/started.json
+- 중복: tevatron x qwen3_vl_emb_2b: ignored results/tevatron/qwen3_vl_emb_2b/6kg59vfo5dbfpe/started.json
+- 중복: unsloth x gemma4_e2b: ignored results/unsloth/gemma4_e2b/32plsncjtkxzvv/started.json
+- 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/yh32nxs19wlqv2/started.json
+- 중복: unsloth x qwen3_vl_emb_2b: ignored results/unsloth/qwen3_vl_emb_2b/n75371z1ll7tz0/started.json
