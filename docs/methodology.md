@@ -511,7 +511,7 @@ AND된다(`masking_utils.py:182`, 결합은 `:972`). "저장소에 블록 대각
 `attention_mask`가 `None`일 것, `past_key_values`가 `None`일 것. 2D 패딩 마스크를
 하나라도 넘기면(all-ones여도) 패킹 감지가 통째로 꺼진다.
 
-`axes.PackedCollate.__call__`(`trainbench/axes.py:1405`)이 내는 dict의 키는
+`axes.PackedCollate.__call__`(`trainbench/axes.py`)이 내는 dict의 키는
 `input_ids`/`position_ids`/`cu_seqlens`/`seq_lengths` 넷이고 `attention_mask`가 없다.
 `position_ids`는 시퀀스마다 `torch.arange(...)`이고, 학습 forward에는 캐시가 없다.
 세 전제를 모두 만족한다.
@@ -534,7 +534,8 @@ Qwen3.5의 Gated DeltaNet 레이어(`config.layer_types`가 `linear_attention`�
 (`models/qwen3_5/modeling_qwen3_5.py:549`), causal conv는 `kwargs["seq_idx"]`를
 (`:498`) 읽고, 그 레이어가 받는 마스크는 `create_recurrent_attention_mask`
 (`masking_utils.py:1447`)가 만든 2D 패딩 마스크라 패킹 정보가 한 글자도 없다.
-그리고 `trainbench/collate.py:429`가 `axes.PACKED_BOUNDARY_KEYS`로 `cu_seqlens`와
+그리고 `collate.PackedBatches.__call__`(`trainbench/collate.py`)이
+`axes.PACKED_BOUNDARY_KEYS`로 `cu_seqlens`와
 `seq_lengths`를 모델에 넘기기 전에 배치에서 빼낸다. **즉 오늘 Qwen3.5 + packing 런은
 linear 레이어에서 격리 없이 돈다** — 예외도 경고도 없다. 그 배선은 packing 레인의
 몫이고, 그때까지 Qwen3.5의 packing 수치는 다른 계산의 수치다.
@@ -615,7 +616,9 @@ digest를 고정해도 커널은 고정되지 않는다. `trainbench/kernels.py:
 이름은 마스크 생성을 통째로 건너뛰고 어텐션 레이어에 `attention_mask=None`이 간다
 (`masking_utils.py:826`, 반환은 `:939`). 어텐션을 등록해도 마스크는 등록되지 않으며,
 위 rewrite가 만든 repo id 문자열도 그 표에 없다. 미등록 + packing은 10.1의 격리가
-조용히 사라지는 상태이므로 `kernels.assert_packing_is_isolated`가 그 조합을 거부한다.
+조용히 사라지는 상태이므로 `kernels.assert_packing_is_isolated`가 그 조합을 거부한다 —
+호출자는 `scripts/bench.py`의 `refuse_packing_the_mask_registry_cannot_isolate`이고
+목적을 가리지 않는다.
 그리고 등록 여부는 이름의 성질이 아니라 바인딩 후의 상태다 — 같은 문자열이 커널을 받기
 전에는 미등록, 받은 뒤에는 등록일 수 있다.
 
@@ -625,6 +628,10 @@ digest를 고정해도 커널은 고정되지 않는다. `trainbench/kernels.py:
 — transformers를 이미 import한 프로세스에서 변수를 바꾸는 것은 아무 효과가 없다.
 `kernels.forbid_runtime_kernel_fetch`가 변수와 캐시된 전역을 함께 닫고,
 `assert_no_runtime_kernel_fetch`가 열린 문이 하나라도 있으면 런을 세운다.
+호출자는 `scripts/bench.py`의 `close_kernel_fetch_doors`와 `build_run`이며 **둘 다
+`applied.ENFORCED_PURPOSES`(timing/quality)에서만 돈다.** probe는 캐시를 채우는
+갈래여서 문을 닫으면 "이 프레임워크가 이 모델을 못 만든다"가 "이 파드에 캐시가
+없었다"가 된다. 즉 profile 런의 커널 출처는 이 검사가 답하지 않는다.
 
 `USE_HUB_KERNELS`만으로는 위 rewrite가 닫히지 않는다 — 그 분기의 조건은
 `is_kernels_available()` 하나뿐이다(`modeling_utils.py:1997-2002`). 닫는 것은

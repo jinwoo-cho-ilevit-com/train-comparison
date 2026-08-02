@@ -40,6 +40,8 @@ from typing import Any
 
 import publish_result
 
+from trainbench.metrics import validity
+
 MARKER = "<!-- generated: probe results -->"
 
 # The generated section's heading, and the text a rival hand-written section would
@@ -94,9 +96,18 @@ BASELINE_DIR_PREFIX = publish_result.UNSAFE_IN_PATH.sub("-", BASELINE_RUN_PREFIX
 # whether the *host* was slower.
 BASELINE_METRIC = "step_seconds_p50"
 
-# AGENTS.md and PLAN.md (다중 pod 규칙 3): a pod deviating from the canonical
-# baseline by more than this is thrown out rather than averaged in.
+# What a record that declares no threshold of its own was measured under. Not a
+# second source of truth: it is the default of `measurement.baseline_tolerance`
+# (trainbench/config_schema.py), and the value a record carries wins over it.
 BASELINE_DEVIATION_LIMIT = 0.03
+
+# Where a record states the threshold its campaign ran under. `metrics.summarise`
+# writes both from `config.measurement`, so a tolerance derived on the first pod
+# arrives here instead of being declared and then ignored.
+TOLERANCE_FIELD = "baseline_tolerance"
+TOLERANCE_STATUS_FIELD = "baseline_tolerance_status"
+TOLERANCE_CALIBRATED = "calibrated"
+TOLERANCE_UNDECLARED = "미선언"
 
 # Printed next to every deviation figure. docs/methodology.md §4 states this
 # outright, and a threshold that looks derived is worse than no threshold: the
@@ -107,6 +118,14 @@ BASELINE_DEVIATION_SOURCE = (
     "동일 pod에서 baseline을 5회 반복해 편차를 실측한 뒤 확정한다. 실측 편차가 이 값을 "
     "넘으면 임계값이 아니라 측정 절차를 고쳐야 한다는 신호다. 아래 판정은 그 교정 전의 "
     "잠정 판정이다."
+)
+
+# The counterpart, for when the records say the number was derived rather than
+# assumed. It names the field so a reader can check the claim in the artifact.
+BASELINE_DEVIATION_CALIBRATED_SOURCE = (
+    "**교정된 임계값이다.** baseline 레코드의 `metrics.measurement.baseline_tolerance`가 "
+    "이 값을 싣고 `baseline_tolerance_status`가 `calibrated`라고 적는다. 판정은 그 값으로 "
+    "냈다."
 )
 
 POD_OK = "OK"
@@ -384,54 +403,29 @@ def checks_of(artifact: Artifact | None) -> list[dict[str, Any]]:
 def training_verdict(payload: dict[str, Any]) -> tuple[bool, list[str]]:
     """Whether this record is a measurement of training, and why not when it is not.
 
-    Three unsloth cells passed `infonce_backward` with `params_with_grad=0` and
-    `trainable_params=0`: a fully frozen graph stays differentiable through the
-    embedding output, so `loss.backward()` returns normally and the step time
-    that comes out is the cost of a forward pass. Nothing between the record and
-    this table read those fields, so that number was publishable as a speed.
+    The rule is `trainbench.metrics.validity.training_verdict` and nothing here.
+    This file used to carry a second implementation of it, so tightening the
+    library left the speed table ranking runs the library refuses — and loosening
+    it left the table dropping runs the library passes — with no test failing
+    either way.
+
+    What is left is the extraction: the rule needs `peft.mode` and the device, and
+    neither is in `metrics`. A record that does not carry `peft.mode` is refused
+    rather than checked without it, for the reason the library gives for an absent
+    `total_params` — skipping the comparison is how a full finetune that froze
+    most of its tensors gets published as a full finetune.
     """
-    metrics = payload.get("metrics")
-    if not isinstance(metrics, dict):
-        return False, ["no `metrics`: nothing was reported to check"]
-    reasons = []
-
-    grad_norm = metrics.get("grad_norm")
-    if isinstance(grad_norm, bool) or not isinstance(grad_norm, (int, float)):
-        reasons.append("`grad_norm` is absent")
-    elif not math.isfinite(grad_norm) or grad_norm <= 0:
-        reasons.append(f"`grad_norm`={grad_norm}: the backward reached no parameter")
-
-    trainable = metrics.get("trainable_params")
-    total = metrics.get("total_params")
     mode = ((payload.get("config") or {}).get("peft") or {}).get("mode")
-    if isinstance(trainable, bool) or not isinstance(trainable, int) or trainable <= 0:
-        reasons.append(f"`trainable_params`={trainable!r}: this model cannot learn")
-    elif isinstance(total, int) and not isinstance(total, bool):
-        if mode == "full" and trainable != total:
-            reasons.append(
-                f"peft.mode=full but {trainable} of {total} parameter tensors train; "
-                "a full finetune that froze part of the model is a different workload"
-            )
-        if mode in ("lora", "qlora") and trainable >= total:
-            reasons.append(
-                f"peft.mode={mode} but {trainable} of {total} parameter tensors train; "
-                "the adapter did not narrow anything"
-            )
-
-    first, last = metrics.get("loss_first"), metrics.get("loss_last")
-    if not isinstance(first, (int, float)) or not isinstance(last, (int, float)):
-        reasons.append("`loss_first`/`loss_last` are absent")
-    elif not (math.isfinite(first) and math.isfinite(last)):
-        reasons.append(f"loss is not finite: {first} -> {last}")
-    elif last >= first:
-        reasons.append(f"loss did not fall: {first} -> {last}")
-
-    if str(payload.get("device", "")).startswith("cuda"):
-        peak = metrics.get("peak_memory_bytes")
-        if isinstance(peak, bool) or not isinstance(peak, int) or peak <= 0:
-            reasons.append(f"`peak_memory_bytes`={peak!r} on a CUDA run")
-
-    return not reasons, reasons
+    if not isinstance(mode, str) or not mode:
+        return False, [
+            f"`config.peft.mode`={mode!r}: nothing says how many parameter tensors "
+            "this run was supposed to train, so the counts cannot be judged"
+        ]
+    return validity.training_verdict(
+        payload.get("metrics"),
+        peft_mode=mode,
+        device=str(payload.get("device", "")),
+    )
 
 
 def stack_of(artifact: Artifact) -> tuple[str, str] | None:
@@ -508,8 +502,57 @@ def _baseline_value(artifact: Artifact) -> tuple[float | None, str]:
     return float(raw), ""
 
 
+@dataclass(frozen=True)
+class Tolerance:
+    """The deviation threshold pod verdicts were decided with, and where it came from."""
+
+    value: float
+    status: str
+    notes: list[str]
+
+
+def declared_tolerance(baselines: list[Artifact]) -> Tolerance:
+    """The threshold the baseline records themselves declare.
+
+    The first GPU pod is supposed to derive this number from the noise floor and
+    record it. Until this read it, deriving it changed nothing: the verdicts came
+    from a constant in this file, so a campaign run at a measured 8.1% would have
+    been judged at the 3% it was run to replace, with `calibrated` printed in the
+    record beside it.
+
+    Disagreement is a finding rather than an average. Records naming different
+    thresholds are not one campaign, so the strictest decides and the spread is
+    printed — admitting a pod under a threshold the other records never declared
+    is the direction that publishes an incomparable number.
+    """
+    declared: dict[float, set[str]] = {}
+    for artifact in baselines:
+        measurement = (artifact.metrics or {}).get("measurement")
+        if not isinstance(measurement, dict):
+            continue
+        value = measurement.get(TOLERANCE_FIELD)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+            continue
+        status = measurement.get(TOLERANCE_STATUS_FIELD)
+        declared.setdefault(float(value), set()).add(
+            status if isinstance(status, str) and status else TOLERANCE_UNDECLARED
+        )
+    if not declared:
+        return Tolerance(BASELINE_DEVIATION_LIMIT, TOLERANCE_UNDECLARED, [])
+    value = min(declared)
+    notes = []
+    if len(declared) > 1:
+        spread = ", ".join(f"{v:g}" for v in sorted(declared))
+        notes.append(
+            f"baseline 레코드들이 서로 다른 `measurement.{TOLERANCE_FIELD}`를 싣고 있다 "
+            f"({spread}) — 가장 엄격한 {value:g}로 판정했다. 한 캠페인이 하나의 임계값을 "
+            "쓰지 않았다는 뜻이고, 그 자체가 결과다"
+        )
+    return Tolerance(value, "/".join(sorted(declared[value])), notes)
+
+
 def baseline_gate(
-    baselines: list[Artifact], measured: list[Artifact]
+    baselines: list[Artifact], measured: list[Artifact], tolerance: Tolerance | None = None
 ) -> tuple[dict[str, PodVerdict], float | None, list[str]]:
     """Per-pod verdicts, the reference they were compared against, and warnings.
 
@@ -524,8 +567,9 @@ def baseline_gate(
     the case this gate exists for — nothing says whether its host was comparable —
     so it gets its own verdict rather than an absence.
     """
+    tolerance = tolerance or declared_tolerance(baselines)
     newest: dict[str, Artifact] = {}
-    notes: list[str] = []
+    notes: list[str] = list(tolerance.notes)
     for artifact in sorted(baselines, key=lambda a: (a.produced_result, a.timestamp)):
         if (previous := newest.get(artifact.pod)) is not None:
             notes.append(f"{artifact.pod}: baseline이 둘 이상 — {previous.path}를 무시했다")
@@ -548,7 +592,7 @@ def baseline_gate(
             continue
         value = values[pod]
         deviation = abs(value - reference) / reference
-        over = deviation > BASELINE_DEVIATION_LIMIT
+        over = deviation > tolerance.value
         verdicts[pod] = PodVerdict(
             pod,
             value,
@@ -874,8 +918,22 @@ def render_measurements(measured: list[Artifact], verdicts: dict[str, PodVerdict
     return lines
 
 
+def _tolerance_source(tolerance: Tolerance) -> str:
+    """Which provenance sentence the threshold gets.
+
+    Only a record that says `calibrated` earns the calibrated wording; an
+    undeclared threshold and one declared `uncalibrated` are the same claim.
+    """
+    if tolerance.status == TOLERANCE_CALIBRATED:
+        return BASELINE_DEVIATION_CALIBRATED_SOURCE
+    return BASELINE_DEVIATION_SOURCE
+
+
 def render_baseline_gate(
-    verdicts: dict[str, PodVerdict], reference: float | None, notes: list[str]
+    verdicts: dict[str, PodVerdict],
+    reference: float | None,
+    notes: list[str],
+    tolerance: Tolerance,
 ) -> list[str]:
     """The cross-pod deviation gate, with the threshold's provenance attached."""
     if not verdicts:
@@ -894,7 +952,7 @@ def render_baseline_gate(
         "순서가 판정을 정하고, 평균을 쓰면 드러내야 할 이상치가 기준값을 끌고 간다. 중앙값은 "
         "어느 파드가 실제로 낸 값이기도 하다(보간하지 않는다).",
         "",
-        f"임계값 {BASELINE_DEVIATION_LIMIT * 100:.0f}% — {BASELINE_DEVIATION_SOURCE}",
+        f"임계값 {tolerance.value * 100:.2f}% — {_tolerance_source(tolerance)}",
         "",
         f"기준값: {shown}",
         "",
@@ -1014,7 +1072,8 @@ def render(
 ) -> str:
     measured = list(measured or [])
     baselines = list(baselines or [])
-    verdicts, reference, gate_notes = baseline_gate(baselines, measured)
+    tolerance = declared_tolerance(baselines)
+    verdicts, reference, gate_notes = baseline_gate(baselines, measured, tolerance)
     per_combination: dict[tuple[str, str], list[Artifact]] = {}
     for artifact in measured:
         per_combination.setdefault((artifact.framework, artifact.model), []).append(artifact)
@@ -1098,7 +1157,7 @@ def render(
         lines.append("실패 없음.")
 
     lines += render_measurements(measured, verdicts)
-    lines += render_baseline_gate(verdicts, reference, gate_notes)
+    lines += render_baseline_gate(verdicts, reference, gate_notes, tolerance)
     lines += render_owned_axes(measured + baselines + list(chosen.values()))
     lines += render_metric_definitions(measured + baselines)
 

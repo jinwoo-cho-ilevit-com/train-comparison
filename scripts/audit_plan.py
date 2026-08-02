@@ -1606,6 +1606,11 @@ AXIS_VALUE_COMPANIONS: dict[str, tuple[str, ...]] = {
     # other two models rather than letting it freeze nothing.
     "freeze/ple": ("model=gemma4_e2b",),
     "freeze/vision_and_ple": ("model=gemma4_e2b",),
+    # Gated DeltaNet is a Qwen3.5 layer, so `axes.FLA_ARCHS` is `{qwen3_5}` and
+    # the default model refuses `kernel=fla` on architecture before the packages
+    # are ever asked about. Without this the value is uncountable in every
+    # environment, including an image that ships fla and CUDA.
+    "kernel/fla": ("model=qwen3_5_0_8b",),
 }
 
 

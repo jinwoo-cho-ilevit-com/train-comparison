@@ -58,6 +58,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from trainbench import axes
 from trainbench.applied import (
+    PRECISION_RECIPE_AXIS,
     AppliedMismatch,
     Built,
     assert_matches,
@@ -4639,6 +4640,7 @@ def install_transformer_engine(monkeypatch, *, available=True, tuples=True):
 
     pytorch = ModuleType("transformer_engine.pytorch")
     pytorch.autocast = autocast
+    pytorch.Linear = _TELinear
     for name, module in {
         "transformer_engine.common.recipe": recipes,
         "transformer_engine.pytorch.quantization": quantization,
@@ -4648,6 +4650,27 @@ def install_transformer_engine(monkeypatch, *, available=True, tuples=True):
     return entered
 
 
+class _TELinear(torch.nn.Linear):
+    """A layer whose defining package is the recipe's, which is what
+    `applied._module_roots` reads to tell a swapped model from a plain torch one."""
+
+    __module__ = "transformer_engine.pytorch"
+
+
+def recipe_model() -> torch.nn.Module:
+    """The regime the fp8 recipes actually run in: bf16 base weights, and modules
+    the recipe package defines.
+
+    `plain_model()` is neither — fp32 parameters and no Transformer Engine module —
+    and `applied._capture_precision` reads both back, so a recipe over it is
+    undetermined rather than mxfp8. Asserting the recipe's name off that model
+    asserted the defect where a recipe object alone certified the axis.
+    """
+    model = torch.nn.Sequential(_TELinear(2, 2)).to(torch.bfloat16)
+    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
+    return model
+
+
 @pytest.mark.parametrize(
     "precision,recipe_class", [("mxfp8", "MXFP8BlockScaling"), ("nvfp4", "NVFP4BlockScaling")]
 )
@@ -4655,12 +4678,18 @@ def test_an_fp8_recipe_wraps_the_step_and_is_what_the_run_is_read_by(
     composed, monkeypatch, precision, recipe_class
 ):
     """These recipes keep bf16 parameters and cast inside the step, so the weights
-    cannot say which one ran. `Built.precision_recipe` is the only evidence, which
-    is why `assemble` builds one as well as `step_context`."""
+    cannot say which one ran. `Built.precision_recipe` is the only thing that can
+    name the value, which is why `assemble` builds one as well as `step_context`.
+
+    Naming is not certifying, so the model has to be one an fp8 run is loaded as:
+    `recipe_model()` gives bf16 base weights and Transformer Engine modules. Over
+    `plain_model()` — fp32, no recipe module — capture is undetermined, and it is
+    the test below that pins that.
+    """
     entered = install_transformer_engine(monkeypatch)
     config = bench(composed, **{"precision.name": precision})
 
-    built, names = axes.assemble(plain_model(), config, CPU, framework="native")
+    built, names = axes.assemble(recipe_model(), config, CPU, framework="native")
     with axes.step_context(config):
         pass
 
@@ -4669,6 +4698,27 @@ def test_an_fp8_recipe_wraps_the_step_and_is_what_the_run_is_read_by(
     assert type(entered[0]["recipe"]).__name__ == recipe_class
     assert entered[0]["enabled"] is True
     assert axis(capture(built, config), "precision.name").applied == precision
+
+
+@pytest.mark.parametrize("precision", ["mxfp8", "nvfp4"])
+def test_a_recipe_over_a_model_no_fp8_run_is_loaded_as_is_undetermined(
+    composed, monkeypatch, precision
+):
+    """The recipe object is built from the same config the state is checked
+    against, so a capture that read only its class name would hand the request
+    back. `plain_model()` is fp32 with no Transformer Engine module — the state
+    `_capture_precision`'s dtype refusals exist for — and a run over it must not
+    be published as mxfp8.
+    """
+    install_transformer_engine(monkeypatch)
+    config = bench(composed, **{"precision.name": precision})
+
+    built, _ = axes.assemble(plain_model(), config, CPU, framework="native")
+
+    entry = axis(capture(built, config), "precision.name")
+    assert type(built.precision_recipe).__name__ in PRECISION_RECIPE_AXIS
+    assert entry.applied is None
+    assert entry.matches is False
 
 
 @pytest.mark.parametrize("tuples", [True, False], ids=["tuple", "bool"])

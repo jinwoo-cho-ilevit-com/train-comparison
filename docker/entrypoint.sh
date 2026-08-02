@@ -202,6 +202,11 @@ if [[ "${purpose}" == "probe" ]]; then
     # forty times at seventeen-second intervals, and the probe branch was the branch
     # that skipped this check.
     #
+    # An axis this image cannot apply does not stop a probe: `bench.py::preflight`
+    # only counts that against a purpose `applied` enforces, and `probe` is not
+    # one — the refusal is the answer the pod was launched for, and standing it
+    # down here published it as `결과 없음(기동됨)`.
+    #
     # The plan the orchestrator sent, wrapped when it did not send one: preflight's
     # subject is a list of settings, and reading zero of them as "none refused" is
     # the vacuous pass this repository has shipped before.
@@ -228,8 +233,9 @@ PY
         # Not run, and said so. A probe that cannot compose its own config would
         # otherwise crash inside verify_env.py once per container restart.
         run_status=${preflight_status}
-        run_note="preflight refused this pod's config (exit ${run_status}); the image's own"
-        run_note="${run_note} schema and the config it was handed do not agree, so nothing ran"
+        run_note="preflight refused this pod's config (exit ${run_status}); the image cannot"
+        run_note="${run_note} parse or run it at all, so nothing ran. An axis this image"
+        run_note="${run_note} declines does not reach here — the probe runs and reports it"
         echo "-- probe not started: ${run_note}" >&2
     else
         run_with_secrets timeout --signal=TERM --kill-after="${KILL_GRACE_SECONDS}" \

@@ -871,6 +871,13 @@ def preflight(plan_path: Path, stream: Any = None) -> int:
     naming it, and taking the pod down over it here would silently overturn that —
     the rest of the axis is still worth the pod that was booted for it.
 
+    An axis refusal only stands the pod down for a purpose `applied` enforces.
+    `probe` is not one: "does this framework take this axis" is the question a
+    probe pod was launched to answer, and refusing to start it turns a deliberate
+    answer into `결과 없음(기동됨)` — indistinguishable from a pod that booted and
+    died. A config the image's own schema cannot parse is still a refusal for
+    every purpose, because that setting cannot be answered at all.
+
     The GPU is checked too, and before the settings, because it is a property of
     the pod rather than of any one of them (`gpu_refusal`). Both are reported even
     when the first has already decided the answer: one pod log that names the wrong
@@ -897,7 +904,7 @@ def preflight(plan_path: Path, stream: Any = None) -> int:
     if gpu is None:
         print(f"preflight: this pod's GPU is sm_{arch}, which the image covers OK", file=stream)
 
-    refused, checked = [], 0
+    refused, declined, checked = [], [], 0
     for index, item in enumerate(plan):
         name = (isinstance(item, dict) and item.get("name")) or f"setting-{index}"
         resolved = item.get("config") if isinstance(item, dict) else None
@@ -907,16 +914,28 @@ def preflight(plan_path: Path, stream: Any = None) -> int:
         checked += 1
         try:
             config = to_bench_config(resolved)
+        except Exception as exc:  # noqa: BLE001 - the image's schema rejected the config
+            refused.append(f"{name}: {type(exc).__name__}: {' '.join(str(exc).split())}")
+            continue
+        described = f"{name}: {{}}"
+        try:
             axes.patch(config)
             axes.load_kwargs(config)
             with axes.step_context(config):
                 pass
-        except Exception as exc:  # noqa: BLE001 - anything that stops a setting stops the pod
-            refused.append(f"{name}: {type(exc).__name__}: {' '.join(str(exc).split())}")
+        except refusal_types() as exc:
+            line = described.format(f"{type(exc).__name__}: {' '.join(str(exc).split())}")
+            target = declined if config.run.purpose not in ENFORCED_PURPOSES else refused
+            target.append(line)
+            continue
+        except Exception as exc:  # noqa: BLE001 - anything else that stops a setting stops the pod
+            refused.append(described.format(f"{type(exc).__name__}: {' '.join(str(exc).split())}"))
             continue
         print(f"preflight: {name} OK", file=stream)
     if gpu is not None:
         print(f"preflight REFUSED this pod's GPU: {gpu}", file=stream)
+    for line in declined:
+        print(f"preflight: {line} — declined, and the run is what files that", file=stream)
     for line in refused:
         print(f"preflight REFUSED {line}", file=stream)
     if refused or gpu is not None:
@@ -933,6 +952,13 @@ def preflight(plan_path: Path, stream: Any = None) -> int:
             file=stream,
         )
         return PREFLIGHT_EXIT
+    if declined:
+        print(
+            f"preflight: {len(declined)} of the {checked} setting(s) decline an axis this "
+            "image cannot apply, and the run publishes that as its answer",
+            file=stream,
+        )
+        return 0
     print(f"preflight: all {checked} setting(s) can run", file=stream)
     return 0
 
