@@ -241,6 +241,72 @@ class TrainConfig(Strict):
     deterministic: bool = False
 
 
+class MeasurementConfig(Strict):
+    """How a reported figure is produced from the steps and the runs behind it.
+
+    Each field replaced a constant that was written into the harness. A constant
+    an adapter is free to choose differently is a difference the result
+    attributes to the axis under test, and every one of these was measured to
+    matter: padding reaches 89% of a batch on some corpora and decides which way
+    the packing axis ranks, GPU contention alone has produced a 30x change in
+    standard deviation, and `torch.compile` autotuning spends its first steps
+    benchmarking kernels.
+
+    **No default here is calibrated.** They are the values the harness already
+    behaved as if it had, written down so a run records them; what this study
+    should use is a question a pod answers after measuring the noise floor.
+    `baseline_tolerance_calibrated` is how a reader tells the two apart.
+    """
+
+    # MLPerf repeats its Small-LLM finetuning benchmark at least ten times. One
+    # is what this harness does today, and one repeat has no spread at all.
+    repeats: int = Field(default=1, gt=0)
+    # Where the clock is read. `cuda_event` records events in the stream instead
+    # of synchronising around a host clock; it is refused off CUDA rather than
+    # falling back, because a wall-clock number under a device-measurement label
+    # is the failure this whole module exists to prevent.
+    instrument: Literal["wall_clock", "cuda_event"] = "wall_clock"
+    aggregate: Literal["mean", "median", "trimmed_mean", "olympic"] = "mean"
+    # Fraction removed from each end for `trimmed_mean`, and meaningless for the
+    # others - a validator keeps the two from disagreeing.
+    trim_fraction: float = Field(default=0.0, ge=0.0, lt=0.5)
+    # `fixed` re-measures one point; `per_repeat` samples the distribution the
+    # spread claims to describe. MLPerf CLOSED requires the latter and requires
+    # every drawn seed to be logged.
+    seed_policy: Literal["fixed", "per_repeat"] = "fixed"
+    # Which token count divides the step time. Padding is not free - the forward
+    # computes on it - so both answers are defensible and they rank the
+    # `dataloader.packing` axis differently. Declared rather than assumed.
+    throughput_denominator: Literal["tokens", "padded_tokens"] = "tokens"
+    # Deviation from the canonical baseline that invalidates a pod.
+    baseline_tolerance: float = Field(default=0.03, gt=0.0)
+    # False means the number above is the one AGENTS.md carries without a source.
+    # It travels into the result so a reader is not left to assume it was derived.
+    baseline_tolerance_calibrated: bool = False
+
+    @property
+    def tolerance_status(self) -> str:
+        return "calibrated" if self.baseline_tolerance_calibrated else "uncalibrated"
+
+    @model_validator(mode="after")
+    def _the_trim_and_the_aggregate_agree(self) -> MeasurementConfig:
+        """A `trim_fraction` under an aggregate that ignores it is a knob that
+        reads as applied and changes nothing, and `trimmed_mean` with nothing
+        trimmed is an arithmetic mean wearing another name in the result."""
+        if self.aggregate == "trimmed_mean" and self.trim_fraction <= 0:
+            raise ValueError(
+                "measurement.aggregate=trimmed_mean requires trim_fraction > 0; with "
+                "nothing trimmed it is the arithmetic mean reported under another name."
+            )
+        if self.aggregate != "trimmed_mean" and self.trim_fraction > 0:
+            raise ValueError(
+                f"measurement.trim_fraction={self.trim_fraction} is set under "
+                f"aggregate={self.aggregate}, which does not trim; the knob would be "
+                "recorded as applied while changing nothing."
+            )
+        return self
+
+
 class RunConfig(Strict):
     # timing  : the numbers we report. Profiler and deterministic mode are banned.
     # profile : kernel breakdown for diagnosis. Its timings are not reportable.
@@ -271,6 +337,11 @@ class BenchConfig(Strict):
     parallel: ParallelConfig
     framework: FrameworkConfig
     train: TrainConfig
+    # Defaulted rather than composed: there is no `configs/measurement/` group
+    # yet, and creating one needs `configs/config.yaml` and the audit's group
+    # tables, both of which belong to the integration wave (.plans/notes/measure.md).
+    # Every field is overridable as `+measurement.<field>=...` in the meantime.
+    measurement: MeasurementConfig = MeasurementConfig()
 
     @model_validator(mode="after")
     def _timing_runs_are_uncontaminated(self) -> BenchConfig:
@@ -338,6 +409,49 @@ class BenchConfig(Strict):
                 f"train.warmup_discard_steps ({self.train.warmup_discard_steps}) must be "
                 f"less than train.steps ({self.train.steps}); nothing would be measured."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _the_aggregate_has_samples_to_aggregate(self) -> BenchConfig:
+        """The measured window has to be wide enough for the statistic chosen over it.
+
+        Olympic scoring discards the fastest and the slowest step, so a two-step
+        window leaves nothing; a trim fraction can remove every sample the same
+        way. Refused before the run rather than after it, because both failures
+        surface only once the steps have already been paid for.
+        """
+        measured = self.train.steps - self.train.warmup_discard_steps
+        method = self.measurement.aggregate
+        if method == "olympic" and measured < 3:
+            raise ValueError(
+                f"measurement.aggregate=olympic drops the fastest and the slowest step, so "
+                f"it needs at least 3 measured steps; train.steps ({self.train.steps}) minus "
+                f"train.warmup_discard_steps ({self.train.warmup_discard_steps}) leaves "
+                f"{measured}."
+            )
+        if method == "trimmed_mean" and int(measured * self.measurement.trim_fraction) * 2 >= (
+            measured
+        ):
+            raise ValueError(
+                f"measurement.trim_fraction={self.measurement.trim_fraction} removes every "
+                f"one of the {measured} measured step(s) from both ends; a mean over nothing "
+                "is not a measurement."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _the_instrument_exists_on_the_requested_device(self) -> BenchConfig:
+        """CUDA events cannot time a CPU run. Refused here when the device is
+        named, and again in `metrics.build_timer` when it is resolved at runtime —
+        `device: null` lets `trainbench.device` pick, so this validator alone
+        would leave the case it was written for unguarded."""
+        if self.measurement.instrument == "cuda_event" and self.device is not None:
+            if not str(self.device).startswith("cuda"):
+                raise ValueError(
+                    f"measurement.instrument=cuda_event with device={self.device!r}: CUDA "
+                    "events do not exist there, and falling back to the host clock would "
+                    "report a wall-clock number under a device-measurement label."
+                )
         return self
 
     @model_validator(mode="after")

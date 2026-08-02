@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from trainbench.compose import resolve
 from trainbench.config_schema import CORRUPT_DATA_REVISIONS, BenchConfig
+from trainbench.metrics import repeat_seeds
 
 from .conftest import CONFIG_DIR
 
@@ -243,3 +244,106 @@ def test_an_adapter_with_no_rank_is_refused():
     nothing while reporting itself as one."""
     with pytest.raises(ValidationError, match="requires peft.r"):
         compose_cfg("peft=lora", "peft.r=0")
+
+
+# ---------------------------------------------------------------------------
+# measurement: seed policy, the deviation threshold, and the statistics knobs
+# ---------------------------------------------------------------------------
+
+
+def test_the_seed_policy_schema_can_express_a_distinct_seed_per_repeat():
+    """MLPerf CLOSED draws each run's seed from `/dev/urandom` and requires that no
+    two runs log the same one. Repeating a fixed seed re-measures a single point,
+    which is not the distribution a spread over those repeats claims to describe.
+
+    The study still runs `fixed`; changing that needs a pod's noise floor first.
+    What must exist now is the ability to express and record the other policy, so
+    that change is a config edit rather than a schema change.
+    """
+    config = compose_cfg("+measurement.repeats=4", "+measurement.seed_policy=per_repeat")
+    assert config.measurement.seed_policy == "per_repeat"
+
+    seeds = repeat_seeds("per_repeat", config.measurement.repeats, config.train.seed)
+    assert len(seeds) == 4
+    assert len(set(seeds)) == 4, f"two repeats share a seed: {seeds}"
+    assert seeds != repeat_seeds("per_repeat", 4, config.train.seed), (
+        "two draws produced the same four seeds, so the policy is deriving them from "
+        "the base seed rather than sampling"
+    )
+
+
+def test_the_fixed_seed_policy_records_that_it_re_measures_one_point():
+    """`fixed` is the current policy and it must not look like four samples.
+
+    Every repeat gets the configured seed, so the recorded seeds collapse to one
+    value — which is the honest reading of what the repeats measured.
+    """
+    config = compose_cfg("+measurement.repeats=4")
+    assert config.measurement.seed_policy == "fixed"
+
+    seeds = repeat_seeds("fixed", config.measurement.repeats, config.train.seed)
+    assert seeds == (config.train.seed,) * 4
+    assert len(set(seeds)) == 1
+
+
+def test_an_unknown_seed_policy_is_refused_rather_than_defaulted():
+    with pytest.raises(ValidationError):
+        compose_cfg("+measurement.seed_policy=urandom")
+    with pytest.raises(ValueError, match="unknown measurement.seed_policy"):
+        repeat_seeds("urandom", 2, 1234)
+
+
+def test_the_seed_policy_travels_with_an_uncalibrated_deviation_threshold():
+    """AGENTS.md's 3% has no source, and GPU contention alone has moved a step-time
+    standard deviation by 30x elsewhere. The number is read from config and carries
+    the fact that nothing derived it, so a reader is not left to assume it was."""
+    config = compose_cfg()
+    assert config.measurement.baseline_tolerance == 0.03
+    assert config.measurement.baseline_tolerance_calibrated is False
+    assert config.measurement.tolerance_status == "uncalibrated"
+
+    calibrated = compose_cfg(
+        "+measurement.baseline_tolerance=0.081",
+        "+measurement.baseline_tolerance_calibrated=true",
+    )
+    assert calibrated.measurement.baseline_tolerance == pytest.approx(0.081)
+    assert calibrated.measurement.tolerance_status == "calibrated"
+
+
+def test_a_trim_fraction_and_an_aggregate_that_ignores_it_cannot_coexist():
+    """Either direction is a knob recorded as applied while changing nothing:
+    `trimmed_mean` with nothing trimmed is the arithmetic mean under another name,
+    and a trim fraction under `mean` is a setting the result reports and the run
+    never used."""
+    with pytest.raises(ValidationError, match="requires trim_fraction"):
+        compose_cfg("+measurement.aggregate=trimmed_mean")
+    with pytest.raises(ValidationError, match="does not trim"):
+        compose_cfg("+measurement.trim_fraction=0.1")
+
+    assert compose_cfg(
+        "+measurement.aggregate=trimmed_mean", "+measurement.trim_fraction=0.1"
+    ).measurement.trim_fraction == pytest.approx(0.1)
+
+
+def test_an_aggregate_wider_than_the_measured_window_is_refused_before_the_run():
+    """Olympic scoring drops the fastest and the slowest step; a two-step window
+    leaves nothing to average. Caught before the steps are paid for."""
+    with pytest.raises(ValidationError, match="at least 3 measured steps"):
+        compose_cfg(
+            "+measurement.aggregate=olympic", "train.steps=4", "train.warmup_discard_steps=2"
+        )
+
+    assert (
+        compose_cfg(
+            "+measurement.aggregate=olympic", "train.steps=6", "train.warmup_discard_steps=2"
+        ).measurement.aggregate
+        == "olympic"
+    )
+
+
+def test_cuda_event_timing_is_refused_on_a_device_that_has_no_events():
+    """A silent fall back to the host clock would report a wall-clock number under
+    a device-measurement label — the same shape as `kernel=none` picking up an
+    environment-provided fla."""
+    with pytest.raises(ValidationError, match="CUDA events do not exist"):
+        compose_cfg("device=cpu", "+measurement.instrument=cuda_event")
