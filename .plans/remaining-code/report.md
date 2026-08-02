@@ -15,7 +15,6 @@ scripts/orchestrate.py
 scripts/prepare_data.py
 docker/entrypoint.sh
 configs/run/
-pyproject.toml                          trackio extra 제거분만
 tests/test_report.py
 tests/test_pods.py
 tests/contract/test_record_report.py    마커 5개 제거만
@@ -138,9 +137,12 @@ Phase 0 의 18파드가 그 축을 모델당 여섯 갈래로 쪼갰는데 가�
 - `config-consumed` 오탐 2건: `scripts/prepare_data.py` 가 `data = config.data` 별칭으로 읽어서
   탐지기가 못 본다(`audit_plan.py:103` 이 이 한계를 문서화해 두었다). 호출부 4줄.
   **수가 실제 구멍보다 2 크면 진짜 미소비 knob 이 목록에 묻힌다**
-- trackio 제거(결정 3): `configs/run/*.yaml` 4개 + `pyproject.toml` 의 `tracking` extra.
-  스키마 쪽은 **measure 레인**이 뺀다. **경계에서 맞춘다** — 한쪽만 빠지면 config 합성이 깨진다.
-  `.plans/notes/report.md` 에 무엇을 뺐는지 적는다
+- trackio 제거(결정 3): **네 몫은 `configs/run/*.yaml` 4개뿐이다.**
+  스키마 쪽은 **measure 레인**이 뺀다 — **경계에서 맞춘다**, 한쪽만 빠지면 config 합성이 깨진다.
+  루트 `pyproject.toml` 의 `tracking` extra 는 **통합자 전용**이다(`uv.lock` 재해석을
+  `env-locks`/`doc-commands` 가 검사하고, 이 호스트에서 재해석할 수 없는 lock 이 여섯 중
+  다섯이다). **`.plans/notes/report.md` 에 "루트 pyproject.toml 의 tracking extra 제거"라고
+  적어 넘긴다.** 직접 지우지 않는다
 - `gradcache` 죽은 핀: `envs/native/pyproject.toml` 이 고정하는데 import 0건이고
   `axes._loss` 의 `gradcache_backward` 는 손으로 짠 것이다. `optim=muon` 이 세운 원칙
   ("라이브러리를 쓰고 손으로 짜지 않는다")과 어긋난다.

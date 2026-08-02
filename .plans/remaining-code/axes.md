@@ -47,9 +47,31 @@ wave 0/1 이 파일을 바꿨을 수 있다.
 
 - **`kernel=fla` 는 코드 작업이 아니다.** qwen3_5 + CUDA + causal_conv1d 면 자동 통과한다.
   이미지/파드 문제다
-- **`kernel=liger` 의 qwen3_5 엔트리포인트 철자가 검증되지 않았다** — `axes.py` 가 스스로
-  그렇게 적어두었다. `.plans/research/axis-libraries.md` 가 답했으면 쓰고,
-  못 했으면 **파드 질문으로 등록한다.** 지어내지 않는다
+- **`kernel=liger` 의 엔트리포인트 철자는 리서치가 확정했다** — 그리고 `LIGER_ENTRYPOINTS`
+  표가 **두 군데 틀렸다**고 보고했다. `.plans/research/axis-libraries.md §1` 을 읽고,
+  거기 인용된 원문을 **네가 직접 열어 확인한 뒤** 고친다
+
+## 리서치가 바꾼 것 — 읽기 전에 이것부터
+
+`.plans/research/axis-libraries.md §8` 의 표가 축 값마다 "이 호스트에서 구현 검증 가능 /
+이미지 필요 / GPU 필요"를 갈라 놓았다. 두 가지가 이 레인의 완료 조건을 바꾼다.
+
+**1. `precision=mxfp8`/`nvfp4` 는 하드웨어가 없어서 못 켠다.**
+리서치 §6.4: mxfp8 은 **compute capability 10.x 전용**, nvfp4 는 **CC ≥ 10.0 전용**이고
+**지원 검사 자체가 없다**(CC 미만에서 진입하면 무엇이 일어나는지도 미확인).
+이 스터디의 파드는 A100 이다. RunPod 에서 CC 10.x 를 확보할 수 있는지는 **확인 안 함**이며
+리서치가 파드 질문 9번으로 등록했다.
+
+→ **`precision` 그룹이 단일값으로 남을 수 있고, 그것은 코드 결함이 아니라 하드웨어 사실이다.**
+그 둘을 뭉개지 않는다. 구현은 하되(recipe 컨텍스트는 열 수 있다), `axis-values` 가 그것을
+여전히 단일값으로 세면 **그 이유를 코드 미구현이 아니라 하드웨어로 기록**하고
+`.plans/notes/axes.md` 에 적어 넘긴다. 이 저장소는 note 가 "어느 레인 소관"이 아니라
+**"그 구멍의 결과"** 를 적어야 한다는 규칙을 이미 갖고 있다(`HAZARDS.md §3`).
+
+**2. `kernel=kernels_hub` 는 이미 다른 이유로도 죽어 있다.**
+리서치 §3.1: `envs/native` 의 `kernels` 핀 0.16.0 을 transformers 5.14.1 이 거부한다.
+결정 6(축 값을 버린다)은 그대로이되, **이유가 하나 더 있고 그것이 독립적이다.**
+제거 사유를 기록할 때 둘 다 적는다.
 
 ## `kernel=kernels_hub` 를 제거한다 (결정 6)
 
@@ -86,6 +108,10 @@ bitsandbytes / deepspeed / Transformer Engine / DALI 중 **어느 것도 이 호
 
 1. `axis-values` 의 단일값 그룹이 0 →
    `infisical run --env=dev -- uv run python scripts/audit_plan.py`
+   **예외**: `precision` 이 하드웨어 이유(CC 10.x 부재)로 단일값으로 남을 수 있다.
+   남으면 그것을 **미구현이 아니라 하드웨어로** 기록하고 `.plans/notes/axes.md` 에 넘긴다.
+   남은 이유를 코드 미구현으로 적으면 그것이 이 저장소가 아홉 번 겪은 "note 가 blocker 를
+   가린" 모양이다
 2. **축 값마다** 적용 지점을 비우면 `axis-values` 가 그 값을 이름으로 지목한다.
    감사가 공허해지지 않는 것을 실증한다. **축마다 mutation 출력 인용**
 3. `kernels_hub` 가 config 에서 제거되고 이유가 기록됐다.

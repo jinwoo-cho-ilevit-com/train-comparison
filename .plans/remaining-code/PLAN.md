@@ -133,7 +133,7 @@ documented_entry_point`. split 은 앞의 셋만 채우고 나머지는 `None`/�
 |---|---|
 | **capture** | `trainbench/applied.py`, `tests/test_applied.py`, `tests/contract/test_applied_axes.py`(마커 제거만) |
 | **measure** | `trainbench/metrics/`, `trainbench/config_schema.py`, `tests/test_metrics.py`, `tests/test_config.py`, `tests/test_data.py` |
-| **report** | `scripts/report.py`, `scripts/orchestrate.py`, `scripts/prepare_data.py`, `docker/entrypoint.sh`, `configs/run/`, `tests/test_report.py`, `tests/test_pods.py`, `tests/contract/test_record_report.py`(마커 제거만), `docs/open-verdicts.json`(항목 1개만) |
+| **report** | `scripts/report.py`, `scripts/orchestrate.py`, `scripts/prepare_data.py`, `docker/entrypoint.sh`, `configs/run/`, `tests/test_report.py`, `tests/test_pods.py`, `tests/contract/test_record_report.py`(마커 제거만), `docs/open-verdicts.json`(항목 1개만). **루트 `pyproject.toml` 은 아니다** — trackio extra 제거는 노트로 넘긴다 |
 | **probe** | `trainbench/probe/steps.py`, `trainbench/probe/sentence_transformers.py`, `trainbench/probe/tevatron.py`, `tests/test_probe.py` |
 | **kernels** | ⊕`trainbench/kernels.py`, ⊕`tests/test_kernels.py`, `docs/methodology.md` |
 
@@ -219,7 +219,12 @@ infisical run --env=dev -- uv run python scripts/env_report.py \
 - 모든 레인의 완료 조건 충족 → 각 레인 브리프
 - `pytest tests/contract -q` → **122 passed, 0 xfailed**
 - 네 게이트 통과
-- `axis-values` 단일값 그룹 0 / `config-consumed` 0
+- `config-consumed` 0
+- `axis-values` 단일값 그룹 0 — **단 `precision` 은 예외일 수 있다.**
+  리서치가 확정했다: `mxfp8` 은 compute capability 10.x 전용, `nvfp4` 는 CC ≥ 10.0 전용이고
+  이 스터디의 파드는 A100 이다 (`.plans/research/axis-libraries.md §6.4`).
+  RunPod 에서 CC 10.x 를 확보할 수 있는지는 **확인 안 함**. 남는다면 그것은 **코드 결함이
+  아니라 하드웨어 사실**이고, 그 구별이 baseline note 에 그대로 적혀야 한다
 - `verdicts-closed` **2 open** (파드 판정 둘)
 - 리뷰(micro 9 + macro 4) → 적대적 검증 → 수정 → 재검증 완료
 - `[pod]` Phase 0 18/18 → verdict: ____ by: ____ at: ____
