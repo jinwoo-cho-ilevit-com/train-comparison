@@ -20,6 +20,10 @@ What it pins, and why each one is a way to be wrong silently:
   corpus cannot be reported as an image run.
 * `cu_seqlens` is present exactly when the batch is packed. It is what selects the
   pooling; absent-but-packed pools the wrong positions and still reports a number.
+* A pack's boundaries reach two kernels by two different names, and each is judged
+  on its own gate: the varlen four all together for attention, `seq_idx` alone for
+  the causal conv. One rule over both would let either group's absence pass as the
+  other group's shape.
 * Units hold: a field named `tokens` is always a token count, never a row count.
 * `tensors` is exactly `model(**tensors)` and carries no accounting number and no
   packing boundary.
@@ -55,7 +59,13 @@ COUNTER_NAMES = tuple(
     field["name"] for field in FIELDS if field["type"] == "int" and field["required"]
 )
 BOUNDARY_KEYS = tuple(SPEC["packing_boundary_keys"])
-MAY_ADD = tuple(SPEC["tensors_may_add"])
+# Two groups, one gate each. `varlen_attention` is all-or-nothing because
+# transformers reads the four together; `packed_conv` is judged on its own
+# invariants, and holding it to the varlen rule is what would make a `qwen3_vl`
+# pack — four kwargs, no conv to isolate — read as a partial varlen set.
+VARLEN_KWARGS = tuple(SPEC["tensors_may_add"]["varlen_attention"])
+PACKED_CONV_KWARGS = tuple(SPEC["tensors_may_add"]["packed_conv"])
+MAY_ADD = VARLEN_KWARGS + PACKED_CONV_KWARGS
 PAD_ID = SPEC["pad_id"]
 
 # Where the payload may be defined, in the order lane-d moves it. `scripts/bench.py`
@@ -317,10 +327,10 @@ def test_every_invariant_holds_for_a_real_batch(case: str):
         "names. model(**tensors) would reject them, and a count sent to the device would be "
         "read back inside the timed window."
     )
-    present = [name for name in MAY_ADD if tensors.get(name) is not None]
-    assert len(present) in (0, len(MAY_ADD)), (
+    present = [name for name in VARLEN_KWARGS if tensors.get(name) is not None]
+    assert len(present) in (0, len(VARLEN_KWARGS)), (
         f"{case}.tensors carries {present} of the varlen kwargs. transformers takes the varlen "
-        f"path only when all of {list(MAY_ADD)} are non-None, so a partial set is a padded "
+        f"path only when all of {list(VARLEN_KWARGS)} are non-None, so a partial set is a padded "
         "forward pass reported as a packed one."
     )
 
@@ -355,6 +365,38 @@ def test_every_invariant_holds_for_a_real_batch(case: str):
         assert bool((offsets[1:] > offsets[:-1]).all()), "cu_seqlens must strictly increase"
     else:
         assert produced.rows == int(input_ids.shape[0])
+
+    # The conv half of a pack's isolation, on its own gate. `Qwen3_5GatedDeltaNet`
+    # hands `causal_conv1d_fn` nothing but `seq_idx`, so none of the rules above
+    # say anything about whether the convolution stays inside a sequence.
+    marks = tensors.get("seq_idx")
+    assert (marks is not None) is packed, (
+        f"{case}: seq_idx is present exactly when the batch is packed. Absent-but-packed lets "
+        "the causal conv of arch=qwen3_5 run its receptive field across every sequence "
+        "boundary in the pack, and present-but-padded names segments the rectangle has not got."
+    )
+    if packed:
+        assert marks.dtype == torch.int32, (
+            f"{case}: seq_idx is {marks.dtype}; TransformersKwargs declares torch.IntTensor "
+            "(transformers/utils/generic.py:839)"
+        )
+        assert marks.shape == input_ids.shape, (
+            f"{case}: seq_idx is {list(marks.shape)} and input_ids is {list(input_ids.shape)}. "
+            "It is one index per token slot; any other shape indexes tokens it does not have."
+        )
+        row = marks[0]
+        assert int(row[0]) == 0
+        assert bool((row[1:] >= row[:-1]).all()), "seq_idx must not decrease along the pack"
+        assert int(row[-1]) == produced.rows - 1, (
+            f"{case}: seq_idx ends at {int(row[-1])} and the pack holds {produced.rows} "
+            "sequences; the last sequence would be merged into the one before it."
+        )
+        changes = (row[1:] != row[:-1]).nonzero().flatten() + 1
+        assert changes.tolist() == produced.cu_seqlens[1:-1].tolist(), (
+            f"{case}: seq_idx changes at {changes.tolist()} and the pack's boundaries are "
+            f"{produced.cu_seqlens[1:-1].tolist()}. The conv would be cut somewhere no "
+            "sequence begins, which isolates the wrong thing and still raises nothing."
+        )
 
     # Images.
     if produced.images_per_row is None:

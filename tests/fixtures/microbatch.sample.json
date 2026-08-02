@@ -33,12 +33,18 @@
     "cu_seqlens",
     "seq_lengths"
   ],
-  "tensors_may_add": [
-    "cu_seq_lens_q",
-    "cu_seq_lens_k",
-    "max_length_q",
-    "max_length_k"
-  ],
+  "why_tensors_may_add_is_grouped": "the keys a collate may put into tensors beyond the ones frozen per payload, split by the kernel each group gates. varlen_attention is all-or-nothing: modeling_flash_attention_utils.py:761-763 takes the varlen path only on all(kwarg is not None for kwarg in (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k)), so three of four is a dense forward pass reported as a packed one. packed_conv is not part of that rule: Qwen3_5GatedDeltaNet passes seq_idx and nothing else to causal_conv1d_fn (modeling_qwen3_5.py:492-499), so it is a separate gate on a separate kernel and holding it to the varlen four would make either group's absence look like the other's. The two were one flat list until seq_idx was added, which is why the groups exist.",
+  "tensors_may_add": {
+    "varlen_attention": [
+      "cu_seq_lens_q",
+      "cu_seq_lens_k",
+      "max_length_q",
+      "max_length_k"
+    ],
+    "packed_conv": [
+      "seq_idx"
+    ]
+  },
   "fields": [
     {
       "name": "tensors",
@@ -119,7 +125,12 @@
     "images_per_row is null, or len(images_per_row) == rows and sum(images_per_row) == images",
     "no key of tensors is an accounting field name or a packing boundary name",
     "every accounting field is an int, never a rate: the payload carries counters and the measurement side computes tokens/sec from them",
-    "of the varlen kwargs in tensors_may_add, either all four are present or none are (transformers takes the fast path only when all four are non-None)"
+    "of tensors_may_add.varlen_attention, either all four are present or none are (transformers takes the fast path only when all four are non-None)",
+    "tensors_may_add.packed_conv is outside that rule: seq_idx gates its own kernel and is judged by the four lines below alone",
+    "seq_idx is in tensors if and only if the batch is packed",
+    "seq_idx is int32 and has exactly the shape of tensors['input_ids'] -- one index per token slot",
+    "seq_idx[0] starts at 0, never decreases, and ends at rows - 1",
+    "seq_idx[0] changes value exactly at the cu_seqlens boundaries, so the segments it marks are the pack's sequences and not some other cut"
   ],
   "payloads": {
     "padded_multimodal": {
@@ -236,6 +247,13 @@
             "shape": [1, 35],
             "values": [
               [0, 1, 2, 3, 4, 0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 0, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6]
+            ]
+          },
+          "seq_idx": {
+            "dtype": "int32",
+            "shape": [1, 35],
+            "values": [
+              [0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 5, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7]
             ]
           }
         },

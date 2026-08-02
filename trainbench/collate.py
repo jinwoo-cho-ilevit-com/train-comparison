@@ -29,13 +29,18 @@ from trainbench.prompt import format_prompt
 # belongs.
 MMEB_IMAGE_MARKER = re.compile(r"<\|image_\d+\|>")
 
-# The pack's boundaries under the names `model(**tensors)` reads them by. They are
-# `TransformersKwargs` members (`transformers/utils/generic.py:800-839`) and the
-# only keys a collate may add to `tensors`
+# The pack's boundaries under the names `model(**tensors)` reads them by. All of
+# these are `TransformersKwargs` members (`transformers/utils/generic.py:800-839`),
+# and together they are the keys a collate may add to `tensors`
 # (`tests/fixtures/microbatch.sample.json:tensors_may_add`). The two spellings in
 # `axes.PACKED_BOUNDARY_KEYS` carry the same boundaries and the model does reject
 # those, which is why they are lifted out and these put in.
+#
+# Two groups, because they gate two different kernels and are not all-or-nothing
+# with each other: the varlen four reach attention, `seq_idx` reaches the causal
+# conv of `arch=qwen3_5`'s linear-attention layers.
 VARLEN_KWARGS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+SEQ_IDX_KWARGS = ("seq_idx",)
 
 
 class MicroBatch(NamedTuple):
@@ -416,8 +421,8 @@ class PackedBatches:
     tokens and images that batch stood for. The boundary vectors are lifted out of
     the batch here rather than in the step, so what stays in `tensors` is exactly
     what `model(**tensors)` takes — and put back under the names the model does
-    read them by (`varlen_kwargs`), which is the only place a pack's boundaries
-    reach attention.
+    read them by (`varlen_kwargs` for attention, `seq_idx_kwargs` for the causal
+    conv), which is the only place a pack's boundaries reach either kernel.
 
     `axis_packing` is **read off the wrapped collate**, never declared again. A
     second declaration is a second answer to the question
@@ -446,6 +451,7 @@ class PackedBatches:
         boundaries = {key: batch.pop(key) for key in axes.PACKED_BOUNDARY_KEYS}
         total = int(batch["input_ids"].numel())
         batch.update(varlen_kwargs(boundaries["cu_seqlens"], boundaries["seq_lengths"]))
+        batch.update(seq_idx_kwargs(boundaries["seq_lengths"]))
         return MicroBatch(
             tensors=batch,
             tokens=total,
@@ -485,10 +491,7 @@ def varlen_kwargs(cu_seqlens: torch.Tensor, seq_lengths: torch.Tensor) -> dict[s
     here would be a second place a pack's isolation could be lost by editing a
     config field that names no attention.
 
-    The conv half of that arch is **not** closed here: `causal_conv1d_fn` takes
-    `seq_idx` (`modeling_qwen3_5.py:492-499`) and convolves across boundaries
-    without it. `seq_idx` is not among the keys the collate-metrics fixture allows
-    in `tensors`, so it is a boundary request rather than a line of code.
+    The conv half of the same arch is `seq_idx_kwargs` below, on its own gate.
 
     `max_length_*` stay Python ints. `to_device` passes non-tensors through
     untouched, so a 0-dim tensor here would be a host-to-device round trip inside
@@ -499,6 +502,39 @@ def varlen_kwargs(cu_seqlens: torch.Tensor, seq_lengths: torch.Tensor) -> dict[s
         "cu_seq_lens_k": cu_seqlens,
         "max_length_q": int(seq_lengths.max()),
         "max_length_k": int(seq_lengths.max()),
+    }
+
+
+def seq_idx_kwargs(seq_lengths: torch.Tensor) -> dict[str, Any]:
+    """Which sequence of the pack each token belongs to, for the causal conv.
+
+    The varlen four never reach `arch=qwen3_5`'s conv. `Qwen3_5GatedDeltaNet` calls
+    `causal_conv1d_fn(..., seq_idx=kwargs.get("seq_idx"))`
+    (`modeling_qwen3_5.py:492-499`) and that argument alone is what stops the
+    convolution's receptive field from running over a sequence boundary — a
+    different kernel from the one `varlen_kwargs` gates, so the two are not
+    all-or-nothing with each other and the fixture groups them apart.
+
+    One int32 index per token, shaped like `input_ids`. That is the form the only
+    pinned implementation of the semantics reads: `Lfm2ShortConv.slow_forward`
+    takes `seq_idx[0]`, cuts at `si[1:] != si[:-1]` and convolves each segment on
+    its own (`modeling_lfm2.py:383-396`).
+
+    Emitted for every packed batch rather than for `arch=qwen3_5` alone, for the
+    reason `varlen_kwargs` gives: an arch switch here is a second place a pack's
+    isolation can be lost by editing a config field that names no attention.
+    Measured 2026-08-03 on CPU, this checkout — `Qwen3_5TextModel`,
+    `Qwen3VLTextModel` and `Gemma4TextModel` all accept it on a packed forward and
+    return byte-identical hidden states with and without it. Identical is what a
+    host without `causal-conv1d` can show: the fallback branch
+    (`modeling_qwen3_5.py:500-501`) has no `seq_idx` argument at all, so whether
+    the real kernel honours the boundaries is a pod question.
+    """
+    counts = seq_lengths.to(torch.long)
+    return {
+        "seq_idx": torch.repeat_interleave(
+            torch.arange(counts.numel(), dtype=torch.int32), counts
+        ).unsqueeze(0)
     }
 
 
