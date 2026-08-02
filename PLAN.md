@@ -429,6 +429,7 @@ train-comparison/
 │   ├── seed.py                # 시드 단일 헬퍼
 │   ├── record.py              # run 기록 + 원자적 쓰기
 │   ├── embedding.py           # 풀링 + InfoNCE
+│   ├── prompt.py              # 모델의 prompt_format을 읽는 유일한 지점
 │   ├── axes.py                # 축을 켜는 유일한 지점
 │   ├── applied.py             # 켜졌는지 읽는 유일한 지점
 │   ├── pods.py                # RunPod pod 수명주기
@@ -456,6 +457,7 @@ train-comparison/
 │   ├── test_metrics.py
 │   ├── test_pods.py
 │   ├── test_probe.py
+│   ├── test_prompt.py
 │   ├── test_report.py
 │   └── test_smoke_cpu.py
 ├── docker/                    # Dockerfile.base + Dockerfile.framework + entrypoint
