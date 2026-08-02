@@ -1,0 +1,108 @@
+{
+  "contract": "kernel-provenance",
+  "schema_version": 1,
+  "note": "Synthetic samples, not measured. No GPU pod has produced a kernel fingerprint from this repository, so the revisions below are well-formed placeholders and none of them names a kernel that was observed to bind. What is frozen here is the shape; the values arrive from a run.",
+  "samples": {
+    "sdpa_builtin_gemma4": {
+      "requested": {
+        "axis": "attn.name",
+        "value": "sdpa",
+        "attn_implementation": "sdpa"
+      },
+      "resolved": {
+        "attn_implementation": "sdpa",
+        "identity": {
+          "source": "builtin",
+          "package": "transformers",
+          "package_version": "5.14.1",
+          "repo_id": null,
+          "requested_ref": null,
+          "revision": null
+        },
+        "mask_registered": true,
+        "mask_registry": "transformers.masking_utils.AttentionMaskInterface"
+      },
+      "backbones": {
+        "audio_config": {
+          "attn_implementation": "sdpa",
+          "mask_registered": true,
+          "requested": true
+        },
+        "text_config": {
+          "attn_implementation": "sdpa",
+          "mask_registered": true,
+          "requested": true
+        },
+        "vision_config": {
+          "attn_implementation": "sdpa",
+          "mask_registered": true,
+          "requested": true
+        }
+      }
+    },
+    "fa2_hub_fallback_qwen3_vl": {
+      "requested": {
+        "axis": "attn.name",
+        "value": "fa2",
+        "attn_implementation": "flash_attention_2"
+      },
+      "resolved": {
+        "attn_implementation": "kernels-community/flash-attn2",
+        "identity": {
+          "source": "hub",
+          "package": null,
+          "package_version": null,
+          "repo_id": "kernels-community/flash-attn2",
+          "requested_ref": "version=1",
+          "revision": "0000000000000000000000000000000000000000"
+        },
+        "mask_registered": true,
+        "mask_registry": "transformers.masking_utils.AttentionMaskInterface"
+      },
+      "backbones": {
+        "text_config": {
+          "attn_implementation": "kernels-community/flash-attn2",
+          "mask_registered": true,
+          "requested": true
+        },
+        "vision_config": {
+          "attn_implementation": "sdpa",
+          "mask_registered": true,
+          "requested": false
+        }
+      }
+    },
+    "fa3_hub_kernel_mask_unregistered_qwen3_vl": {
+      "requested": {
+        "axis": "attn.name",
+        "value": "fa3",
+        "attn_implementation": "flash_attention_3"
+      },
+      "resolved": {
+        "attn_implementation": "kernels-community/vllm-flash-attn3",
+        "identity": {
+          "source": "hub",
+          "package": null,
+          "package_version": null,
+          "repo_id": "kernels-community/vllm-flash-attn3",
+          "requested_ref": "@main",
+          "revision": "1111111111111111111111111111111111111111"
+        },
+        "mask_registered": false,
+        "mask_registry": "transformers.masking_utils.AttentionMaskInterface"
+      },
+      "backbones": {
+        "text_config": {
+          "attn_implementation": "kernels-community/vllm-flash-attn3",
+          "mask_registered": false,
+          "requested": true
+        },
+        "vision_config": {
+          "attn_implementation": "sdpa",
+          "mask_registered": true,
+          "requested": false
+        }
+      }
+    }
+  }
+}
