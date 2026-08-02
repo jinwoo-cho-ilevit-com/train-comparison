@@ -1322,11 +1322,18 @@ def _deepspeed(model: Any, optimizer: Any, config: BenchConfig) -> tuple[Any, li
     `initialize` returns.** deepspeed returns its own wrapper around it, whose
     class name is neither `AdamW` nor anything `applied.OPTIM_CLASS_AXIS` names, so
     recording it would report `optim.name` as `deepspeedzerooptimizer` and block
-    every ZeRO run on an axis that has nothing to do with ZeRO. What steps is still
-    this instance — deepspeed's wrapper holds it and delegates — and the engine on
-    `Built.model` is what carries the ZeRO evidence. That the record shows only one
-    of the two layers is a gap on the capture side, written up in
-    `.plans/notes/axes.md`.
+    every ZeRO run on an axis that has nothing to do with ZeRO.
+
+    **What that instance's `step()` does under ZeRO is 확인 안 함.** Nothing in
+    this repository calls `engine.backward` or `engine.step`: the measured loop
+    runs `loss.backward()` and `built.optimizer.step()` on the instance handed in
+    here (`scripts/bench.py`), so the forward is the only part of a ZeRO run that
+    provably goes through the engine. Whether the rest is a partitioned step is a
+    claim about deepspeed, which no environment on this side installs, and it is
+    not made here — the pod answers it. Until it does, a ZeRO row is certified
+    from `engine._config` and measured through a plain torch step.
+    `tests/test_axes.py::test_the_measured_step_never_drives_the_engine` holds
+    that gap open; driving the engine from the loop is what closes it.
 
     **Offload needs a stage, and the stage is `parallel.strategy`.** `offload_optimizer`
     and `offload_param` are sections of `zero_optimization`, so there is no offload

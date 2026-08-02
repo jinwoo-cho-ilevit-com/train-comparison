@@ -2062,6 +2062,23 @@ def test_a_sharding_strategy_over_one_rank_is_the_single_gpu_run(composed, monke
         axes.assemble(plain_model(), config, CPU, framework="native")
 
 
+def ddp_recorder(monkeypatch) -> dict:
+    """The DDP stand-in, keeping the argument instead of discarding it.
+
+    The wrapper is not what these tests are about — what is, is the one argument
+    `_parallel` derives — and the lambda that used to stand in for it took
+    `device_ids` only to drop it, so every derivation read the same.
+    """
+    seen: dict = {}
+
+    def stub(module, device_ids=None):
+        seen["device_ids"] = device_ids
+        return DistributedDataParallel(module)
+
+    monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", stub)
+    return seen
+
+
 def test_ddp_wraps_the_model_and_reads_back_as_ddp(composed, monkeypatch):
     """The whole pair in one run: `_parallel` builds the wrapper and
     `applied._capture_parallel_strategy` finds it by class name. The wrapper is
@@ -2069,16 +2086,62 @@ def test_ddp_wraps_the_model_and_reads_back_as_ddp(composed, monkeypatch):
     capture while proving nothing about what this module builds."""
     world_of(monkeypatch, 2)
     config = bench(composed, **{"parallel.strategy": "ddp"})
-    monkeypatch.setattr(
-        torch.nn.parallel,
-        "DistributedDataParallel",
-        lambda module, device_ids=None: DistributedDataParallel(module),
-    )
+    ddp_recorder(monkeypatch)
 
     built, names = axes.assemble(plain_model(), config, CPU, framework="native")
 
     assert "parallel.strategy" in names
     assert axis(capture(built, config), "parallel.strategy").applied == "ddp"
+
+
+class IndexedParameter(torch.nn.Parameter):
+    """A parameter that reports a device with an index, on a host that has none.
+
+    Only the report is faked: `_parallel` reads `p.device` and nothing else, so
+    this is the input to the derivation rather than a stand-in for the derivation.
+    CPU tensors carry `index=None` however they are allocated
+    (`torch.zeros(2, device=torch.device("cpu", 0)).device.index is None`), which
+    is why the indexed half cannot be reached with a real device here.
+    """
+
+    INDEX = 3
+
+    @property
+    def device(self):
+        return torch.device("cuda", self.INDEX)
+
+
+def test_the_ddp_replica_is_pinned_to_the_device_its_parameters_are_on(composed, monkeypatch):
+    """A guessed index would put every rank's replica on device 0 — the harm the
+    comment at the derivation claims to prevent, and until now the only thing
+    saying so. `ids = [0]` left the whole suite green."""
+    world_of(monkeypatch, 2)
+    seen = ddp_recorder(monkeypatch)
+    model = plain_model()
+    model[0].weight = IndexedParameter(model[0].weight.data)
+    config = bench(composed, **{"parallel.strategy": "ddp"})
+
+    axes.assemble(model, config, CPU, framework="native")
+
+    assert seen["device_ids"] == [IndexedParameter.INDEX]
+
+
+def test_a_cpu_replica_is_wrapped_without_device_ids(composed, monkeypatch):
+    """The other half, and the one this host can answer for real. torch refuses
+    `device_ids` for a module on CPU — `self.device_type == "cpu"` with a truthy
+    `device_ids` is a `ValueError`
+    (`torch/nn/parallel/distributed.py:932-946`, torch 2.13.0, read in this
+    worktree's install) — so `[None]`, which is what dropping the index check
+    produces, would not wrap a CPU run at all."""
+    world_of(monkeypatch, 2)
+    seen = ddp_recorder(monkeypatch)
+    config = bench(composed, **{"parallel.strategy": "ddp"})
+
+    assert next(plain_model().parameters()).device.index is None
+
+    axes.assemble(plain_model(), config, CPU, framework="native")
+
+    assert seen["device_ids"] is None
 
 
 def test_fsdp2_shards_in_place_and_the_capture_reads_it_off_the_mro(composed, monkeypatch):
@@ -2143,12 +2206,31 @@ def test_fsdp1s_wrapper_is_named_rather_than_reported_as_the_axis_value(composed
 
 class DeepSpeedEngine(torch.nn.Module):
     """Named for what `applied.PARALLEL_WRAPPERS` matches on, and answering the
-    three readers `applied.zero_stage`/`offload_targets` call."""
+    three readers `applied.zero_stage`/`offload_targets` call.
+
+    `forward`, `backward` and `step` are the engine's own step surface. The
+    forward delegates so a run can be driven through this object; the other two
+    only record, because what they log is the question — nothing here knows what
+    deepspeed's do, and this file imports no deepspeed to ask.
+    """
 
     def __init__(self, module, config):
         super().__init__()
         self.module = module
         self.ds_config = config
+        self.driven: list[str] = []
+        self.forwards = 0
+
+    def forward(self, *args, **kwargs):
+        self.forwards += 1
+        return self.module(*args, **kwargs)
+
+    def backward(self, loss):
+        self.driven.append("backward")
+        loss.backward()
+
+    def step(self):
+        self.driven.append("step")
 
     def zero_optimization_stage(self):
         return self.ds_config["zero_optimization"]["stage"]
@@ -2212,11 +2294,52 @@ def test_zero_hands_deepspeed_the_stage_and_the_offload_sections(
     assert axis(state, "train.offload").applied == offload
 
 
+def test_the_batch_deepspeed_is_told_about_is_the_one_the_loop_feeds(composed, monkeypatch):
+    """`grad_accum > 1`, which no composed config in this repository sets: with it
+    at 1 the micro batch and the total batch are the same number, so the assertion
+    above holds equally against `batch_size * grad_accum` — and deepspeed would
+    derive a `train_batch_size` `grad_accum * world_size` too large, partitioning
+    and accumulating for a workload no config asked for.
+
+    The other two keys were asserted by nothing at all. `gradient_accumulation_steps`
+    is what tells deepspeed where a step boundary is, and the loop feeds
+    `config.train.grad_accum` micro-batches between `optimizer.step()` calls
+    (`scripts/bench.py`); hardcoding 1 makes every micro-batch a step to the engine
+    and none to the harness. `bf16` is the numeric regime, and dropping it leaves a
+    run labelled `precision=bf16` on deepspeed's default — which
+    `applied._capture_precision` cannot see, because it reads the weights' dtype
+    and the weights are bf16 either way.
+    """
+    world_of(monkeypatch, 2)
+    calls = install_deepspeed(monkeypatch)
+    config = bench(composed, **{"parallel.strategy": "zero2", "train.grad_accum": 4})
+
+    axes.assemble(plain_model(), config, CPU, framework="native")
+
+    handed = calls[0]["config"]
+    assert config.train.grad_accum == 4
+    assert handed["train_micro_batch_size_per_gpu"] == config.train.batch_size
+    assert handed["train_micro_batch_size_per_gpu"] != (
+        config.train.batch_size * config.train.grad_accum
+    )
+    assert handed["gradient_accumulation_steps"] == config.train.grad_accum
+    assert handed["bf16"] == {"enabled": True}
+    # The whole dict, so a key added here has to be said out loud: `optimizer` and
+    # `training_data` are absent on purpose and the two tests below say why.
+    assert set(handed) == {
+        "train_micro_batch_size_per_gpu",
+        "gradient_accumulation_steps",
+        "zero_optimization",
+        "bf16",
+    }
+
+
 def test_the_optimizer_on_built_is_the_one_deepspeed_was_given(composed, monkeypatch):
     """deepspeed returns its own wrapper around it, and recording that would report
     `optim.name` as the wrapper's class — blocking every ZeRO run on an axis that
-    has nothing to do with ZeRO. The engine on `Built.model` is what carries the
-    ZeRO evidence, so nothing is lost by keeping the algorithm here."""
+    has nothing to do with ZeRO. What the wrapper does with this instance is
+    확인 안 함 and is the test below's subject; what is settled here is only which
+    of the two `optim.name` is read off."""
     world_of(monkeypatch, 2)
     calls = install_deepspeed(monkeypatch)
     config = bench(composed, **{"parallel.strategy": "zero2"})
@@ -2225,6 +2348,55 @@ def test_the_optimizer_on_built_is_the_one_deepspeed_was_given(composed, monkeyp
 
     assert built.optimizer is calls[0]["optimizer"]
     assert axis(capture(built, config), "optim.name").applied == "adamw_unfused"
+
+
+def test_the_measured_step_never_drives_the_engine(composed, monkeypatch):
+    """The gap a ZeRO row rests on, frozen so it cannot be claimed shut by prose.
+
+    The real measured loop is run here — `scripts/bench.py::train`, the same entry
+    `tests/test_smoke_cpu.py` drives — over a `Built` that `assemble` produced with
+    both ZeRO axes on. The engine's forward is used, and its `backward`/`step` are
+    not: the loop issues `loss.backward()` and `built.optimizer.step()` on the
+    instance handed to `initialize`. So `parallel.strategy=zero2` and
+    `train.offload=optimizer` read back as applied off the engine's config while
+    the step that was timed is a plain single-process one.
+
+    That is why `axes._deepspeed` states no delegation. Wiring the loop to the
+    engine belongs to `scripts/bench.py`, and when it lands this test inverts —
+    `driven` becomes `["backward", "step"] * steps` — and the caveat in the
+    docstring comes off with it. Until then the number a pod would publish under
+    a ZeRO label is 확인 안 함, and nothing but this says so.
+    """
+    from .test_smoke_cpu import TinyEmbedder, bench_entry, micro_batch
+
+    world_of(monkeypatch, 2)
+    install_deepspeed(monkeypatch)
+    config = bench(
+        composed,
+        **{
+            "run.purpose": "probe",
+            "train.steps": 3,
+            "train.warmup_discard_steps": 1,
+            "train.batch_size": 2,
+            "data.limit": 8,
+            "parallel.strategy": "zero2",
+            "train.offload": "optimizer",
+        },
+    )
+
+    built, _ = axes.assemble(TinyEmbedder(), config, CPU, framework="native")
+    state = capture(built, config)
+    summary = bench_entry.train(built, [micro_batch(2) for _ in range(6)], config, CPU)
+
+    # Both axes certified, from the engine's config alone.
+    assert axis(state, "parallel.strategy").applied == "zero2"
+    assert axis(state, "train.offload").applied == "optimizer"
+    # And the steps that produced the number went through neither engine method.
+    # `forwards` is what keeps that from being the absence of a run: the engine was
+    # in the path for every micro-batch and was driven for none of them.
+    assert summary["steps_measured"] == 2
+    assert built.model.forwards == config.train.steps * config.train.grad_accum
+    assert built.model.driven == []
 
 
 def test_the_dataloader_is_ours_and_not_the_one_deepspeed_would_return(composed, monkeypatch):
