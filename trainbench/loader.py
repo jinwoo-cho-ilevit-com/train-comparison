@@ -22,7 +22,7 @@ from typing import Any, get_args
 import torch
 
 from trainbench import axes, kernels
-from trainbench.applied import FRAMEWORK_OWNABLE
+from trainbench.applied import FRAMEWORK_OWNABLE, AppliedMismatch
 from trainbench.config_schema import BenchConfig, FrameworkConfig, axis_knobs
 from trainbench.embedding import align_padding_side
 
@@ -46,6 +46,9 @@ UNVERIFIED = "확인 안 함"
 # The `attention` block of the build fingerprint, whose shape belongs to the
 # `kernel-provenance` boundary. `kernel.name` is a different axis.
 BUILD_FINGERPRINT_KEY = kernels.BUILD_FINGERPRINT_KEY
+# The key a run record carries the whole fingerprint under. Re-exported so the
+# producer here and the record writer name it in one place.
+RUN_RECORD_KEY = kernels.RUN_RECORD_KEY
 ROOT_MODULE = "model"
 # Root plus children plus grandchildren. Deeper is per-layer and grows with the
 # checkpoint; shallower cannot tell a wrapper (peft, DenseModel) from the backbone
@@ -54,9 +57,19 @@ MODULE_CLASS_DEPTH = 2
 
 ATTENTION_AXIS = "attn.name"
 
+# peft modes that make parameters trainable *after* this module is done: the
+# adapter is attached by `axes._peft`, inside `axes.assemble`.
+ADAPTER_ATTACHING_PEFT_MODES = ("lora", "qlora")
 
-class AdapterRefusal(RuntimeError):
-    """A framework built something this harness must not put a number on."""
+
+class AdapterRefusal(AppliedMismatch):
+    """A framework built something this harness must not put a number on.
+
+    An `AppliedMismatch` because that is the type `scripts/bench.py`'s `refusing()`
+    catches. A refusal outside its catch list leaves no result file at all, so a
+    build this harness declined would be published as a pod that crashed rather
+    than as a setting that was refused.
+    """
 
 
 # --- the boundary types -------------------------------------------------------
@@ -292,8 +305,24 @@ def fingerprint_diff(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[
     return diff
 
 
-def _refuse_a_build_the_fingerprint_condemns(
-    framework: str, fingerprint: Mapping[str, Any], context: StepContext | None
+def attaches_an_adapter_later(config: BenchConfig) -> bool:
+    """Whether something after the load still has to make parameters trainable.
+
+    unsloth freezes every parameter without a LoRA marker inside
+    `from_pretrained`, and the LoRA that unfreezes it is attached by `axes._peft`
+    inside `axes.assemble` — later than any load here. So a frozen build under
+    `peft.mode=lora`/`qlora` is the expected intermediate state, and the
+    frozen-graph refusal belongs to whoever holds the assembled model.
+    """
+    return config.peft.mode in ADAPTER_ATTACHING_PEFT_MODES
+
+
+def refuse_a_build_the_fingerprint_condemns(
+    framework: str,
+    fingerprint: Mapping[str, Any],
+    context: StepContext | None,
+    *,
+    adapter_attaches_later: bool = False,
 ) -> None:
     """The two states the fingerprint exists to stop, at the site that reads it.
 
@@ -301,10 +330,15 @@ def _refuse_a_build_the_fingerprint_condemns(
     and the backward pass survived it; axolotl leaves two modules in fp32 and
     upstream absorbs the difference in an autocast this harness has to be told
     about.
+
+    Public and re-callable so the deferred half has no second definition: the
+    caller that holds the model after `axes.assemble` runs this again with
+    `adapter_attaches_later=False`, and that call is what actually catches a LoRA
+    run whose adapter never attached.
     """
     dtypes = fingerprint["parameter_dtypes"]
     trainable = fingerprint["trainable_parameter_names"]
-    if not trainable:
+    if not trainable and not adapter_attaches_later:
         raise AdapterRefusal(
             f"{framework} built a model with no trainable parameter among "
             f"{len(dtypes)}; a step over a frozen graph still produces a number, and "
@@ -522,8 +556,11 @@ def describe(
 ) -> AdapterOut:
     """Fingerprint a built model and bind it to what its adapter declares."""
     fingerprint = build_fingerprint(model, config, **fingerprint_kwargs)
-    _refuse_a_build_the_fingerprint_condemns(
-        adapter.name, fingerprint, adapter.required_step_context
+    refuse_a_build_the_fingerprint_condemns(
+        adapter.name,
+        fingerprint,
+        adapter.required_step_context,
+        adapter_attaches_later=attaches_an_adapter_later(config),
     )
     return AdapterOut(
         framework=adapter.name,

@@ -19,9 +19,31 @@ import torch
 
 from trainbench.config_schema import BenchConfig
 from trainbench.embedding import info_nce
+from trainbench.loader import AdapterRefusal
 from trainbench.probe import steps
 from trainbench.probe.fixtures import PROBE_PAIRS
 from trainbench.probe.types import ProbeReport
+
+
+def processor_of(model: Any) -> Any:
+    """The HF processor ST loaded, which is not the `SentenceTransformer` itself.
+
+    `AdapterOut.processor` is called as an HF processor — `trainbench/collate.py`
+    does `processor(text=..., return_tensors=...)` and reads `chat_template` off
+    it — and `SentenceTransformer.forward(input, **kwargs)` answers neither.
+    ST holds the real one inside its first module and republishes it as
+    `.processor`/`.tokenizer` (sentence-transformers 5.6.1 base/model.py:1505,
+    :1524 -> base/modules/transformer.py:671, :902).
+    """
+    for name in ("processor", "tokenizer"):
+        found = getattr(model, name, None)
+        if found is not None:
+            return found
+    raise AdapterRefusal(
+        f"sentence_transformers built a {type(model).__name__} that publishes neither "
+        "'processor' nor 'tokenizer', so this harness has nothing to tokenise a batch "
+        "with; handing back the model itself would fail inside the first collate instead"
+    )
 
 
 def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any]) -> tuple[Any, Any]:
@@ -29,8 +51,7 @@ def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any])
 
     `model_kwargs` is forwarded to `AutoModel.from_pretrained` on the torch
     backend, so this is one of the two paths where a load-time axis can be
-    honoured. The model is its own processor: ST tokenises inside its first
-    module rather than through a separate object.
+    honoured.
     """
     from sentence_transformers import SentenceTransformer
 
@@ -40,7 +61,7 @@ def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any])
         revision=config.model.revision,
         model_kwargs=load_kwargs,
     )
-    return model, model
+    return model, processor_of(model)
 
 
 def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:

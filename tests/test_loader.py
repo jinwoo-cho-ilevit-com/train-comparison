@@ -9,6 +9,7 @@ framework actually loads a checkpoint is a pod question and is recorded as one i
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.util
 import json
@@ -203,6 +204,28 @@ def test_fingerprint_catches_a_fully_frozen_build(config):
     assert loader.build_fingerprint(frozen, config)["trainable_parameter_names"] == []
     with pytest.raises(loader.AdapterRefusal, match="no trainable parameter"):
         loader.describe(loader.ADAPTERS["native"], frozen, object(), config)
+
+
+def test_a_frozen_build_is_the_state_lora_has_not_attached_to_yet(config):
+    """Every unsloth LoRA run died on the intermediate state the harness makes.
+
+    `FastVisionModel.from_pretrained(full_finetuning=False)` freezes every
+    parameter without a LoRA marker, and `axes._peft` attaches the LoRA inside
+    `axes.assemble` — after this module. Refusing the frozen build at load time
+    took out half the full-vs-LoRA comparison for one of six frameworks.
+    """
+    lora = to_bench_config(compose_bench("peft=lora"))
+    frozen = _Build()
+    frozen.requires_grad_(False)
+
+    assert loader.attaches_an_adapter_later(lora)
+    assert not loader.attaches_an_adapter_later(config)
+    out = loader.describe(loader.ADAPTERS["unsloth"], frozen, object(), lora)
+    assert out.fingerprint["trainable_parameter_names"] == []
+    # Deferred, not dropped: the same check condemns the same build once nothing
+    # is left to attach, which is the call the assembled model gets.
+    with pytest.raises(loader.AdapterRefusal, match="no trainable parameter"):
+        loader.refuse_a_build_the_fingerprint_condemns("unsloth", out.fingerprint, None)
 
 
 def test_fingerprint_catches_two_modules_left_in_fp32(config):
@@ -474,6 +497,41 @@ def test_bench_reads_the_binding_fields_this_module_produces():
     assert "trainbench.loader" in source
 
 
+def test_an_adapter_refusal_is_caught_by_the_block_that_wraps_the_load():
+    """`bench.build_run` loads inside `refusing('load_kwargs')`, whose catch list is
+    the two refusal types — everything else leaves no result file at all.
+
+    A refusal that escapes it is published as a pod that crashed rather than as a
+    setting this harness declined, which is the difference the block exists for.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_bench_for_refusal", REPO_ROOT / "scripts" / "bench.py"
+    )
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+
+    with pytest.raises(bench.RefusedSetting) as refused:
+        with bench.refusing("load_kwargs"):
+            raise loader.AdapterRefusal("a build this harness must not put a number on")
+
+    assert type(refused.value.cause) is loader.AdapterRefusal
+
+
+def test_the_fingerprint_is_the_shape_a_run_record_carries(config, contract):
+    """The lane's axis-G deliverable has to survive the trip into a result file.
+
+    `RUN_RECORD_KEY` is named here rather than spelled again by the record writer,
+    and the payload is judged by the frozen validator rather than by a second
+    opinion written in this file.
+    """
+    out = loader.describe(loader.ADAPTERS["native"], _Build(), object(), config)
+    carried = json.loads(json.dumps({loader.RUN_RECORD_KEY: dict(out.fingerprint)}))
+
+    assert loader.RUN_RECORD_KEY == "build_fingerprint"
+    payload = {**out.to_payload(), "fingerprint": carried[loader.RUN_RECORD_KEY]}
+    assert contract.validate("native", payload) == []
+
+
 FRAMEWORK_CALL = ("from_pretrained", "ModelLoader", "get_model_processor", "SentenceTransformer")
 
 
@@ -515,12 +573,43 @@ def test_the_framework_imports_stay_out_of_this_module():
     assert loader.PROBE_PACKAGE == "trainbench.probe"
 
 
+def _module_level_functions(tree):
+    return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+
+def _plain_calls(node):
+    """Every `name(...)` under `node`, nested functions and lambdas included.
+
+    Bare names only. `steps.load_kwargs(config, report)` is an attribute call on an
+    imported module and is exactly what this must not count: it satisfied the
+    regex this test used to be, so the check stayed green over a `run` that had
+    stopped calling the shared build at all.
+    """
+    return {
+        call.func.id
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
+
+
 @pytest.mark.parametrize("name", sorted(loader.ADAPTERS))
 def test_the_probe_and_the_harness_take_the_same_load(name):
     """Two definitions of `full_finetuning=` or of axolotl's validate/normalize
-    order is what a whole campaign cost."""
-    module = importlib.import_module(loader.ADAPTERS[name].module)
-    source = Path(module.__file__).read_text(encoding="utf-8")
-    run_body = source.partition("\ndef run(")[2]
+    order is what a whole campaign cost.
 
-    assert re.search(r"\bload(?:_\w+)?\(config", run_body), name
+    `loader.Adapter.load` calls this module's `load`, so `run` has to reach that
+    same function — either directly, or through every module-level helper `load`
+    itself calls, which is how native takes the processor and the model as two
+    checks.
+    """
+    module = importlib.import_module(loader.ADAPTERS[name].module)
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    functions = _module_level_functions(tree)
+
+    entry = functions["load"]
+    helpers = _plain_calls(entry) & set(functions)
+    reached = _plain_calls(functions["run"]) & ({"load"} | helpers)
+
+    assert reached, f"{name}.run calls neither load nor any helper of it: {sorted(helpers)}"
+    if "load" not in reached:
+        assert reached >= helpers, f"{name}.run takes {sorted(reached)} of {sorted(helpers)}"

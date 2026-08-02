@@ -28,6 +28,15 @@ import torch  # isort: skip
 FRAMEWORKS = ["unsloth", "ms_swift", "sentence_transformers", "tevatron", "axolotl"]
 
 
+class _StubProcessor:
+    """The HF processor sentence-transformers holds inside its first module.
+
+    `AutoProcessor.from_pretrained` is what lands there (sentence-transformers
+    5.6.1 base/modules/transformer.py:671), and it is republished as
+    `SentenceTransformer.processor` (base/model.py:1524).
+    """
+
+
 def compose_probe(*overrides):
     """A resolved probe mapping, composed rather than hand-written.
 
@@ -702,6 +711,7 @@ def test_the_same_refusal_does_not_read_as_a_framework_that_cannot_load(
         def __init__(self, *args, **kwargs):
             super().__init__()
             self.linear = torch.nn.Linear(2, 2)
+            self.processor = _StubProcessor()
 
         def __iter__(self):
             return iter([self.linear])
@@ -976,6 +986,7 @@ def _stub_sentence_transformers(monkeypatch, frozen):
             super().__init__()
             self.embed = torch.nn.Embedding(8, 4)
             self.proj = torch.nn.Linear(4, 4)
+            self.processor = _StubProcessor()
             if frozen:
                 self.requires_grad_(False)
                 self.embed.register_forward_hook(
@@ -1009,6 +1020,32 @@ def _sentence_transformers_checks(config_mapping, monkeypatch, frozen):
     mapping["framework"]["name"] = "sentence_transformers"
     report = run_probe(to_bench_config(mapping), get_device("cpu"))
     return {c.name: c for c in report.checks}
+
+
+def test_the_sentence_transformers_load_hands_back_a_processor_not_the_model(
+    config_mapping, monkeypatch
+):
+    """`AdapterOut.processor` is called as an HF processor and this adapter used to
+    return the model in that slot, so every ST timing batch raised before a step.
+
+    `trainbench/collate.py:326` does `processor(text=..., return_tensors=...)` and
+    reads `chat_template` off it; `SentenceTransformer.forward(input, **kwargs)`
+    (sentence-transformers 5.6.1 base/model.py:496) answers neither.
+    """
+    from trainbench.loader import AdapterRefusal
+    from trainbench.probe import sentence_transformers as adapter
+
+    _stub_sentence_transformers(monkeypatch, frozen=False)
+    config = to_bench_config(config_mapping)
+
+    model, processor = adapter.load(config, get_device("cpu"), {})
+
+    assert processor is not model
+    assert processor is model.processor
+    # A tokeniser is the same answer for a text-only checkpoint; a model is not.
+    assert adapter.processor_of(types.SimpleNamespace(tokenizer="t")) == "t"
+    with pytest.raises(AdapterRefusal, match="nothing to tokenise"):
+        adapter.processor_of(types.SimpleNamespace())
 
 
 def test_a_sentence_transformers_frozen_model_is_refused_like_every_other(
