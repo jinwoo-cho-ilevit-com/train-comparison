@@ -8,11 +8,14 @@ requires-python = ">=3.13,<3.14"
 # This env carries the ablation packages because the ablation runs here: every
 # phase2 manifest in configs/experiment/ sets `framework: native`. A framework
 # image gets an axis package only when its own default path needs it, which keeps
-# five of the six images off the multi-hour CUDA source builds below.
+# five of the six images off the CUDA source builds below (deepspeed and
+# transformer-engine-torch; the multi-hour one, flash-attn, is prebuilt now).
 dependencies = [
     "trainbench[native]",
-    # attn/fa2, attn/fa3, attn/fa4
-    "flash-attn>=2.8",
+    # attn/fa2, attn/fa3, attn/fa4. Pinned exactly because the wheel installed for
+    # it is a binary we built: the version is part of the ABI the URL below
+    # claims, not a floor to resolve above. See [tool.uv.sources].
+    "flash-attn==2.8.3.post1",
     # kernel/fla. Also Qwen3.5's Gated DeltaNet fast path, which is why every
     # other env carries these two as well.
     "flash-linear-attention>=0.5",
@@ -43,24 +46,31 @@ dependencies = [
 ]
 
 [dependency-groups]
-# flash-attn and deepspeed ship no pyproject.toml, so a PEP 517 build sees only
-# setuptools' default requires while their setup.py does `import torch` at module
-# level. Build isolation cannot work for them, hence no-build-isolation-package
-# below — and that ban means the environment itself has to supply the build
-# dependencies. The image installs this group first for exactly that reason.
+# deepspeed ships no pyproject.toml, so a PEP 517 build sees only setuptools'
+# default requires while its setup.py does `import torch` at module level. Build
+# isolation cannot work for it, hence no-build-isolation-package below — and that
+# ban means the environment itself has to supply the build dependencies. The image
+# installs this group first for exactly that reason.
 # causal-conv1d and transformer-engine-torch declare torch in build-system.requires
 # and so build under isolation unaided; they are left alone.
 build = ["torch", "setuptools>=77", "packaging", "wheel", "ninja"]
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
-no-build-isolation-package = ["flash-attn", "deepspeed"]
+no-build-isolation-package = ["deepspeed"]
 # Kept in the default set so the second sync pass cannot uninstall setuptools out
 # from under the source builds it is about to run.
 default-groups = ["build"]
 
 [tool.uv.sources]
 trainbench = { path = "../..", editable = true }
+# Our own build of the upstream sdist, unmodified, published as a release asset on
+# this repository. Compiling it here cost 13,663 s on a GitHub runner — 88% of the
+# native image build. The release tag states the ABI the binary was built against
+# (cu130 / torch 2.13.0 / cp313); nothing in a URL wheel checks that claim at
+# install time, so `prebuilt-wheels` in scripts/audit_plan.py compares it against
+# what this lock resolves. Provenance: docs/prebuilt-wheels.yaml.
+flash-attn = { url = "https://github.com/jinwoo-cho-ilevit-com/train-comparison/releases/download/flash-attn-2.8.3.post1-cu130-torch2.13.0-cp313/flash_attn-2.8.3.post1-cp313-cp313-linux_x86_64.whl" }
 torch = [{ index = "pytorch-cuda" }]
 torchvision = [{ index = "pytorch-cuda" }]
 nvidia-dali-cuda130 = [{ index = "nvidia" }]

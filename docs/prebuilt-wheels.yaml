@@ -1,0 +1,53 @@
+# Machine-readable half of the prebuilt-wheel record in docs/support-matrix.md.
+#
+# A wheel installed from a URL bypasses the resolver: uv checks nothing about
+# what the binary was compiled against, so the ABI claim lives here and
+# `prebuilt-wheels` in scripts/audit_plan.py compares it against what the lock
+# actually resolves. Editing a value here alone fails the audit.
+#
+# `verified` says which fields this repository re-checked itself and which are
+# reported by whoever ran the build. Nothing here proves the wheel imports on a
+# GPU — see docs/support-matrix.md for what the next image build must show.
+
+wheels:
+  - env: native
+    package: flash-attn
+    version: "2.8.3.post1"
+    url: https://github.com/jinwoo-cho-ilevit-com/train-comparison/releases/download/flash-attn-2.8.3.post1-cu130-torch2.13.0-cp313/flash_attn-2.8.3.post1-cp313-cp313-linux_x86_64.whl
+    sha256: 166a27d0090ab036029673202f518b2aaa2ca405c45c033cb5b58c0ede9b3d2a
+    size_bytes: 180912127
+    # What the binary was compiled against. `torch` and `cuda` must equal what the
+    # env lock resolves for torch; `python` must be the only minor the lock admits;
+    # `cuda_archs` must equal TRAINBENCH_CUDA_ARCHS in docker/Dockerfile.framework,
+    # because flash-attn emits code=sm_XX with no PTX — a pod on an arch outside
+    # this list gets "no kernel image is available", not a slow fallback.
+    abi:
+      torch: "2.13.0"
+      cuda: cu130
+      python: cp313
+      cuda_archs: [80, 90, 100]
+    build:
+      # Upstream sdist flash_attn-2.8.3.post1.tar.gz, unmodified. Only the binary
+      # is ours; the source version did not change when this replaced the source
+      # build, so no measured number moves because of it.
+      source: PyPI sdist flash-attn 2.8.3.post1, unmodified
+      by: train-comparison images lane
+      date: "2026-08-02"
+      # Compiling this one package took 13,663 s on a GitHub Actions standard
+      # runner (4 cores / 16 GB, MAX_JOBS=2 NVCC_THREADS=1) — 88% of the native
+      # image build. That is why it is prebuilt.
+      host: RunPod A100 pod, cgroup 21 cores / 108 GB
+      flags: MAX_JOBS=5 NVCC_THREADS=4 FLASH_ATTN_CUDA_ARCHS="80;90;100"
+      seconds: 2323
+    verified:
+      # `uv lock` fetched the asset and wrote this same digest into
+      # envs/native/uv.lock; `content-length` came back 180912127 on an anonymous
+      # GET; the wheel's own WHEEL metadata says `Tag: cp313-cp313-linux_x86_64`;
+      # and walking the .nv_fatbin section of flash_attn_2_cuda…so found 72
+      # fatbins, each holding exactly three SASS entries at sm_80/90/100 and no
+      # PTX entry at all. Checked here, not quoted (2026-08-02, macOS).
+      here: [url, sha256, version, size_bytes, abi]
+      # Nobody has run it. Whether the kernels load, and whether they are faster
+      # than the source build was, is 측정 안 함 — no CUDA GPU has touched this
+      # file from this repository.
+      reported: [host, flags, seconds]

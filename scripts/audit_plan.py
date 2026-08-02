@@ -26,6 +26,8 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -1201,6 +1203,234 @@ def image_locks_agree_with_their_projects() -> Result:
         "env-locks",
         not problems,
         f"every lock agrees with its pyproject.toml and every image sync asserts it ({scope})"
+        if not problems
+        else f"{'; '.join(problems)} ({scope})",
+        count=len(problems),
+    )
+
+
+# Where the ABI claim for a URL-pinned binary lives. Resolved from REPO at call
+# time, not bound here, so a check run against another tree reads that tree's.
+PREBUILT_WHEELS = Path("docs/prebuilt-wheels.yaml")
+# PEP 427, without the optional build tag none of ours carry:
+# flash_attn-2.8.3.post1-cp313-cp313-linux_x86_64.whl
+WHEEL_FILENAME = re.compile(
+    r"^(?P<name>[^-]+)-(?P<version>[^-]+)-(?P<python>[^-]+)-(?P<abi>[^-]+)-(?P<platform>.+)\.whl$"
+)
+# The release tag carries the ABI the binary was built for, because a wheel
+# filename cannot: `flash-attn-2.8.3.post1-cu130-torch2.13.0-cp313`.
+TORCH_CLAIM = re.compile(r"(?:^|-)torch(?P<version>\d+(?:\.\d+)*)(?:-|$)")
+CUDA_CLAIM = re.compile(r"(?:^|-)(?P<cuda>cu\d+)(?:-|$)")
+DOCKERFILE_ARCHS = re.compile(r'TRAINBENCH_CUDA_ARCHS="(?P<archs>[^"]*)"')
+
+
+def _lock_contents(directory: Path) -> tuple[str, dict[str, dict]]:
+    """`requires-python` and the packages, keyed by name, of one uv.lock."""
+    lock = tomllib.loads((directory / "uv.lock").read_text())
+    return lock.get("requires-python", ""), {p["name"]: p for p in lock.get("package", [])}
+
+
+def _url_sourced(directory: Path) -> dict[str, str]:
+    """Package name -> URL, for everything a lock installs from a bare URL.
+
+    These are the ones the resolver checks nothing about. A registry or git
+    source is resolved against metadata; a URL wheel is taken at its word.
+    """
+    _, packages = _lock_contents(directory)
+    return {
+        name: url
+        for name, package in packages.items()
+        if (url := (package.get("source") or {}).get("url"))
+    }
+
+
+def _admits_only(requires_python: str, minor: int) -> bool:
+    """Whether a lock's requires-python admits 3.<minor> and no neighbouring minor.
+
+    Containment alone is not the property: `>=3.13` contains 3.13 and also every
+    later interpreter, and a cp313 binary loaded by 3.14 is the failure this is
+    here to stop.
+    """
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
+
+    try:
+        spec = SpecifierSet(requires_python)
+    except InvalidSpecifier:
+        return False
+    return spec.contains(f"3.{minor}.0") and not any(
+        spec.contains(f"3.{neighbour}.0") for neighbour in (minor - 1, minor + 1)
+    )
+
+
+def prebuilt_wheel_problems(
+    record: dict, requires_python: str, packages: dict[str, dict], archs_declared: str | None
+) -> list[str]:
+    """Everything that disagrees about one prebuilt wheel.
+
+    The wheel is a binary we compiled, pinned by URL. Nothing between here and a
+    pod re-checks what it was built against: uv installs a URL wheel without
+    asking, and the mismatch surfaces as a CUDA error mid-run, on a pod, after
+    the pod-hour has been spent. So the claim is compared here — against the
+    artifact's own name, against what the lock resolves, and against the archs
+    the image declares.
+    """
+    env, package = record.get("env"), record.get("package")
+    where = f"docs/prebuilt-wheels.yaml {env}/{package}"
+    entry = packages.get(package)
+    if entry is None:
+        return [
+            f"{where}: envs/{env}/uv.lock has no {package}; the record outlived what it records"
+        ]
+
+    problems = []
+    url = (entry.get("source") or {}).get("url")
+    if url is None:
+        kind = ", ".join(entry.get("source") or {}) or "nothing"
+        problems.append(
+            f"{where}: the lock installs {package} from {kind}, not from the recorded wheel URL — "
+            "the prebuilt binary is not what the image gets"
+        )
+    elif url != record.get("url"):
+        problems.append(f"{where}: the lock installs {url}, not the recorded URL")
+    if entry.get("version") != record.get("version"):
+        problems.append(
+            f"{where}: the lock resolves {package} {entry.get('version')}, recorded "
+            f"{record.get('version')}"
+        )
+    digests = [wheel.get("hash") for wheel in entry.get("wheels", [])]
+    if digests != [f"sha256:{record.get('sha256')}"]:
+        problems.append(f"{where}: the lock pins {digests}, recorded sha256:{record.get('sha256')}")
+
+    abi = record.get("abi") or {}
+    # The artifact's own name. A record may not claim an ABI its filename denies.
+    parts = urllib.parse.urlparse(record.get("url") or "").path.split("/")
+    filename = WHEEL_FILENAME.match(parts[-1]) if parts else None
+    if filename is None:
+        problems.append(f"{where}: {parts[-1] if parts else 'the url'} is not a PEP 427 wheel name")
+    else:
+        for claim, actual, what in (
+            (record.get("version"), filename["version"], "version"),
+            (abi.get("python"), filename["python"], "python tag"),
+        ):
+            if claim != actual:
+                problems.append(
+                    f"{where}: the wheel filename says {what} {actual}, recorded {claim}"
+                )
+    # The release tag, which is where the torch/CUDA ABI is stated at all.
+    tag = parts[-2] if len(parts) > 1 else ""
+    torch_claimed = TORCH_CLAIM.search(tag)
+    cuda_claimed = CUDA_CLAIM.search(tag)
+    if torch_claimed is None or cuda_claimed is None:
+        problems.append(
+            f"{where}: the release tag `{tag}` states no torch/CUDA ABI, so nothing says what this "
+            "binary was built against"
+        )
+    else:
+        if torch_claimed["version"] != abi.get("torch"):
+            problems.append(
+                f"{where}: the release tag was built for torch {torch_claimed['version']}, "
+                f"recorded {abi.get('torch')}"
+            )
+        if cuda_claimed["cuda"] != abi.get("cuda"):
+            problems.append(
+                f"{where}: the release tag was built for {cuda_claimed['cuda']}, "
+                f"recorded {abi.get('cuda')}"
+            )
+
+    # What the lock resolves. This is the mutation that has no other alarm: a
+    # torch bump re-locks cleanly and breaks the binary at load time.
+    torch = packages.get("torch")
+    if torch is None:
+        problems.append(f"{where}: envs/{env}/uv.lock resolves no torch to compare the ABI against")
+    else:
+        resolved, _, local = str(torch.get("version")).partition("+")
+        if resolved != abi.get("torch"):
+            problems.append(
+                f"{where}: the lock resolves torch {resolved}, but the wheel was built against "
+                f"{abi.get('torch')} — the C++ ABI it links is gone"
+            )
+        if local != abi.get("cuda"):
+            problems.append(
+                f"{where}: the lock resolves torch on {local or 'no CUDA build'}, but the "
+                f"wheel was built for {abi.get('cuda')}"
+            )
+
+    python_tag = str(abi.get("python") or "")
+    if not (minor := re.fullmatch(r"cp3(\d+)", python_tag)):
+        problems.append(f"{where}: `{python_tag}` is not a CPython 3.x tag this can compare")
+    elif not _admits_only(requires_python, int(minor[1])):
+        problems.append(
+            f"{where}: envs/{env}/uv.lock admits requires-python {requires_python!r}, which is not "
+            f"3.{minor[1]} alone — the wheel is {python_tag} only"
+        )
+
+    if archs_declared is None:
+        problems.append(
+            f"{where}: docker/Dockerfile.framework declares no TRAINBENCH_CUDA_ARCHS, so nothing "
+            "says which GPUs the image expects the wheel to have kernels for"
+        )
+    elif (declared := [a for a in archs_declared.split(";") if a]) != [
+        str(a) for a in abi.get("cuda_archs") or []
+    ]:
+        problems.append(
+            f"{where}: the image declares CUDA archs {declared}, the wheel was built for "
+            f"{abi.get('cuda_archs')} — flash-attn emits no PTX, so an arch outside the wheel is "
+            "a dead pod, not a slow one"
+        )
+    return problems
+
+
+@check("prebuilt-wheels")
+def prebuilt_wheels_match_what_the_locks_resolve() -> Result:
+    """Every URL-pinned binary wheel is the one docs/prebuilt-wheels.yaml records.
+
+    flash-attn is compiled here rather than downloaded: 13,663 s on a GitHub
+    runner, 88% of the native image build. The wheel that replaced that build is
+    ours, and it is valid for exactly one torch, one CUDA, one interpreter and
+    one set of GPU archs — none of which uv re-checks when it installs a URL.
+
+    Both directions are the same property. A record whose lock no longer installs
+    it is a build that silently went back to compiling; a URL wheel with no record
+    is a binary in the images whose provenance nobody wrote down.
+    """
+    record_file = REPO / PREBUILT_WHEELS
+    if not record_file.exists():
+        return Result("prebuilt-wheels", False, f"{PREBUILT_WHEELS} is missing")
+    records = (yaml.safe_load(record_file.read_text()) or {}).get("wheels") or []
+    if empty := _nothing_to_check(records, f"wheels in {PREBUILT_WHEELS}"):
+        return Result("prebuilt-wheels", False, empty)
+    archs = (
+        found["archs"]
+        if FRAMEWORK_DOCKERFILE.exists()
+        and (found := DOCKERFILE_ARCHS.search(FRAMEWORK_DOCKERFILE.read_text()))
+        else None
+    )
+    problems = []
+    for record in records:
+        directory = REPO / "envs" / str(record.get("env"))
+        if not (directory / "uv.lock").exists():
+            problems.append(
+                f"docs/prebuilt-wheels.yaml {record.get('env')}/{record.get('package')} names "
+                f"envs/{record.get('env')}, which has no uv.lock"
+            )
+            continue
+        problems += prebuilt_wheel_problems(record, *_lock_contents(directory), archs)
+    recorded = {(r.get("env"), r.get("package")) for r in records}
+    problems += [
+        f"envs/{directory.name}/uv.lock installs {name} from a URL with no record in "
+        f"{PREBUILT_WHEELS}: {url}"
+        for directory in sorted(path.parent for path in (REPO / "envs").glob("*/uv.lock"))
+        for name, url in sorted(_url_sourced(directory).items())
+        if (directory.name, name) not in recorded
+    ]
+    scope = (
+        f"{len(records)} recorded wheel(s); {len(list((REPO / 'envs').glob('*/uv.lock')))} env "
+        "lock(s) scanned for URL sources"
+    )
+    return Result(
+        "prebuilt-wheels",
+        not problems,
+        f"every prebuilt wheel matches the ABI its lock resolves ({scope})"
         if not problems
         else f"{'; '.join(problems)} ({scope})",
         count=len(problems),

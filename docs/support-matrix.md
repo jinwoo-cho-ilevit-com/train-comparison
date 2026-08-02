@@ -714,6 +714,100 @@ editable로 참조하는 최소 프로젝트를 만들고 그 소스 디렉터�
 `uv sync --locked --only-group build`가 몇 초 안에 통과하면 답이 나온 것이고,
 `The lockfile at uv.lock needs to be updated`로 멈추면 uv 버전 차이다.
 
+## flash-attn을 소스 빌드에서 직접 만든 휠로 바꿨다 (2026-08-02)
+
+위 "소스 빌드가 필요한 패키지"의 넷 중 `flash-attn` 하나가 네이티브 이미지 빌드
+시간의 대부분이었다. **실측**: GitHub Actions 표준 러너(4코어 / 16GB,
+`MAX_JOBS=2 NVCC_THREADS=1`)에서 이 패키지 하나가 **13,663초**, 네이티브 이미지 빌드
+전체의 **88%**. 같은 컴파일이 RunPod A100 파드(cgroup 21코어 / 108GB,
+`MAX_JOBS=5 NVCC_THREADS=4`)에서는 **2,323초**였다.
+
+그래서 파드에서 한 번 빌드해 이 저장소의 GitHub Release 자산으로 올렸고,
+`envs/native`는 그것을 URL로 설치한다. 상류 sdist는 그대로이므로 **소스 버전은
+바뀌지 않았다** — `flash-attn 2.8.3.post1` 그대로다. 바뀐 것은 바이너리의 출처뿐이다.
+
+### 이 변경이 측정에 대해 무엇을 바꾸고 무엇을 안 바꾸는가
+
+**안 바꾸는 것.** 커널은 같은 소스에서 나왔고 gencode도 같다(sm_80/90/100). 지금까지
+기록된 어떤 수치도 이 변경 때문에 움직이지 않는다 — 애초에 `docs/`의 모든 수치는 CPU
+아니면 미측정이고, flash-attn 경로를 탄 측정은 존재한 적이 없다.
+
+**바꾸는 것.** 바이너리 자체가 이제 상류가 아니라 우리 것이다. AGENTS.md가 "런마다
+해석된 torch/framework 버전을 기록하라 — 버전은 결과에 보여야 하는 교란 변수다"라고
+요구하는 대상이 하나 늘었다. 그 기록이 `docs/prebuilt-wheels.yaml`이고, 기계가 읽는
+쪽이다. 누가·언제·무엇 위에서·어떤 arch로 빌드했는지, sha256과 크기가 거기 있다.
+
+**바꾸지 않는데 바뀐 것처럼 보일 수 있는 것.** 빌드 시간은 이미지 빌드의 성질이지
+측정 대상이 아니다. 13,663초는 벤치마크 결과가 아니라 CI 비용이다.
+
+### 이 저장소가 직접 확인한 것 (2026-08-02, macOS)
+
+| 항목 | 방법 | 결과 |
+|---|---|---|
+| URL이 익명으로 받아진다 | `curl -sIL` | HTTP 200, `content-length: 180912127` |
+| sha256 | `uv lock`이 자산을 받아 `envs/native/uv.lock`에 기록 | `166a27d0…d2a`, 기록된 값과 일치 |
+| 인터프리터 태그 | 휠의 `WHEEL` 메타데이터 | `Tag: cp313-cp313-linux_x86_64` |
+| GPU arch | `flash_attn_2_cuda…so`의 `.nv_fatbin` 섹션을 직접 순회 | fatbin 72개, 각 3개씩 총 **216개 SASS 엔트리가 sm_80/90/100**, **PTX 엔트리 0개** |
+| 다른 핀이 안 움직였다 | `uv lock` 전후 lock의 (name, version) 비교 | 142개 패키지 전부 동일, `flash-attn`의 `source`만 registry -> url |
+
+PTX 엔트리가 0개라는 것은 Dockerfile 주석이 원래 주장하던 "JIT으로 흘러갈 경로가
+없다"를 이 휠에 대해 실제로 확인한 것이다. 목록 밖의 arch를 가진 파드는 느려지는
+것이 아니라 죽는다.
+
+### 확인하지 **않은** 것 — 주장하지 않는다
+
+- **이 휠이 실제로 import되는지는 측정 안 함.** CUDA GPU가 필요하고, 이 저장소에서
+  GPU가 이 파일을 만진 적이 없다. 다음 이미지 빌드가 답해야 하는 것:
+  `uv sync --locked`가 소스 빌드 없이(로그에 `Building flash-attn` 줄이 **없이**) 끝나고
+  네이티브 이미지가 4시간이 아니라 몇 분 안에 나오는 것.
+  다음 파드가 답해야 하는 것: `scripts/verify_env.py`의 native x 세 모델 프로브가
+  `attn/fa2`에서 `import flash_attn` 이후 실제로 스텝을 도는 것.
+- **빌드가 정말 저 파드에서 저 시간에 났는지는 보고받은 값이다.** 호스트·플래그·초는
+  `docs/prebuilt-wheels.yaml`의 `verified.reported`에 그렇게 표시돼 있다.
+- 휠은 `linux_x86_64` 전용이다. `envs/native`의 lock은 aarch64도 해석하므로 aarch64
+  파드는 이 패키지에서 설치가 실패한다. 시끄러운 실패라 감사 대상에 넣지 않았지만,
+  GH200을 쓰려면 휠을 하나 더 빌드해야 한다.
+
+### `prebuilt-wheels` 감사 체크
+
+URL로 고정한 휠은 리졸버가 **아무것도 검사하지 않는다.** uv는 URL 휠을 그대로
+설치하므로, torch가 한 번 올라가면 어긋남은 파드 위에서 CUDA 오류로 나타난다 —
+파드 시간을 다 쓴 뒤에. 그래서 주장을 여기서 대조한다. 상세 계약은 `docs/CONTRACTS.md`.
+
+체크를 실제로 깨뜨려 보고 출력을 확인했다. 열 가지 변이 전부 이름을 불러 막았다:
+lock의 torch를 2.14.0으로 올리기 / `requires-python`을 `>=3.13`으로 넓히기 /
+`[tool.uv.sources]`를 지우고 재-lock(= 소스 빌드로 회귀) / 릴리스 URL의 인터프리터
+태그 바꾸기 / `TRAINBENCH_CUDA_ARCHS`에 120 추가 / 기록 삭제 / sha256 한 바이트
+뒤집기 / `abi.cuda`를 cu128로 / 기록이 다른 패키지를 가리켜 휠이 미기록으로 남기 /
+릴리스 태그를 ABI를 말하지 않는 `v1`로 바꾸기.
+
+### 남은 소스 빌드 — 확대하지 않고 보고만 한다
+
+env별 lock에서 휠이 없어 소스에서 빌드되는 패키지(2026-08-02, lock 실측):
+
+| env | 소스 빌드 |
+|---|---|
+| native | `causal-conv1d`, `deepspeed`, `transformer-engine-torch` |
+| sentence-transformers / tevatron / unsloth | `causal-conv1d` |
+| ms-swift | `causal-conv1d` 외 CUDA 아닌 것 4종 |
+| axolotl | `causal-conv1d` 외 CUDA 아닌 것 7종 |
+
+**`flash-attn`은 어느 env에도 더는 없다** — 원래 native에만 있었다. 같은 처리를
+받을 다음 후보는 `causal-conv1d`다: 여섯 env 전부에 있고, arch를 좁히는 변수를
+읽지 않아 gencode 아홉 개를 항상 빌드한다. 다만 **비용은 미측정이다.** 커밋
+`821f8f4` 빌드 로그가 주는 것은 완료 시각뿐이고(`transformer-engine-torch` 1346.1초,
+`causal-conv1d` 1418.4초), 이것은 소요 시간이 아니다. flash-attn과 달리 "네 시간"을
+주장할 근거가 없으므로 이 레인은 손대지 않았다.
+
+### 레인 게이트 (2026-08-02, wheel 레인)
+
+| | 결과 |
+|---|---|
+| `uv run pytest` | 748 passed (기준선 735 + 신규 테스트 11 + 체크가 하나 늘어 `CHECKS`를 도는 parametrize 2건) |
+| `ruff check` / `ruff format --check` | 지적 0건 |
+| `scripts/audit_plan.py` | 12/15 (`prebuilt-wheels` 신설·통과, `verdicts-closed` 미해소는 기존 상태) |
+| `scripts/env_report.py` 설정 경로 | 통과, `torch 2.13.0 / transformers 5.14.1` 기록 |
+
 ---
 
 여기부터 아래는 `scripts/report.py`가 생성한다. 아직 pod 결과가 없으면 비어 있다.

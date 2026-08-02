@@ -31,6 +31,7 @@ from audit_plan import (  # noqa: E402
     merge_baseline,
     missing_plan_files,
     model_spec_problems,
+    prebuilt_wheel_problems,
     undocumented_files,
     verdict_ledger_problems,
 )
@@ -1038,3 +1039,147 @@ def test_the_repositorys_own_ledger_has_open_items_and_names_them():
     assert not result.ok
     assert "open:" in result.detail
     assert result.count and result.count > 0
+
+
+# envs/native installs flash-attn as a wheel this project compiled, pinned by URL.
+# uv checks nothing about a URL wheel, so these are the comparisons that stand
+# between a drifted lock and a CUDA error on a paid pod.
+WHEEL_URL = (
+    "https://github.com/jinwoo-cho-ilevit-com/train-comparison/releases/download/"
+    "flash-attn-2.8.3.post1-cu130-torch2.13.0-cp313/"
+    "flash_attn-2.8.3.post1-cp313-cp313-linux_x86_64.whl"
+)
+WHEEL_SHA = "166a27d0090ab036029673202f518b2aaa2ca405c45c033cb5b58c0ede9b3d2a"
+WHEEL_RECORD = {
+    "env": "native",
+    "package": "flash-attn",
+    "version": "2.8.3.post1",
+    "url": WHEEL_URL,
+    "sha256": WHEEL_SHA,
+    "abi": {"torch": "2.13.0", "cuda": "cu130", "python": "cp313", "cuda_archs": [80, 90, 100]},
+}
+WHEEL_PACKAGES = {
+    "flash-attn": {
+        "name": "flash-attn",
+        "version": "2.8.3.post1",
+        "source": {"url": WHEEL_URL},
+        "wheels": [{"url": WHEEL_URL, "hash": f"sha256:{WHEEL_SHA}"}],
+    },
+    "torch": {"name": "torch", "version": "2.13.0+cu130"},
+}
+
+
+def _wheel_problems(record=None, packages=None, requires_python="==3.13.*", archs="80;90;100"):
+    return prebuilt_wheel_problems(
+        record or WHEEL_RECORD, requires_python, packages or WHEEL_PACKAGES, archs
+    )
+
+
+def test_a_prebuilt_wheel_that_matches_its_lock_has_nothing_to_report():
+    assert _wheel_problems() == []
+
+
+def test_a_torch_bump_invalidates_the_binary_and_is_named_as_that():
+    """The mutation with no other alarm. The lock re-resolves cleanly, the image
+    builds, and the wheel's C++ ABI is gone — which surfaces as a CUDA error
+    mid-run, on a pod, after the pod-hour is spent."""
+    bumped = WHEEL_PACKAGES | {"torch": {"name": "torch", "version": "2.14.0+cu130"}}
+
+    problems = _wheel_problems(packages=bumped)
+
+    assert len(problems) == 1
+    assert "the lock resolves torch 2.14.0" in problems[0]
+
+
+def test_a_cuda_build_the_wheel_was_not_compiled_for_is_caught():
+    on_cu128 = WHEEL_PACKAGES | {"torch": {"name": "torch", "version": "2.13.0+cu128"}}
+
+    assert "the wheel was built for cu130" in "; ".join(_wheel_problems(packages=on_cu128))
+
+
+def test_requires_python_must_admit_the_wheels_interpreter_and_no_other():
+    """Containment alone is not the property: `>=3.13` admits 3.13 and also 3.14,
+    and a cp313 binary loaded by 3.14 is exactly the failure this stops."""
+    assert _wheel_problems(requires_python="==3.13.*") == []
+
+    for widened in (">=3.13", ">=3.12,<3.14", ""):
+        problems = _wheel_problems(requires_python=widened)
+        assert len(problems) == 1, widened
+        assert "is not 3.13 alone" in problems[0]
+
+
+def test_a_lock_that_went_back_to_building_from_source_is_caught():
+    """Reverting [tool.uv.sources] to a plain version spec re-locks cleanly and
+    costs the next native image build 13,663 s. The record outliving the URL is
+    the whole signal."""
+    from_pypi = WHEEL_PACKAGES | {
+        "flash-attn": {
+            "name": "flash-attn",
+            "version": "2.8.3.post1",
+            "source": {"registry": "https://pypi.org/simple"},
+            "sdist": {"url": "https://files.pythonhosted.org/flash_attn-2.8.3.post1.tar.gz"},
+        }
+    }
+
+    problems = "; ".join(_wheel_problems(packages=from_pypi))
+
+    assert "installs flash-attn from registry, not from the recorded wheel URL" in problems
+
+
+def test_a_package_the_lock_no_longer_carries_is_a_record_that_outlived_it():
+    assert _wheel_problems(packages={"torch": WHEEL_PACKAGES["torch"]}) == [
+        "docs/prebuilt-wheels.yaml native/flash-attn: envs/native/uv.lock has no flash-attn; "
+        "the record outlived what it records"
+    ]
+
+
+def test_the_recorded_digest_must_be_the_one_the_lock_pins():
+    swapped = WHEEL_RECORD | {"sha256": "0" * 64}
+
+    assert "the lock pins" in "; ".join(_wheel_problems(record=swapped))
+
+
+def test_a_record_may_not_claim_an_abi_its_own_artifact_denies():
+    """The filename and the release tag are the artifact's own statement about
+    what it is. A record is free to be wrong; it is not free to be wrong in a way
+    the URL it points at contradicts."""
+    lying = WHEEL_RECORD | {"abi": WHEEL_RECORD["abi"] | {"python": "cp312"}}
+
+    problems = "; ".join(_wheel_problems(record=lying))
+
+    assert "the wheel filename says python tag cp313, recorded cp312" in problems
+
+
+def test_a_release_tag_that_states_no_abi_is_not_a_pass():
+    """A wheel filename cannot carry a torch version, so the tag is the only place
+    the ABI is written down. Untagged means nothing says what this binary was
+    built against — which is a failure, not an absence of one."""
+    untagged = WHEEL_RECORD | {
+        "url": "https://example.invalid/v1/flash_attn-2.8.3.post1-cp313-cp313-linux_x86_64.whl"
+    }
+    lock = WHEEL_PACKAGES | {
+        "flash-attn": WHEEL_PACKAGES["flash-attn"]
+        | {"source": {"url": untagged["url"]}, "wheels": [{"hash": f"sha256:{WHEEL_SHA}"}]}
+    }
+
+    problems = "; ".join(_wheel_problems(record=untagged, packages=lock))
+
+    assert "states no torch/CUDA ABI" in problems
+
+
+def test_an_image_arch_the_wheel_has_no_kernels_for_is_a_dead_pod():
+    """flash-attn emits code=sm_XX with no PTX — measured on this very wheel: 72
+    fatbins, 216 SASS entries at sm_80/90/100, zero PTX entries. Widening the
+    image's declared archs without rebuilding gives "no kernel image is
+    available", and the audit is the last place that can say so."""
+    assert "the image declares CUDA archs" in "; ".join(_wheel_problems(archs="80;90;100;120"))
+    assert "declares no TRAINBENCH_CUDA_ARCHS" in "; ".join(_wheel_problems(archs=None))
+
+
+def test_the_repositorys_own_prebuilt_wheel_agrees_with_its_lock():
+    """The live state, not a fixture. envs/native/uv.lock must install exactly the
+    wheel docs/prebuilt-wheels.yaml records, for the torch it resolves."""
+    result = audit_plan.CHECKS["prebuilt-wheels"]()
+
+    assert result.ok, result.detail
+    assert result.count == 0

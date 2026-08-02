@@ -862,6 +862,33 @@ class ProbeReport:
   - **다른 레인이 알아야 할 것**: `envs/*/pyproject.toml`이나 루트 `pyproject.toml`의
     의존성을 건드리면 해당 env에서 `uv lock`을 돌려야 게이트가 녹색이 된다.
 
+- 2026-08-02 **새 체크 `prebuilt-wheels` — URL로 고정한 바이너리 휠은 lock이 해석하는
+  ABI와 같아야 한다** (`audit_plan.py`, `tests/test_audit.py`,
+  `docs/prebuilt-wheels.yaml`, `envs/native/pyproject.toml`,
+  `docker/Dockerfile.framework`. wheel 레인).
+  `envs/native`가 `flash-attn`을 소스에서 빌드하는 대신 이 저장소가 직접 빌드해
+  릴리스로 올린 휠을 URL로 설치한다(실측 근거와 무엇이 미측정인지는
+  `docs/support-matrix.md`). **URL 휠은 리졸버가 아무것도 검사하지 않는다** — uv는
+  받아서 그대로 넣고, 어긋남은 파드 위에서 CUDA 오류로 나타난다. 그래서 그 휠이
+  무엇에 대해 빌드됐는지를 `docs/prebuilt-wheels.yaml`에 적고 매 게이트에서 대조한다
+  (`docs/model-spec.yaml`과 같은 모양: 산문은 문서, 기계가 비교하는 값은 YAML).
+  - 대조 대상 넷: **아티팩트 자신의 이름**(PEP 427 파일명의 버전·인터프리터 태그,
+    릴리스 태그의 `torch<ver>`/`cu<ver>`), **lock이 해석한 것**(`torch`의 버전과 로컬
+    CUDA 태그, `source = { url = … }`와 sha256), **lock의 `requires-python`**,
+    **이미지가 선언한 arch**(`TRAINBENCH_CUDA_ARCHS`).
+  - `requires-python`은 포함 관계만으로는 부족하다. `>=3.13`은 3.13도 3.14도 담고,
+    cp313 바이너리를 3.14가 로드하는 것이 막으려는 실패다. 그래서 "3.13을 담고 이웃
+    마이너는 담지 않는가"를 묻는다.
+  - 양방향이다. 기록은 있는데 lock이 URL로 설치하지 않으면 **조용히 소스 빌드로
+    되돌아간 것**이고(네이티브 이미지 빌드에 13,663초가 다시 붙는다), URL로 설치하는데
+    기록이 없으면 **출처를 아무도 안 적은 바이너리**다.
+  - 릴리스 태그가 ABI를 말하지 않으면 통과가 아니라 실패다. 휠 파일명은 torch 버전을
+    실을 수 없으므로 태그가 그것이 적히는 유일한 자리다.
+  - **다른 레인이 알아야 할 것**: `envs/native`의 torch가 올라가면 이 체크가 막는다.
+    막히는 것이 옳다 — 그 휠은 그 torch에 대해 다시 빌드해야 하고, 릴리스와
+    `docs/prebuilt-wheels.yaml`을 함께 갱신해야 한다. `TRAINBENCH_CUDA_ARCHS`를 넓히는
+    것도 같다: 휠에 없는 arch는 느린 파드가 아니라 죽은 파드다.
+
 - 2026-08-02 **`pods.get`이 자기 GraphQL 문서를 보내고, 재시작한 컨테이너는 파드의
   계획을 다시 돌리지 않는다** (`trainbench/pods.py`, `docker/entrypoint.sh`.
   레인 C 소유. **원장의 `uptime_seconds`가 이제 실제로 채워지므로** 남긴다).
