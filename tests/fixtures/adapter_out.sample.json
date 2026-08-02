@@ -1,0 +1,266 @@
+{
+  "boundary": "loader-bench",
+  "produced_by": "lane-g (trainbench/loader.py + the six framework adapters)",
+  "consumed_by": "lane-d (scripts/bench.py::build_run)",
+  "values_are": "illustrative shapes. No class name, parameter name, dtype or count in this file is a measurement, and tests/contract/test_loader_bench.py never asserts one — it validates vocabulary, required keys and the cross-field rules. The only measured facts this boundary rests on are cited in AGENTS.md and .plans/remaining-code/lane-g.md.",
+  "adapters": {
+    "native": {
+      "framework": "native",
+      "model_class": "Qwen3VLModel",
+      "processor_class": "Qwen3VLProcessor",
+      "step": {
+        "owner": "harness",
+        "callable": null,
+        "batch_keys": ["input_ids", "attention_mask"]
+      },
+      "owned_axes": {},
+      "required_step_context": null,
+      "fingerprint": {
+        "module_classes": {
+          "model": "Qwen3VLModel",
+          "visual": "Qwen3VLVisionModel",
+          "language_model": "Qwen3VLTextModel"
+        },
+        "parameter_dtypes": {
+          "visual.patch_embed.proj.weight": "bfloat16",
+          "language_model.embed_tokens.weight": "bfloat16",
+          "language_model.layers.0.self_attn.q_proj.weight": "bfloat16"
+        },
+        "buffer_dtypes": {
+          "language_model.rotary_emb.inv_freq": "float32"
+        },
+        "trainable_parameter_names": [
+          "visual.patch_embed.proj.weight",
+          "language_model.embed_tokens.weight",
+          "language_model.layers.0.self_attn.q_proj.weight"
+        ],
+        "attention": {
+          "requested": "sdpa",
+          "bound": "transformers.integrations.sdpa_attention.sdpa_attention_forward",
+          "per_module": {"model": "sdpa", "visual": "sdpa"},
+          "mask_fn_registered": false
+        }
+      },
+      "documented_entry_point": {
+        "framework": "transformers AutoModel.from_pretrained + a hand-written loop",
+        "harness_uses": "transformers AutoModel.from_pretrained + a hand-written loop",
+        "differs": false,
+        "source": "trainbench/probe/native.py:46 — the reference path, which is this harness itself"
+      }
+    },
+    "unsloth": {
+      "framework": "unsloth",
+      "model_class": "Qwen3VLForConditionalGeneration",
+      "processor_class": "Qwen3VLProcessor",
+      "step": {
+        "owner": "harness",
+        "callable": null,
+        "batch_keys": ["input_ids", "attention_mask"]
+      },
+      "owned_axes": {},
+      "required_step_context": null,
+      "fingerprint": {
+        "module_classes": {
+          "model": "Qwen3VLForConditionalGeneration",
+          "model.visual": "Qwen3VLVisionModel",
+          "model.language_model": "Qwen3VLTextModel"
+        },
+        "parameter_dtypes": {
+          "model.visual.patch_embed.proj.weight": "bfloat16",
+          "model.language_model.embed_tokens.weight": "bfloat16",
+          "model.language_model.layers.0.self_attn.q_proj.weight": "bfloat16"
+        },
+        "buffer_dtypes": {
+          "model.language_model.rotary_emb.inv_freq": "float32"
+        },
+        "trainable_parameter_names": [
+          "model.visual.patch_embed.proj.weight",
+          "model.language_model.embed_tokens.weight",
+          "model.language_model.layers.0.self_attn.q_proj.weight"
+        ],
+        "attention": {
+          "requested": "sdpa",
+          "bound": "unsloth_zoo.temporary_patches.attention.patched_attention_forward",
+          "per_module": {"model": "sdpa"},
+          "mask_fn_registered": true
+        }
+      },
+      "documented_entry_point": {
+        "framework": "FastVisionModel.from_pretrained -> FastVisionModel.for_training(model) -> SFTTrainer",
+        "harness_uses": "FastVisionModel.from_pretrained(full_finetuning=...) + the harness loop, no for_training()",
+        "differs": true,
+        "source": "unsloth 2026.7.6 models/vision.py:1164-1187, 2094-2129 — full_finetuning defaults False and the chain ends in requires_grad_(False) on every non-LoRA parameter"
+      }
+    },
+    "ms_swift": {
+      "framework": "ms_swift",
+      "model_class": "Qwen3VLForConditionalGeneration",
+      "processor_class": "Qwen3VLProcessor",
+      "step": {
+        "owner": "harness",
+        "callable": null,
+        "batch_keys": ["input_ids", "attention_mask"]
+      },
+      "owned_axes": {},
+      "required_step_context": null,
+      "fingerprint": {
+        "module_classes": {
+          "model": "Qwen3VLForConditionalGeneration",
+          "model.visual": "Qwen3VLVisionModel"
+        },
+        "parameter_dtypes": {
+          "model.visual.patch_embed.proj.weight": "bfloat16",
+          "model.language_model.embed_tokens.weight": "bfloat16"
+        },
+        "buffer_dtypes": {},
+        "trainable_parameter_names": [
+          "model.visual.patch_embed.proj.weight",
+          "model.language_model.embed_tokens.weight"
+        ],
+        "attention": {
+          "requested": "sdpa",
+          "bound": "transformers.integrations.sdpa_attention.sdpa_attention_forward",
+          "per_module": {"model": "sdpa"},
+          "mask_fn_registered": false
+        }
+      },
+      "documented_entry_point": {
+        "framework": "swift.llm.sft_main / EmbeddingTrainer with swift's own infonce loss",
+        "harness_uses": "swift.get_model_processor + the harness loop, no swift trainer",
+        "differs": true,
+        "source": "trainbench/probe/ms_swift.py:34-39 — get_model_processor owns the from_pretrained call, so axes.load_kwargs has nowhere to go on this path"
+      }
+    },
+    "sentence_transformers": {
+      "framework": "sentence_transformers",
+      "model_class": "SentenceTransformer",
+      "processor_class": "Qwen3VLProcessor",
+      "step": {
+        "owner": "harness",
+        "callable": null,
+        "batch_keys": ["input_ids", "attention_mask"]
+      },
+      "owned_axes": {},
+      "required_step_context": null,
+      "fingerprint": {
+        "module_classes": {
+          "model": "SentenceTransformer",
+          "0": "Transformer",
+          "1": "Pooling"
+        },
+        "parameter_dtypes": {
+          "0.auto_model.embed_tokens.weight": "bfloat16",
+          "0.auto_model.layers.0.self_attn.q_proj.weight": "bfloat16"
+        },
+        "buffer_dtypes": {},
+        "trainable_parameter_names": [
+          "0.auto_model.embed_tokens.weight",
+          "0.auto_model.layers.0.self_attn.q_proj.weight"
+        ],
+        "attention": {
+          "requested": "sdpa",
+          "bound": "transformers.integrations.sdpa_attention.sdpa_attention_forward",
+          "per_module": {"0.auto_model": "sdpa"},
+          "mask_fn_registered": false
+        }
+      },
+      "documented_entry_point": {
+        "framework": "SentenceTransformerTrainer with MultipleNegativesRankingLoss",
+        "harness_uses": "SentenceTransformer(...) + the harness loop over trainbench.embedding.info_nce",
+        "differs": null,
+        "source": "확인 안 함 — whether ST's call convention takes the Collate processor(text=..., images=...) output, and whether ST supplies its own loss on this path, are both open. lane-g settles them inside the ST image; nothing on this host can."
+      }
+    },
+    "tevatron": {
+      "framework": "tevatron",
+      "model_class": "DenseModel",
+      "processor_class": "Qwen3VLProcessor",
+      "step": {
+        "owner": "framework",
+        "callable": "tevatron.retriever.modeling.DenseModel.forward",
+        "batch_keys": ["query", "passage"]
+      },
+      "owned_axes": {
+        "loss.name": "DenseModel.forward encodes, pools, normalises, scores and computes InfoNCE itself, so the harness loss never runs in this cell (pinned dd06310, src/tevatron/retriever/modeling/encoder.py:52-87)",
+        "parallel.cross_device_negatives": "the same forward performs the distributed gather, so whether negatives cross devices is tevatron's decision and not an axis this harness sets"
+      },
+      "required_step_context": null,
+      "fingerprint": {
+        "module_classes": {
+          "model": "DenseModel",
+          "encoder": "Qwen3VLModel"
+        },
+        "parameter_dtypes": {
+          "encoder.embed_tokens.weight": "bfloat16",
+          "encoder.layers.0.self_attn.q_proj.weight": "bfloat16"
+        },
+        "buffer_dtypes": {},
+        "trainable_parameter_names": [
+          "encoder.embed_tokens.weight",
+          "encoder.layers.0.self_attn.q_proj.weight"
+        ],
+        "attention": {
+          "requested": "sdpa",
+          "bound": "transformers.integrations.sdpa_attention.sdpa_attention_forward",
+          "per_module": {"encoder": "sdpa"},
+          "mask_fn_registered": false
+        }
+      },
+      "documented_entry_point": {
+        "framework": "tevatron.retriever.driver.train -> TevatronTrainer over DenseModel.forward(query=, passage=)",
+        "harness_uses": "DenseModel.load(...) + DenseModel.forward(query=, passage=) driven by the harness timer",
+        "differs": true,
+        "source": "pinned dd06310, src/tevatron/retriever/modeling/encoder.py:52-87 — forward takes query=/passage= dicts, not the model(**batch) that trainbench/probe/steps.py:190-195 expects"
+      }
+    },
+    "axolotl": {
+      "framework": "axolotl",
+      "model_class": "Qwen3VLForConditionalGeneration",
+      "processor_class": "Qwen2TokenizerFast",
+      "step": {
+        "owner": "harness",
+        "callable": null,
+        "batch_keys": ["input_ids", "attention_mask"]
+      },
+      "owned_axes": {},
+      "required_step_context": {
+        "kind": "autocast",
+        "device_type": "cuda",
+        "dtype": "bfloat16",
+        "reason": "axolotl leaves embed_tokens and lm_head in fp32 and trains inside HF Trainer's autocast; the restoring branch needs adapter/FSDP/cut_cross_entropy and this path has none of them (axolotl loaders/model.py:433-436, :456-475). Measured without the context, native (pure bf16) and axolotl are two numeric regimes reported under one label.",
+        "established_by": "axes.step_context"
+      },
+      "fingerprint": {
+        "module_classes": {
+          "model": "Qwen3VLForConditionalGeneration",
+          "model.language_model": "Qwen3VLTextModel"
+        },
+        "parameter_dtypes": {
+          "model.language_model.embed_tokens.weight": "float32",
+          "model.language_model.layers.0.self_attn.q_proj.weight": "bfloat16",
+          "lm_head.weight": "float32"
+        },
+        "buffer_dtypes": {
+          "model.language_model.rotary_emb.inv_freq": "float32"
+        },
+        "trainable_parameter_names": [
+          "model.language_model.embed_tokens.weight",
+          "model.language_model.layers.0.self_attn.q_proj.weight",
+          "lm_head.weight"
+        ],
+        "attention": {
+          "requested": "sdpa",
+          "bound": "transformers.integrations.sdpa_attention.sdpa_attention_forward",
+          "per_module": {"model": "sdpa"},
+          "mask_fn_registered": false
+        }
+      },
+      "documented_entry_point": {
+        "framework": "axolotl.cli.train -> AxolotlTrainer (HF Trainer, autocast around the step)",
+        "harness_uses": "ModelLoader(cfg, tokenizer).load() + the harness loop inside axes.step_context",
+        "differs": true,
+        "source": "axolotl 0.18.0 cli/config.py:303-322 (prepare_plugins -> validate_config -> normalize_config) and loaders/model.py:433-436"
+      }
+    }
+  }
+}
