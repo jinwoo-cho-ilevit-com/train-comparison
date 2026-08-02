@@ -283,10 +283,10 @@ def _capture_freeze_ple(built: Built, config: BenchConfig) -> tuple[str | None, 
 
 
 # The class a run built, in this axis's vocabulary. A table from the constructed
-# object, never a translation of the request: `kind.lower()` cannot produce an
-# underscore, so `adamw_8bit` was unreachable and a run asking for it could never
-# be certified — but mapping the request instead would make this a mirror and
-# certify every run.
+# object, never a translation of the request: mapping the request would make this
+# a mirror and certify every run. It is also the only way to a value — a class
+# that is not here is undetermined, because a name derived from the class instead
+# would reach values this table deliberately gates.
 #
 # `AdamW` is deliberately absent. Whether the fused kernel is in use is a property
 # of the param groups rather than of the class, and an entry here would put the
@@ -384,10 +384,15 @@ def _capture_optim(built: Built, config: BenchConfig) -> tuple[str | None, dict[
     named = OPTIM_CLASS_AXIS.get(kind)
     if named is not None:
         return named, detail
-    # A class the table does not name earns no configured value: being an optimizer
-    # at all is not what certifies this axis, and rounding to the nearest label is
-    # how a vendor's own 8-bit AdamW would publish its number as ours.
-    return kind.lower(), detail
+    # A class the table does not name earns no value: deriving one from the class
+    # name is how `MUON` spells a value the config offers off a class the
+    # Newton-Schulz reading above never examines — it knows one exact spelling.
+    return None, {
+        **detail,
+        "reason": f"{kind} is not a class this names, so which optimizer stepped cannot be "
+        "read off it. A run that means to certify this axis has to add the class to "
+        "OPTIM_CLASS_AXIS, with whatever else that class needs read back first",
+    }
 
 
 def _capture_loss(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
@@ -1055,6 +1060,13 @@ PRECISION_RECIPE_AXIS = {
     "NVFP4BlockScaling": "nvfp4",
 }
 
+# The store a recipe run's base weights have to be in. Not a claim about
+# Transformer Engine: this study loads every model through
+# `probe/steps.py::dtype_for`, which is bf16 on CUDA and fp32 everywhere else, so
+# fp32 base weights under an fp8 recipe are a model loaded off CUDA — and the
+# recipe object is built from the config either way.
+RECIPE_BASE_DTYPES = ("bf16", "fp16")
+
 # peft holds its adapter weights in fp32 over a bf16 base. Measured on peft
 # 0.20.0: `get_peft_model` over a bfloat16 model returns `lora_A`/`lora_B` in
 # float32 while every base tensor stays bfloat16. A probe demanding one dtype
@@ -1082,16 +1094,20 @@ def _capture_precision(built: Built, config: BenchConfig) -> tuple[str | None, d
     not what a correct LoRA run looks like.
 
     Which fp8 recipe is in effect is not on the weights at all — those cast inside
-    the step — so it is read off the recipe the step was wrapped with, which is
-    what `Built.precision_recipe` carries. That reading comes first, because it is
-    direct evidence where the module scan below is only a reason to distrust the
-    dtypes. Without a recipe, a model whose modules come from a recipe package is
-    undetermined; the alternative is to read bf16 off an mxfp8 run's parameters and
-    certify it as bf16.
+    the step — so the recipe the step was wrapped with (`Built.precision_recipe`)
+    is what names the value. Naming is not certifying: `axes.assemble` builds that
+    object out of the same config this state is checked against, so a branch that
+    read only its class name would hand the request back and every dtype reading
+    below would be skipped. The model has to agree — base weights in a store a
+    recipe casts from (`RECIPE_BASE_DTYPES`), and, once the model lists modules at
+    all, modules from a recipe package among them. Without a recipe, a model whose
+    modules come from a recipe package is undetermined; the alternative is to read
+    bf16 off an mxfp8 run's parameters and certify it as bf16.
     """
     if built.model is None:
         return None, {"reason": "no model was built"}
-    swapped = sorted(set(_module_roots(built.model)) & set(PRECISION_MODULE_ROOTS))
+    roots = _module_roots(built.model)
+    swapped = sorted(set(roots) & set(PRECISION_MODULE_ROOTS))
     base: dict[str, int] = {}
     adapter: dict[str, int] = {}
     for name, param in built.model.named_parameters():
@@ -1101,25 +1117,16 @@ def _capture_precision(built: Built, config: BenchConfig) -> tuple[str | None, d
         spelling = DTYPE_NAMES.get(spelling, spelling.rsplit(".", 1)[-1])
         bucket = adapter if ADAPTER_PARAM_MARKER in name else base
         bucket[spelling] = bucket.get(spelling, 0) + 1
-    detail: dict[str, Any] = {"base": base, "adapter": adapter}
-    if built.precision_recipe is not None:
-        recipe = type(built.precision_recipe).__name__
+    detail: dict[str, Any] = {"base": base, "adapter": adapter, "recipe_modules": swapped}
+    recipe = None if built.precision_recipe is None else type(built.precision_recipe).__name__
+    if recipe is not None:
         detail = {**detail, "recipe": recipe}
-        named = PRECISION_RECIPE_AXIS.get(recipe)
-        if named is None:
+        if recipe not in PRECISION_RECIPE_AXIS:
             return None, {
                 **detail,
                 "reason": f"the step is wrapped with a {recipe} recipe, which this does not "
                 "name, so which precision the matmuls ran in is unknown",
             }
-        return named, detail
-    if swapped:
-        return None, {
-            **detail,
-            "reason": f"{', '.join(swapped)} defines modules in this model, and those cast "
-            "inside the step rather than on the weights, so which recipe is in effect cannot "
-            "be read off the parameters",
-        }
     if not base:
         return None, {
             **detail,
@@ -1132,6 +1139,35 @@ def _capture_precision(built: Built, config: BenchConfig) -> tuple[str | None, d
             "reason": f"this model carries an adapter but no parameter name contains "
             f"{ADAPTER_PARAM_MARKER!r}, so adapter weights cannot be told apart from base "
             "weights and either could be the dtype reported here",
+        }
+    if recipe is not None:
+        named = PRECISION_RECIPE_AXIS[recipe]
+        # The module scan is evidence against the recipe, not for it: a model listing
+        # modules of its own, none of them from a recipe package, is one the recipe
+        # wraps with nothing of the package in it. 확인 안 함 — transformer-engine
+        # does not import here, so a pod must print `_module_roots(model)`.
+        if roots and not swapped:
+            return None, {
+                **detail,
+                "reason": f"the step is wrapped with a {recipe} recipe, but none of this "
+                f"model's {sum(roots.values())} modules come from "
+                f"{' or '.join(PRECISION_MODULE_ROOTS)}, so nothing in the model says the "
+                f"matmuls ran in {named}",
+            }
+        if len(base) != 1 or next(iter(base)) not in RECIPE_BASE_DTYPES:
+            return None, {
+                **detail,
+                "reason": f"the base weights are {'+'.join(sorted(base))} where a {named} run "
+                f"is loaded in one of {', '.join(RECIPE_BASE_DTYPES)}, so the {recipe} recipe "
+                "is over parameters this study does not load an fp8 run in",
+            }
+        return named, detail
+    if swapped:
+        return None, {
+            **detail,
+            "reason": f"{', '.join(swapped)} defines modules in this model, and those cast "
+            "inside the step rather than on the weights, so which recipe is in effect cannot "
+            "be read off the parameters",
         }
     if len(base) == 1:
         return next(iter(base)), detail
