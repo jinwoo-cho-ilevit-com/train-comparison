@@ -199,10 +199,6 @@ def full_state(config: BenchConfig, **replace: AxisState) -> AppliedState:
 # --- 1. the vocabulary: three states, not two --------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed applied.AXIS_STATES; remove this marker when it does",
-)
 def test_the_state_vocabulary_names_three_states():
     """A named vocabulary rather than a trichotomy each reader re-derives from two
     nullable fields. `report.py` has to show a tevatron cell as having no loss axis
@@ -211,10 +207,6 @@ def test_the_state_vocabulary_names_three_states():
     assert set(applied_module.AXIS_STATES) == {APPLIED, FRAMEWORK_OWNED, UNDETERMINED}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed applied.FRAMEWORK_OWNABLE; remove this marker when it does",
-)
 def test_ownership_is_bounded_by_a_declared_set():
     """An adapter that could own any axis could disclaim all of them, and capture
     would certify a run by declining to look at it."""
@@ -225,10 +217,6 @@ def test_ownership_is_bounded_by_a_declared_set():
     assert "framework.name" not in ownable, "an adapter may not disclaim being itself"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed AxisState.owner; remove this marker when it does",
-)
 def test_a_framework_owned_axis_does_not_block_a_reportable_run(config_mapping):
     config = bench(config_mapping, **{"framework.name": "tevatron"})
     owned = AxisState(
@@ -253,10 +241,6 @@ def test_a_framework_owned_axis_does_not_block_a_reportable_run(config_mapping):
     assert_matches(state, config)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed AxisState.state; remove this marker when it does",
-)
 def test_the_same_axis_unowned_and_unread_still_blocks(config_mapping):
     """Paired with the test above: on its own that one passes even if
     `assert_matches` stopped enforcing anything at all."""
@@ -270,10 +254,6 @@ def test_the_same_axis_unowned_and_unread_still_blocks(config_mapping):
         assert_matches(state, config)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed Built.owned_axes; remove this marker when it does",
-)
 def test_ownership_comes_from_the_adapter_not_from_the_config(config_mapping):
     """The mirror failure in its new-state form.
 
@@ -303,10 +283,6 @@ def test_ownership_comes_from_the_adapter_not_from_the_config(config_mapping):
     assert owned.detail.get("reason"), "a disclaimed axis has to say whose it is and why"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed Built.owned_axes; remove this marker when it does",
-)
 def test_an_axis_outside_the_declared_set_cannot_be_disclaimed(config_mapping):
     config = bench(config_mapping, **{"framework.name": "tevatron"})
 
@@ -316,10 +292,6 @@ def test_an_axis_outside_the_declared_set_cannot_be_disclaimed(config_mapping):
     assert axis(state, "kernel.name").state != FRAMEWORK_OWNED
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed Built.owned_axes; remove this marker when it does",
-)
 def test_ownership_without_a_declared_adapter_is_not_ownership(config_mapping):
     """`owner` names who computes the axis instead of us. A run where no adapter
     declared itself has nobody to name, and 'owned by nobody' must fall back to
@@ -468,10 +440,6 @@ def test_deliberately_unnameable_values_survive(config_mapping, name, build, exp
 # --- 3. the four axes that cannot currently equal their config value ---------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed applied.OPTIM_CLASS_AXIS; remove this marker when it does",
-)
 def test_the_optimizer_class_table_only_maps_to_values_the_config_offers():
     """`kind.lower()` cannot produce an underscore, so `adamw_8bit` was unreachable
     and a run that requested it could never be certified. The fix is a table from
@@ -489,10 +457,6 @@ def test_the_optimizer_class_table_only_maps_to_values_the_config_offers():
     assert "adamw_8bit" in set(table.values())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed applied.OPTIM_CLASS_AXIS; remove this marker when it does",
-)
 def test_the_optimizer_axis_is_decided_by_the_table(config_mapping):
     config = bench(config_mapping, **{"optim.name": "adamw_8bit"})
     class_name = next(
@@ -524,10 +488,6 @@ def test_an_optimizer_the_table_does_not_name_earns_no_config_value(config_mappi
     assert not entry.matches
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed applied.PRECISION_RECIPE_AXIS; remove this marker when it does",
-)
 def test_the_precision_recipe_table_only_maps_to_values_the_config_offers():
     """`_capture_precision` refuses to read an fp8 run's precision off bf16 weights,
     which is correct and is why the axis is permanently undetermined. The recipe is
@@ -543,10 +503,6 @@ def test_the_precision_recipe_table_only_maps_to_values_the_config_offers():
     assert {"mxfp8", "nvfp4"} <= set(table.values())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed Built.precision_recipe; remove this marker when it does",
-)
 @pytest.mark.parametrize("wanted", ["mxfp8", "nvfp4"])
 def test_precision_is_read_off_the_recipe_the_step_actually_wrapped_with(config_mapping, wanted):
     config = bench(config_mapping, **{"precision.name": wanted})
@@ -566,10 +522,6 @@ def test_precision_is_read_off_the_recipe_the_step_actually_wrapped_with(config_
     assert entry.matches
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed Built.precision_recipe; remove this marker when it does",
-)
 def test_an_fp8_request_with_no_recipe_is_never_certified_from_the_weights(config_mapping):
     """The refusal that must survive the change: bf16 parameters are what an fp8 run
     has, so reading the dtype and calling it mxfp8 is exactly the failure this
@@ -589,10 +541,6 @@ def engine_model(engine_class: str = "DeepSpeedEngine", params=()):
     return model(modules=[("module", instance(engine_class))], params=params)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed applied.zero_stage; remove this marker when it does",
-)
 @pytest.mark.parametrize("stage,expected", [(2, "zero2"), (3, "zero3")])
 def test_the_zero_stage_is_read_off_the_engine_not_off_the_config(
     config_mapping, monkeypatch, stage, expected
@@ -616,10 +564,6 @@ def test_the_zero_stage_is_read_off_the_engine_not_off_the_config(
     assert entry.matches
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed applied.zero_stage; remove this marker when it does",
-)
 def test_an_engine_whose_stage_cannot_be_read_is_undetermined(config_mapping, monkeypatch):
     config = bench(config_mapping, **{"parallel.strategy": "zero3"})
     monkeypatch.setattr(applied_module, "zero_stage", lambda engine: None)
@@ -649,10 +593,6 @@ OFFLOAD_TARGETS = (
 )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed applied.offload_targets; remove this marker when it does",
-)
 @pytest.mark.parametrize("targets,expected", OFFLOAD_TARGETS, ids=[o[1] for o in OFFLOAD_TARGETS])
 def test_offload_is_read_off_the_engine_config(config_mapping, monkeypatch, targets, expected):
     """The docstring on `_capture_offload` concedes it: under deepspeed the setting
@@ -680,10 +620,6 @@ def test_offload_is_read_off_the_engine_config(config_mapping, monkeypatch, targ
     assert entry.matches
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed applied.offload_targets; remove this marker when it does",
-)
 def test_an_engine_that_does_not_say_where_it_offloads_is_undetermined(config_mapping, monkeypatch):
     """The direction that must not flip: reporting `none` because nothing looked is
     worse than reporting nothing."""
@@ -705,10 +641,6 @@ def test_an_engine_that_does_not_say_where_it_offloads_is_undetermined(config_ma
     assert entry.state == UNDETERMINED
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed applied.OPTIM_CLASS_AXIS; remove this marker when it does",
-)
 @pytest.mark.parametrize("name", CONTESTED)
 def test_every_contested_axis_can_reach_a_state_that_matches(config_mapping, name):
     """The reason this boundary exists at all: lane-h cannot implement an axis whose
@@ -735,10 +667,6 @@ def test_every_contested_axis_can_reach_a_state_that_matches(config_mapping, nam
 # --- 4. what travels ---------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed applied.FRAMEWORK_OWNABLE; remove this marker when it does",
-)
 def test_the_stored_sample_is_itself_a_valid_instance_of_the_contract():
     """The fixture is the thing two lanes look at instead of reading prose the same
     way. A sample that has drifted out of the contract is worse than none."""
@@ -776,11 +704,6 @@ def test_the_stored_sample_is_itself_a_valid_instance_of_the_contract():
     assert set(CONTESTED) <= {entry["axis"] for entry in payload["axes"]}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed the owner/state/framework_owned record keys; "
-    "remove this marker when it does",
-)
 def test_the_record_has_the_shape_the_sample_pins(config_mapping):
     """`build_record` writes this dict under `applied`, and it is the only thing a
     result file says about what actually ran. A key dropped here is a state that
@@ -793,10 +716,6 @@ def test_the_record_has_the_shape_the_sample_pins(config_mapping):
     assert json.loads(json.dumps(payload)) == payload
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed AppliedState.framework_owned; remove this marker when it does",
-)
 def test_a_framework_owned_axis_survives_the_round_trip():
     """Two runs that differ only in whether the loss was somebody else's must not
     serialise to the same record.
@@ -827,10 +746,6 @@ def test_a_framework_owned_axis_survives_the_round_trip():
     assert entry != other
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed AxisState.state; remove this marker when it does",
-)
 def test_the_three_states_are_distinguishable_from_the_record_alone(config_mapping):
     """report.py has to show a tevatron cell as having no loss axis rather than as
     having an unverified one, and it reads the file, not the objects."""
@@ -901,11 +816,6 @@ def _dotted(node: ast.AST) -> str:
     return ".".join(reversed(parts))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="lane-c has not landed the boundary, so this file still defers 21 tests; "
-    "remove this marker last, once every other one is gone",
-)
 def test_the_contract_defers_nothing():
     """The check that stops the deferral from becoming the vacuum it was meant to
     avoid.

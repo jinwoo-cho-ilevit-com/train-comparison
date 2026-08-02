@@ -14,6 +14,16 @@ undetermined axis fails a timing run exactly like a mismatched one. That is the
 fail-safe direction: an axis is only ever certified once someone writes a probe
 that actually looks.
 
+An axis has three states, not two. `framework_owned` is the third, and it exists
+because some axes are not ours to read back: tevatron's `DenseModel.forward` does
+the encoding, pooling, normalisation, scoring, InfoNCE and the distributed gather
+itself, and the decision taken for this study is to measure each framework's own
+training step. With two states a tevatron cell requesting `loss=mnrl` reads as our
+loss failing to apply and the run is refused. Ownership is a declaration that
+nobody looked, never a certification: an owned axis carries `applied=None`, never
+matches, and can only be declared by the adapter that ran (`Built.owned_axes`) for
+an axis the boundary allows to be disclaimed (`FRAMEWORK_OWNABLE`).
+
 The set of axes is derived from the schema, not listed here. A hand-written list
 fails open — an axis missing from it is not "undetermined", it does not exist,
 and deleting a line would disable a check with nothing to notice. Marking a field
@@ -36,6 +46,22 @@ ENFORCED_PURPOSES = ("timing", "quality")
 # it is enforced.
 KNOWN_PURPOSES = get_args(RunConfig.model_fields["purpose"].annotation)
 
+# The three states an axis can be in, named once so every reader shares one
+# vocabulary instead of re-deriving a trichotomy from two nullable fields — which
+# is where the third state gets collapsed back into the other two.
+APPLIED = "applied"
+FRAMEWORK_OWNED = "framework_owned"
+UNDETERMINED = "undetermined"
+AXIS_STATES = (APPLIED, FRAMEWORK_OWNED, UNDETERMINED)
+
+# Axes an adapter may declare as its own. Both sit inside tevatron's
+# `DenseModel.forward`. The set is bounded because an adapter free to disclaim any
+# axis could disclaim all of them, and capture would then certify a run by
+# declining to look at it. `framework.name` is deliberately absent: it is the
+# evidence of which framework ran, and an adapter able to disclaim that could
+# disclaim everything downstream of it.
+FRAMEWORK_OWNABLE = ("loss.name", "parallel.cross_device_negatives")
+
 
 @dataclass(frozen=True)
 class AxisState:
@@ -45,20 +71,39 @@ class AxisState:
     requested: str
     applied: str | None
     detail: dict[str, Any] = field(default_factory=dict)
+    # The adapter that computes this axis instead of us. Set from
+    # `Built.owned_axes`, never from the config, which is only the request.
+    owner: str | None = None
 
     @property
     def determined(self) -> bool:
         return self.applied is not None
 
     @property
+    def state(self) -> str:
+        """Which of `AXIS_STATES` this axis is in.
+
+        Membership of `FRAMEWORK_OWNABLE` is re-checked here rather than trusted
+        from whoever set `owner`, so a state assembled by hand cannot exempt an
+        axis the boundary never allowed to be disclaimed.
+        """
+        if self.owner is not None and self.axis in FRAMEWORK_OWNABLE:
+            return FRAMEWORK_OWNED
+        return APPLIED if self.determined else UNDETERMINED
+
+    @property
     def matches(self) -> bool:
-        return self.determined and self.applied == self.requested
+        # `state == APPLIED` rather than `determined`: an owned axis carrying a
+        # value would be an adapter certifying itself for having declined to look.
+        return self.state == APPLIED and self.applied == self.requested
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "axis": self.axis,
             "requested": self.requested,
             "applied": self.applied,
+            "owner": self.owner,
+            "state": self.state,
             "determined": self.determined,
             "matches": self.matches,
             "detail": self.detail,
@@ -70,10 +115,16 @@ class AppliedState:
     axes: tuple[AxisState, ...]
 
     def mismatched(self) -> list[AxisState]:
+        # Keyed on `determined` rather than on `state == APPLIED`: an owned axis
+        # that arrived carrying a value is a contradiction, and this is what makes
+        # it stop the run instead of passing as somebody else's.
         return [a for a in self.axes if a.determined and not a.matches]
 
     def undetermined(self) -> list[AxisState]:
-        return [a for a in self.axes if not a.determined]
+        return [a for a in self.axes if a.state == UNDETERMINED]
+
+    def framework_owned(self) -> list[AxisState]:
+        return [a for a in self.axes if a.state == FRAMEWORK_OWNED]
 
     def missing(self) -> list[str]:
         """Axis knobs the schema declares that this state says nothing about."""
@@ -84,6 +135,10 @@ class AppliedState:
             "axes": [a.to_dict() for a in self.axes],
             "all_determined": not self.undetermined(),
             "all_matched": not self.mismatched(),
+            # What separates a run whose loss was somebody else's from one whose
+            # loss nobody read. `all_determined` cannot carry it: forcing it false
+            # for an owned axis makes the two records identical.
+            "framework_owned": sorted(a.axis for a in self.framework_owned()),
             "missing": self.missing(),
         }
 
@@ -114,6 +169,17 @@ class Built:
     # from the config: the config is the request, and telling the two apart is the
     # entire job of this module.
     framework: str | None = None
+    # The recipe the training step was wrapped with, for the precisions that cast
+    # inside the step rather than on the weights. Without it an fp8 run's precision
+    # can only be read off bf16 parameters, which is the misreading this module
+    # exists to prevent — so the axis stays undetermined forever instead.
+    precision_recipe: Any = None
+    # Axes this adapter computes itself, named by the object the adapter built.
+    # Taken from here rather than from the config so that `framework=tevatron` —
+    # the request — cannot exempt a cell from the axes it was least likely to
+    # apply. Membership is all that is read, so a mapping of axis to reason works
+    # here as well as a tuple of names.
+    owned_axes: tuple[str, ...] = ()
 
 
 # --- per-axis capture probes -------------------------------------------------
@@ -215,12 +281,37 @@ def _capture_freeze_ple(built: Built, config: BenchConfig) -> tuple[str | None, 
     return "partial", {**detail, "unfrozen_sample": unfrozen[:5]}
 
 
+# The class a run built, in this axis's vocabulary. A table from the constructed
+# object, never a translation of the request: `kind.lower()` cannot produce an
+# underscore, so `adamw_8bit` was unreachable and a run asking for it could never
+# be certified — but mapping the request instead would make this a mirror and
+# certify every run.
+#
+# `AdamW` is deliberately absent. Whether the fused kernel is in use is a property
+# of the param groups rather than of the class, and an entry here would put the
+# fused label on an unfused run.
+#
+# The 8-bit spellings are `bitsandbytes.optim.AdamW8bit` and its paged sibling
+# (`bitsandbytes/optim/__init__.py`, read in `.plans/research/axis-libraries.md`
+# §4.1); `configs/optim/adamw_8bit.yaml` targets the first. 확인 안 함: which of
+# them a run actually constructs, because bitsandbytes does not import on this
+# host. A pod must print `type(optimizer).__name__` for `optim=adamw_8bit` and for
+# `optim=muon` and correct this table.
+OPTIM_CLASS_AXIS = {
+    "AdamW8bit": "adamw_8bit",
+    "PagedAdamW8bit": "adamw_8bit",
+    "Muon": "muon",
+}
+
+
 def _capture_optim(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
     """Which optimizer a run is actually stepping with.
 
-    The fused AdamW kernel is CUDA-only, so an unfused AdamW is reported as a
-    different applied value: `adamw_fused` is the name of a kernel, and a run that
-    did not use it must not carry that label.
+    `OPTIM_CLASS_AXIS` decides the axis from the built optimizer's class, except
+    for the two values one class cannot separate. The fused AdamW kernel is
+    CUDA-only, so an unfused AdamW is reported as a different applied value:
+    `adamw_fused` is the name of a kernel, and a run that did not use it must not
+    carry that label.
 
     Muon needs one more read than its class name. It holds an AdamW inside itself
     and routes each param group to Newton-Schulz or to that AdamW on the group's
@@ -262,9 +353,15 @@ def _capture_optim(built: Built, config: BenchConfig) -> tuple[str | None, dict[
                 "too until a probe can tell what that one orthogonalises"
             )
             return None, detail
-    if kind != "AdamW":
-        return kind.lower(), detail
-    return ("adamw_fused" if fused else "adamw_unfused"), detail
+    if kind == "AdamW":
+        return ("adamw_fused" if fused else "adamw_unfused"), detail
+    named = OPTIM_CLASS_AXIS.get(kind)
+    if named is not None:
+        return named, detail
+    # A class the table does not name earns no configured value: being an optimizer
+    # at all is not what certifies this axis, and rounding to the nearest label is
+    # how a vendor's own 8-bit AdamW would publish its number as ours.
+    return kind.lower(), detail
 
 
 def _capture_loss(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
@@ -727,6 +824,100 @@ PARALLEL_WRAPPERS = {
     "DeepSpeedEngine": "deepspeed",
 }
 
+# Which ZeRO stage is which axis value. One engine class stands for both, so the
+# class name alone can only say `deepspeed` — a value no config offers, which is
+# what blocked `zero2` and `zero3` outright.
+ZERO_STAGE_AXIS = {2: "zero2", 3: "zero3"}
+
+# Which `(offload_optimizer, offload_param)` pair is which axis value. The pair is
+# what every value of this axis is made of, and reading both is what tells
+# `optimizer` from `param` from `both`.
+OFFLOAD_TARGET_AXIS = {
+    (False, False): "none",
+    (True, False): "optimizer",
+    (False, True): "param",
+    (True, True): "both",
+}
+
+# How the engine answers each of the three questions, and how "not offloaded" is
+# spelled in the answer. `DeepSpeedEngine.zero_optimization_stage()` returns a
+# `ZeroStageEnum` (an int subclass) and `zero_offload_optimizer()` /
+# `zero_offload_param()` return an offload config or None, whose `.device` is an
+# `OffloadDeviceEnum` (a str subclass) with `none`/`cpu`/`nvme`
+# (`deepspeed/runtime/engine.py:1125-1154`, `runtime/zero/offload_config.py:14-18`,
+# read in `.plans/research/axis-libraries.md` §5.2).
+ZERO_STAGE_READER = "zero_optimization_stage"
+OFFLOAD_READERS = ("zero_offload_optimizer", "zero_offload_param")
+OFFLOAD_DISABLED_DEVICE = "none"
+
+
+# Distinct from None, which is an answer these readers can legitimately give.
+_UNREADABLE = object()
+
+
+def _engine_answer(engine: Any, reader: str) -> Any:
+    """What `engine.<reader>()` says, or `_UNREADABLE` if it will not say.
+
+    Every branch that gives up here ends in an undetermined axis rather than in a
+    guess, because both readers below decide a value no other object in the run
+    can be asked for.
+    """
+    method = getattr(engine, reader, None)
+    if not callable(method):
+        return _UNREADABLE
+    try:
+        return method()
+    except BaseException:  # noqa: BLE001 - an engine that raises has told us nothing
+        return _UNREADABLE
+
+
+def zero_stage(engine: Any) -> int | None:
+    """Which ZeRO stage this engine was initialised with, or None if it will not say.
+
+    확인 안 함: what a real `DeepSpeedEngine` answers. deepspeed does not import on
+    this host (checked 2026-08-02), and it is sdist-only in the env locks, so it is
+    built on the pod. A pod running `parallel=zero3` must print
+    `type(engine).__name__` and `engine.zero_optimization_stage()` and correct this.
+    Until then the answer is None, which is undetermined — the axis blocks the run
+    rather than reporting a stage nothing read.
+    """
+    stage = _engine_answer(engine, ZERO_STAGE_READER)
+    if not isinstance(stage, int) or isinstance(stage, bool):
+        return None
+    return int(stage)
+
+
+def offload_targets(engine: Any) -> tuple[bool, bool] | None:
+    """Whether this engine offloads `(optimizer, param)`, or None if it will not say.
+
+    A section the engine reports as absent, or as sitting on the `none` device, is
+    read as not offloaded; anything else is. The comparison is against the string
+    because `OffloadDeviceEnum` subclasses `str`, so its members compare equal to
+    their own spelling while `str()` of them does not.
+
+    확인 안 함, on the same terms as `zero_stage`: a pod running
+    `train.offload=optimizer` must print `engine.zero_offload_optimizer()` and
+    `engine.zero_offload_param()` and correct this.
+    """
+    enabled = []
+    for reader in OFFLOAD_READERS:
+        settings = _engine_answer(engine, reader)
+        if settings is _UNREADABLE:
+            return None
+        device = getattr(settings, "device", None)
+        enabled.append(settings is not None and device != OFFLOAD_DISABLED_DEVICE)
+    return (enabled[0], enabled[1])
+
+
+def _deepspeed_engine(model: Any) -> tuple[str, Any] | None:
+    """The deepspeed engine in this model's tree, as `(name, module)`."""
+    if model is None:
+        return None
+    for name, module in model.named_modules():
+        if PARALLEL_WRAPPERS.get(type(module).__name__) == "deepspeed":
+            return name or "model", module
+    return None
+
 
 def _capture_parallel_strategy(
     built: Built, config: BenchConfig
@@ -737,6 +928,10 @@ def _capture_parallel_strategy(
     a wrapper. A job launched under `torchrun` with `parallel=single` runs one
     unsynchronised replica per rank and finishes faster than one process would;
     that number is not a single-GPU number and must not be recorded as one.
+
+    Under deepspeed the wrapper is not the whole answer, because one engine class
+    is both `zero2` and `zero3`. The stage comes off the engine; an engine that
+    will not say is undetermined rather than rounded to either.
     """
     import torch.distributed as dist
 
@@ -747,8 +942,22 @@ def _capture_parallel_strategy(
     detail: dict[str, Any] = {"world_size": world_size, "process_group": initialised}
     for name, module in built.model.named_modules():
         strategy = PARALLEL_WRAPPERS.get(type(module).__name__)
-        if strategy is not None:
-            return strategy, {**detail, "wrapper": type(module).__name__, "at": name or "model"}
+        if strategy is None:
+            continue
+        detail = {**detail, "wrapper": type(module).__name__, "at": name or "model"}
+        if strategy != "deepspeed":
+            return strategy, detail
+        stage = zero_stage(module)
+        if stage is None:
+            return None, {
+                **detail,
+                "reason": "this deepspeed engine does not report a ZeRO stage, and one engine "
+                "class is both zero2 and zero3, so which one ran cannot be read back",
+            }
+        detail = {**detail, "zero_stage": stage}
+        # A stage outside the two the config offers is named rather than rounded:
+        # stage 0 and stage 1 are runs that belong to no setting here.
+        return ZERO_STAGE_AXIS.get(stage, f"deepspeed(stage={stage})"), detail
     if world_size > 1:
         return f"unwrapped(world_size={world_size})", detail
     return "single", detail
@@ -771,6 +980,22 @@ DTYPE_NAMES = {
 # the parameter dtype is no longer the whole answer and this probe says so instead
 # of reading bf16 off the weights of an fp8 run.
 PRECISION_MODULE_ROOTS = ("transformer_engine", "torchao")
+
+# The recipe class the step was wrapped with, in this axis's vocabulary. This is
+# the only thing that can decide an fp8 run: the weights stay bf16, and reading
+# them would certify an mxfp8 run as bf16 — which is why this axis was permanently
+# undetermined before the recipe travelled on `Built`.
+#
+# The spellings are Transformer Engine's `MXFP8BlockScaling` and `NVFP4BlockScaling`
+# (`transformer_engine/common/recipe/__init__.py:337,479`, read in
+# `.plans/research/axis-libraries.md` §6). 확인 안 함: which of them
+# `axes.step_context` ends up constructing, because transformer-engine does not
+# import on this host. A pod must print `type(recipe).__name__` for `mxfp8` and for
+# `nvfp4` and correct this table.
+PRECISION_RECIPE_AXIS = {
+    "MXFP8BlockScaling": "mxfp8",
+    "NVFP4BlockScaling": "nvfp4",
+}
 
 # peft holds its adapter weights in fp32 over a bf16 base. Measured on peft
 # 0.20.0: `get_peft_model` over a bfloat16 model returns `lora_A`/`lora_B` in
@@ -798,10 +1023,13 @@ def _capture_precision(built: Built, config: BenchConfig) -> tuple[str | None, d
     keeps them in fp32 over a bf16 base, so one dtype across the whole model is
     not what a correct LoRA run looks like.
 
-    What it cannot see is which fp8 recipe is in effect. Those cast inside the
-    step rather than on the weights, so a model carrying their modules is reported
-    undetermined — the alternative is to read bf16 off an mxfp8 run's parameters
-    and certify it as bf16.
+    Which fp8 recipe is in effect is not on the weights at all — those cast inside
+    the step — so it is read off the recipe the step was wrapped with, which is
+    what `Built.precision_recipe` carries. That reading comes first, because it is
+    direct evidence where the module scan below is only a reason to distrust the
+    dtypes. Without a recipe, a model whose modules come from a recipe package is
+    undetermined; the alternative is to read bf16 off an mxfp8 run's parameters and
+    certify it as bf16.
     """
     if built.model is None:
         return None, {"reason": "no model was built"}
@@ -816,6 +1044,17 @@ def _capture_precision(built: Built, config: BenchConfig) -> tuple[str | None, d
         bucket = adapter if ADAPTER_PARAM_MARKER in name else base
         bucket[spelling] = bucket.get(spelling, 0) + 1
     detail: dict[str, Any] = {"base": base, "adapter": adapter}
+    if built.precision_recipe is not None:
+        recipe = type(built.precision_recipe).__name__
+        detail = {**detail, "recipe": recipe}
+        named = PRECISION_RECIPE_AXIS.get(recipe)
+        if named is None:
+            return None, {
+                **detail,
+                "reason": f"the step is wrapped with a {recipe} recipe, which this does not "
+                "name, so which precision the matmuls ran in is unknown",
+            }
+        return named, detail
     if swapped:
         return None, {
             **detail,
@@ -846,37 +1085,43 @@ def _capture_precision(built: Built, config: BenchConfig) -> tuple[str | None, d
 def _capture_offload(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
     """Whether anything the optimizer holds lives off the compute device.
 
-    Only `none` can reach a run: `axes.assemble` raises `UnappliedAxis` for every
-    other value, because offload is inseparable from `deepspeed.initialize` and
-    deepspeed is in no environment here. So this probe proves the one value it can
-    and refuses to speak for the rest — under deepspeed the setting lives in its
-    own config rather than on any object reachable from here, and reporting `none`
-    because nothing looked would be worse than reporting nothing.
+    Two readings, because the axis has two régimes. Under deepspeed the setting is
+    in the engine's own configuration and nothing reachable from the optimizer says
+    what it is, so the engine is asked directly — `(offload_optimizer,
+    offload_param)` is the pair every value of this axis is made of. An engine that
+    will not answer is undetermined rather than `none`, because reporting `none`
+    from a look that found nothing is worse than reporting nothing.
 
-    `none` is positive evidence, not an absence: every parameter and every
-    optimizer state tensor is on a device the model computes on. Optimizer state
-    is empty until the first step, which is why the parameters are read too — a
-    check whose only subject is an empty dict passes by having nothing to examine.
+    Without an engine, `none` is positive evidence rather than an absence: every
+    parameter and every optimizer state tensor is on a device the model computes
+    on. Optimizer state is empty until the first step, which is why the parameters
+    are read too — a check whose only subject is an empty dict passes by having
+    nothing to examine.
     """
     if built.optimizer is None:
         return None, {"reason": "no optimizer was built"}
     package = type(built.optimizer).__module__.split(".")[0]
-    engine = None
-    if built.model is not None:
-        engine = next(
-            (
-                type(module).__name__
-                for _, module in built.model.named_modules()
-                if PARALLEL_WRAPPERS.get(type(module).__name__) == "deepspeed"
-            ),
-            None,
-        )
+    found = _deepspeed_engine(built.model)
+    engine = type(found[1]).__name__ if found is not None else None
     detail: dict[str, Any] = {"optimizer": type(built.optimizer).__name__, "engine": engine}
-    if package == "deepspeed" or engine is not None:
+    if found is not None:
+        targets = offload_targets(found[1])
+        if targets is None:
+            return None, {
+                **detail,
+                "reason": "this deepspeed engine does not say where it offloads, and the "
+                "setting lives in its own config rather than on the optimizer",
+            }
+        return OFFLOAD_TARGET_AXIS[targets], {
+            **detail,
+            "offload_optimizer": targets[0],
+            "offload_param": targets[1],
+        }
+    if package == "deepspeed":
         return None, {
             **detail,
-            "reason": "deepspeed decides offload inside its own config, which is not readable "
-            "from the optimizer or the engine here",
+            "reason": "the optimizer is deepspeed's but no engine is in the model, so the "
+            "config that decides offload is not reachable from here",
         }
 
     compute = sorted(
@@ -1042,6 +1287,21 @@ _REQUESTED_OVERRIDES: dict[str, Callable[[BenchConfig], Any]] = {
 }
 
 
+def _disclaimed(built: Built, axis: str) -> str | None:
+    """The adapter that owns this axis, when one has declared it.
+
+    Three conditions, and each closes a way the third state could exempt a run it
+    was not meant to. The declaration comes off `Built`, so the config's request
+    cannot make an axis somebody else's. It has to name an adapter, so "owned by
+    nobody" falls back to undetermined rather than to exempt. And the axis has to
+    be one `FRAMEWORK_OWNABLE` allows to be disclaimed, so no adapter can decline
+    to look at everything.
+    """
+    if built.framework is None or axis not in built.owned_axes:
+        return None
+    return str(built.framework) if axis in FRAMEWORK_OWNABLE else None
+
+
 def capture(built: Built, config: BenchConfig) -> AppliedState:
     """Read back the state of every axis from what the run actually constructed.
 
@@ -1056,6 +1316,24 @@ def capture(built: Built, config: BenchConfig) -> AppliedState:
         except BaseException as exc:  # noqa: BLE001 - an unreadable request is still an axis
             reason = f"{type(exc).__name__}: {exc}"[:300]
             states.append(AxisState(axis, "unreadable", None, {"reason": reason}))
+            continue
+        owner = _disclaimed(built, axis)
+        if owner is not None:
+            # `applied` stays None on purpose. Ownership says this run's value was
+            # not ours to read, and an owned axis carrying one would be the adapter
+            # certifying itself for having declined to look.
+            states.append(
+                AxisState(
+                    axis,
+                    requested,
+                    None,
+                    {
+                        "reason": f"{owner} computes {axis} inside its own training step, so "
+                        "this run's value is not ours to read back"
+                    },
+                    owner=owner,
+                )
+            )
             continue
         probe = _CAPTURES.get(axis)
         if probe is None:
@@ -1078,6 +1356,11 @@ def assert_matches(state: AppliedState, config: BenchConfig) -> None:
     read as "it is fine", or the whole mechanism becomes decorative. An empty or
     partial state is the same failure one level up — it means capture never ran
     for some axis, not that the axis was fine.
+
+    A framework-owned axis is the one exemption, and it is narrow: the adapter that
+    ran declared it, the boundary allows that axis to be declared, and the record
+    says so under `framework_owned`. An owned axis that arrived carrying a value is
+    not exempt — it is mismatched, and it stops the run.
 
     Takes the config rather than a purpose string so the value cannot be a typo:
     `"Timing"` would otherwise pass every check silently.

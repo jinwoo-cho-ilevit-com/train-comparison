@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import contextlib
 import json
+from enum import Enum
 from types import SimpleNamespace
+from typing import get_args
 
 import pytest
 import torch
 
+from trainbench import applied as applied_module
 from trainbench import axes
 from trainbench.applied import (
     ADAPTER_PARAM_MARKER,
@@ -20,7 +23,7 @@ from trainbench.applied import (
     capture,
 )
 from trainbench.config import to_bench_config
-from trainbench.config_schema import axis_knobs
+from trainbench.config_schema import BenchConfig, axis_knobs
 from trainbench.probe.types import Check, ProbeReport
 
 CPU = torch.device("cpu")
@@ -263,10 +266,13 @@ def test_applied_state_serialises_for_the_record(config_mapping):
         "axis": "attn.name",
         "requested": "sdpa",
         "applied": "sdpa",
+        "owner": None,
+        "state": "applied",
         "determined": True,
         "matches": True,
         "detail": {"implementations": {"sdpa": 1}, "modules_checked": 1},
     }
+    assert payload["framework_owned"] == []
 
 
 def test_the_attention_detail_does_not_grow_with_the_model():
@@ -848,4 +854,227 @@ def test_capture_reports_an_axis_with_no_probe_as_undetermined(config_mapping, m
     assert unwired.applied is None
     assert unwired.detail["reason"] == "no capture probe implemented"
     with pytest.raises(AppliedMismatch, match="synthetic.unwired"):
+        assert_matches(state, config)
+
+
+# --- the deepspeed engine readers ---------------------------------------------
+# `tests/contract/test_applied_axes.py` patches `zero_stage` and `offload_targets`
+# and pins that capture consults them. What it deliberately does not pin is what
+# they read, because that is a pod question. These are that half: an engine shaped
+# like the one `deepspeed/runtime/engine.py:1125-1154` documents, so the readers
+# are exercised against a shape rather than only against a patch.
+#
+# 확인 안 함: that a real DeepSpeedEngine answers this way. deepspeed does not
+# import on this host, and the package is sdist-only in the env locks.
+
+
+class _Stage(int):
+    """An int subclass, as `ZeroStageEnum` is."""
+
+
+class _Device(str, Enum):  # noqa: UP042 - `OffloadDeviceEnum` is spelled this way
+    """A str subclass, as `OffloadDeviceEnum` is."""
+
+    none = "none"
+    cpu = "cpu"
+
+
+class _Offload:
+    def __init__(self, device):
+        self.device = device
+
+
+class DeepSpeedEngineWithReaders(torch.nn.Module):
+    """The engine, renamed at construction to what `PARALLEL_WRAPPERS` matches on."""
+
+
+STAGE_3 = _Stage(3)
+
+
+def zero_engine(stage=STAGE_3, optimizer_to=None, param_to=None, without=()):
+    engine = DeepSpeedEngineWithReaders()
+    engine.__class__ = type("DeepSpeedEngine", (DeepSpeedEngineWithReaders,), {})
+    if "zero_optimization_stage" not in without:
+        engine.zero_optimization_stage = lambda: stage
+    if "zero_offload_optimizer" not in without:
+        engine.zero_offload_optimizer = lambda: optimizer_to and _Offload(optimizer_to)
+    if "zero_offload_param" not in without:
+        engine.zero_offload_param = lambda: param_to and _Offload(param_to)
+    return engine
+
+
+def test_the_stage_comes_off_the_engines_own_reader():
+    assert applied_module.zero_stage(zero_engine(stage=_Stage(2))) == 2
+    assert applied_module.zero_stage(zero_engine(stage=_Stage(3))) == 3
+
+
+def test_an_engine_that_answers_nothing_usable_reports_no_stage():
+    """Each of these is a run whose stage nothing read, and `zero2` is not the
+    nearest guess — it is a different partitioning with a different speed."""
+
+    def raises():
+        raise RuntimeError("uninitialised")
+
+    angry = zero_engine()
+    angry.zero_optimization_stage = raises
+
+    assert applied_module.zero_stage(zero_engine(without=("zero_optimization_stage",))) is None
+    assert applied_module.zero_stage(angry) is None
+    assert applied_module.zero_stage(zero_engine(stage=True)) is None, "a bool is not a stage"
+    assert applied_module.zero_stage(zero_engine(stage="3")) is None
+
+
+def test_a_stage_outside_the_two_the_config_offers_is_named_not_rounded(config_mapping):
+    """ZeRO has more stages than this study asks for. A run on stage 1 belongs to
+    no setting here, and rounding it into one publishes its speed as another's."""
+    config = bench(config_mapping, **{"parallel.strategy": "zero2"})
+    model = bf16_model()
+    model.engine = zero_engine(stage=_Stage(1))
+
+    strategy = axis(capture(Built(model=model), config), "parallel.strategy")
+
+    assert strategy.applied == "deepspeed(stage=1)"
+    assert not strategy.matches
+
+
+def test_the_offload_pair_comes_off_the_engines_own_readers():
+    """`OffloadDeviceEnum` subclasses `str`, so `device == "none"` is the reading
+    that works and `str(device)` is not — that spells the member's own repr and
+    would report every un-offloaded engine as offloaded."""
+    targets = applied_module.offload_targets
+
+    assert targets(zero_engine()) == (False, False)
+    assert targets(zero_engine(optimizer_to=_Device.cpu)) == (True, False)
+    assert targets(zero_engine(param_to=_Device.cpu)) == (False, True)
+    assert targets(zero_engine(optimizer_to=_Device.cpu, param_to=_Device.cpu)) == (True, True)
+    assert targets(zero_engine(optimizer_to=_Device.none)) == (False, False)
+
+
+def test_an_engine_that_does_not_expose_the_readers_says_nothing():
+    assert applied_module.offload_targets(zero_engine(without=("zero_offload_param",))) is None
+    assert applied_module.offload_targets(object()) is None
+
+
+def test_a_real_engine_in_the_tree_decides_both_axes(config_mapping):
+    """End to end, without a patch: the engine is where both of these live, and
+    until it was read `zero2`/`zero3` and every offload but `none` could not be
+    certified at all, so `assert_matches` refused every run that asked for them."""
+    config = bench(config_mapping, **{"parallel.strategy": "zero3", "train.offload": "optimizer"})
+    model = bf16_model()
+    model.engine = zero_engine(stage=_Stage(3), optimizer_to=_Device.cpu)
+
+    state = capture(Built(model=model, optimizer=optimizer_over(model)), config)
+
+    assert axis(state, "parallel.strategy").applied == "zero3"
+    assert axis(state, "parallel.strategy").matches
+    assert axis(state, "train.offload").applied == "optimizer"
+    assert axis(state, "train.offload").matches
+    assert axis(state, "train.offload").detail["offload_optimizer"] is True
+
+
+# --- the two class tables -----------------------------------------------------
+
+
+def literal_values(section: str, name: str) -> set[str]:
+    annotation = BenchConfig.model_fields[section].annotation.model_fields[name].annotation
+    return {str(option) for option in get_args(annotation)}
+
+
+def test_the_tables_map_from_what_ran_not_from_what_was_asked_for():
+    """The shortest way to make the contested axes match is a table keyed by the
+    request, and that certifies every run. Both tables are keyed by the class the
+    run built, so no key of either may be a value the config can ask for."""
+    assert not set(applied_module.OPTIM_CLASS_AXIS) & literal_values("optim", "name")
+    assert not set(applied_module.PRECISION_RECIPE_AXIS) & literal_values("precision", "name")
+
+
+def test_a_recipe_the_table_does_not_name_is_undetermined(config_mapping):
+    """An fp8 run wrapped with something this cannot name is a run whose matmul
+    precision nobody read. Falling back to the bf16 on the weights is exactly the
+    misreading the recipe path exists to remove."""
+    config = bench(config_mapping, **{"precision.name": "mxfp8"})
+    recipe = type("Float8CurrentScaling", (), {})()
+
+    state = capture(Built(model=bf16_model(), precision_recipe=recipe), config)
+    precision = axis(state, "precision.name")
+
+    assert precision.applied is None
+    assert precision.detail["recipe"] == "Float8CurrentScaling"
+    with pytest.raises(AppliedMismatch, match="precision.name"):
+        assert_matches(state, config)
+
+
+# --- the third state ----------------------------------------------------------
+
+
+def owned_run(config, framework="tevatron", owned=("loss.name",)) -> Built:
+    """A whole run whose loss the adapter computed itself, as tevatron's does."""
+    run = whole_run(config)
+    return Built(
+        model=run.model,
+        optimizer=run.optimizer,
+        dataloader=run.dataloader,
+        loss_fn=None,
+        framework=framework,
+        owned_axes=owned,
+    )
+
+
+def test_a_disclaimed_axis_lets_the_run_measure_and_says_who_has_it(config_mapping):
+    """The tevatron cell. Its loss is computed inside `DenseModel.forward`, so with
+    two states the run is refused over an axis that was never ours."""
+    config = bench(config_mapping, **{"run.purpose": "timing", "framework.name": "tevatron"})
+
+    state = capture(owned_run(config), config)
+    loss = axis(state, "loss.name")
+
+    assert loss.state == "framework_owned"
+    assert loss.owner == "tevatron"
+    assert loss.applied is None
+    assert "tevatron" in loss.detail["reason"]
+    assert [a.axis for a in state.framework_owned()] == ["loss.name"]
+    assert loss not in state.undetermined()
+    assert state.to_dict()["framework_owned"] == ["loss.name"]
+
+
+def test_the_same_run_without_the_declaration_is_still_refused(config_mapping):
+    """Paired with the test above, which on its own passes even if `assert_matches`
+    stopped enforcing anything: the only difference here is the declaration."""
+    config = bench(config_mapping, **{"run.purpose": "timing", "framework.name": "tevatron"})
+
+    state = capture(owned_run(config, owned=()), config)
+
+    assert axis(state, "loss.name").state == "undetermined"
+    with pytest.raises(AppliedMismatch, match="loss.name"):
+        assert_matches(state, config)
+
+
+def test_a_disclaimed_axis_that_carries_a_value_is_a_mismatch():
+    """Ownership is a declaration that nobody looked. An entry with both an owner
+    and an applied value is an adapter certifying itself for having declined to
+    look, and it has to stop the run rather than pass as somebody else's."""
+    forged = AxisState("loss.name", "mnrl", "mnrl", owner="tevatron")
+
+    assert forged.state == "framework_owned"
+    assert not forged.matches
+    assert forged in AppliedState((forged,)).mismatched()
+
+
+def test_an_owner_on_an_axis_the_boundary_does_not_allow_is_not_ownership(config_mapping):
+    """Re-checked on the state rather than only where capture grants it: hand-built
+    states are what the record round trip and `report.py` produce, and an adapter
+    able to disclaim `framework.name` could disclaim everything under it."""
+    config = bench(config_mapping, **{"run.purpose": "timing"})
+    forged = AxisState("framework.name", "native", None, owner="tevatron")
+
+    assert forged.state == "undetermined"
+    state = AppliedState(
+        tuple(
+            forged if a.axis == "framework.name" else a
+            for a in capture(whole_run(config), config).axes
+        )
+    )
+
+    assert state.to_dict()["framework_owned"] == []
+    with pytest.raises(AppliedMismatch, match="framework.name"):
         assert_matches(state, config)
