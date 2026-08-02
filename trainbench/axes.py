@@ -47,6 +47,8 @@ import functools
 import importlib
 import importlib.metadata
 import importlib.util
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -89,6 +91,13 @@ VISION_PARAM_MARKERS = {
 # that a kernel library patched it. Liger replaces the transformers classes
 # (`apply_liger_kernel_to_llama()` then "# 2. Instantiate patched model"), so a
 # model built afterwards carries their modules; a model built before it does not.
+#
+# `kernels` stays although `kernels_hub` is no longer an axis value (decision 6).
+# This is the read-back table, not the apply table: an adapter that turns hub
+# dispatch on itself still produces a model made of that package's classes, and
+# dropping the row would read it back as `none` and match a `kernel=none` request.
+# The value it maps to names no setting on purpose, exactly like `_capture_kernel`'s
+# `mixed(...)` and `partial(...)` — that is what makes `assert_matches` refuse.
 KERNEL_MODULE_ROOTS = {
     "liger_kernel": "liger",
     "fla": "fla",
@@ -558,50 +567,11 @@ def _environment_bound_refusal(config: BenchConfig, name: str, bound: str) -> st
     return head + tail
 
 
-def _patch_kernels_hub(config: BenchConfig) -> list[str]:
-    """kernels-hub dispatch, dropped as an axis value. Two independent reasons.
-
-    **The call site.** transformers 5.14.1 turns hub kernels on in two places, both
-    of which need the model: `from_pretrained(use_kernels=True)`, which ends in
-    `model.set_use_kernels(...)` (`modeling_utils.py`), and
-    `integrations/hub_kernels.py::kernelize(model)`, which reads `model.device` to
-    pick the device-specific kernel to fetch. The one pre-construction knob,
-    `USE_HUB_KERNELS`, is read when that module is first imported and only ever
-    turns dispatch *off*. So the value cannot be applied from `patch` without
-    pretending, and moving it is a contract change (docs/CONTRACTS.md §2 assigns
-    `kernel.name` to this site).
-
-    **The pin.** Independently of where it would be applied, the native lock cannot
-    run it: `is_kernels_available()` requires `0.15.2 <= kernels < 0.16.0`
-    (`utils/import_utils.py:144`, upper bound exclusive) and `envs/native/uv.lock`
-    pins exactly `0.16.0`. False there makes `use_kernel_forward_from_hub` a silent
-    identity decorator (`integrations/hub_kernels.py:387`), so the axis would be a
-    label on a stock model rather than an error
-    (`.plans/research/axis-libraries.md` §3.1-3.2).
-
-    `configs/kernel/kernels_hub.yaml` is gone, so no composed run can select it.
-    This stays because `config_schema.py`'s Literal still offers it and a run built
-    straight from the schema — which `scripts/bench.py::preflight` is handed — must
-    be refused with the reason rather than with a `KeyError`. It goes when that
-    Literal does.
-    """
-    raise UnappliedAxis(
-        "kernel=kernels_hub is dropped as an axis value, for two reasons that hold "
-        "separately. It is turned on by from_pretrained(use_kernels=True) and "
-        "integrations.hub_kernels.kernelize(model), both of which need a model, while the "
-        "patch site this axis is assigned to (docs/CONTRACTS.md §2) runs before one exists. "
-        "And envs/native pins kernels==0.16.0 against transformers' exclusive upper bound of "
-        "the same version, which turns hub dispatch into a silent no-op wherever it were "
-        "applied."
-    )
-
-
 # The dispatch itself. `none` is not here: it is the absence of a patch, and an
 # entry for it would be a function that exists to do nothing.
 KERNEL_PATCHERS = {
     "liger": _patch_liger,
     "fla": _patch_fla,
-    "kernels_hub": _patch_kernels_hub,
 }
 
 
@@ -690,12 +660,22 @@ def assemble(
     device: torch.device,
     framework: str,
     dataset: Any = None,
+    owned_axes: Mapping[str, str] = MappingProxyType({}),
 ) -> tuple[Built, list[str]]:
     """Build everything a run needs, and report which axes that put into effect.
 
     `framework` is passed in by the adapter that is running rather than read from
     the config: the config says which framework was requested, and the whole point
     of the capture side is that the request is not evidence of what ran.
+
+    `owned_axes` travels the same way and for the same reason. It is the adapter's
+    `AdapterOut.owned_axes` — the axes that framework computes inside its own
+    training step, which this harness therefore never gets to build. Carried into
+    `Built` rather than read from the config, so `framework=tevatron` as a *request*
+    cannot exempt a cell; only the object an adapter actually returned can.
+    Nothing is validated here: `applied._disclaimed` re-checks membership of
+    `FRAMEWORK_OWNABLE` on every axis, so an adapter claiming one outside it is
+    refused at capture rather than trusted at construction.
 
     Does not report success beyond naming the axes it applied — `applied.capture`
     decides that by inspecting the result. A function that both acts and certifies
@@ -732,6 +712,7 @@ def assemble(
         loss_fn=loss,
         framework=framework,
         precision_recipe=recipe,
+        owned_axes=tuple(owned_axes),
     )
     return built, [*applied, "framework.name"]
 
@@ -830,7 +811,7 @@ def _precision_recipe(config: BenchConfig) -> Any:
     reads `Built.precision_recipe` instead.
     """
     precision = config.precision.name
-    if precision == "bf16":
+    if precision == NO_RECIPE_PRECISION:
         return None
     named = TE_PRECISIONS.get(precision)
     if named is None:
@@ -872,8 +853,64 @@ def _recorded_precision_recipe(config: BenchConfig) -> Any:
         return None
 
 
-def step_context(config: BenchConfig) -> contextlib.AbstractContextManager:
+def _autocast_step_context(required: Any, config: BenchConfig) -> contextlib.AbstractContextManager:
+    """`torch.autocast` as an adapter asked for it, or a refusal saying why not.
+
+    Both refusals exist because `torch.autocast` does not have one. Asked for a
+    device it cannot reach, or a dtype that device does not support, it emits a
+    warning and sets `enabled=False` (`torch/amp/autocast_mode.py`), and the step
+    then runs in the plain regime under the adapter's label — the shape this
+    repository has already published three times.
+
+    The device is compared against the one this run resolves to rather than
+    against what torch was compiled with: `is_autocast_available("cuda")` is True
+    on a host with no GPU at all.
+    """
+    device = get_device(config.device)
+    wanted = str(getattr(required, "device_type", ""))
+    if wanted != device.type:
+        raise UnappliedAxis(
+            f"{getattr(required, 'reason', 'this framework')} needs a {wanted} autocast region "
+            f"and this run is on {device.type}. torch.autocast would warn and disable itself, "
+            "so the step would be measured outside the regime the framework trains in."
+        )
+    name = str(getattr(required, "dtype", ""))
+    dtype = getattr(torch, name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise UnappliedAxis(
+            f"required_step_context.dtype={name!r} is not a torch dtype, so the autocast "
+            "region this framework asks for cannot be built."
+        )
+    return torch.autocast(device_type=device.type, dtype=dtype)
+
+
+# The one precision whose answer is the weights rather than a recipe: the model is
+# already loaded in it, so the step needs no region of its own.
+NO_RECIPE_PRECISION = "bf16"
+
+# The kinds of context an adapter may ask this site to establish, and what builds
+# each. `tests/contract/test_loader_bench.py` fixes the set of names; this is the
+# other half — a name the contract admits and this table does not is a contract
+# that promised a region nothing enters.
+STEP_CONTEXT_ESTABLISHERS = {
+    "autocast": _autocast_step_context,
+}
+
+
+def step_context(config: BenchConfig, required: Any = None) -> contextlib.AbstractContextManager:
     """Context wrapping one training step.
+
+    Two things ask for one, and this is the only site that establishes either
+    (docs/CONTRACTS.md §2). `config.precision` is the axis this study varies.
+    `required` is `AdapterOut.required_step_context`: a regime the framework
+    already trains in upstream, which the adapter states and never enters itself —
+    axolotl loads `embed_tokens`/`lm_head` in fp32 beside a bf16 body and needs
+    `torch.autocast` for the matmul between them (decision 1).
+
+    **The two cannot both be in effect.** An fp8 recipe and a bf16 autocast are
+    two answers to what precision a step runs in, and nesting them would report an
+    fp8 number for a step that also ran under bf16 autocast. A run that asks for
+    both is refused here rather than given the arbitrary winner.
 
     bf16 needs none: the model is already loaded in that dtype, so an autocast
     region would be a second, different answer to the same question. The fp8/fp4
@@ -893,6 +930,28 @@ def step_context(config: BenchConfig) -> contextlib.AbstractContextManager:
     settings object with no run state, so `assemble` and this site building one
     each through `_precision_recipe` cannot disagree about which one is in effect.
     """
+    if required is not None:
+        # Decided on the *request*, before `_precision_recipe` is consulted. Asking
+        # the recipe first made this branch unreachable wherever Transformer Engine
+        # is absent — the import refusal fired instead, and the conflict would only
+        # ever have been detected on a pod that could build the recipe anyway.
+        if config.precision.name != NO_RECIPE_PRECISION:
+            raise UnappliedAxis(
+                f"precision={config.precision.name} wraps the step in a Transformer Engine "
+                f"recipe and this framework also requires a {getattr(required, 'kind', '?')} "
+                f"region ({getattr(required, 'reason', 'no reason given')}). Both decide what "
+                "precision the step runs in, so the number would carry one label and two "
+                "regimes."
+            )
+        kind = getattr(required, "kind", None)
+        establish = STEP_CONTEXT_ESTABLISHERS.get(str(kind))
+        if establish is None:
+            raise UnappliedAxis(
+                f"required_step_context.kind={kind!r} has no establisher in "
+                f"STEP_CONTEXT_ESTABLISHERS ({sorted(STEP_CONTEXT_ESTABLISHERS)}); nothing "
+                "here can enter the region this framework trains in."
+            )
+        return establish(required, config)
     recipe = _precision_recipe(config)
     if recipe is None:
         return contextlib.nullcontext()

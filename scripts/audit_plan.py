@@ -791,7 +791,6 @@ AXIS_PACKAGES = {
     "attn/fa4": ("flash-attn",),
     "kernel/liger": ("liger-kernel",),
     "kernel/fla": ("flash-linear-attention", "causal-conv1d"),
-    "kernel/kernels_hub": ("kernels",),
     "precision/mxfp8": ("transformer-engine",),
     "precision/nvfp4": ("transformer-engine",),
     "optim/adamw_8bit": ("bitsandbytes",),

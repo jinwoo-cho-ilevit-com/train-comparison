@@ -33,6 +33,7 @@ and deleting a line would disable a check with nothing to notice. Marking a fiel
 from __future__ import annotations
 
 import functools
+import importlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, get_args
@@ -304,6 +305,23 @@ OPTIM_CLASS_AXIS = {
 }
 
 
+def _engine_optimizer_class(built: Built) -> str | None:
+    """The class of the optimizer a deepspeed engine holds, when one is in the tree.
+
+    Two objects step under ZeRO and the result used to carry only ours, so nothing
+    in a `zero3` record said which partitioner ran. Read by `getattr` and dropped
+    when it is not there, never asserted: deepspeed does not import on this host
+    (checked 2026-08-03) and is sdist-only in every env lock, so `engine.optimizer`
+    is read from `axes._deepspeed`'s own call shape rather than from a wheel this
+    session opened. A pod running `parallel=zero2` prints the real name.
+    """
+    found = _deepspeed_engine(built.model)
+    if found is None:
+        return None
+    optimizer = getattr(found[1], "optimizer", None)
+    return None if optimizer is None else type(optimizer).__name__
+
+
 def _capture_optim(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
     """Which optimizer a run is actually stepping with.
 
@@ -333,6 +351,14 @@ def _capture_optim(built: Built, config: BenchConfig) -> tuple[str | None, dict[
         "fused": bool(fused),
         "param_groups": len(built.optimizer.param_groups),
     }
+    engine_optimizer = _engine_optimizer_class(built)
+    if engine_optimizer is not None:
+        # Under ZeRO two objects step, and only one of them decides this axis.
+        # `axes._deepspeed` keeps ours on `Built` because the engine's wrapper is a
+        # class name `OPTIM_CLASS_AXIS` does not carry, and reading it as the axis
+        # would block every ZeRO run over a name that has nothing to do with
+        # `optim`. Recorded here so the result still says which partitioner ran.
+        detail["engine_optimizer"] = engine_optimizer
     if kind == "Muon":
         # Frozen tensors are excluded because Muon skips a parameter with no
         # gradient: they sit in the group without ever reaching the iteration.
@@ -815,14 +841,46 @@ def _capture_peft(built: Built, config: BenchConfig) -> tuple[str | None, dict[s
     return "peft(" + ",".join(kinds or ["unknown"]) + ")", detail
 
 
-# How each parallelism wrapper announces itself. Matched on the class name because
-# the packages that define them are not installed in every environment, so
+# How each parallelism wrapper announces itself by class name. Matched on the name
+# because the packages that define them are not installed in every environment, so
 # `isinstance` would need an import that is allowed to fail.
+#
+# `FullyShardedDataParallel` is FSDP1's wrapper and is named `fsdp1`, which is no
+# configured value. It used to map to `fsdp2`, and that was two errors making one
+# wrong pass: FSDP1 would have been measured under FSDP2's label, and FSDP2 itself
+# was never found (see `_is_fsdp2`). An FSDP1 run is now refused by name.
 PARALLEL_WRAPPERS = {
     "DistributedDataParallel": "ddp",
-    "FullyShardedDataParallel": "fsdp2",
+    "FullyShardedDataParallel": "fsdp1",
     "DeepSpeedEngine": "deepspeed",
 }
+
+# FSDP2 has no class name to match. `fully_shard` keeps the module object and
+# rebinds its class to `type(f"FSDP{cls.__name__}", (FSDPModule, cls), dct)`
+# (`torch/distributed/fsdp/_fully_shard/_fsdp_init.py:421-430`, torch 2.13.0, read
+# in this worktree's install), so the name is whatever the checkpoint's class was
+# with `FSDP` in front of it. Matching that prefix instead would collect a user
+# class called `FSDPBlock`; the MRO is what the API actually guarantees.
+FSDP2_BASE = ("torch.distributed.fsdp", "FSDPModule")
+
+
+def _is_fsdp2(module: Any) -> bool:
+    """Whether `fully_shard` has sharded this module in place."""
+    package, name = FSDP2_BASE
+    try:
+        base = getattr(importlib.import_module(package), name, None)
+    except ImportError:
+        return False
+    return isinstance(base, type) and isinstance(module, base)
+
+
+def _parallel_strategy_of(module: Any) -> str | None:
+    """Which parallelism this module is wrapped or sharded by, if any."""
+    named = PARALLEL_WRAPPERS.get(type(module).__name__)
+    if named is not None:
+        return named
+    return "fsdp2" if _is_fsdp2(module) else None
+
 
 # Which ZeRO stage is which axis value. One engine class stands for both, so the
 # class name alone can only say `deepspeed` — a value no config offers, which is
@@ -941,7 +999,7 @@ def _capture_parallel_strategy(
     world_size = dist.get_world_size() if initialised else 1
     detail: dict[str, Any] = {"world_size": world_size, "process_group": initialised}
     for name, module in built.model.named_modules():
-        strategy = PARALLEL_WRAPPERS.get(type(module).__name__)
+        strategy = _parallel_strategy_of(module)
         if strategy is None:
             continue
         detail = {**detail, "wrapper": type(module).__name__, "at": name or "model"}
