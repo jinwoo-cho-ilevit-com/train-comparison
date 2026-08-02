@@ -817,6 +817,12 @@ def main(argv: list[str] | None = None) -> int:
                 "pod_id": None,
                 "launch_error": None,
                 "outcome": None,
+                # What the watch currently cannot see. Written while it is true and
+                # cleared by the outcome, which carries the finished story. An
+                # orchestrator killed mid-sweep — which is how the last three pods
+                # ended — otherwise leaves a ledger that says nothing about ten
+                # minutes of failed reads.
+                "unreadable": None,
             }
         )
 
@@ -846,8 +852,20 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     pending = list(experiments)
-    watch = pods.PodWatch(timeout_seconds=args.timeout_minutes * 60)
     running: dict[str, Experiment] = {}
+
+    def blind(pod_id: str, message: str) -> None:
+        """Say — and record — that a pod cannot be seen, while it is happening.
+
+        `wait_for_any` blocks inside itself, so this is the only point at which a
+        blind watch is audible before its ceiling is reached.
+        """
+        console.print(f"[yellow]{message}[/yellow]")
+        if (exp := running.get(pod_id)) is not None:
+            entries[exp.name]["unreadable"] = message
+            write_json(args.out, ledger)
+
+    watch = pods.PodWatch(timeout_seconds=args.timeout_minutes * 60, on_blind=blind)
     # The ledger is written at every state change, not at the end: an orchestrator
     # killed mid-sweep must still leave behind the ids of the pods it started, or
     # they bill until someone finds them by hand.
@@ -901,7 +919,15 @@ def main(argv: list[str] | None = None) -> int:
             exp = running.pop(outcome.pod_id, None)
             if exp is not None:
                 entries[exp.name]["outcome"] = outcome.to_dict()
-                console.print(f"{outcome.reason} {exp.name} ({outcome.pod_id})")
+                # The live note is superseded by the outcome, which carries the
+                # whole spell rather than its latest moment.
+                entries[exp.name]["unreadable"] = None
+                colour = "red" if outcome.reason == pods.REASON_UNREADABLE else "default"
+                console.print(
+                    f"[{colour}]{outcome.reason}[/{colour}] {exp.name} ({outcome.pod_id})"
+                )
+                if outcome.unreadable:
+                    console.print(f"  [yellow]{outcome.unreadable}[/yellow]")
             # Terminate unconditionally: a pod left running keeps billing, and the
             # result has already been uploaded by the entrypoint.
             try:

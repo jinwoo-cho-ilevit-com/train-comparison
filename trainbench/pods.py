@@ -28,6 +28,10 @@ preference:
   forced. `runpod.get_pod` selects `runtime { ports { … } }` and nothing else, so
   the container clock this module is built on never arrived — see POD_QUERY.
 
+Writing the read by hand cost one thing the SDK gave away, and the third pod paid
+for it: `requests` sends a User-Agent and urllib does not, and the GraphQL host
+refuses urllib's default outright. See USER_AGENT.
+
 A restarting container is a third thing, and neither transport counts restarts.
 Measured 2026-08-02 against the live account, because guessing the field is how
 this repository has repeatedly ended up checking something other than the thing:
@@ -101,6 +105,29 @@ POLL_SECONDS = 20
 REST_BASE_URL = "https://rest.runpod.io/v1"
 REST_TIMEOUT_SECONDS = 60
 
+# Every request this module sends identifies itself, and that is a transport
+# requirement rather than politeness. urllib's default signature —
+# `Python-urllib/3.13` — is refused at the edge by api.runpod.io/graphql with
+# `403: error code: 1010`, a Cloudflare rule on the client signature and not on
+# the credential or the document. Measured 2026-08-02 against the live API, same
+# key, same body, same minute:
+#
+#     Python-urllib/3.13  -> 403, error code: 1010
+#     curl/8.0            -> 200
+#     trainbench/1.0      -> 200
+#
+# Reading used to go through the `runpod` SDK, which sends `requests`' own
+# User-Agent; replacing it with a hand-written urllib request took the reads from
+# succeeding-without-the-clock to not succeeding at all, and `observe` turned every
+# one of them into `unknown` in silence.
+#
+# Set in `send`, so on every request, rather than only on the GraphQL ones.
+# rest.runpod.io answered the default with 200 in that same measurement, so REST
+# does not need it today — but which of a provider's hosts has an edge rule
+# enabled is the provider's setting, and this is the module's one door to the
+# network. A per-host header would be a second list to keep in step with the hosts.
+USER_AGENT = "trainbench/1.0"
+
 # How much of a rejection body to keep in the error. A launch failure is written
 # to the orchestrator's ledger, so the message has to be long enough to name the
 # offending field and short enough not to be a dump.
@@ -148,12 +175,37 @@ CLOCK_LAG_ALLOWANCE_SECONDS = 3 * CLOCK_REFRESH_SECONDS
 # desiredStatus values that mean the container will not come back.
 TERMINAL_DESIRED_STATUS = frozenset({"TERMINATED", "EXITED"})
 
+# How long a watch may learn nothing before it stops counting as a watch.
+#
+# `unknown` is deliberately not a completion state — a 502 from the control plane
+# says nothing about the pod — but with no ceiling at all, "the reads are failing"
+# and "the pod is busy" are the same thing to every caller. That is the third time
+# this class has cost a pod: a Cloudflare rule answered 403 to every poll for ten
+# minutes, `observe` returned `unknown` each time, the ledger recorded
+# `outcome: null`, and the pod was deleted by hand.
+#
+# Wall time rather than a poll count, so the ceiling does not move when
+# `poll_seconds` does. The value is a judgement and not a measurement — how long
+# RunPod's control plane stays unreadable is not measured here — set far above any
+# single-poll blip and far below a pod deadline (60 minutes by default), so a
+# transport that is broken rather than busy is named while the pod still has most
+# of its allowance left.
+#
+# Ending the watch terminates the pod, and that is the intended trade. Blind, we
+# cannot tell a finished pod from a running one, so leaving it costs unbounded
+# billing; the pod also carries its own self-kill deadline, so this is the earlier
+# of two stops rather than the only one.
+UNREADABLE_CEILING_SECONDS = 5 * 60
+
 # Why a pod stopped being watched. Recorded per pod, because "the work finished"
 # and "we gave up waiting" are different results and only one of them is a datum.
 REASON_EXITED = "exited"
 REASON_STOPPED = "stopped"  # runtime went from present to absent
 REASON_GONE = "gone"
 REASON_TIMEOUT = "timeout"
+# Nothing was learned about this pod for long enough that the watch was not a
+# watch. See UNREADABLE_CEILING_SECONDS.
+REASON_UNREADABLE = "unreadable"
 # The container was replaced by another one. Not tolerated even once, and the
 # reason is the entrypoint rather than the platform: it runs the pod's whole plan
 # from the top, so a second container repeats settings the first already published
@@ -260,7 +312,13 @@ def send(request: Request, urlopen: Callable[..., Any] = urllib.request.urlopen)
     http = urllib.request.Request(
         request.url,
         data=request.body,
-        headers={**request.headers, "Authorization": f"Bearer {_api_key()}"},
+        headers={
+            # First, so a Request may state its own; last would silently un-set the
+            # one thing between these reads and a 403.
+            "User-Agent": USER_AGENT,
+            **request.headers,
+            "Authorization": f"Bearer {_api_key()}",
+        },
         method=request.method,
     )
     try:
@@ -371,10 +429,17 @@ class Reading:
     container clock — a pending pod, a failed call, or a runtime whose shape the
     API changed. None never reads as a restart: an absence is not evidence, and
     the alternative is terminating live pods over a field that moved.
+
+    `detail` is why an `unknown` is unknown, and it exists because the sentinel on
+    its own is unactionable. Ten minutes of `unknown` looked identical whether the
+    control plane was blinking or the edge was refusing every request outright —
+    and it was the second, with `403: error code: 1010` in an exception nobody
+    kept. It is None for every reading that learned something.
     """
 
     status: str
     uptime_seconds: int | None = None
+    detail: str | None = None
 
 
 def container_uptime(runtime: Any) -> int | None:
@@ -470,8 +535,12 @@ def observe(
         ):
             return Reading(RESTARTING, uptime)
         return Reading(RUNNING, uptime)
-    except Exception:  # noqa: BLE001 - any transport or shape failure is the same non-answer
-        return Reading(UNKNOWN)
+    except Exception as exc:  # noqa: BLE001 - any transport or shape failure is the same non-answer
+        # The sentinel is the same for every way of not learning the state; the
+        # reason is not, and losing it is how a 403 on every single request read as
+        # a pod that was merely slow. `type` as well as the message, because a
+        # shape failure raises something with an unhelpful text (`KeyError: 'pod'`).
+        return Reading(UNKNOWN, detail=f"{type(exc).__name__}: {exc}"[:ERROR_BODY_CHARS])
 
 
 def is_finished(status: str, ever_ran: bool) -> bool:
@@ -531,6 +600,12 @@ class PodOutcome:
     # clock, which is the state in which restarts cannot be seen at all.
     uptime_seconds: int | None = None
     peak_uptime_seconds: int | None = None
+    # How much of this watch learned nothing, and the last reason it learned
+    # nothing. Set on every outcome that had an unreadable poll, not only on
+    # `REASON_UNREADABLE`: a `timeout` reached through ten minutes of 403s and a
+    # `timeout` reached through ten minutes of clean reads are different results,
+    # and the ledger recorded them identically. None when every read answered.
+    unreadable: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -541,6 +616,7 @@ class PodOutcome:
             "waited_seconds": round(self.waited_seconds, 1),
             "uptime_seconds": self.uptime_seconds,
             "peak_uptime_seconds": self.peak_uptime_seconds,
+            "unreadable": self.unreadable,
         }
 
 
@@ -565,6 +641,30 @@ class _Tracked:
     anchor_at: float | None = None
     # The longest-lived container seen, for the ledger. See PodOutcome.
     peak_uptime: int | None = None
+    # The blindness. `unknown_since` is when the current unbroken run of
+    # unreadable polls began and is cleared by any reading that learned
+    # something, so it measures a spell rather than a total; `unknown_total`
+    # counts every unreadable poll of the watch, so a pod read through repeated
+    # short outages still says so in the ledger.
+    unknown_since: float | None = None
+    unknown_total: int = 0
+    last_detail: str | None = None
+
+
+def _unreadable_summary(state: _Tracked, now: float) -> str | None:
+    """What this watch failed to learn, in one sentence for the ledger.
+
+    None when every poll answered, so the field's presence is itself the signal.
+    """
+    if not state.unknown_total:
+        return None
+    unbroken = ""
+    if state.unknown_since is not None:
+        unbroken = f", the last {round(now - state.unknown_since)}s of it unbroken"
+    return (
+        f"{state.unknown_total} of this watch's polls learned nothing{unbroken}. "
+        f"Last failure: {state.last_detail}"
+    )
 
 
 @dataclass
@@ -582,6 +682,13 @@ class PodWatch:
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     poll_seconds: float = POLL_SECONDS
+    # Called with `(pod_id, message)` on every poll that learned nothing, before
+    # the ceiling has been reached. `wait_for_any` loops inside itself, so without
+    # this the caller holds no thread of control between the launch and the
+    # outcome, and a watch that was blind from its first poll had nowhere to say
+    # so for ten minutes. Silence is the default because `PodWatch` has no console
+    # of its own; the orchestrator supplies one.
+    on_blind: Callable[[str, str], None] = lambda _pod_id, _message: None
     _tracked: dict[str, _Tracked] = field(default_factory=dict)
 
     def track(self, pod_id: str) -> None:
@@ -605,6 +712,20 @@ class PodWatch:
                 pod_id, self.get_pod, state.last_uptime, state.anchor_uptime, since_anchor
             )
             status = reading.status
+            if status == UNKNOWN:
+                state.unknown_total += 1
+                state.last_detail = reading.detail
+                if state.unknown_since is None:
+                    state.unknown_since = now
+                self.on_blind(
+                    pod_id,
+                    f"cannot see {pod_id}: {round(now - state.unknown_since)}s of "
+                    f"unreadable polls ({state.unknown_total} in this watch), "
+                    f"{round(UNREADABLE_CEILING_SECONDS - (now - state.unknown_since))}s "
+                    f"before the watch gives up. Last failure: {reading.detail}",
+                )
+            else:
+                state.unknown_since = None
             if reading.uptime_seconds is not None:
                 state.last_uptime = reading.uptime_seconds
                 if state.anchor_at is None:
@@ -634,6 +755,14 @@ class PodWatch:
                     GONE: REASON_GONE,
                     RESTARTING: REASON_RESTARTED,
                 }.get(status, REASON_STOPPED)
+            elif (
+                state.unknown_since is not None
+                and now - state.unknown_since >= UNREADABLE_CEILING_SECONDS
+            ):
+                # Checked before the deadline, so a watch that has learned nothing
+                # is reported as unreadable rather than as a pod that ran out of
+                # time — a distinction the ledger had no way to make.
+                reason = REASON_UNREADABLE
             elif now >= state.deadline:
                 reason = REASON_TIMEOUT
             if reason is None:
@@ -647,6 +776,7 @@ class PodWatch:
                     waited_seconds=now - state.started,
                     uptime_seconds=reading.uptime_seconds,
                     peak_uptime_seconds=state.peak_uptime,
+                    unreadable=_unreadable_summary(state, now),
                 )
             )
             self.forget(pod_id)

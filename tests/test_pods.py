@@ -7,13 +7,18 @@ launch and filed every combination as producing no result.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import http.server
 import io
 import json
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import urllib.error
+import urllib.request
 from collections import namedtuple
 from pathlib import Path
 
@@ -139,6 +144,133 @@ def test_a_pod_survives_a_transient_api_failure_and_still_completes():
     outcomes = watch.wait_for_any()
     assert [o.reason for o in outcomes] == [pods.REASON_STOPPED]
     assert outcomes[0].ever_ran is True
+
+
+# --- a watcher that learns nothing must not look like one that is waiting -------
+#
+# The third consecutive pod deleted by hand (2026-08-02, `1jscf6cxmjz72y`) and the
+# class of failure it belongs to. `pods.create` was once stubbed at exactly its
+# defective point, so 592 tests passed against an API call that could not work;
+# `observe`'s decision function was fed hand-built dicts, so the read path was
+# never in the loop; then every read 403'd at the edge (see the User-Agent section
+# below). Each time the orchestrator produced no outcome at all, the ledger
+# recorded `outcome: null`, and somebody found the pod by hand.
+#
+# `unknown` stays a non-completion state — a 502 says nothing about a pod — but a
+# spell of them that outlasts `UNREADABLE_CEILING_SECONDS` ends the watch, because
+# past that point "the pod is busy" and "nobody is watching this pod" are the same
+# reading.
+
+# What the live API answered every poll of that pod, verbatim.
+CLOUDFLARE_403 = "RunPod REST POST https://api.runpod.io/graphql -> 403: error code: 1010"
+
+
+def blind_watcher(clock, timeout=3600):
+    """A watch whose every read fails the way the real one did."""
+
+    def refused(pod_id):
+        raise RuntimeError(CLOUDFLARE_403)
+
+    return pods.PodWatch(
+        timeout_seconds=timeout,
+        get_pod=refused,
+        clock=clock,
+        sleep=clock.advance,
+        poll_seconds=10,
+    )
+
+
+def test_a_failed_read_carries_why_it_failed_and_not_only_that_it_did():
+    """The sentinel alone is unactionable: a blinking control plane and an edge
+    refusing every request outright were the same `Reading`."""
+    reading = pods.observe("p", lambda _: (_ for _ in ()).throw(RuntimeError(CLOUDFLARE_403)))
+    assert reading.status == pods.UNKNOWN
+    assert "error code: 1010" in reading.detail
+
+
+def test_a_reading_that_learned_something_carries_no_failure_detail():
+    assert pods.observe("p", lambda _: LIVE).detail is None
+
+
+def test_a_shape_failure_names_its_type_because_its_message_says_nothing():
+    """A payload of the wrong shape and a refused request are the same sentinel and
+    must not be the same note. The type is carried because these messages alone
+    read as a bug in this module rather than as an answer the API gave."""
+    assert pods.observe("p", lambda _: 7).detail.startswith("AttributeError:")
+
+
+def test_a_watch_that_learns_nothing_ends_instead_of_waiting_out_the_deadline():
+    """The defect: six polls, all `unknown`, and nothing after them either."""
+    clock = FakeClock()
+    watch = blind_watcher(clock)
+    watch.track("p")
+    (outcome,) = watch.wait_for_any()
+    assert outcome.reason == pods.REASON_UNREADABLE
+    assert outcome.waited_seconds == pytest.approx(pods.UNREADABLE_CEILING_SECONDS, abs=10)
+    # Forgotten, so `main` terminates it rather than waiting on a result that
+    # nothing left in the loop is able to report.
+    assert watch.watching == []
+
+
+def test_the_ledger_names_the_transport_failure_rather_than_recording_a_null():
+    entry = blind_outcome().to_dict()
+    assert entry["reason"] == pods.REASON_UNREADABLE
+    assert "403" in entry["unreadable"]
+    assert "error code: 1010" in entry["unreadable"]
+
+
+def blind_outcome(timeout=3600):
+    clock = FakeClock()
+    watch = blind_watcher(clock, timeout=timeout)
+    watch.track("p")
+    (outcome,) = watch.wait_for_any()
+    return outcome
+
+
+def test_the_watch_says_so_at_the_first_failed_poll_not_only_at_the_ceiling():
+    """`wait_for_any` blocks inside itself, so the caller holds no thread of
+    control between the launch and the outcome. Ten minutes of that silence is
+    what made a blind watch indistinguishable from a busy pod."""
+    clock = FakeClock()
+    heard = []
+    watch = blind_watcher(clock)
+    watch.on_blind = lambda pod_id, message: heard.append((pod_id, message))
+    watch.track("p")
+    assert watch.poll() == []
+    assert [pod_id for pod_id, _ in heard] == ["p"]
+    assert "cannot see p" in heard[0][1]
+    assert "error code: 1010" in heard[0][1]
+
+
+def test_a_blip_does_not_start_a_countdown_that_never_resets():
+    """The ceiling is for a spell, not a total. A pod read through repeated short
+    outages must still run to its own end — that is why `unknown` was made a
+    non-completion state in the first place, and the ceiling must not undo it."""
+    clock = FakeClock()
+    climbing = [live(100 + 10 * i) for i in range(80)]
+    watch = watcher({"p": [RuntimeError("502"), *climbing]}, clock=clock, timeout=3600)
+    watch.track("p")
+    for _ in range(60):  # 600 seconds of wall time, twice the ceiling
+        assert watch.poll() == []
+        clock.advance(10)
+    assert watch.watching == ["p"]
+
+
+def test_an_outcome_reached_through_a_blind_spell_says_so_even_when_that_is_not_why():
+    """A `timeout` reached through ten minutes of 403s and one reached through ten
+    minutes of clean reads were the same ledger entry."""
+    outcome = blind_outcome(timeout=60)
+    assert outcome.reason == pods.REASON_TIMEOUT, "the deadline came before the ceiling"
+    assert "error code: 1010" in outcome.unreadable
+
+
+def test_a_watch_that_never_lost_sight_of_its_pod_records_nothing_about_reads():
+    """The field's presence is the signal, so it has to be absent when it is false."""
+    watch = watcher({"p": [LIVE, STOPPED, STOPPED]})
+    watch.track("p")
+    (outcome,) = watch.wait_for_any()
+    assert outcome.unreadable is None
+    assert outcome.to_dict()["unreadable"] is None
 
 
 # --- an inferred ending has to repeat before it is acted on --------------------
@@ -808,6 +940,115 @@ def test_a_created_pod_is_returned_whole():
     assert pod["id"] == "abc123"
 
 
+# --- the signature the edge refuses --------------------------------------------
+#
+# Moving the read off the SDK onto a hand-written urllib request dropped one thing
+# `requests` had been supplying: a User-Agent. api.runpod.io/graphql refuses
+# urllib's default with `403: error code: 1010`, a Cloudflare rule on the client
+# signature — so every read failed, `observe` returned `unknown` for every poll of
+# every pod, and a watcher that learned nothing looked exactly like one that was
+# waiting. Measured 2026-08-02 against the live API, same key, same body, same
+# minute:
+#
+#   User-Agent: Python-urllib/3.13  (urllib's default)  ->  403, error code: 1010
+#   User-Agent: curl/8.0                                ->  200, RUNNING
+#   User-Agent: trainbench/1.0                          ->  200, RUNNING
+#
+# Nothing below stubs `send` or `urlopen`, and that is the point: a stand-in
+# accepts whatever headers it is handed, so it cannot be wrong about a header the
+# way a server can. These stand a real HTTP server on a loopback port, send
+# through the real opener over a real socket, and assert on what the *server*
+# received. Take the header out of `send` and the server sees `Python-urllib/…`,
+# which is the string that produced the incident.
+
+
+class _Received(http.server.BaseHTTPRequestHandler):
+    """Records the headers of one request and answers a well-formed empty read."""
+
+    seen: list[dict[str, str]] = []
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler's naming
+        _Received.seen.append({k.lower(): v for k, v in self.headers.items()})
+        body = b'{"data": {"pod": null}}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        """pytest's captured output is not a web server log."""
+
+
+@contextlib.contextmanager
+def loopback_server():
+    _Received.seen = []
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Received)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/graphql"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def headers_the_server_received(request, monkeypatch):
+    """Send `request` to a loopback server through the real transport, unredirected."""
+    monkeypatch.setenv("RUNPOD_API_KEY", KEY)
+    with loopback_server() as url:
+        pods.send(dataclasses.replace(request, url=url))
+    (received,) = _Received.seen
+    return received
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [pods.read_request("dn2jrijcn0gujx"), pods.create_request(spec())],
+    ids=["read", "create"],
+)
+def test_no_request_goes_out_under_the_signature_the_edge_refuses(request_, monkeypatch):
+    """The pin, on the bytes a real server parsed off a real socket.
+
+    Both requests, because `send` is the one door to the network and a per-host
+    header would be a second list to keep in step with the hosts.
+    """
+    received = headers_the_server_received(request_, monkeypatch)
+    assert received["user-agent"] == pods.USER_AGENT
+    assert not received["user-agent"].startswith("Python-urllib")
+
+
+def test_the_default_that_arrives_when_nobody_sets_one_is_the_refused_one(monkeypatch):
+    """What the pin above prevents, kept rather than described.
+
+    Same server, same opener, one difference: the header is not set. If urllib
+    ever stops substituting its own signature this goes red, and the pin above
+    stops being the thing standing between `observe` and ten minutes of `unknown`.
+    """
+    monkeypatch.setenv("RUNPOD_API_KEY", KEY)
+    with loopback_server() as url:
+        urllib.request.urlopen(urllib.request.Request(url, data=b"{}", method="POST")).read()
+    (received,) = _Received.seen
+    assert received["user-agent"].startswith("Python-urllib/")
+
+
+def test_a_request_may_state_its_own_signature_but_never_its_own_credential(monkeypatch):
+    """Ordering inside `send`: the User-Agent is a default, the bearer is not.
+
+    A `Request` that could set `Authorization` would be a way to put a credential
+    into an object callers hold, log, and write to ledgers.
+    """
+    monkeypatch.setenv("RUNPOD_API_KEY", KEY)
+    request = pods.Request(
+        method="POST",
+        url="unset",
+        headers={"User-Agent": "trainbench-probe/9", "Authorization": "Bearer not-the-key"},
+        body=b"{}",
+    )
+    received = headers_the_server_received(request, monkeypatch)
+    assert received["user-agent"] == "trainbench-probe/9"
+    assert received["authorization"] == f"Bearer {KEY}"
+
+
 # --- experiment manifests ------------------------------------------------------
 
 
@@ -1466,25 +1707,37 @@ def exited(pod_id):
     return pods.PodOutcome(pod_id, pods.REASON_EXITED, pods.EXITED, True, 1.0)
 
 
-def fake_watch(outcome=exited):
+def fake_watch(outcome=exited, announce=None, after_announce=None):
     """A `PodWatch` stand-in: every tracked pod finishes on the first wait, so
-    `main`'s loop ends. `outcome` is how it finished."""
+    `main`'s loop ends. `outcome` is how it finished.
+
+    `announce` is a message the watch reports through `on_blind` before finishing,
+    and `after_announce` runs the moment the orchestrator has handled it. Together
+    they are how a test reaches what the ledger holds *while* a pod cannot be seen
+    rather than only what it holds once the watch has ended — which is the state
+    the last three pods were killed in."""
 
     class FakeWatch:
-        def __init__(self, timeout_seconds):
+        def __init__(self, timeout_seconds, on_blind=lambda *_: None):
             self.watching = []
+            self.on_blind = on_blind
 
         def track(self, pod_id):
             self.watching.append(pod_id)
 
         def wait_for_any(self):
             done, self.watching = self.watching, []
+            for pod_id in done:
+                if announce is not None:
+                    self.on_blind(pod_id, announce)
+                    if after_announce is not None:
+                        after_announce()
             return [outcome(pod_id) for pod_id in done]
 
     return FakeWatch
 
 
-def launch(tmp_path, monkeypatch, reachable, outcome=exited):
+def launch(tmp_path, monkeypatch, reachable, outcome=exited, announce=None, after_announce=None):
     """Run the real `main` over one shipped manifest with nothing real behind it."""
     created = []
     terminated = []
@@ -1496,7 +1749,7 @@ def launch(tmp_path, monkeypatch, reachable, outcome=exited):
         orchestrate.pods, "create", lambda spec: created.append(spec) or {"id": "p"}
     )
     monkeypatch.setattr(orchestrate.pods, "terminate", terminated.append)
-    monkeypatch.setattr(orchestrate.pods, "PodWatch", fake_watch(outcome))
+    monkeypatch.setattr(orchestrate.pods, "PodWatch", fake_watch(outcome, announce, after_announce))
     code = orchestrate.main(
         [
             "--experiment",
@@ -1509,6 +1762,51 @@ def launch(tmp_path, monkeypatch, reachable, outcome=exited):
         ]
     )
     return code, created, terminated
+
+
+def unreadable(pod_id):
+    return pods.PodOutcome(
+        pod_id,
+        pods.REASON_UNREADABLE,
+        pods.UNKNOWN,
+        ever_ran=False,
+        waited_seconds=300.0,
+        unreadable=f"30 of this watch's polls learned nothing. Last failure: {CLOUDFLARE_403}",
+    )
+
+
+def test_the_ledger_says_it_cannot_see_a_pod_while_that_is_still_true(tmp_path, monkeypatch):
+    """`outputs/orchestrate-phase0-verify2.json` held `outcome: null` for ten
+    minutes with nothing anywhere saying why.
+
+    The orchestrator sits inside `wait_for_any` for the whole of a blind watch, so
+    when somebody kills it — which is how the last three pods ended — the ledger on
+    disk is the only record there is, and it said nothing at all. Both halves are
+    asserted: the note written while the watch is blind, and the outcome that
+    supersedes it.
+    """
+    out = tmp_path / "orchestrate.json"
+    blind_ledger = []
+    code, _, terminated = launch(
+        tmp_path,
+        monkeypatch,
+        ["HF_TOKEN"],
+        outcome=unreadable,
+        announce=f"cannot see p: 40s of unreadable polls. Last failure: {CLOUDFLARE_403}",
+        after_announce=lambda: blind_ledger.append(json.loads(out.read_text())),
+    )
+    assert code == 0
+    # What an operator would have found on disk had they killed it mid-watch.
+    (blind_entry,) = blind_ledger[0]["experiments"]
+    assert "error code: 1010" in blind_entry["unreadable"]
+    assert blind_entry["outcome"] is None, "the outcome is still exactly what it was"
+    (entry,) = json.loads(out.read_text())["experiments"]
+    assert entry["outcome"]["reason"] == pods.REASON_UNREADABLE
+    assert "error code: 1010" in entry["outcome"]["unreadable"]
+    # The live note is the outcome's job once there is an outcome.
+    assert entry["unreadable"] is None
+    # And a pod nobody can see is still a pod that bills.
+    assert terminated == ["p"]
 
 
 def test_no_pod_is_created_while_the_token_can_read_a_forbidden_secret(tmp_path, monkeypatch):
