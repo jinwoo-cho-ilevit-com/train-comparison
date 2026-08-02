@@ -446,6 +446,8 @@ train-comparison/
 │   ├── report.py              # pod별 결과 병합
 │   └── audit_plan.py          # 계획-문서-코드 정합 회귀 추적기
 ├── tests/
+│   ├── contract/              # 레인 경계 계약 — 어느 레인도 소유하지 않고 팬아웃 전에 쓰인다
+│   ├── fixtures/              # 경계별 대표 페이로드 — 계약의 진실은 산문이 아니라 이 파일이다
 │   ├── conftest.py
 │   ├── test_config.py
 │   ├── test_applied.py

@@ -22,6 +22,11 @@ optimizer가 아니라 engine config를 읽는 경로**가 함께 필요하다. 
 ## Owns
 
 - `trainbench/applied.py`
+- `tests/test_applied.py`
+
+`tests/test_applied.py`가 이 레인에 들어온 이유는 실측이다 — 경계 에이전트가 프로토타입으로
+전체 스위트를 돌려 `test_applied_state_serialises_for_the_record`가 축별 dict를 **정확히**
+못박고 있어 `owner`/`state` 추가로 깨지는 것을 확인했다. 명세 초안에 소유자가 없었다.
 
 ## 할 일
 

@@ -13,6 +13,7 @@
 - `docs/support-matrix.md`
 - `README.md`
 - `docs/open-verdicts.json`
+- `docs/audit-baseline.json`
 
 ## 할 일
 
@@ -83,6 +84,13 @@ Smoke 명령은 넣지 않는다 — `env_report.py`는 training smoke가 아니
 - `verdicts-closed`가 2 open이다 (남는 둘은 파드가 답할 `loss-empty-pixel-slice`와
   `loss-gradcache-memory-and-overhead`)
   → `infisical run --env=dev -- uv run python scripts/audit_plan.py`
+- 4 → 2로 줄면 감사가 `shrank`로 BLOCK한다. 그것은 결함이 아니라 래칫이다 —
+  `docs/audit-baseline.json`의 `verdicts-closed` count와 note를 **줄어든 상태에 맞게 고쳐야**
+  통과한다. note는 남은 둘이 왜 파드 없이 닫힐 수 없는지를 계속 말해야 한다
+  → `infisical run --env=dev -- uv run python scripts/audit_plan.py` (exit 0)
+- 베이스라인의 `verdicts-closed` note에 적힌 lane-f/lane-b 몫이 실제로 닫혔는지 대조한다.
+  두 레인이 앵커를 만들지 못했으면 **닫지 말고 note를 갱신한다** — 원장의 `closed`는
+  "합의된 조치가 착지했다"이지 "결함이 사라졌다"가 아니다
 - 게이트 넷이 전부 통과한다
   → `uv run ruff check && uv run ruff format --check`
   → `infisical run --env=dev -- uv run pytest`
