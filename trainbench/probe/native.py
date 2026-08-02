@@ -16,11 +16,41 @@ from trainbench.probe import steps
 from trainbench.probe.types import ProbeReport
 
 
+def load_processor(config: BenchConfig) -> Any:
+    from transformers import AutoProcessor
+
+    return AutoProcessor.from_pretrained(config.model.hf_id, revision=config.model.revision)
+
+
+def load_model(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any]) -> Any:
+    """AutoModel rather than the generative head: an embedding model never
+    materialises the LM head, which for gemma4 is 262144 x 1536."""
+    from transformers import AutoModel
+
+    return AutoModel.from_pretrained(
+        config.model.hf_id,
+        revision=config.model.revision,
+        dtype=steps.dtype_for(device),
+        **load_kwargs,
+    )
+
+
+def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any]) -> tuple[Any, Any]:
+    """The reference build, for `trainbench/loader.py`.
+
+    The probe below takes the same two calls as separate checks: a processor that
+    does not load and a model that does not load are different answers, and the
+    harness has no report to record the difference in.
+    """
+    processor = load_processor(config)
+    model = load_model(config, device, load_kwargs)
+    model.to(device)
+    return model, processor
+
+
 def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     """Fills `report` in place. The registry owns it so that whatever was recorded
     before a crash survives the crash (see trainbench/probe/registry.py)."""
-    from transformers import AutoModel, AutoProcessor
-
     hf_id = config.model.hf_id
     revision = config.model.revision
 
@@ -29,27 +59,12 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     # about the axis, not about the checkpoint (see steps.load_kwargs).
     load_kwargs = steps.load_kwargs(config, report)
 
-    ok, processor = report.run(
-        "processor_load",
-        lambda: AutoProcessor.from_pretrained(hf_id, revision=revision),
-    )
+    ok, processor = report.run("processor_load", lambda: load_processor(config))
     if not ok:
         report.skip("model_load", "processor did not load")
         return
 
-    ok, model = report.run(
-        "model_load",
-        # AutoModel rather than the generative head: an embedding model never
-        # materialises the LM head, which for gemma4 is 262144 x 1536.
-        # Axis settings come from trainbench/axes.py so that there is one place
-        # that asks for them and one place that reads them back.
-        lambda: AutoModel.from_pretrained(
-            hf_id,
-            revision=revision,
-            dtype=steps.dtype_for(device),
-            **load_kwargs,
-        ),
-    )
+    ok, model = report.run("model_load", lambda: load_model(config, device, load_kwargs))
     if not ok:
         return
     model.to(device)

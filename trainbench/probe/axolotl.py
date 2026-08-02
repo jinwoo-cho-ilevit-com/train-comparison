@@ -23,6 +23,51 @@ from trainbench.probe import steps
 from trainbench.probe.types import ProbeReport
 
 
+def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any]) -> tuple[Any, Any]:
+    """axolotl's own order, which this probe used to invert.
+
+    `normalize_config` is written against a cfg that `validate_config` has already
+    filled in: run first it divides `batch_size // micro_batch_size` with both
+    still None, because `DictDefault.__missing__` returns None instead of raising
+    (axolotl 0.18.0 cli/config.py:303-322). Filling those two keys by hand does not
+    fix it — the next unfilled key is `context_parallel_size`, compared against 1
+    in loaders/patch_manager.py. Only validation puts defaults on all of them.
+    """
+    from axolotl.loaders.model import ModelLoader
+    from axolotl.loaders.tokenizer import load_tokenizer
+    from axolotl.utils.config import normalize_config, prepare_plugins, validate_config
+    from axolotl.utils.dict import DictDefault
+
+    cfg = DictDefault(
+        {
+            "base_model": config.model.hf_id,
+            "sequence_len": config.data.max_seq_len,
+            "bf16": True,
+            "load_in_4bit": config.peft.mode == "qlora",
+            "adapter": None if config.peft.mode == "full" else config.peft.mode,
+            "lora_r": config.peft.r or None,
+            "lora_alpha": config.peft.alpha or None,
+            "lora_dropout": config.peft.dropout,
+            "lora_target_linear": config.peft.mode != "full",
+            # The four keys axolotl's schema requires before a cfg is a cfg, every
+            # one of them read from this study's own config rather than invented.
+            # `validate_config` fetches nothing, so naming the real repo costs no
+            # download.
+            "micro_batch_size": config.train.batch_size,
+            "gradient_accumulation_steps": config.train.grad_accum,
+            "learning_rate": config.optim.lr,
+            "datasets": [{"path": config.data.repo_id, "type": "completion"}],
+        }
+    )
+    prepare_plugins(cfg)
+    cfg = validate_config(cfg)
+    normalize_config(cfg)
+    tokenizer = load_tokenizer(cfg)
+    model, _ = ModelLoader(cfg, tokenizer).load()
+    model.to(device)
+    return model, tokenizer
+
+
 def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     import axolotl
 
@@ -32,48 +77,10 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     loaded: dict[str, Any] = {}
 
     def _load() -> dict[str, Any]:
-        from axolotl.loaders.model import ModelLoader
-        from axolotl.loaders.tokenizer import load_tokenizer
-        from axolotl.utils.config import normalize_config, prepare_plugins, validate_config
-        from axolotl.utils.dict import DictDefault
-
-        cfg = DictDefault(
-            {
-                "base_model": config.model.hf_id,
-                "sequence_len": config.data.max_seq_len,
-                "bf16": True,
-                "load_in_4bit": config.peft.mode == "qlora",
-                "adapter": None if config.peft.mode == "full" else config.peft.mode,
-                "lora_r": config.peft.r or None,
-                "lora_alpha": config.peft.alpha or None,
-                "lora_dropout": config.peft.dropout,
-                "lora_target_linear": config.peft.mode != "full",
-                # The four keys axolotl's schema requires before a cfg is a cfg,
-                # every one of them read from this study's own config rather than
-                # invented. `datasets` names the repo the run would train on; a
-                # one-item list is the minimum `MinLen(1)` takes and omitting the
-                # key is refused separately, while an empty list is refused by
-                # both. `validate_config` fetches nothing, so naming the real repo
-                # costs no download.
-                "micro_batch_size": config.train.batch_size,
-                "gradient_accumulation_steps": config.train.grad_accum,
-                "learning_rate": config.optim.lr,
-                "datasets": [{"path": config.data.repo_id, "type": "completion"}],
-            }
-        )
-        # axolotl's own order (axolotl 0.18.0 cli/config.py:303-322), which this
-        # probe used to invert. `normalize_config` is written against a cfg that
-        # `validate_config` has already filled in: run first it divides
-        # `batch_size // micro_batch_size` with both still None, because
-        # `DictDefault.__missing__` returns None instead of raising. Filling those
-        # two keys by hand does not fix it — the next unfilled key is
-        # `context_parallel_size`, compared against 1 in loaders/patch_manager.py.
-        # Only validation puts defaults on all of them.
-        prepare_plugins(cfg)
-        cfg = validate_config(cfg)
-        normalize_config(cfg)
-        tokenizer = load_tokenizer(cfg)
-        model, _ = ModelLoader(cfg, tokenizer).load()
+        # The cfg and the validate/normalize order live in `load` above, which is
+        # also what a timing run takes. Two copies of that order is how the
+        # inverted one survived a whole campaign.
+        model, tokenizer = load(config, device, {})
         loaded["model"] = model
         loaded["tokenizer"] = tokenizer
         return {
@@ -86,7 +93,6 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
         return
 
     model, tokenizer = loaded["model"], loaded["tokenizer"]
-    model.to(device)
     model = steps.verify_axes(model, config, device, "axolotl", report)
 
     tokenized: dict[str, torch.Tensor] = {}

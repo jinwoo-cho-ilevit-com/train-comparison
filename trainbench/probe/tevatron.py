@@ -65,6 +65,39 @@ def plant_pad_token_id(hf_config: Any) -> dict[str, Any]:
     }
 
 
+def load_dense_model(config: BenchConfig) -> tuple[Any, dict[str, Any]]:
+    """`DenseModel.load` with the shim planted first, and what the shim did."""
+    from transformers import AutoConfig
+
+    modeling = importlib.import_module("tevatron.retriever.modeling")
+    hf_config = AutoConfig.from_pretrained(config.model.hf_id, revision=config.model.revision)
+    shim = plant_pad_token_id(hf_config)
+    model = modeling.DenseModel.load(
+        config.model.hf_id,
+        pooling="last",
+        normalize=True,
+        config=hf_config,
+        revision=config.model.revision,
+    )
+    return model, shim
+
+
+def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any]) -> tuple[Any, Any]:
+    """The build `trainbench/loader.py` takes for a timing run.
+
+    `load_kwargs` is not forced through `DenseModel.load`: the same dict reaches
+    `LoraConfig.from_pretrained` on the LoRA path (tevatron dd06310
+    retriever/modeling/encoder.py:131, :170), so a transformers-only keyword would
+    be refused there rather than here.
+    """
+    from transformers import AutoProcessor
+
+    model, _ = load_dense_model(config)
+    model.to(device)
+    processor = AutoProcessor.from_pretrained(config.model.hf_id, revision=config.model.revision)
+    return model, processor
+
+
 def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     import tevatron
 
@@ -82,19 +115,7 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     loaded: dict[str, Any] = {}
 
     def _load() -> dict[str, Any]:
-        from transformers import AutoConfig
-
-        modeling = importlib.import_module("tevatron.retriever.modeling")
-        dense = modeling.DenseModel
-        hf_config = AutoConfig.from_pretrained(config.model.hf_id, revision=config.model.revision)
-        shim = plant_pad_token_id(hf_config)
-        model = dense.load(
-            config.model.hf_id,
-            pooling="last",
-            normalize=True,
-            config=hf_config,
-            revision=config.model.revision,
-        )
+        model, shim = load_dense_model(config)
         loaded["model"] = model
         return {"model_class": type(model).__name__, **shim}
 
