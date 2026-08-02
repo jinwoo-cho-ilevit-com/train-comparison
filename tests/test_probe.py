@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import pathlib
 import sys
 import types
@@ -27,8 +28,13 @@ import torch  # isort: skip
 FRAMEWORKS = ["unsloth", "ms_swift", "sentence_transformers", "tevatron", "axolotl"]
 
 
-@pytest.fixture
-def config_mapping(tmp_path):
+def compose_probe(*overrides):
+    """A resolved probe mapping, composed rather than hand-written.
+
+    Extra overrides are for the tests whose subject is a config group — the
+    environment-bound kernel only exists on one architecture, and swapping the
+    field by hand would build a model config no `configs/model/` file describes.
+    """
     from hydra import compose, initialize_config_dir
 
     from trainbench.compose import resolve
@@ -36,8 +42,13 @@ def config_mapping(tmp_path):
     from .conftest import CONFIG_DIR
 
     with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
-        cfg = compose(config_name="config", overrides=["run=probe", "device=cpu"])
+        cfg = compose(config_name="config", overrides=["run=probe", "device=cpu", *overrides])
         return resolve(cfg)[1]
+
+
+@pytest.fixture
+def config_mapping(tmp_path):
+    return compose_probe()
 
 
 @pytest.mark.parametrize("framework", FRAMEWORKS)
@@ -942,6 +953,319 @@ def test_the_load_axes_reach_from_pretrained_as_the_whole_mapping(config_mapping
     assert comparable(reached) == comparable(wanted)
     check = next(c for c in report.checks if c.name == "axes_load_kwargs")
     assert (check.ok, check.detail) == (True, {"requested": sorted(wanted)})
+
+
+def _stub_sentence_transformers(monkeypatch, frozen):
+    """sentence-transformers stood in for, with the one shape the guard is about real.
+
+    Frozen means what unsloth made real and what could happen here: every
+    parameter has `requires_grad=False` while the graph stays differentiable
+    through a hook on the embedding *output*, which is what
+    `enable_input_require_grads` does. Counters are not simulated — the freeze,
+    the forward and the backward are the real ones, so a guard that only looked at
+    the loss would still see a finite number.
+
+    `BaseModel` is an `nn.Sequential` (sentence-transformers 5.6.1
+    base/model.py:50), so `.parameters()` reaching the backbone is ST's own shape;
+    the package installs only inside its own image, which is why it is stood in for.
+    """
+    module = types.ModuleType("sentence_transformers")
+
+    class _SentenceTransformer(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.embed = torch.nn.Embedding(8, 4)
+            self.proj = torch.nn.Linear(4, 4)
+            if frozen:
+                self.requires_grad_(False)
+                self.embed.register_forward_hook(
+                    lambda module, args, output: output.requires_grad_(True)
+                )
+
+        def __iter__(self):
+            return iter([self.embed, self.proj])
+
+        def get_sentence_embedding_dimension(self):
+            return 4
+
+        def tokenize(self, texts):
+            ids = torch.arange(len(texts) * 3).reshape(len(texts), 3) % 8
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+        def forward(self, features):
+            return {"sentence_embedding": self.proj(self.embed(features["input_ids"]))[:, -1]}
+
+        def encode(self, texts, convert_to_tensor=True):
+            return self(self.tokenize(texts))["sentence_embedding"]
+
+    module.SentenceTransformer = _SentenceTransformer
+    module.__version__ = "0.0-stub"
+    monkeypatch.setitem(sys.modules, "sentence_transformers", module)
+
+
+def _sentence_transformers_checks(config_mapping, monkeypatch, frozen):
+    _stub_sentence_transformers(monkeypatch, frozen)
+    mapping = json.loads(json.dumps(config_mapping))
+    mapping["framework"]["name"] = "sentence_transformers"
+    report = run_probe(to_bench_config(mapping), get_device("cpu"))
+    return {c.name: c for c in report.checks}
+
+
+def test_a_sentence_transformers_frozen_model_is_refused_like_every_other(
+    config_mapping, monkeypatch
+):
+    """This adapter computes its own loss, so `steps.infonce_backward`'s guard was
+    not on it: it returned `params_with_grad` alone and never counted
+    `trainable_params` or compared it to zero. The 2026-08-02 values were
+    310/320/505, but a fully frozen model here would have been recorded green —
+    the same reading that filed three unsloth cells as supported."""
+    checks = _sentence_transformers_checks(config_mapping, monkeypatch, frozen=True)
+    check = checks["mnrl_backward"]
+
+    assert (check.ok, check.error_type) == (False, "ValueError"), check.error
+    assert "trained nothing" in check.error
+
+
+def test_the_sentence_transformers_frozen_graph_it_refuses_returns_a_finite_loss(
+    config_mapping, monkeypatch
+):
+    """The other half of the same claim: had the backward raised on its own, or had
+    the loss come back non-finite, there would have been nothing for the old check
+    to pass on. The refused message carries the loss the old one would have
+    published."""
+    checks = _sentence_transformers_checks(config_mapping, monkeypatch, frozen=True)
+
+    loss = float(checks["mnrl_backward"].error.split("loss=")[1].split(" ")[0])
+    assert math.isfinite(loss)
+
+
+def test_a_sentence_transformers_step_that_did_train_still_passes(config_mapping, monkeypatch):
+    """The break for the test above: a guard that refused everything would satisfy
+    it and close the framework."""
+    checks = _sentence_transformers_checks(config_mapping, monkeypatch, frozen=False)
+    check = checks["mnrl_backward"]
+
+    assert check.ok, check.error
+    # embedding weight, linear weight, linear bias
+    assert check.detail["trainable_params"] == check.detail["total_params"] == 3
+    assert check.detail["params_with_grad"] == 3
+
+
+def _axes_verified(mapping, framework_literal):
+    from trainbench.probe.steps import verify_axes
+
+    report = ProbeReport(framework=mapping["framework"]["name"], model="m")
+    verify_axes(
+        torch.nn.Linear(2, 2),
+        to_bench_config(mapping),
+        get_device("cpu"),
+        framework_literal,
+        report,
+    )
+    return next(c for c in report.checks if c.name == "axes_verified"), report
+
+
+def test_axes_verified_refuses_a_mismatch_rather_than_recording_it_green(config_mapping):
+    """`assert_matches` returns immediately for `purpose=probe`, so this check was
+    green on `all_matched: false` — and two mismatches were already sitting under
+    that green in the 2026-08-02 matrix (docs/support-matrix.md)."""
+    mapping = json.loads(json.dumps(config_mapping))
+    mapping["framework"]["name"] = "ms_swift"
+
+    check, report = _axes_verified(mapping, "native")
+
+    assert (check.ok, check.error_type) == (False, "AppliedMismatch"), check.detail
+    assert "framework.name" in check.error
+    # Refused, not removed: the mismatch is what the result has to carry.
+    assert not report.applied.to_dict()["all_matched"]
+    assert not report.all_ok
+
+
+def test_axes_verified_names_every_mismatch_rather_than_the_first(config_mapping):
+    """No probe config on this host has all its determined axes matched: the load
+    dtype is fp32 off CUDA (`steps.dtype_for`) and the fused AdamW kernel is
+    CUDA-only, while `configs/precision/` offers no fp32 and `configs/optim/` no
+    unfused AdamW. So every CPU probe cell is refused here, and whether a pod cell
+    passes is a pod question — 확인 안 함. What is asserted is that the refusal
+    names all of them."""
+    check, report = _axes_verified(json.loads(json.dumps(config_mapping)), "native")
+
+    named = {axis.axis for axis in report.applied.mismatched()}
+    assert named, "nothing mismatched, so this test would assert nothing"
+    assert not check.ok
+    for axis in named:
+        assert axis in check.error
+
+
+def test_axes_verified_does_not_grade_an_undetermined_axis(config_mapping):
+    """The break for the tests above, and the boundary this check deliberately does
+    not cross. A probe builds no dataloader, so those axes come back undetermined
+    in every cell; refusing them here would paint every cell red over a question
+    the probe never claimed to answer. `assert_matches` is where undetermined stops
+    a run, for the purposes whose numbers get published."""
+    from trainbench.applied import AppliedState, AxisState
+    from trainbench.probe.steps import _refuse_mismatch
+
+    state = AppliedState(
+        (
+            AxisState("framework.name", "native", "native"),
+            AxisState("dataloader.backend", "torch", None, {"reason": "no dataloader was built"}),
+        )
+    )
+    assert state.undetermined() and not state.mismatched()
+
+    assert _refuse_mismatch(state, to_bench_config(config_mapping)) is None
+
+
+def test_axes_verified_names_an_environment_bound_kernel_mismatch(monkeypatch):
+    """`kernel=none` is unsatisfiable on qwen3_5 in any image that ships fla:
+    transformers binds it while it imports the modelling module, which is why
+    `axes.patch` refuses reported purposes outright. A probe is the run that
+    exists to report it, so the mismatch stays and the message says which kind it
+    is. The binding is stood in for because no image on this host has fla — that
+    is a property of the image, and `_fla_binding` is the reader that decides it.
+    """
+    from trainbench import axes
+    from trainbench.applied import AxisState
+    from trainbench.probe.steps import _environment_bound
+
+    monkeypatch.setattr(axes, "_fla_binding", lambda: (True, ""))
+    config = to_bench_config(compose_probe("model=qwen3_5_0_8b"))
+
+    note = _environment_bound(AxisState("kernel.name", "none", "fla"), config)
+
+    assert "environment-bound" in note
+    assert "fla" in note
+
+
+@pytest.mark.parametrize(
+    ("axis", "requested", "applied_value"),
+    [
+        # The kernel axis on an architecture nothing binds: a real mismatch that
+        # happens to be on the one axis the classifier can read.
+        ("kernel.name", "liger", "none"),
+        # The other measured mismatch. axolotl keeps embed_tokens/lm_head in fp32
+        # and peft keeps adapter weights there; neither is distinguishable from a
+        # bf16 request answered in fp32 by anything readable here.
+        ("precision.name", "bf16", "mixed(bf16,fp32)"),
+    ],
+)
+def test_a_mismatch_this_cannot_classify_is_not_called_environment_bound(
+    config_mapping, axis, requested, applied_value
+):
+    from trainbench.applied import AxisState
+    from trainbench.probe.steps import _environment_bound
+
+    config = to_bench_config(config_mapping)
+
+    assert _environment_bound(AxisState(axis, requested, applied_value), config) == ""
+
+
+def _fake_tevatron(monkeypatch, seen):
+    """A miniature of tevatron dd063104 keeping the two lines the shim is for.
+
+    `DenseModel.load` reads `base_model.config.pad_token_id` directly rather than
+    through `getattr` and then fills a `None` with 0
+    (retriever/modeling/encoder.py:166-169). Both are reproduced verbatim: a stub
+    using `getattr` would keep passing with the shim removed, which is the whole
+    thing under test. The `config` kwarg is honoured the way
+    `AutoModel.from_pretrained` honours it — a `PreTrainedConfig` instance is used
+    as given and `AutoConfig` is not consulted (transformers 5.14.1
+    models/auto/auto_factory.py:262, :324).
+    """
+
+    class _Loaded(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 2)
+            self.config = config
+
+    class DenseModel:
+        @staticmethod
+        def load(
+            model_name_or_path, pooling="cls", normalize=False, lora_name_or_path=None, **hf_kwargs
+        ):
+            from transformers import AutoConfig
+
+            seen["hf_kwargs"] = hf_kwargs
+            config = hf_kwargs.get("config")
+            if config is None:
+                config = AutoConfig.from_pretrained(model_name_or_path)
+            base_model = _Loaded(config)
+            if base_model.config.pad_token_id is None:
+                base_model.config.pad_token_id = 0
+            return base_model
+
+    root = types.ModuleType("tevatron")
+    root.__path__ = []
+    root.__version__ = "0.0-stub"
+    modeling = types.ModuleType("tevatron.retriever.modeling")
+    modeling.DenseModel = DenseModel
+    for name, module in {
+        "tevatron": root,
+        "tevatron.retriever": types.ModuleType("tevatron.retriever"),
+        "tevatron.retriever.modeling": modeling,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+COMPOSITE_CONFIGS = {
+    "qwen3_vl": "transformers.models.qwen3_vl.configuration_qwen3_vl:Qwen3VLConfig",
+    "qwen3_5": "transformers.models.qwen3_5.configuration_qwen3_5:Qwen3_5Config",
+    "gemma4": "transformers.models.gemma4.configuration_gemma4:Gemma4Config",
+}
+
+
+@pytest.mark.parametrize("arch", sorted(COMPOSITE_CONFIGS))
+def test_the_tevatron_probe_plants_pad_token_id_on_every_composite_config(
+    config_mapping, monkeypatch, arch
+):
+    """All three tevatron cells of the second campaign died on
+    `'<X>Config' object has no attribute 'pad_token_id'`. The real config classes
+    are built here rather than stubbed: what the shim works around is transformers
+    5.14.1 declaring the field only on the text sub-config, and a stub would be
+    asserting its own layout."""
+    import importlib as _importlib
+
+    from transformers import AutoConfig
+
+    module_name, class_name = COMPOSITE_CONFIGS[arch].split(":")
+    hf_config = getattr(_importlib.import_module(module_name), class_name)()
+    # The premise, asserted: with the field present at the top level there would be
+    # nothing for the shim to plant and this test would pass on an empty subject.
+    assert not hasattr(hf_config, "pad_token_id")
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *args, **kwargs: hf_config)
+
+    seen: dict[str, object] = {}
+    _fake_tevatron(monkeypatch, seen)
+    mapping = json.loads(json.dumps(config_mapping))
+    mapping["framework"]["name"] = "tevatron"
+    config = to_bench_config(mapping)
+
+    report = run_probe(config, get_device("cpu"))
+    check = next(c for c in report.checks if c.name == "dense_model_load")
+
+    assert check.ok, check.error
+    assert seen["hf_kwargs"]["config"] is hf_config
+    assert seen["hf_kwargs"]["revision"] == config.model.revision
+    assert check.detail["pad_token_id_planted"] is True
+    # What the text sub-config declares, planted verbatim — including `None`, which
+    # upstream's own next line then fills with 0.
+    assert check.detail["pad_token_id"] == getattr(
+        hf_config.get_text_config(), "pad_token_id", "missing"
+    )
+    assert hf_config.pad_token_id == 0
+
+
+def test_the_tevatron_shim_leaves_a_config_that_already_declares_it_alone():
+    """Planting over a declared value would replace the checkpoint's own answer
+    with the text sub-config's."""
+    from trainbench.probe.tevatron import plant_pad_token_id
+
+    hf_config = types.SimpleNamespace(pad_token_id=7)
+
+    assert plant_pad_token_id(hf_config)["pad_token_id_planted"] is False
+    assert hf_config.pad_token_id == 7
 
 
 def test_proportional_quota_preserves_composition_and_total():

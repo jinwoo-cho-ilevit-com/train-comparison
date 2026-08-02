@@ -110,7 +110,70 @@ def verify_axes(
 
 def _verified(state: applied.AppliedState, config: BenchConfig) -> dict[str, Any]:
     applied.assert_matches(state, config)
+    _refuse_mismatch(state, config)
     return state.to_dict()
+
+
+def _refuse_mismatch(state: applied.AppliedState, config: BenchConfig) -> None:
+    """Fail this check when the built model is not the one the run asked for.
+
+    `assert_matches` returns immediately for `purpose=probe`, so `axes_verified`
+    used to be green on `all_matched: false` and a support-matrix cell read as
+    clean while two mismatches sat under it (docs/support-matrix.md): `kernel.name`
+    requested `none` and applied `fla` on every qwen3_5 cell, and `precision.name`
+    requested `bf16` and applied `mixed(bf16,fp32)` on six others.
+
+    The mismatch is not removed, which is the point — an uneven application is
+    state to report, not noise to hide (docs/CONTRACTS.md §2). It stays on
+    `report.applied`, which is what the result file carries; what changes is that
+    nothing reads it as a pass.
+
+    Undetermined axes are deliberately not refused here. A probe builds no
+    dataloader, so those axes come back undetermined in every cell, and grading
+    them here would paint every cell red over a question the probe never claimed
+    to answer. Undetermined stops a run in `assert_matches`, for the purposes whose
+    numbers get published.
+    """
+    mismatched = state.mismatched()
+    if not mismatched:
+        return
+    problems = []
+    for axis in mismatched:
+        note = _environment_bound(axis, config)
+        problems.append(
+            f"{axis.axis}: requested {axis.requested!r}, applied {axis.applied!r}"
+            + (f" ({note})" if note else "")
+        )
+    raise applied.AppliedMismatch(
+        "the model that was built is not the one this run asked for: " + "; ".join(problems)
+    )
+
+
+def _environment_bound(state: applied.AxisState, config: BenchConfig) -> str:
+    """Why this mismatch is the image rather than the run, when that can be read.
+
+    Only `kernel.name` can be answered, and by the reader that already decides it
+    at the patch site rather than by a second copy of the rule: transformers binds
+    fla while it imports the modelling module, so on those architectures the
+    request was unsatisfiable before any model existed.
+
+    Every other axis returns "". Nothing reachable from here tells a framework's
+    own dtype policy apart from a load that went wrong — the `mixed(bf16,fp32)`
+    above is axolotl holding `embed_tokens`/`lm_head` in fp32 and peft holding
+    adapter weights there, and both look identical to a bf16 request answered in
+    fp32. Calling one of them environment-bound would be inventing the
+    distinction rather than reading it.
+    """
+    if state.axis != "kernel.name" or state.applied is None:
+        return ""
+    bound = axes._environment_bound_kernel(config)
+    if not bound or bound not in state.applied:
+        return ""
+    return (
+        f"environment-bound: this image binds kernel={bound} on arch={config.model.arch} "
+        "while transformers imports the modelling module, so no run in it can apply the "
+        "requested value"
+    )
 
 
 # transformers' default when a checkpoint names no padding_side. It is not a
@@ -386,32 +449,26 @@ def visual_token_count(
     }
 
 
-def infonce_backward(
-    model: Any, batch: dict[str, torch.Tensor], temperature: float, padding_side: str
-) -> dict:
-    """One contrastive training step, refused when it trained nothing.
-
-    This is the check that matters for framework support: patching that works for
-    a language-modelling loss can still break when the loss is contrastive over
-    pooled embeddings, because no LM head is involved.
+def training_step_evidence(model: Any, loss: torch.Tensor) -> dict[str, Any]:
+    """What a backward that has just run actually reached, refused when it is nothing.
 
     A finite loss is not evidence that a step happened. Every framework here calls
     something like `enable_input_require_grads`, which puts `requires_grad` on the
     *embedding output* rather than on a parameter, so the graph stays
     differentiable and `loss.backward()` returns normally even when every
     parameter is frozen. The 2026-08-02 campaign recorded ok=True with
-    `trainable_params=0` on three cells for exactly that reason. The counts were
-    already in this detail and nothing read them, so they are asked here instead
-    of published for later.
+    `trainable_params=0` on three cells for exactly that reason.
+
+    Shared rather than per-adapter because an adapter that computes its own loss —
+    sentence_transformers pools inside its own module — otherwise reports
+    `params_with_grad` alone, which reads 0 for a frozen model and 0 for a
+    detached one and is the same green the campaign already published once.
 
     Both counts are of parameter *tensors*, not elements; what they answer is
     "did anything train", for which the number of elements is the wrong unit.
+    Gradients are cleared before the refusal so a caller that records the failure
+    and carries on does not accumulate into the next check.
     """
-    model.train()
-    pooled = encode(model, batch, padding_side)
-    half = pooled.shape[0] // 2
-    loss = info_nce(pooled[:half], pooled[half:], temperature)
-    loss.backward()
     with_grad = sum(1 for p in model.parameters() if p.requires_grad and p.grad is not None)
     trainable = sum(1 for p in model.parameters() if p.requires_grad)
     total = sum(1 for _ in model.parameters())
@@ -436,3 +493,20 @@ def infonce_backward(
         "trainable_params": trainable,
         "total_params": total,
     }
+
+
+def infonce_backward(
+    model: Any, batch: dict[str, torch.Tensor], temperature: float, padding_side: str
+) -> dict:
+    """One contrastive training step, refused when it trained nothing.
+
+    This is the check that matters for framework support: patching that works for
+    a language-modelling loss can still break when the loss is contrastive over
+    pooled embeddings, because no LM head is involved.
+    """
+    model.train()
+    pooled = encode(model, batch, padding_side)
+    half = pooled.shape[0] // 2
+    loss = info_nce(pooled[:half], pooled[half:], temperature)
+    loss.backward()
+    return training_step_evidence(model, loss)
