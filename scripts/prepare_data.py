@@ -21,10 +21,10 @@ tracked by branch.
 
 **`pos_text` and `qry` are stored verbatim, MMEB placeholder markup included** —
 `"<|image_1|>\\nRepresent the given image.\\n"`. That markup is MMEB's, not any
-model's: each model under test needs its own `apply_chat_template` conversion
-(different image tokens, different generation-prompt handling, per
-`docs/model-spec.md`). Converting here would bake one model's template into the
-shared corpus. The loader that does the conversion is Wave 3's, not this script's.
+model's: each model under test needs its own prompt-format conversion (different
+image tokens, different generation-prompt handling, and gemma-4 has no chat
+template at all, per `docs/model-spec.md`). Converting here would bake one model's
+format into the shared corpus. The loader that converts is `trainbench/prompt.py`.
 
 Why the quality gate exists: the subset pushed before this rewrite was validated
 on row count and config coverage alone, reported `2048/2048, 20/20`, and was

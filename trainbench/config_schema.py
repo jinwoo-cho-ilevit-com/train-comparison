@@ -94,6 +94,11 @@ class ModelConfig(Strict):
     # (1_Pooling/config.json); for the generative models this is our choice, and
     # writing it down is what makes it reviewable.
     pooling: Literal["lasttoken"]
+    # Whether this checkpoint ships a chat template. `raw` is the pre-trained
+    # checkpoint that does not, and its rows carry no role or turn markers — a
+    # difference in what is measured, not an implementation detail, which is why
+    # it is declared here and read only by trainbench/prompt.py.
+    prompt_format: Literal["chat_template", "raw"]
     # The most visual tokens one image can become, where the model declares a cap.
     # No model here has a fixed per-image count: gemma4's processor computes the
     # count from the aspect ratio and stops at max_soft_tokens=280, and the Qwen
@@ -464,6 +469,19 @@ class BenchConfig(Strict):
                 "arch=gemma4's processor declares max_soft_tokens; "
                 "model.max_tokens_per_image must carry it so a measured count above the "
                 "cap is caught instead of published."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _a_raw_prompt_has_no_generation_prompt(self) -> BenchConfig:
+        """`add_generation_prompt` is an argument to `apply_chat_template`, and
+        prompt_format=raw is the case where there is no template to pass it to. With
+        last-token pooling it decides which token becomes the embedding, so the two
+        cannot be left to disagree — the run would report a value it never applied."""
+        if self.model.prompt_format == "raw" and self.model.add_generation_prompt:
+            raise ValueError(
+                "model.add_generation_prompt is true under model.prompt_format=raw, which "
+                "has no chat template to append a generation prompt to."
             )
         return self
 

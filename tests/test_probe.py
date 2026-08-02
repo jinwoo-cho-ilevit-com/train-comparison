@@ -17,6 +17,7 @@ import pytest
 from trainbench.config import to_bench_config
 from trainbench.device import get_device
 from trainbench.probe import registry, run_probe
+from trainbench.probe.fixtures import PROBE_PAIRS
 from trainbench.probe.steps import image_token_id, visual_token_count
 from trainbench.probe.types import ProbeReport
 from trainbench.record import write_json
@@ -135,22 +136,34 @@ def test_image_token_id_says_where_it_looked_when_there_is_none():
 
 
 class _Processor:
-    """Emits a fixed batch so the count under test is the one written here."""
+    """Emits a fixed batch so the count under test is the one written here.
+
+    It declares a chat template because `prompt_format=chat_template` is what these
+    counts are measured under, and trainbench/prompt.py refuses that format from a
+    processor that has none — a fake with no template would be refused too.
+    """
+
+    chat_template = "{{ messages }}"
+    image_token = "<image>"
 
     def __init__(self, input_ids, padding_side="right", pad_token_id=None):
         self._input_ids = input_ids
         self.padding_side = padding_side
         self.pad_token_id = pad_token_id
+        self.images_seen = None
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
         return "<image>text"
 
     def __call__(self, text=None, images=None, return_tensors=None, padding=None):
+        self.images_seen = images
         return {"input_ids": self._input_ids}
 
 
-def _count(processor, model, max_tokens_per_image=None):
-    return visual_token_count(processor, model, get_device("cpu"), "right", max_tokens_per_image)
+def _count(processor, model, max_tokens_per_image=None, prompt_format="chat_template"):
+    return visual_token_count(
+        processor, model, get_device("cpu"), "right", max_tokens_per_image, prompt_format
+    )
 
 
 def test_visual_token_count_reports_the_placeholder_count():
@@ -162,6 +175,43 @@ def test_visual_token_count_reports_the_placeholder_count():
     assert detail["visual_tokens_per_image"] == 3
     assert detail["image_token_id_source"] == "config.image_token_id"
     assert detail["total_seq_len"] == 5
+
+
+class _BareProcessor(_Processor):
+    """gemma-4's shape: no chat template, an image token, and an
+    `apply_chat_template` that raises what transformers 5.14.1 raises."""
+
+    chat_template = None
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        raise AssertionError("prompt_format=raw must not reach apply_chat_template")
+
+
+def test_the_probe_counts_visual_tokens_without_a_chat_template():
+    """The 2026-08-02 campaign lost `visual_tokens` on three frameworks at once
+    because this call was unconditional. The count itself is unchanged: what the
+    format decides is the markup around the placeholders, not the placeholders."""
+    processor = _BareProcessor(torch.tensor([[5] + [7] * 256 + [6]]))
+    model = _Model(_Config(image_token_id=7))
+
+    detail = _count(processor, model, max_tokens_per_image=280, prompt_format="raw")
+
+    assert detail["visual_tokens_per_image"] == 256
+    assert detail["prompt_format"] == "raw"
+
+
+def test_the_probe_hands_the_processor_one_image_list_per_row():
+    """Measured 2026-08-02: `Gemma4Processor` reads a flat list as one row carrying
+    every image and refuses the batch, so no gemma-4 probe could build one. Both
+    Qwen processors return byte-identical tensors either way."""
+    processor = _BareProcessor(torch.tensor([[5] + [7] * 256 + [6]]))
+    model = _Model(_Config(image_token_id=7))
+
+    _count(processor, model, max_tokens_per_image=280, prompt_format="raw")
+
+    seen = processor.images_seen
+    assert all(isinstance(row, list) for row in seen), f"one list per row, got {seen!r}"
+    assert [len(row) for row in seen] == [1] * len(PROBE_PAIRS)
 
 
 def test_visual_token_count_refuses_a_zero_count():

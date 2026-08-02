@@ -261,6 +261,50 @@ template을 적용하는 것은 **널리 쓰이는 관행이지 공식 규격이
 - `add_generation_prompt`를 모델별 값으로 주입(결정 2)
 - Qwen3-VL-Embedding에 instruction prompt 부착(결정 1)
 
+(2026-08-02 정정: 이 결정은 **세 모델 모두 chat template을 갖고 있다**는 전제 위에
+있었고, 그 전제가 틀렸다. gemma-4-E2B에는 chat template이 없다 — 결정 5. "전 모델"은
+Qwen 두 모델로 좁혀진다. 남은 작업 항목의 `text_batch` 전환도 마찬가지로 gemma-4에는
+적용되지 않는다.)
+
+### 5. chat template 부재 — gemma-4는 raw 형식으로 간다
+
+2026-08-02 실측(transformers 5.14.1, 실제 Hub 저장소):
+
+| 모델 | `chat_template.jinja` | 프로세서의 `chat_template` |
+|---|---|---|
+| Qwen3-VL-Embedding-2B | 있음 | 있음 |
+| Qwen3.5-0.8B | 있음 | 있음 |
+| **gemma-4-E2B** | **없음** | **`None`** |
+
+`google/gemma-4-E2B`는 사전학습 체크포인트이고, 사전학습 체크포인트에는 대화 형식이
+없다 — 모델 카드의 `apply_chat_template` 예제는 전부 `google/gemma-4-E2B-it`를
+적재한다(`-it`에는 `chat_template.jinja`가 있다). 즉 이것은 프레임워크 문제가 아니라
+**체크포인트의 성질**이며, PLAN.md가 고정한 것은 사전학습 쪽이다.
+
+따라서 프롬프트 형식을 모델별 config 값 `model.prompt_format`으로 선언한다.
+`padding_side`와 같은 종류의 값이다 — 체크포인트에 대한 사실이고, 코드가
+`model.arch`로 분기하면 결과에서 보이지 않게 된다.
+
+| 값 | 의미 | 모델 |
+|---|---|---|
+| `chat_template` | 프로세서의 chat template을 탄다 | Qwen 2종 |
+| `raw` | 이미지 placeholder + 텍스트, 역할/턴 마커 없음 | gemma-4-E2B |
+
+**이것은 교란 변수이고 그렇게 읽혀야 한다.** 두 형식은 같은 프롬프트가 아니다.
+`chat_template` 행은 역할·턴 마커에 감싸이고 `raw` 행은 감싸이지 않으므로, 시퀀스
+길이는 두 형식 사이에서 직접 비교되지 않는다. 결정 3이 이미 좁혀 둔 "모델 간 절대
+throughput 비교는 한정한다"와 같은 성격의 제약이 하나 더 붙는 것이다. 측정된
+`visual_tokens` 결과에는 어느 형식으로 잰 값인지가 함께 기록된다.
+
+`raw`가 이미지를 실을 수 있다는 것도 실측이다. gemma-4의 프로세서는 평문 안의
+`<|image|>` 하나를 그 이미지의 soft token 수만큼 펼친다 — 448x448 probe 이미지에서
+**256 토큰, 전체 시퀀스 265 토큰**(2026-08-02). 형식이 바꾸는 것은 placeholder를
+둘러싼 마커이지 placeholder 자체가 아니다.
+
+`trainbench/prompt.py`가 이 값을 읽는 유일한 자리이며, 선언과 체크포인트가
+어긋나면 양방향 모두 런을 멈춘다 — 없는 template을 요구하는 쪽도, template이 있는
+체크포인트를 raw로 자르는 쪽도 거부한다(`padding_side_alignment`와 같은 이유).
+
 ---
 
 ## 남은 미확인

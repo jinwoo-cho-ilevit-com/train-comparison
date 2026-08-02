@@ -84,6 +84,10 @@ class FakeProcessor:
     # processor that does not — it cannot establish which side would be pooled.
     # `main()` calls it, so a stub without this could not stand in for a checkpoint.
     padding_side = "right"
+    # The two Qwen checkpoints this stub stands in for ship one, and
+    # trainbench/prompt.py refuses `prompt_format=chat_template` from a processor
+    # that has none. `raw` is exercised against `RawProcessor` below.
+    chat_template = "{{ messages }}"
 
     def __init__(self, *, accepts_images: bool = True) -> None:
         self.image_processor = SimpleNamespace() if accepts_images else None
@@ -719,6 +723,43 @@ def test_the_processor_is_handed_one_image_list_per_row(config_mapping):  # noqa
     # The two text-only positives get an empty list, not a missing entry: the count
     # of sublists has to equal the count of texts.
     assert processor.images[4] == [] and processor.images[5] == []
+
+
+class RawProcessor(FakeProcessor):
+    """A pre-trained checkpoint: no chat template, an image token, and an
+    `apply_chat_template` that cannot be called. `google/gemma-4-E2B` is this shape
+    (measured 2026-08-02, transformers 5.14.1)."""
+
+    chat_template = None
+    image_token = "<|image|>"
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        raise AssertionError("prompt_format=raw must not reach apply_chat_template")
+
+
+def test_the_collate_builds_rows_for_a_checkpoint_with_no_chat_template(config_mapping):  # noqa: F811
+    """The measured harness reads the same `model.prompt_format` the probe does.
+
+    A raw row is the placeholder and the text and nothing else — no role or turn
+    markers — which is why the format is declared per model and recorded in the
+    result rather than inferred here (docs/model-spec.md).
+    """
+    processor = RawProcessor()
+    config = bench(
+        config_mapping,
+        **{
+            "model.prompt_format": "raw",
+            "model.add_generation_prompt": False,
+            "model.instruction_prompt": None,
+            "data.num_workers": 0,
+        },
+    )
+
+    built = bench_entry.Collate(processor, config).pair_texts(rows(1, qry_image=True))
+
+    # The MMEB marker is gone, the model's own placeholder leads the query, and the
+    # text-only positive carries none.
+    assert built.texts == ["<|image|>ab0", "abab0"]
 
 
 def test_a_dropped_image_is_not_counted_as_one_the_row_still_carries(config_mapping):  # noqa: F811

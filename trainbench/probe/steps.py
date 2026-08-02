@@ -16,6 +16,7 @@ from trainbench.config_schema import BenchConfig
 from trainbench.embedding import align_padding_side, info_nce, last_token_pool
 from trainbench.probe.fixtures import PROBE_IMAGE_SIZE, PROBE_PAIRS, probe_image
 from trainbench.probe.types import ProbeReport
+from trainbench.prompt import format_prompt
 
 
 def dtype_for(device: torch.device) -> torch.dtype:
@@ -170,25 +171,40 @@ def tokenize_text(
     }
 
 
-def image_batch(processor: Any, device: torch.device, padding_side: str) -> dict[str, Any]:
+def image_batch(
+    processor: Any, device: torch.device, padding_side: str, prompt_format: str
+) -> dict[str, Any]:
     """Multimodal batch.
 
     The text must carry the model's image placeholder tokens; passing raw text
     alongside images silently produces zero image tokens against N image features,
-    and the forward pass then fails on the mismatch. `apply_chat_template` is what
-    inserts the placeholders, so it is not optional here.
+    and the forward pass then fails on the mismatch. Which markup puts them there
+    is `config.model.prompt_format` (trainbench/prompt.py) — `apply_chat_template`
+    for a checkpoint that ships a template, the bare placeholder for one that does
+    not. Calling `apply_chat_template` unconditionally is what failed every gemma-4
+    probe of the 2026-08-02 campaign, on three frameworks at once.
+
+    Images are grouped one sublist per row rather than passed flat, the same shape
+    `scripts/bench.py::_group_by_row` builds. Measured 2026-08-02: a flat list
+    reads to `Gemma4Processor` as one row carrying every image and it raises
+    "Received inconsistently sized batches", while both Qwen processors return
+    byte-identical tensors either way.
     """
     align_padding_side(processor, padding_side)
     image = probe_image()
     texts = [
-        processor.apply_chat_template(
-            [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": q}]}],
-            tokenize=False,
+        format_prompt(
+            processor,
+            q,
+            with_image=True,
+            prompt_format=prompt_format,
             add_generation_prompt=False,
         )
         for q, _ in PROBE_PAIRS
     ]
-    batch = processor(text=texts, images=[image] * len(texts), return_tensors="pt", padding=True)
+    batch = processor(
+        text=texts, images=[[image] for _ in texts], return_tensors="pt", padding=True
+    )
     return {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
 
 
@@ -238,6 +254,7 @@ def visual_token_count(
     device: torch.device,
     padding_side: str,
     max_tokens_per_image: int | None,
+    prompt_format: str,
 ) -> dict[str, Any]:
     """How many tokens one fixed image costs on this model.
 
@@ -253,9 +270,8 @@ def visual_token_count(
       than of the model
     * counts that differ per sample mean the id matched something the rows do not
       share; grading `per_sample[0]` alone accepted `[280, 279]`
-    * a count of 0, or one filling the sequence, means the id or the chat template
-      is wrong — `apply_chat_template` always emits role and text tokens around
-      the placeholders
+    * a count of 0, or one filling the sequence, means the id or the prompt format
+      is wrong — every format here emits text tokens around the placeholders
     * a count above `config.model.max_tokens_per_image`, where the model declares a
       cap, cannot be a count of that model's soft tokens. gemma4's processor stops
       at max_soft_tokens=280; exceeding it means the id matched more than the
@@ -272,7 +288,7 @@ def visual_token_count(
 
     A wrong number here silently rescales every tokens/s figure that divides by it.
     """
-    batch = image_batch(processor, device, padding_side)
+    batch = image_batch(processor, device, padding_side, prompt_format)
     token_id, source = image_token_id(model)
     input_ids = batch["input_ids"]
     per_sample = (input_ids == token_id).sum(dim=1).tolist()
@@ -296,7 +312,8 @@ def visual_token_count(
     if not 0 < count < total_seq_len:
         raise ValueError(
             f"visual token count {count} is outside 0 < n < {total_seq_len} for token id "
-            f"{token_id} from {source}; the placeholder id or the chat template is wrong."
+            f"{token_id} from {source}; the placeholder id or prompt_format={prompt_format} "
+            "is wrong."
         )
     if max_tokens_per_image is not None and count > max_tokens_per_image:
         raise ValueError(
@@ -314,6 +331,9 @@ def visual_token_count(
         "visual_tokens_per_sample": per_sample,
         "declared_max_tokens_per_image": max_tokens_per_image,
         "total_seq_len": total_seq_len,
+        # The count is only comparable across models once the prompt around it is
+        # known, and the two formats wrap it in different numbers of tokens.
+        "prompt_format": prompt_format,
     }
 
 

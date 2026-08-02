@@ -208,7 +208,9 @@ flash-linear-attention#installation and Dao-AILab/causal-conv1d
 
 - 멀티모달 배치는 `processor(text=..., images=...)`만으로 만들어지지 않는다. 텍스트에
   이미지 placeholder가 없으면 image token 0개 대 image feature 392개로 forward가
-  실패한다. `apply_chat_template`로 이미지 블록을 넣는 것이 필수다
+  실패한다. placeholder를 넣는 것이 필수다 — 다만 **`apply_chat_template`이 그 방법인
+  것은 chat template을 가진 체크포인트에 한한다.** gemma-4-E2B에는 없고, 그쪽은 평문
+  `<|image|>`가 같은 일을 한다(docs/model-spec.md 결정 5)
 - 이 VLM 프로세서들은 **`torchvision`을 임포트한다**(Qwen3VLVideoProcessor 등).
   없으면 `AutoProcessor.from_pretrained`가 ImportError로 죽는다
 
@@ -237,7 +239,8 @@ pod 실행으로 판정한다.
 
 **주의 — Task 3에 반영 필요**: 쿼리 텍스트에 MMEB 자체 placeholder `<|image_1|>`가
 들어 있다. 모델의 이미지 토큰이 아니므로 그대로 넣으면 image token 0개 대 feature N개
-불일치로 forward가 실패한다. 모델별 `apply_chat_template`으로 변환해야 한다.
+불일치로 forward가 실패한다. 모델별 프롬프트 형식으로 변환해야 한다
+(`trainbench/prompt.py`; gemma-4는 chat template이 없어 평문 placeholder를 쓴다).
 
 ### 고정 서브셋 생성 완료 (2026-08-01)
 
@@ -807,6 +810,49 @@ env별 lock에서 휠이 없어 소스에서 빌드되는 패키지(2026-08-02, 
 | `ruff check` / `ruff format --check` | 지적 0건 |
 | `scripts/audit_plan.py` | 12/15 (`prebuilt-wheels` 신설·통과, `verdicts-closed` 미해소는 기존 상태) |
 | `scripts/env_report.py` 설정 경로 | 통과, `torch 2.13.0 / transformers 5.14.1` 기록 |
+
+## gemma-4의 chat template 부재를 고쳤다 (2026-08-02)
+
+1차 캠페인에서 세 프레임워크가 **같은 자리에서 같은 메시지로** 실패했다:
+`native x gemma4_e2b / visual_tokens`, `native x gemma4_e2b /
+multimodal_embed_forward`, `ms_swift x gemma4_e2b / visual_tokens`, `unsloth x
+gemma4_e2b / visual_tokens` — 전부 `Cannot use apply_chat_template because this
+processor does not have a chat template.`
+
+세 프레임워크가 같은 실패를 낸다는 것은 프레임워크 문제가 아니다. 원인은 이 저장소가
+모든 프로세서에 chat template이 있다고 가정한 것이었고, 실제로는
+`google/gemma-4-E2B`(사전학습 체크포인트)에 없다. 진단과 결정은
+docs/model-spec.md 결정 5, 형식 값은 `model.prompt_format`이다.
+
+**실측한 것 (CPU, 실제 프로세서, 가중치 미적재)**
+
+| | gemma4_e2b | qwen3_vl_emb_2b |
+|---|---|---|
+| `prompt_format` | `raw` | `chat_template` |
+| `visual_tokens_per_image` (448x448) | 256 | 196 |
+| `total_seq_len` | 265 | 221 |
+| `image_token_id` | 258880 | 151655 |
+
+같은 실행에서 `visual_token_count`가 통과한다 — pod에서 죽던 그 체크다. 이미지 목록을
+행별로 묶는 변경도 함께 들어갔다(프로브 쪽. `scripts/bench.py`는 이미 그렇게 하고
+있었다): 평평한 목록은 `Gemma4Processor`가 한 행의 이미지로 읽어 배치 자체를 거부한다.
+
+**Qwen 두 모델이 재는 것은 바뀌지 않는다.** 행별 묶음 전후로 두 프로세서의 출력
+텐서가 바이트 단위로 동일함을 실측했다(`input_ids` / `attention_mask` /
+`pixel_values` / `image_grid_thw` / `mm_token_type_ids`).
+
+**측정 안 함**: 이 수정이 실제로 통하는지는 pod에서만 판정된다. 여기서 실행한 것은
+프로세서까지이고 모델 가중치도 GPU도 개입하지 않았다. 다음 캠페인이 초록으로
+바꿔야 하는 칸:
+
+| 칸 | 체크 |
+|---|---|
+| `native x gemma4_e2b` | `visual_tokens`, `multimodal_embed_forward` |
+| `ms_swift x gemma4_e2b` | `visual_tokens` |
+| `unsloth x gemma4_e2b` | `visual_tokens` |
+
+`ms_swift`/`unsloth`의 gemma-4 칸은 이 체크 하나만 막고 있던 것이 아닐 수 있다 —
+이 수정이 여는 것은 이 실패까지이고, 그 뒤에 무엇이 있는지는 미측정이다.
 
 ---
 

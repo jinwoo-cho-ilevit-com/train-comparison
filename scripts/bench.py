@@ -47,6 +47,7 @@ from trainbench.config_schema import BenchConfig, axis_knobs
 from trainbench.device import get_device
 from trainbench.embedding import align_padding_side, packed_last_token_pool
 from trainbench.probe import steps
+from trainbench.prompt import format_prompt
 from trainbench.record import build_record, write_json
 from trainbench.seed import set_seed
 
@@ -78,7 +79,7 @@ REFUSED_STATUS = "axis-refused"
 # MMEB stores its own placeholder markup inside `qry` / `pos_text` verbatim
 # (`scripts/prepare_data.py`): `"<|image_1|>\nRepresent the given image.\n"`. It is
 # MMEB's markup, not any model's, and this is the loader that converts — each model
-# has different image tokens, which `apply_chat_template` is what inserts. Leaving
+# has different image tokens, which `trainbench/prompt.py` is what inserts. Leaving
 # the marker in would feed one model literal text where another model's placeholder
 # belongs.
 MMEB_IMAGE_MARKER = re.compile(r"<\|image_\d+\|>")
@@ -259,19 +260,19 @@ class Collate:
         self.accepts_images = getattr(processor, "image_processor", None) is not None
 
     def _text(self, raw: str | None, with_image: bool) -> str:
-        """One side of a pair, in this model's own chat format.
+        """One side of a pair, in this model's own prompt format.
 
-        `add_generation_prompt` is `config.model.add_generation_prompt`, which is
-        exactly this argument (docs/CONTRACTS.md §5) — with last-token pooling it
-        decides which token becomes the embedding, so it cannot be defaulted here.
+        Both `add_generation_prompt` and `prompt_format` are the config's
+        (docs/CONTRACTS.md §5) — with last-token pooling the first decides which
+        token becomes the embedding, and the second decides whether there is a chat
+        template to pass it to at all. Neither can be defaulted here.
         """
         text = MMEB_IMAGE_MARKER.sub("", raw or "").strip()
-        content: list[dict[str, Any]] = [{"type": "text", "text": text}]
-        if with_image:
-            content.insert(0, {"type": "image"})
-        return self.processor.apply_chat_template(
-            [{"role": "user", "content": content}],
-            tokenize=False,
+        return format_prompt(
+            self.processor,
+            text,
+            with_image=with_image,
+            prompt_format=self.config.model.prompt_format,
             add_generation_prompt=self.config.model.add_generation_prompt,
         )
 

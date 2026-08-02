@@ -9,6 +9,10 @@ instruction_prompt: null
 # pads left, and therefore the only one exercising that pooling branch.
 padding_side: left
 pooling: lasttoken
+# The pre-trained checkpoint ships no chat_template.jinja and its processor's
+# chat_template is None (measured, transformers 5.14.1), so its rows carry no role
+# or turn markers. Only `google/gemma-4-E2B-it` ships one. See docs/model-spec.md.
+prompt_format: raw
 # processor_config.json: max_soft_tokens 280. An upper bound, not a per-image
 # count — the processor derives each image's count from its aspect ratio and only
 # reaches 280 when the ratio divides evenly (measured: 448x448 -> 256,

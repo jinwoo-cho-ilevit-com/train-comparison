@@ -162,6 +162,24 @@ def test_padding_side_is_declared_per_model():
         assert compose_cfg(f"model={name}").model.padding_side == "right"
 
 
+def test_prompt_format_is_declared_per_model():
+    """Measured 2026-08-02 against the Hub: both Qwen repositories ship
+    chat_template.jinja and `google/gemma-4-E2B` does not — it is the pre-trained
+    checkpoint, and only `google/gemma-4-E2B-it` ships one. Calling
+    `apply_chat_template` regardless is what failed gemma-4 on three frameworks."""
+    assert compose_cfg("model=gemma4_e2b").model.prompt_format == "raw"
+    for name in ("qwen3_vl_emb_2b", "qwen3_5_0_8b"):
+        assert compose_cfg(f"model={name}").model.prompt_format == "chat_template"
+
+
+def test_a_raw_prompt_format_refuses_a_generation_prompt():
+    """`add_generation_prompt` is an argument to `apply_chat_template`, and raw has
+    no template to pass it to. With last-token pooling the pair would otherwise
+    report a value that decided nothing."""
+    with pytest.raises(ValidationError, match="no chat template"):
+        compose_cfg("model=gemma4_e2b", "model.add_generation_prompt=true")
+
+
 def test_instruction_prompt_only_for_the_official_embedding_model():
     with pytest.raises(ValidationError, match="no official embedding prompt"):
         compose_cfg("model=qwen3_5_0_8b", "model.instruction_prompt='Represent this.'")

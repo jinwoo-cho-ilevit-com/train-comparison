@@ -72,7 +72,12 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     report.run(
         "visual_tokens",
         lambda: steps.visual_token_count(
-            processor, model, device, side, config.model.max_tokens_per_image
+            processor,
+            model,
+            device,
+            side,
+            config.model.max_tokens_per_image,
+            config.model.prompt_format,
         ),
     )
 
@@ -87,7 +92,8 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
         report.skip("infonce_backward", "tokenization failed")
 
     report.run(
-        "multimodal_embed_forward", lambda: _multimodal_embed(model, processor, device, side)
+        "multimodal_embed_forward",
+        lambda: _multimodal_embed(model, processor, device, side, config.model.prompt_format),
     )
 
     if config.model.arch == "gemma4":
@@ -105,10 +111,10 @@ def _embed(model: Any, batch: dict[str, torch.Tensor], padding_side: str) -> dic
 
 
 def _multimodal_embed(
-    model: Any, processor: Any, device: torch.device, padding_side: str
+    model: Any, processor: Any, device: torch.device, padding_side: str, prompt_format: str
 ) -> dict[str, Any]:
     model.eval()
-    batch = steps.image_batch(processor, device, padding_side)
+    batch = steps.image_batch(processor, device, padding_side, prompt_format)
     with torch.no_grad():
         pooled = steps.encode(model, batch, padding_side)
     return {"embedding_shape": list(pooled.shape), "seq_len": int(batch["input_ids"].shape[1])}
