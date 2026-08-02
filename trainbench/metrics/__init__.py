@@ -19,17 +19,66 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import torch
 
+from trainbench.metrics.statistics import (
+    AGGREGATORS,
+    CudaEventTimer,
+    aggregate,
+    build_timer,
+    repeat_seeds,
+    stdev,
+)
+from trainbench.metrics.validity import (
+    GATE_FIELDS,
+    STATUS_OOM,
+    gradient_norm,
+    is_oom,
+    oom_status,
+    parameter_counts,
+    training_verdict,
+)
+
+if TYPE_CHECKING:
+    from trainbench.config_schema import BenchConfig
+
 __all__ = [
+    "AGGREGATORS",
+    "GATE_FIELDS",
     "METRIC_DEFINITIONS",
-    "percentile",
-    "summarise",
-    "peak_memory_bytes",
-    "reset_peak_memory",
+    "STATUS_OOM",
+    "CudaEventTimer",
     "StepTimer",
+    "aggregate",
+    "build_timer",
+    "gradient_norm",
+    "is_oom",
+    "oom_status",
+    "parameter_counts",
+    "peak_memory_bytes",
+    "percentile",
+    "repeat_seeds",
+    "reset_peak_memory",
+    "stdev",
+    "summarise",
+    "training_verdict",
 ]
+
+# Counter names `summarise` produces itself. An `extra_counts` entry that
+# reuses one would overwrite the figure computed from the named parameter, so
+# the two counts of the same thing would land under one key and the loser would
+# be invisible.
+_RESERVED_COUNTS = frozenset({"rows", "tokens", "padded_tokens"})
+
+# Substrings that mark a name as a rate rather than a counter. `summarise` is
+# the only place a rate is allowed to come into existence, because it is the
+# only place that knows the time the counts were divided by. A rate arriving
+# from a caller is a framework's own tokens/sec under a different name, which
+# the `collate-metrics` boundary forbids from crossing and this forbids from
+# landing.
+_RATE_MARKERS = ("per_second", "per_sec", "_rate", "throughput", "tokens_per", "samples_per")
 
 # What each counted name means, carried in every summary. An unstated definition
 # is how a number gets misread later: `rows` and `samples` differ by a factor of
@@ -59,6 +108,29 @@ METRIC_DEFINITIONS: dict[str, str] = {
     "images_dropped": (
         "images present in the rows that the processor could not take, per step. Non-zero "
         "means this model read a text-only view of an image corpus"
+    ),
+    # The validity gate's counts. Written here so the definition travels in the
+    # result rather than living only in trainbench/metrics/validity.py, and so
+    # the unit is legible beside the number: `trainbench/probe/steps.py` reports
+    # the same names at probe time and the two must not drift apart.
+    "grad_norm": (
+        "global L2 norm over `p.grad` of every parameter carrying one, taken after the "
+        "backward of the last measured step and before the optimizer zeroes them. Zero "
+        "means the backward reached no parameter, which a finite loss does not rule out"
+    ),
+    "trainable_params": (
+        "parameter *tensors* with requires_grad, not elements. The question is whether "
+        "anything trained, for which an element count is the wrong unit"
+    ),
+    "total_params": "parameter tensors the model holds, trainable or not",
+    "params_with_grad": (
+        "trainable parameter tensors that actually received a gradient. Below "
+        "`trainable_params` means part of the model is detached from the loss"
+    ),
+    "peak_memory_bytes": (
+        "device high-water mark since the reset that follows warmup, so it belongs to the "
+        "measured window rather than to model construction and autotuning. None off CUDA, "
+        "because zero bytes is a measurement and this is the absence of one"
     ),
 }
 
@@ -142,15 +214,46 @@ class StepTimer:
         self.durations.append(time.perf_counter() - self._start)
 
 
+def _measurement_block(config: BenchConfig | None) -> dict[str, object]:
+    """How this figure was produced, as the run declared it.
+
+    A summary built without a config still carries a block, marked
+    `declared: false` and filled with the schema's defaults. The alternative —
+    omitting it — makes an undeclared run indistinguishable from one that
+    declared the defaults, and the whole point of moving these off the harness
+    was that a reader can tell.
+    """
+    from trainbench.config_schema import MeasurementConfig
+
+    declared = config is not None
+    measurement = config.measurement if config is not None else MeasurementConfig()
+    return {
+        "declared": declared,
+        "repeats": measurement.repeats,
+        "instrument": measurement.instrument,
+        "aggregate": measurement.aggregate,
+        "trim_fraction": measurement.trim_fraction,
+        "seed_policy": measurement.seed_policy,
+        "throughput_denominator": measurement.throughput_denominator,
+        "baseline_tolerance": measurement.baseline_tolerance,
+        # "uncalibrated" is the current answer and it is a finding, not a
+        # placeholder: the 3% in AGENTS.md has no source, and contention alone
+        # has moved a step-time standard deviation by 30x elsewhere.
+        "baseline_tolerance_status": measurement.tolerance_status,
+    }
+
+
 def summarise(
     durations: Sequence[float],
     *,
     discard: int,
     rows_per_step: float,
     tokens_per_step: float | None = None,
+    padded_tokens_per_step: float | None = None,
     peak_bytes: int | None = None,
     extra_counts: Mapping[str, float] | None = None,
     totals: Mapping[str, object] | None = None,
+    config: BenchConfig | None = None,
 ) -> dict[str, object]:
     """The reported figures, from the steps that were kept.
 
@@ -170,8 +273,19 @@ def summarise(
     step, which on a 32-row batch is 3% — the same size as the deviation that
     invalidates a pod baseline (AGENTS.md).
 
+    `padded_tokens_per_step` is a named parameter rather than one more entry in
+    `extra_counts` because it is the other candidate denominator, not an
+    incidental count: which of the two divides the step time reverses the
+    ranking of the `dataloader.packing` axis, so the choice is declared in
+    `config.measurement.throughput_denominator` and both counts are carried.
+
     `extra_counts` gets the same per-step/per-second treatment under its own
     names, and `totals` is merged verbatim for figures that are not rates.
+    Neither may carry a name that reads as a rate: this function is the only
+    place a rate comes into existence, because it is the only place that knows
+    the time the counts were divided by, and a rate arriving from a caller is a
+    framework's own tokens/sec by another name.
+
     Both, and the fixed `METRIC_DEFINITIONS`, travel in the summary so a reader
     of the result JSON never has to infer what was counted.
     """
@@ -183,27 +297,102 @@ def summarise(
             f"{len(durations)} step(s) timed and {discard} discarded leaves nothing to "
             "report; a summary over zero steps is not a measurement"
         )
+    extra_counts = dict(extra_counts or {})
+    totals = dict(totals or {})
+    _refuse_rates_and_collisions(extra_counts, totals, padded_tokens_per_step)
+
+    measurement = _measurement_block(config)
     total = sum(kept)
+    mean = total / len(kept)
+    counts: dict[str, float | None] = {
+        "tokens": tokens_per_step,
+        "padded_tokens": padded_tokens_per_step
+        if padded_tokens_per_step is not None
+        else extra_counts.get("padded_tokens"),
+    }
+    denominator = str(measurement["throughput_denominator"])
+    if config is not None and counts[denominator] is None:
+        raise ValueError(
+            f"measurement.throughput_denominator={denominator} but this run counted no "
+            f"{denominator}; the declared denominator of every rate in the result was "
+            "never measured"
+        )
+
     summary: dict[str, object] = {
         "steps_timed": len(durations),
         "steps_discarded": discard,
         "steps_measured": len(kept),
         "step_seconds_p50": percentile(kept, 0.50),
         "step_seconds_p95": percentile(kept, 0.95),
-        "step_seconds_mean": total / len(kept),
+        "step_seconds_mean": mean,
+        # The declared statistic, beside the fixed-definition mean rather than in
+        # place of it: every rate below divides by the mean, so replacing it would
+        # make the rates and the headline step time disagree about the same run.
+        "step_seconds_aggregate": aggregate(
+            kept,
+            method=str(measurement["aggregate"]),
+            trim_fraction=float(measurement["trim_fraction"]),  # type: ignore[arg-type]
+        ),
+        "step_seconds_stdev": stdev(kept),
         "rows_per_step": rows_per_step,
-        "rows_per_second": rows_per_step * len(kept) / total,
+        "rows_per_second": rows_per_step / mean,
         "tokens_per_step": tokens_per_step,
-        "tokens_per_second": (tokens_per_step * len(kept) / total) if tokens_per_step else None,
+        "tokens_per_second": (tokens_per_step / mean) if tokens_per_step else None,
         "peak_memory_bytes": peak_bytes,
+        # Which of the two token counts is the headline throughput. A name, not a
+        # third rate: both rates are already here, and a duplicated number is one
+        # more thing that can disagree with itself.
+        "throughput_denominator": denominator,
+        # Whether the profiler was on. A profiled run's step time is not
+        # reportable, and a record that cannot say which it was cannot be filtered.
+        "profiled": config.run.profiler if config is not None else None,
+        "measurement": measurement,
         # Named so a reader does not have to know why it is missing. MFU is absent
         # by decision, not by oversight (see the module docstring).
         "mfu": None,
         "mfu_reason": "no per-model FLOP formula is validated for GDN / PLE / sliding window",
         "metric_definitions": METRIC_DEFINITIONS,
     }
-    for name, per_step in (extra_counts or {}).items():
+    if padded_tokens_per_step is not None:
+        extra_counts["padded_tokens"] = padded_tokens_per_step
+    for name, per_step in extra_counts.items():
         summary[f"{name}_per_step"] = per_step
-        summary[f"{name}_per_second"] = per_step * len(kept) / total
-    summary.update(totals or {})
+        summary[f"{name}_per_second"] = per_step / mean
+    summary.update(totals)
     return summary
+
+
+def _refuse_rates_and_collisions(
+    extra_counts: Mapping[str, float],
+    totals: Mapping[str, object],
+    padded_tokens_per_step: float | None,
+) -> None:
+    """Guard the two ways a caller can corrupt the summary without an error.
+
+    A rate handed in is a framework's own figure entering through the door that
+    exists to keep it out. A counter name this function already produces is
+    worse than a duplicate: the loser of the collision leaves no trace, so a
+    result carries one of two disagreeing counts and says nothing about the other.
+    """
+    offenders = sorted(
+        name for name in (*extra_counts, *totals) if any(marker in name for marker in _RATE_MARKERS)
+    )
+    if offenders:
+        raise ValueError(
+            f"{offenders} name a rate. `summarise` divides the counters by the time it "
+            "measured; a rate arriving here was computed against a time this side never "
+            "read, which is a framework's own tokens/sec by another name."
+        )
+    if padded_tokens_per_step is not None and "padded_tokens" in extra_counts:
+        raise ValueError(
+            "padded_tokens arrived both as the named parameter and in extra_counts; one of "
+            "the two counts would be silently overwritten"
+        )
+    # `padded_tokens` is exempt: it is a named parameter *and* a legal
+    # `extra_counts` key, and the line above is what stops it being both at once.
+    collisions = sorted((_RESERVED_COUNTS & set(extra_counts)) - {"padded_tokens"})
+    if collisions:
+        raise ValueError(
+            f"extra_counts reuses {collisions}, which `summarise` computes from its own "
+            "named parameters; the two counts would land under one key"
+        )
