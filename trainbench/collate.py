@@ -29,6 +29,14 @@ from trainbench.prompt import format_prompt
 # belongs.
 MMEB_IMAGE_MARKER = re.compile(r"<\|image_\d+\|>")
 
+# The pack's boundaries under the names `model(**tensors)` reads them by. They are
+# `TransformersKwargs` members (`transformers/utils/generic.py:800-839`) and the
+# only keys a collate may add to `tensors`
+# (`tests/fixtures/microbatch.sample.json:tensors_may_add`). The two spellings in
+# `axes.PACKED_BOUNDARY_KEYS` carry the same boundaries and the model does reject
+# those, which is why they are lifted out and these put in.
+VARLEN_KWARGS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+
 
 class MicroBatch(NamedTuple):
     """One collated micro-batch, plus what it contained.
@@ -407,7 +415,9 @@ class PackedBatches:
     returns bare tensors, and the measured loop needs to know how many samples,
     tokens and images that batch stood for. The boundary vectors are lifted out of
     the batch here rather than in the step, so what stays in `tensors` is exactly
-    what `model(**tensors)` takes.
+    what `model(**tensors)` takes — and put back under the names the model does
+    read them by (`varlen_kwargs`), which is the only place a pack's boundaries
+    reach attention.
 
     `axis_packing` is **read off the wrapped collate**, never declared again. A
     second declaration is a second answer to the question
@@ -435,6 +445,7 @@ class PackedBatches:
         batch = self.packed(rows)
         boundaries = {key: batch.pop(key) for key in axes.PACKED_BOUNDARY_KEYS}
         total = int(batch["input_ids"].numel())
+        batch.update(varlen_kwargs(boundaries["cu_seqlens"], boundaries["seq_lengths"]))
         return MicroBatch(
             tensors=batch,
             tokens=total,
@@ -445,6 +456,50 @@ class PackedBatches:
             images_dropped=dropped,
             cu_seqlens=boundaries["cu_seqlens"],
         )
+
+
+def varlen_kwargs(cu_seqlens: torch.Tensor, seq_lengths: torch.Tensor) -> dict[str, Any]:
+    """The pack's boundaries, in the four names transformers takes varlen on.
+
+    `modeling_flash_attention_utils.py:761-763` is the gate:
+
+        is_fa_with_varlen_kwargs = all(
+            kwarg is not None
+            for kwarg in (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k)
+        )
+
+    All four or none — a partial set leaves that `all(...)` false, the pack runs as
+    one dense sequence, and the run still reports `dataloader.packing=True`. That is
+    why they are built together here rather than assigned key by key at the call
+    site, and why the boundary's fixture states the same rule as an invariant.
+
+    **`arch=qwen3_5` is what this is for.** `qwen3_vl` and `gemma4` get their
+    isolation from `position_ids` alone: `masking_utils.py:858-868` derives the
+    packed-sequence mask from it whenever no 2D mask and no cache are passed, which
+    a packed batch satisfies. Qwen3.5 alternates full_attention with
+    linear_attention, and `Qwen3_5GatedDeltaNet.forward` never receives
+    `position_ids` — it reads `kwargs.get("cu_seq_lens_q")`
+    (`modeling_qwen3_5.py:538-550`) and scans the whole pack as a single sequence
+    when that is None, silently. Emitted for every packed batch and not for that
+    arch alone, because the boundaries are the same either way and an arch switch
+    here would be a second place a pack's isolation could be lost by editing a
+    config field that names no attention.
+
+    The conv half of that arch is **not** closed here: `causal_conv1d_fn` takes
+    `seq_idx` (`modeling_qwen3_5.py:492-499`) and convolves across boundaries
+    without it. `seq_idx` is not among the keys the collate-metrics fixture allows
+    in `tensors`, so it is a boundary request rather than a line of code.
+
+    `max_length_*` stay Python ints. `to_device` passes non-tensors through
+    untouched, so a 0-dim tensor here would be a host-to-device round trip inside
+    the timed window for a number that only bounds a kernel launch.
+    """
+    return {
+        "cu_seq_lens_q": cu_seqlens,
+        "cu_seq_lens_k": cu_seqlens,
+        "max_length_q": int(seq_lengths.max()),
+        "max_length_k": int(seq_lengths.max()),
+    }
 
 
 class PretokenizedCollate:
