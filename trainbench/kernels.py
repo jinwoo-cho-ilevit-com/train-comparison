@@ -259,8 +259,14 @@ def assert_packing_is_isolated(fingerprint: Mapping[str, Any]) -> None:
     )
 
 
-def _sub_config_implementations(config: Any) -> dict[str, str]:
-    """Per-sub-config attention implementation, read back off the built config."""
+def _sub_config_implementations(config: Any) -> tuple[dict[str, str], str | None]:
+    """Per-sub-config attention implementation, and the name the `""` key reaches.
+
+    The second element is the backbone the top-level `""` key addresses, which is
+    the parent config and therefore exists only when the model has no sub-configs.
+    A model that has them keeps its parent out of the coverage map, so `""` reaches
+    nothing there — see `_requested_by_backbone`.
+    """
     sub_configs = getattr(config, "sub_configs", None) or {}
     found: dict[str, str] = {}
     for key in sub_configs:
@@ -275,14 +281,15 @@ def _sub_config_implementations(config: Any) -> dict[str, str]:
             )
         found[key] = str(impl)
     if found:
-        return found
+        return found, None
     impl = getattr(config, "_attn_implementation", None)
     if impl is None:
         raise UnidentifiedKernel(
             "the built config records no _attn_implementation on itself or any sub-config, so "
             "nothing says which kernel the model is running"
         )
-    return {str(getattr(config, "model_type", None) or "model"): str(impl)}
+    parent = str(getattr(config, "model_type", None) or "model")
+    return {parent: str(impl)}, parent
 
 
 def _mask_registry() -> Mapping[str, Any]:
@@ -358,15 +365,35 @@ def _identify(
     }
 
 
-def _targeted(requested: str | Mapping[str, str], backbones: Mapping[str, str]) -> list[str]:
+def _requested_by_backbone(
+    requested: str | Mapping[str, str],
+    backbones: Mapping[str, str],
+    parent_key: str | None,
+) -> dict[str, str]:
+    """Which backbone each requested value actually landed on.
+
+    A dict does not broadcast. transformers sets each sub-config from
+    `value.get(<sub-config key>, <its current value>)` and the parent from
+    `value.get("")` (`configuration_utils.py:401-417`), so `""` reaches the parent
+    only, a key naming no sub-config reaches nothing, and an unnamed backbone keeps
+    what it had. When the model has no sub-configs the parent is the sole backbone
+    and `""` is the only key that lands on it.
+    """
     if isinstance(requested, str):
-        return sorted(backbones)
-    named = sorted(key for key in requested if key and key in backbones)
-    if named:
-        return named
-    # A dict carrying only the top-level "" key asks the parent, which dispatches
-    # to every sub-config that can take it.
-    return sorted(backbones)
+        return {name: requested for name in backbones}
+    if parent_key is not None:
+        landed = {parent_key: str(requested[""])} if "" in requested else {}
+    else:
+        landed = {name: str(requested[name]) for name in backbones if name in requested}
+    if not landed:
+        raise UnidentifiedKernel(
+            f"attn_implementation was requested per sub-config as {dict(requested)!r} and none of "
+            f"those keys names a backbone of this model ({sorted(backbones)}). A dict does not "
+            "broadcast: transformers reads each sub-config out of it by its own key and the "
+            "parent out of the '' key, so this request bound no kernel anywhere and the run is "
+            "measuring the implementation the checkpoint loaded with."
+        )
+    return landed
 
 
 def _one(values: list[str], what: str) -> str:
@@ -400,16 +427,14 @@ def read_fingerprint(
     if config is None:
         raise UnidentifiedKernel("the built model carries no config to read the kernel back from")
 
-    backbones = _sub_config_implementations(config)
+    backbones, parent_key = _sub_config_implementations(config)
     registry = _mask_registry()
-    targeted = _targeted(requested, backbones)
-    resolved_impl = _one([backbones[name] for name in targeted], "the implementation that bound")
+    landed = _requested_by_backbone(requested, backbones, parent_key)
+    resolved_impl = _one(
+        [backbones[name] for name in sorted(landed)], "the implementation that bound"
+    )
     asked = (
-        requested
-        if isinstance(requested, str)
-        else _one(
-            [str(requested[name]) for name in targeted if name in requested], "what was asked"
-        )
+        requested if isinstance(requested, str) else _one(list(landed.values()), "what was asked")
     )
     resolved_registered = resolved_impl in registry
 
@@ -455,6 +480,11 @@ def open_fetch_doors(
     as well as the environment is the point: both variables below are read once,
     at import, into a module global, so a process that already imported
     transformers keeps the value it read no matter what is set afterwards.
+
+    An imported module that does not carry the name is a door, not a closed one.
+    `CACHED_FETCH_SWITCHES` is read off one version of each library and the six pod
+    images do not share versions; a renamed global read as absent would leave the
+    live switch untouched and report the process as closed.
     """
     env = os.environ if environ is None else environ
     loaded = sys.modules if modules is None else modules
@@ -467,7 +497,14 @@ def open_fetch_doors(
         module = loaded.get(module_name)
         if module is None:
             continue
-        got = getattr(module, attribute, want)
+        if not hasattr(module, attribute):
+            doors.append(
+                f"{module_name}.{attribute} is absent from the imported module — this check "
+                "reads the switch by name, so the installed version renamed or dropped it and "
+                "whatever it uses instead is still whatever it was"
+            )
+            continue
+        got = getattr(module, attribute)
         if got != want:
             doors.append(
                 f"{module_name}.{attribute}={got!r}, want {want!r} — cached at import, so the "
@@ -485,6 +522,10 @@ def forbid_runtime_kernel_fetch(
     Reading training data off a network volume and downloading a kernel mid-run are
     the same contamination: the measurement stops being of the pipeline. Call this
     before the model is built.
+
+    A name the imported module does not already carry is left alone. Creating it
+    would close nothing — the library reads its own global, not this one — while
+    making the door this function just reported disappear from the next reading.
     """
     env = os.environ if environ is None else environ
     loaded = sys.modules if modules is None else modules
@@ -492,7 +533,7 @@ def forbid_runtime_kernel_fetch(
     env.update(RUNTIME_FETCH_ENV)
     for module_name, attribute, want in CACHED_FETCH_SWITCHES:
         module = loaded.get(module_name)
-        if module is not None:
+        if module is not None and hasattr(module, attribute):
             setattr(module, attribute, want)
     return was_open
 

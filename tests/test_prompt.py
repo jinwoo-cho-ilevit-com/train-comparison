@@ -23,17 +23,30 @@ QWEN_INSTRUCTION = "Represent the user's input."
 
 
 class _Templated:
-    """A checkpoint that ships a chat template, as both Qwen repositories do."""
+    """A checkpoint that ships a chat template, as both Qwen repositories do.
+
+    Every turn handed in is rendered and the roles are kept. Rendering `messages[-1]`
+    alone cannot tell an empty system turn from no system turn, which is the one
+    distinction `test_a_row_with_no_instruction_prompt_sends_no_system_turn` exists
+    to hold.
+    """
 
     chat_template = "{{ messages }}"
     image_token = "<|image_pad|>"
 
+    def __init__(self) -> None:
+        self.roles: list[str] = []
+
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-        content = messages[-1]["content"]
-        blocks = "".join(
-            "<img>" if block["type"] == "image" else block["text"] for block in content
-        )
-        return f"<user>{blocks}{'<gen>' if add_generation_prompt else ''}"
+        self.roles = [message["role"] for message in messages]
+        rendered = ""
+        for message in messages:
+            blocks = "".join(
+                "<img>" if block["type"] == "image" else block["text"]
+                for block in message["content"]
+            )
+            rendered += f"<{message['role']}>{blocks}"
+        return f"{rendered}{'<gen>' if add_generation_prompt else ''}"
 
 
 class _QwenTemplated:
@@ -273,15 +286,26 @@ def test_the_instruction_prompt_is_what_the_config_says_and_not_the_template_def
 
 def test_a_row_with_no_instruction_prompt_sends_no_system_turn():
     """Two of the three models declare none (`instruction_prompt: null`), and an
-    empty system turn is not the same row as no system turn."""
+    empty system turn is not the same row as no system turn.
+
+    It is one more `<|im_start|>system\\n<|im_end|>\\n` on every row of
+    `qwen3_5_0_8b` and `gemma4_e2b`, so the sequence length grows and the tokens/s
+    denominator moves. The roles are asserted as well as the rendering because that
+    is the fact this guard is about; the rendering alone was checked against a stub
+    that dropped every turn but the last, and dropping the `if` in
+    `trainbench/prompt.py:146` then changed nothing any test could see.
+    """
+    processor = _Templated()
+
     templated = format_prompt(
-        _Templated(),
+        processor,
         "q",
         with_image=False,
         prompt_format="chat_template",
         add_generation_prompt=False,
     )
 
+    assert processor.roles == ["user"]
     assert templated == "<user>q"
 
 
