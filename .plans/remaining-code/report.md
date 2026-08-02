@@ -47,7 +47,7 @@ tests/contract/test_record_report.py
 ## 작업 1 — 캠페인 아티팩트 선별이 mtime 으로 떨어진다
 
 `scripts/report.py:235`:
-```python
+```text
 timestamp=float(payload.get("recorded_at") or path.stat().st_mtime),
 ```
 

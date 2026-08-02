@@ -78,7 +78,7 @@ Requires-Dist: accelerate>=0.20.3; extra == "train"
 **(1) `__init__` 는 `model_kwargs` 를 그대로 `super().__init__()` 에 넘긴다.**
 `/private/tmp/claude-501/-Users-jwcho-Codes-train-comparison/528669dc-58ea-4ea9-b391-9c18fa5ed7a9/scratchpad/pins/sentence-transformers-5.6.1/sentence_transformers/sentence_transformer/model.py:148-204`
 
-```python
+```text
     @deprecated_kwargs(tokenizer_kwargs="processor_kwargs")
     def __init__(
         self,
@@ -115,7 +115,7 @@ Requires-Dist: accelerate>=0.20.3; extra == "train"
 **(2) `BaseModel.__init__` → `_load_modules(...)`.**
 `.../sentence_transformers/base/model.py:215-226`
 
-```python
+```text
         if model_name_or_path:
             modules, self.module_kwargs = self._load_modules(
                 model_name_or_path,
@@ -133,7 +133,7 @@ Requires-Dist: accelerate>=0.20.3; extra == "train"
 같은 함수는 `model_kwargs["device_map"]` 를 **먼저** 읽어 `device` 인자를 무력화한다.
 `.../sentence_transformers/base/model.py:184-195`
 
-```python
+```text
         # A `device_map` in `model_kwargs` makes accelerate control placement (not `device`), so we detect it
         # here to skip the `self.to(device)` below that would otherwise pull a `device_map="cuda:1"` model to cuda:0.
         device_map = (model_kwargs or {}).get("device_map") if (backend == "torch" and model_name_or_path) else None
@@ -156,7 +156,7 @@ Requires-Dist: accelerate>=0.20.3; extra == "train"
 **(3) `_load_modules` 는 `modules.json` 유무로 갈린다.**
 `.../sentence_transformers/base/model.py:957-1005`
 
-```python
+```text
         load_kwargs = {
             "token": token,
             "cache_folder": cache_folder,
@@ -188,7 +188,7 @@ Requires-Dist: accelerate>=0.20.3; extra == "train"
 **(4-a) `modules.json` 이 없을 때 — 우선순위 병합 없이 그대로.**
 `.../sentence_transformers/sentence_transformer/model.py:1056-1073`
 
-```python
+```text
         shared_kwargs = {
             "token": token,
             "trust_remote_code": trust_remote_code,
@@ -212,7 +212,7 @@ Requires-Dist: accelerate>=0.20.3; extra == "train"
 `Transformer.__init__` 시그니처에 `cache_dir` 은 **없다**. 데코레이터가 먼저 뽑아 세 dict 에 분배한다 —
 `.../sentence_transformers/util/decorators.py:76-85`:
 
-```python
+```text
         if "cache_dir" in kwargs:
             cache_dir = kwargs.pop("cache_dir")
             if cache_dir is not None:
@@ -228,7 +228,7 @@ Requires-Dist: accelerate>=0.20.3; extra == "train"
 **(4-b) `modules.json` 이 있을 때 — 사용자 `model_kwargs` 가 1순위.**
 `.../sentence_transformers/base/modules/transformer.py:2078-2113`
 
-```python
+```text
         """Build the kwargs dict for ``__init__`` by merging config file, hub kwargs, and caller overrides.
 
         Priority (highest to lowest): caller kwargs > hub kwargs > config file values.
@@ -249,7 +249,7 @@ Requires-Dist: accelerate>=0.20.3; extra == "train"
 **(5) 최종 착지점 — `from_pretrained`.**
 `.../sentence_transformers/base/modules/transformer.py:654-656`
 
-```python
+```text
         self.model = self._load_model(
             model_name_or_path, transformer_task, config, backend, is_peft_model, **model_kwargs
         )
@@ -257,7 +257,7 @@ Requires-Dist: accelerate>=0.20.3; extra == "train"
 
 `.../sentence_transformers/base/modules/transformer.py:1738-1751`
 
-```python
+```text
         if backend == "torch":
             # When loading a PEFT model, we load the base model first. The revision
             # (e.g. "main") refers to the adapter checkpoint, not the base model, so
@@ -277,7 +277,7 @@ Requires-Dist: accelerate>=0.20.3; extra == "train"
 어떤 `AutoModel` 인지는 `transformer_task` 가 정한다. SentenceTransformer 기본값은 `feature-extraction`
 (`transformer.py:593`) → `AutoModel`. `.../sentence_transformers/base/modules/transformer.py:147-161`:
 
-```python
+```text
 TRANSFORMER_TASK_TO_AUTO_MODEL: dict[TransformerTask, Any] = {
     "feature-extraction": AutoModel,  # Used by SentenceTransformer, also covers "image-feature-extraction"
     "sequence-classification": AutoModelForSequenceClassification,  # Used by CrossEncoder
@@ -306,7 +306,7 @@ except ImportError:
 `modules.json` 이 없으면 `_load_default_modules` 다.
 `.../sentence_transformers/sentence_transformer/model.py:1036-1040` (독스트링) 와 `:1074-1088`:
 
-```python
+```text
         """
         Creates a simple Transformer + Mean Pooling model and returns the modules, except for
         CausalLM-based models which use Last Token pooling instead.
@@ -314,7 +314,7 @@ except ImportError:
         This is used as a fallback when no pre-trained SentenceTransformer model is found.
 ```
 
-```python
+```text
         modules = [transformer_model]
         if transformer_model.module_output_name == "token_embeddings":
             config = transformer_model.config
@@ -344,7 +344,7 @@ except ImportError:
 `module_output_name` 은 task 기본값 또는 modality 추론이 정한다.
 `.../sentence_transformers/base/modules/transformer.py:166-187`:
 
-```python
+```text
 TRANSFORMER_TASK_DEFAULTS: dict[TransformerTask, tuple[ModalityConfig, str]] = {
     "feature-extraction": (
         {"text": {"method": "forward", "method_output_name": "last_hidden_state"}},
@@ -354,7 +354,7 @@ TRANSFORMER_TASK_DEFAULTS: dict[TransformerTask, tuple[ModalityConfig, str]] = {
 
 일반 추론 경로 — `.../sentence_transformers/base/modules/transformer.py:1846-1877`:
 
-```python
+```text
         output_fields = self._get_method_output_fields(model.forward)
         if output_fields is None or default_method_output_name in output_fields:
             modality_config: ModalityConfig = {}
@@ -415,7 +415,7 @@ Pooling 은 붙지 않는다.** `_get_method_output_fields` 는 `get_type_hints(
 
 `.../sentence_transformers/sentence_transformer/losses/multiple_negatives_ranking.py:232-236`
 
-```python
+```text
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
         # Compute the embeddings and distribute them to anchor and candidates (positive and optionally negatives)
         embeddings = [self.model(sentence_feature)["sentence_embedding"] for sentence_feature in sentence_features]
@@ -424,7 +424,7 @@ Pooling 은 붙지 않는다.** `_get_method_output_fields` 는 `get_type_hints(
 
 핵심 계산 — 같은 파일 `:237-262` 및 `:311-336`:
 
-```python
+```text
     def compute_loss_from_embeddings(self, embeddings: list[Tensor], labels: Tensor) -> Tensor:
         if len(embeddings) < 2:
             raise ValueError(f"Expected at least 2 embeddings, got {len(embeddings)}")
@@ -437,7 +437,7 @@ Pooling 은 붙지 않는다.** `_get_method_output_fields` 는 `get_type_hints(
         sim_matrices["query_to_doc"] = self.similarity_fct(local_queries, docs_all)
 ```
 
-```python
+```text
         # Apply temperature scaling (scale = 1/temperature) and add hardness penalties.
         # Final logit = cos_sim * scale + alpha * cos_sim (penalty is not temperature-scaled).
         for key in sim_matrices:
@@ -466,7 +466,7 @@ Pooling 은 붙지 않는다.** `_get_method_output_fields` 는 `get_type_hints(
 
 기본값(`multiple_negatives_ranking.py:18-31`):
 
-```python
+```text
     def __init__(
         self,
         model: SentenceTransformer,
@@ -496,7 +496,7 @@ Pooling 은 붙지 않는다.** `_get_method_output_fields` 는 `get_type_hints(
 
 `/Users/jwcho/Codes/train-comparison/trainbench/embedding.py:201-216`
 
-```python
+```text
 def info_nce(
     queries: torch.Tensor,
     documents: torch.Tensor,
@@ -544,7 +544,7 @@ def info_nce(
 
 `.../sentence_transformers/sentence_transformer/losses/cached_multiple_negatives_ranking.py:569-601`
 
-```python
+```text
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
         # Step (1): A quick embedding step without gradients/computation graphs to get all the embeddings
         sentence_features = list(sentence_features)
@@ -581,7 +581,7 @@ def info_nce(
 
 미니배치 임베딩 — 같은 파일 `:388-405`:
 
-```python
+```text
     def embed_minibatch(
         self, ..., with_grad: bool, copy_random_state: bool, random_state: RandContext | None = None,
     ) -> tuple[Tensor, RandContext | None]:
@@ -598,7 +598,7 @@ def info_nce(
 
 미니배치 손실의 정규화 — 같은 파일 `:560-566`:
 
-```python
+```text
             per_sample_loss = -(positive_scores - log_z)
             loss_mbatch = per_sample_loss.mean() * len(local_batch) / batch_size
 
@@ -627,19 +627,19 @@ HF `Trainer` 를 그대로 상속한다.
 
 `.../sentence_transformers/base/trainer.py:76`
 
-```python
+```text
 class BaseTrainer(Trainer, ABC):
 ```
 
 `.../sentence_transformers/sentence_transformer/trainer.py:36`
 
-```python
+```text
 class SentenceTransformerTrainer(BaseTrainer):
 ```
 
 진입점은 **`compute_loss`** 다. `.../sentence_transformers/base/trainer.py:459-509`:
 
-```python
+```text
     def compute_loss(
         self,
         model: BaseModel,
@@ -669,7 +669,7 @@ class SentenceTransformerTrainer(BaseTrainer):
 즉 **모델 forward 는 Trainer 가 아니라 손실 함수가 부른다.** `compute_loss` 는 `inputs` 를 컬럼별
 feature dict 리스트로 쪼개 손실에 넘길 뿐이다. 쪼개는 규칙 — `.../sentence_transformers/base/trainer.py:591-605`:
 
-```python
+```text
         # All inputs ending with one of these suffixes are considered to correspond to a feature
         feature_suffixes = (
             "input_ids",  # text (Transformers)
@@ -684,7 +684,7 @@ feature dict 리스트로 쪼개 손실에 넘길 뿐이다. 쪼개는 규칙 �
 옵티마이저 파라미터 그룹도 모델이 아니라 **손실**을 기준으로 만든다 —
 `.../sentence_transformers/base/trainer.py:1206-1240`:
 
-```python
+```text
     def get_optimizer_cls_and_kwargs(
         self, args: BaseTrainingArguments, model: BaseModel | None = None
     ) -> tuple[Any, Any]:
@@ -708,7 +708,7 @@ feature dict 리스트로 쪼개 손실에 넘길 뿐이다. 쪼개는 규칙 �
 
 `.../sentence_transformers/base/trainer.py:174-180`:
 
-```python
+```text
         if not is_training_available():
             raise RuntimeError(
                 f"To train a {self.model_class.__name__} model, you need to install the `accelerate` and `datasets` modules. "
@@ -719,7 +719,7 @@ feature dict 리스트로 쪼개 손실에 넘길 뿐이다. 쪼개는 규칙 �
 
 `.../sentence_transformers/util/environment.py:109-114`:
 
-```python
+```text
 def is_training_available() -> bool:
     """
     Returns True if we have the required dependencies for training Sentence
@@ -736,7 +736,7 @@ def is_training_available() -> bool:
 
 `sentence_transformers/base/trainer.py:62-63` 은 `datasets` 없이도 **import** 는 통과하도록 만든다:
 
-```python
+```text
 if is_datasets_available():
     from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict, Value
 ```
@@ -752,7 +752,7 @@ if is_datasets_available():
 
 modality → processor 인자 이름 매핑, `.../sentence_transformers/base/modality_types.py:59-67`:
 
-```python
+```text
 ProcessorArgName: TypeAlias = Literal["text", "images", "audio", "videos", "message"]
 MessageFormat: TypeAlias = Literal["auto", "structured", "flat"]
 MODALITY_TO_PROCESSOR_ARG: dict[Modality, ProcessorArgName] = {
@@ -766,7 +766,7 @@ MODALITY_TO_PROCESSOR_ARG: dict[Modality, ProcessorArgName] = {
 
 실제 호출, `.../sentence_transformers/base/modules/transformer.py:1258-1290`:
 
-```python
+```text
     def _call_multimodal_processor(
         self, modality, processor_inputs, modality_kwargs, common_kwargs,
     ) -> dict[str, Any]:
@@ -795,7 +795,7 @@ MODALITY_TO_PROCESSOR_ARG: dict[Modality, ProcessorArgName] = {
 
 분기 스위치, `.../sentence_transformers/base/modules/transformer.py:113`:
 
-```python
+```text
 _TRANSFORMERS_PROCESSOR_SUPPORTS_MODALITY_KWARGS = parse_version(transformers_version) > parse_version("4.56.1")
 ```
 
@@ -806,7 +806,7 @@ _TRANSFORMERS_PROCESSOR_SUPPORTS_MODALITY_KWARGS = parse_version(transformers_ve
 
 `.../sentence_transformers/base/modules/transformer.py:974-978`:
 
-```python
+```text
         # Always convert to the message format if it's supported, since it's most flexible with e.g. defaults
         if "message" in self.modality_config and modality != "message":
             modality, processor_inputs = self.input_formatter.batch_to_message(modality, processor_inputs)
@@ -816,7 +816,7 @@ _TRANSFORMERS_PROCESSOR_SUPPORTS_MODALITY_KWARGS = parse_version(transformers_ve
 
 `"message"` 가 modality_config 에 들어가는 조건은 하나뿐이다 — `transformer.py:1840-1842`:
 
-```python
+```text
         modalities = self.infer_modalities_from_processor(processor)
         if hasattr(processor, "chat_template") and processor.chat_template is not None:
             modalities.append("message")
@@ -829,7 +829,7 @@ _TRANSFORMERS_PROCESSOR_SUPPORTS_MODALITY_KWARGS = parse_version(transformers_ve
 
 modality 목록은 processor 의 하위 속성으로 정해진다 — `transformer.py:1918-1935`:
 
-```python
+```text
         processor_attribute_mapping: dict[str, Modality] = {
             "tokenizer": "text",
             "image_processor": "image",
@@ -849,7 +849,7 @@ modality 목록은 processor 의 하위 속성으로 정해진다 — `transform
 
 `.../sentence_transformers/base/data_collator.py:105-111`:
 
-```python
+```text
         for column_name in column_names:
             task = router_mapping.get(column_name, None)
             prompt = self._get_prompt_for_column(prompts, column_name)
@@ -862,7 +862,7 @@ modality 목록은 processor 의 하위 속성으로 정해진다 — `transform
 
 `preprocess_fn` 은 `model.preprocess` 다 — `.../sentence_transformers/base/trainer.py:367-371`:
 
-```python
+```text
         return self.data_collator_class(
             preprocess_fn=model.preprocess,
             router_mapping=args.router_mapping,
@@ -872,7 +872,7 @@ modality 목록은 processor 의 하위 속성으로 정해진다 — `transform
 
 `BaseModel.preprocess` 는 첫 모듈에 위임한다 — `.../sentence_transformers/base/model.py:556-568`:
 
-```python
+```text
         try:
             preprocessed = self[0].preprocess(inputs, prompt=prompt, **kwargs)
         except TypeError:
@@ -890,7 +890,7 @@ modality 목록은 processor 의 하위 속성으로 정해진다 — `transform
 **probe 레인 주의**: `trainbench/probe/sentence_transformers.py:79` 의 `model.tokenize(texts)` 는
 5.6.1 에서 deprecated 다 — `.../sentence_transformers/base/model.py:572-579`:
 
-```python
+```text
     def tokenize(self, texts: list[str] | list[dict] | list[tuple[str, str]], **kwargs) -> dict[str, Tensor]:
         """
         .. deprecated::
@@ -908,7 +908,7 @@ modality 목록은 processor 의 하위 속성으로 정해진다 — `transform
 
 멀티모달 입력을 담는 타입은 dict 다 — `.../sentence_transformers/base/modality_types.py:44-47`:
 
-```python
+```text
 MultimodalInput: TypeAlias = dict[
     Literal["text", "image", "audio", "video"], TextInput | ImageInput | AudioInput | VideoInput
 ]
@@ -921,7 +921,7 @@ SingleInput: TypeAlias = TextInput | ImageInput | AudioInput | VideoInput | Mess
 
 `.../sentence_transformers/base/model.py:50`
 
-```python
+```text
 class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
 ```
 
@@ -942,7 +942,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
 
 기저 transformers 모델을 꺼내는 공식 통로 — `.../sentence_transformers/base/model.py:1548-1570`:
 
-```python
+```text
     @property
     def transformers_model(self) -> PreTrainedModel | None:
         ...
@@ -959,7 +959,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
 
 프로브 현재 코드 — `/Users/jwcho/Codes/train-comparison/trainbench/probe/sentence_transformers.py:85`:
 
-```python
+```text
         with_grad = sum(1 for p in model.parameters() if p.requires_grad and p.grad is not None)
 ```
 
@@ -985,7 +985,7 @@ AGENTS.md 가 기록한 unsloth 사건(`FastVisionModel.from_pretrained` 가 `fu
 
 gradient checkpointing 은 위임된다 — `.../sentence_transformers/base/model.py:1377-1385`:
 
-```python
+```text
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict[str, Any] | None = None) -> None:
         """Enable gradient checkpointing for the model."""
         # Propagate the gradient checkpointing to the transformer model
@@ -1008,7 +1008,7 @@ gradient checkpointing 은 위임된다 — `.../sentence_transformers/base/mode
 
 `.../sentence_transformers/util/deprecated_import.py:45,53,67`:
 
-```python
+```text
     "sentence_transformers.losses": "sentence_transformers.sentence_transformer.losses",
     ...
     "sentence_transformers.losses.CachedMultipleNegativesRankingLoss": "sentence_transformers.sentence_transformer.losses.cached_multiple_negatives_ranking",
@@ -1023,7 +1023,7 @@ gradient checkpointing 은 위임된다 — `.../sentence_transformers/base/mode
 
 `.../sentence_transformers/__init__.py:3`:
 
-```python
+```text
 __version__ = "5.6.1"
 ```
 
@@ -1033,7 +1033,7 @@ __version__ = "5.6.1"
 
 `.../sentence_transformers/sentence_transformer/model.py:976-977`:
 
-```python
+```text
     def get_sentence_embedding_dimension(self) -> int | None:
         return self.get_embedding_dimension()
 ```
@@ -1048,7 +1048,7 @@ __version__ = "5.6.1"
 
 `.../sentence_transformers/sentence_transformer/modules/pooling.py:224-233`:
 
-```python
+```text
             elif mode == "lasttoken":
                 bs, seq_len, hidden_dim = token_embeddings.shape
                 if torch.jit.is_tracing():
@@ -1088,7 +1088,7 @@ padding-side 정렬을 하지 않는다고 적어둔 결정은 이 코드와 모
 
 `.../sentence_transformers/base/modules/transformer.py:963-972`:
 
-```python
+```text
         # Flatten inputs to avoid padding overhead when using flash attention variable-length functions.
         # Only safe for text-only inputs, since DataCollatorWithFlattening only handles input_ids/labels.
         should_flatten = self.can_flatten_inputs and (

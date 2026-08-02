@@ -39,7 +39,7 @@
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/cli/config.py:303-328`
 
-```python
+```text
     prepare_plugins(cfg)
 
     if cfg.use_ray:
@@ -85,7 +85,7 @@
 Ray 경로만 순서가 다르다.
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/cli/train.py:168-186`
 
-```python
+```text
     capabilities, env_capabilities = gpu_capabilities_fn()
     cfg = validate_config_fn(
         cfg,
@@ -115,7 +115,7 @@ Ray 경로만 순서가 다르다.
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/config/__init__.py:199-213`
 
-```python
+```text
 def normalize_config(cfg):
     # setup some derived config / hyperparams
     if not cfg.use_ray:
@@ -146,7 +146,7 @@ def normalize_config(cfg):
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/config/__init__.py:481-500`
 
-```python
+```text
         return DictDefault(
             dict(
                 _model_with_inherited_default_fallback(
@@ -178,7 +178,7 @@ def normalize_config(cfg):
 `context_parallel_size` 는 다르다. 기본값은 `None` 이지만 `after` 검증기가 1을 넣는다.
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/schemas/validation.py:1634-1641`
 
-```python
+```text
     def check_context_parallel_size(self):
         if self.sequence_parallel_degree and not self.context_parallel_size:
             LOG.warning(
@@ -200,7 +200,7 @@ pydantic 모델 인스턴스화가 곧 기본값 주입이다. 범위를 정하�
 - `exclude_none=True` — 기본값이 `None` 인 필드는 결과 dict 에서 사라진다.
 - 누락 필드 폴백. `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/config/__init__.py:98-119`
 
-```python
+```text
 def _model_with_inherited_default_fallback(model_cls, data):
     try:
         return model_cls(**data)
@@ -236,7 +236,7 @@ def _model_with_inherited_default_fallback(model_cls, data):
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/config/__init__.py:259-286`
 
-```python
+```text
     if not cfg.base_model_config:
         cfg.base_model_config = cfg.base_model
 
@@ -270,14 +270,14 @@ def _model_with_inherited_default_fallback(model_cls, data):
 그리고 마지막 줄에서 `cfg.device` 를 읽는다 (`choose_device` 가 220행에서 세운 값).
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/config/__init__.py:417`
 
-```python
+```text
     log_gpu_memory_usage(LOG, "baseline", cfg.device)
 ```
 
 gemma4 전용 분기도 여기 있다 (`utils/config/__init__.py:385-415`). **무조건이 아니라
 조건부다** (2026-08-02 감사가 잡고 원문으로 재확인함):
 
-```python
+```text
     if cfg.model_config_type in ("gemma4", "gemma4_unified"):
         if cfg.gradient_checkpointing:                                    # 391
             ...
@@ -307,7 +307,7 @@ axes/adapters 레인은 덮어쓰기를 전제하지 말고 자기 런의 config
 `AxolotlInputConfig` 는 19개 믹스인의 합성이다.
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/schemas/config.py:189-212`
 
-```python
+```text
 class AxolotlInputConfig(
     ModelInputConfig,
     ModelOutputConfig,
@@ -338,7 +338,7 @@ class AxolotlInputConfig(
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/schemas/model.py:17-21`
 
-```python
+```text
     base_model: str = Field(
         json_schema_extra={
             "description": "This is the huggingface model that contains *.pt, *.safetensors, or *.bin files. This can also be a relative path to a model on disk"
@@ -348,7 +348,7 @@ class AxolotlInputConfig(
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/schemas/training.py:116`
 
-```python
+```text
     learning_rate: str | float
 ```
 
@@ -356,7 +356,7 @@ class AxolotlInputConfig(
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/schemas/training.py:71-94`
 
-```python
+```text
     gradient_accumulation_steps: int | None = Field(
         default=1,
         json_schema_extra={
@@ -393,7 +393,7 @@ class AxolotlInputConfig(
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/schemas/validation.py:272-279`
 
-```python
+```text
     @model_validator(mode="before")
     @classmethod
     def check_gas_bsz(cls, data):
@@ -408,7 +408,7 @@ class AxolotlInputConfig(
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/schemas/config.py:339-356`
 
-```python
+```text
     datasets: (
         Annotated[
             list[
@@ -431,7 +431,7 @@ class AxolotlInputConfig(
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/schemas/validation.py:79-84`
 
-```python
+```text
     @model_validator(mode="before")
     @classmethod
     def check_dataset_or_pretraining_dataset(cls, data):
@@ -446,7 +446,7 @@ class AxolotlInputConfig(
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/schemas/config.py:1754-1758`
 
-```python
+```text
 class AxolotlConfigWCapabilities(AxolotlInputConfig):
     """Wrapper to valdiate GPU capabilities with the configured options"""
 
@@ -473,7 +473,7 @@ datasets: [{...}]          # 검증기가 요구, MinLen(1)
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/config/__init__.py:191-196`
 
-```python
+```text
     if cfg.bf16 or cfg.bfloat16:
         cfg.torch_dtype = torch.bfloat16
     elif cfg.load_in_8bit or cfg.fp16 or cfg.float16:
@@ -484,7 +484,7 @@ datasets: [{...}]          # 검증기가 요구, MinLen(1)
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/loaders/model.py:611-612`
 
-```python
+```text
         self.model_kwargs["torch_dtype"] = self.cfg.torch_dtype
         self.model_kwargs["dtype"] = self.cfg.torch_dtype
 ```
@@ -495,7 +495,7 @@ datasets: [{...}]          # 검증기가 요구, MinLen(1)
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/loaders/model.py:422-477`
 
-```python
+```text
     def _configure_embedding_dtypes(self):
         """Configure embedding module dtypes."""
         # Get embedding modules
@@ -557,7 +557,7 @@ datasets: [{...}]          # 검증기가 요구, MinLen(1)
 무엇이 올라가는지는 이 루프가 정한다.
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/loaders/model.py:1025-1047`
 
-```python
+```text
     def _convert_embedding_modules_dtype(
         self,
         embedding_modules: list[str],
@@ -588,7 +588,7 @@ datasets: [{...}]          # 검증기가 요구, MinLen(1)
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/loaders/utils.py:231-239`
 
-```python
+```text
 def get_linear_embedding_layers(model_type: str) -> list[str]:
     """Returns layer names of linear embeddings needed for LoRA based on model type."""
     if model_type == "gpt_neox":
@@ -614,7 +614,7 @@ def get_linear_embedding_layers(model_type: str) -> list[str]:
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/loaders/model.py:157-160`
 
-```python
+```text
     @property
     def is_fsdp_enabled(self):
         """Property that determines if FSDP is enabled."""
@@ -623,7 +623,7 @@ def get_linear_embedding_layers(model_type: str) -> list[str]:
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/schemas/config.py:1498-1503`
 
-```python
+```text
     @computed_field  # type: ignore[misc]
     @property
     def attn_needs_dtype_cast(self) -> bool:
@@ -634,7 +634,7 @@ def get_linear_embedding_layers(model_type: str) -> list[str]:
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/schemas/enums.py:158-159`
 
-```python
+```text
 # Backends for which embeddings stay in fp32. Everything else needs fp16/bf16.
 ATTN_IMPLS_WITHOUT_DTYPE_CAST = frozenset({"eager", "sdpa"})
 ```
@@ -642,7 +642,7 @@ ATTN_IMPLS_WITHOUT_DTYPE_CAST = frozenset({"eager", "sdpa"})
 `attn_implementation` 의 기본값:
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/utils/schemas/config.py:839-849`
 
-```python
+```text
     attn_implementation: str | None = Field(
         default=None,
         json_schema_extra={
@@ -680,7 +680,7 @@ axolotl 은 이 fp32 잔재를 스스로 고치지 않는다. HF Trainer 가 for
 **(1) axolotl 이 `bf16` 을 TrainingArguments 로 넘긴다.**
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/core/builders/base.py:270-278`
 
-```python
+```text
     def _configure_precision_settings(self, training_args_kwargs: dict):
         training_args_kwargs["fp16"] = (self.cfg.fp16 and not self.cfg.bf16) or False
         training_args_kwargs["tf32"] = True if self.cfg.tf32 is True else False
@@ -695,7 +695,7 @@ axolotl 은 이 fp32 잔재를 스스로 고치지 않는다. HF Trainer 가 for
 **(2) transformers 가 `mixed_precision="bf16"` 로 옮긴다.**
 `/Users/jwcho/.cache/uv/archive-v0/Kur5R2PrM3RUwEti/transformers/training_args.py:1553-1559`
 
-```python
+```text
         # ── 5. Mixed Precision ──
         # Read from env first; DeepSpeed may override this later
         self.mixed_precision = os.environ.get("ACCELERATE_MIXED_PRECISION", "no")
@@ -707,7 +707,7 @@ axolotl 은 이 fp32 잔재를 스스로 고치지 않는다. HF Trainer 가 for
 
 `/Users/jwcho/.cache/uv/archive-v0/Kur5R2PrM3RUwEti/transformers/trainer.py:706-711`
 
-```python
+```text
     def _build_accelerator_args(self, **kwargs) -> dict[str, Any]:
         """Helper method to build accelerator-specific keyword arguments."""
         args = {
@@ -719,7 +719,7 @@ axolotl 은 이 fp32 잔재를 스스로 고치지 않는다. HF Trainer 가 for
 **(3) accelerate 가 `native_amp` 를 켠다.**
 `/Users/jwcho/.cache/uv/archive-v0/fEtyCRRqLx-Vto5O/accelerate/accelerator.py:584-595`
 
-```python
+```text
         elif self.state.mixed_precision == "bf16" and self.distributed_type not in (
             DistributedType.DEEPSPEED,
             DistributedType.MEGATRON_LM,
@@ -737,7 +737,7 @@ axolotl 은 이 fp32 잔재를 스스로 고치지 않는다. HF Trainer 가 for
 **(4) `prepare_model` 이 `model.forward` 자체를 autocast 로 감싼다.**
 `/Users/jwcho/.cache/uv/archive-v0/fEtyCRRqLx-Vto5O/accelerate/accelerator.py:1806-1818`
 
-```python
+```text
         if self.native_amp:
             model._original_forward = model.forward
             autocast_context = get_mixed_precision_context_manager(self.native_amp, self.autocast_handler)
@@ -755,7 +755,7 @@ axolotl 은 이 fp32 잔재를 스스로 고치지 않는다. HF Trainer 가 for
 **(5) 그 컨텍스트의 정체.**
 `/Users/jwcho/.cache/uv/archive-v0/fEtyCRRqLx-Vto5O/accelerate/utils/modeling.py:2064-2088`
 
-```python
+```text
     if native_amp:
         device_type = (
             "cuda"
@@ -785,7 +785,7 @@ axolotl 은 이 fp32 잔재를 스스로 고치지 않는다. HF Trainer 가 for
 
 ### 5.1 우리가 감쌀 때 필요한 컨텍스트 — 정확히
 
-```python
+```text
 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 ```
 
@@ -805,7 +805,7 @@ torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 `trainbench/axes.py:687-700` 은 이렇게 적혀 있다.
 
-```python
+```text
 def step_context(config: BenchConfig) -> contextlib.AbstractContextManager:
     """Context wrapping one training step.
 
@@ -864,7 +864,7 @@ axolotl = axolotl.cli.main:main
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/cli/main.py:99-106`
 
-```python
+```text
 def train(
     ctx: click.Context,
     config: str,
@@ -882,7 +882,7 @@ def train(
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/train.py:69-84`
 
-```python
+```text
     # Load tokenizer
     LOG.debug(
         f"loading tokenizer... {cfg.tokenizer_config or cfg.base_model_config}",
@@ -903,7 +903,7 @@ def train(
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/train.py:584-596`
 
-```python
+```text
     # Set up trainer
     trainer = setup_trainer(
         cfg=cfg,
@@ -921,7 +921,7 @@ def train(
 
 `/Users/jwcho/.cache/uv/archive-v0/NnUfrC8dsc47HDGS/axolotl/train.py:222-227`
 
-```python
+```text
         # TODO: disabling for now as not compatible with FSDP2 + torchao low bit optimizers
         # if cfg.bf16:
         #     torch.set_default_dtype(torch.bfloat16)
@@ -993,7 +993,7 @@ Requires-Dist: flash-linear-attention==0.4.1; platform_machine != "aarch64"
 
 `/Users/jwcho/.cache/uv/archive-v0/Kur5R2PrM3RUwEti/transformers/models/qwen3_5/modeling_qwen3_5.py:73-77`
 
-```python
+```text
 if is_flash_linear_attention_available():
     from fla.modules import FusedRMSNormGated
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
@@ -1003,7 +1003,7 @@ else:
 
 `/Users/jwcho/.cache/uv/archive-v0/Kur5R2PrM3RUwEti/transformers/models/qwen3_5/modeling_qwen3_5.py:421-431`
 
-```python
+```text
         self.causal_conv1d_fn = causal_conv1d_fn
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
         self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
@@ -1019,7 +1019,7 @@ else:
 
 `/Users/jwcho/.cache/uv/archive-v0/Kur5R2PrM3RUwEti/transformers/utils/import_utils.py:870-872`
 
-```python
+```text
 def is_flash_linear_attention_available():
     is_available, fla_version = _is_package_available("fla", return_version=True)
     return is_torch_cuda_available() and is_available and version.parse(fla_version) >= version.parse("0.2.2")
@@ -1030,7 +1030,7 @@ def is_flash_linear_attention_available():
 
 `/private/tmp/claude-501/-Users-jwcho-Codes-train-comparison/528669dc-58ea-4ea9-b391-9c18fa5ed7a9/scratchpad/pins/fla-core-0.4.1/fla/__init__.py:4`
 
-```python
+```text
 __version__ = '0.4.1'
 ```
 

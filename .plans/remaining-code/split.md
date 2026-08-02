@@ -77,7 +77,7 @@ Collate 14 · PairDataset 5 · build_collate 3 · MicroBatch 2 · Encode 1 · Pa
 
 지금 `build_run`(`bench.py:903-962`)은 프레임워크를 세 곳에서 못박는다:
 
-```python
+```text
 912    from transformers import AutoModel, AutoProcessor
 916    processor = AutoProcessor.from_pretrained(config.model.hf_id, revision=...)
 920    model = AutoModel.from_pretrained(config.model.hf_id, revision=..., dtype=..., **load_kwargs)
@@ -90,7 +90,7 @@ Collate 14 · PairDataset 5 · build_collate 3 · MicroBatch 2 · Encode 1 · Pa
 
 해야 할 것: `bench.py` 안에 바인딩을 만들고 `assemble` 에 **비상수**로 넘긴다.
 
-```python
+```text
 built, applied = axes.assemble(model, config, device, framework=binding.framework, dataset=dataset)
 ```
 
@@ -112,7 +112,7 @@ adapters 레인이 `trainbench/loader.py` 의 `AdapterOut` 을 그 이름 그대
 
 ### 해석은 있으면 쓰고 없으면 native 로 떨어진다
 
-```python
+```text
 # trainbench.loader 가 아직 없으므로, 없으면 지금의 native 경로를 그대로 쓴다.
 # adapters 레인이 그것을 만들면 bench.py 는 한 줄도 바뀌지 않고 그것을 탄다.
 ```
@@ -124,7 +124,7 @@ fallback 은 지금의 912–926 을 그대로 옮긴 것이어야 한다 — **
 `test_loader_serves_every_framework_through_one_entry_point`(`test_loader_bench.py:558`)는
 `xfail(strict=True)` 이고 다음 셋만 본다:
 
-```python
+```text
 loader = importlib.import_module("trainbench.loader")
 assert set(loader.ADAPTERS) == FRAMEWORKS          # 6개
 assert callable(loader.load)

@@ -40,7 +40,7 @@ seam 의 정확한 이름과 필드는 `.plans/notes/split.md` 에 있다.
 `trainbench/loader.py` 에 프레임워크별 함수를 뽑아낸다.
 계약(`tests/contract/test_loader_bench.py:558-567`)이 요구하는 것:
 
-```python
+```text
 set(loader.ADAPTERS) == FRAMEWORKS          # 여섯 개, FrameworkConfig 에서 유도된다
 callable(loader.load)
 {f.name for f in dataclass_fields(loader.AdapterOut)} == ADAPTER_OUT_FIELDS

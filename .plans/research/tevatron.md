@@ -87,7 +87,7 @@ $ ls -d ~/.cache/uv/archive-v0/*/huggingface_hub-1.26.0.dist-info
 
 `TEV/src/tevatron/retriever/modeling/encoder.py:117-129` (`build`)
 
-```python
+```text
     @classmethod
     def build(
             cls,
@@ -106,7 +106,7 @@ $ ls -d ~/.cache/uv/archive-v0/*/huggingface_hub-1.26.0.dist-info
 `TEV/src/tevatron/retriever/modeling/encoder.py:159-172` (`load` — 이 저장소의 프로브가
 쓰는 경로)
 
-```python
+```text
     @classmethod
     def load(cls,
              model_name_or_path: str,
@@ -130,7 +130,7 @@ $ ls -d ~/.cache/uv/archive-v0/*/huggingface_hub-1.26.0.dist-info
 
 `TRANSFORMER_CLS` 는 `encoder.py:26-27`:
 
-```python
+```text
 class EncoderModel(nn.Module):
     TRANSFORMER_CLS = AutoModel
 ```
@@ -145,25 +145,25 @@ class EncoderModel(nn.Module):
 
 `TF/transformers/models/qwen3_5/configuration_qwen3_5.py:104`
 
-```python
+```text
     pad_token_id: int | None = None
 ```
 
 `TF/transformers/models/qwen3_vl/configuration_qwen3_vl.py:96`
 
-```python
+```text
     pad_token_id: int | None = None
 ```
 
 `TF/transformers/models/gemma4/configuration_gemma4.py:169`
 
-```python
+```text
     pad_token_id: int | None = 0
 ```
 
 최상위 합성 config 에는 없다. `TF/transformers/models/qwen3_5/configuration_qwen3_5.py:152-181`
 
-```python
+```text
 @strict
 class Qwen3_5Config(PreTrainedConfig):
     r"""
@@ -189,7 +189,7 @@ class Qwen3_5Config(PreTrainedConfig):
 (`sub_configs = {"vision_config": Qwen3VLVisionConfig, "text_config": Qwen3VLTextConfig}` 가 125행),
 `TF/transformers/models/gemma4/configuration_gemma4.py:323-341` 은
 
-```python
+```text
     model_type = "gemma4"
     sub_configs = {
         "text_config": Gemma4TextConfig,
@@ -215,7 +215,7 @@ class Qwen3_5Config(PreTrainedConfig):
 `PreTrainedConfig` 에는 `__getattr__` 폴백이 없고 `__getattribute__` 는 `attribute_map`
 치환만 한다 — `TF/transformers/configuration_utils.py:456-464`
 
-```python
+```text
     def __setattr__(self, key, value):
         if key in super().__getattribute__("attribute_map"):
             key = super().__getattribute__("attribute_map")[key]
@@ -252,7 +252,7 @@ Gemma4Config text_config Gemma4TextConfig pad_token_id 0
 
 `HH/huggingface_hub/dataclasses.py:136-151`
 
-```python
+```text
         # Override __setattr__ to validate fields on assignment
         original_setattr = cls.__setattr__
 
@@ -280,7 +280,7 @@ Gemma4Config text_config Gemma4TextConfig pad_token_id 0
 
 `TF/transformers/configuration_utils.py:1297-1324`
 
-```python
+```text
         return_both = decoder == encoder  # both unset or both set -> search all possible names
 
         decoder_possible_text_config_names = ("decoder", "generator", "text_config")
@@ -319,7 +319,7 @@ Gemma4Config text_config Gemma4TextConfig pad_token_id 0
 
 `TF/transformers/models/auto/auto_factory.py:388-396`
 
-```python
+```text
         elif has_local_code:
             model_class = _get_model_class(config, cls._model_mapping)
             text_config_class = config.sub_configs.get("text_config", None)
@@ -369,14 +369,14 @@ transformers 전용 키를 넣으면 LoRA 경로에서는 그 dict 가 `LoraConf
 `from_pretrained` 쪽에서 `config` 키가 받아들여진다는 근거는
 `TF/transformers/models/auto/auto_factory.py:261-262`
 
-```python
+```text
     def from_pretrained(cls, pretrained_model_name_or_path: str | os.PathLike[str], *model_args, **kwargs):
         config = kwargs.pop("config", None)
 ```
 
 그리고 `TF/transformers/models/auto/auto_factory.py:324-343`
 
-```python
+```text
         if not isinstance(config, PreTrainedConfig):
             kwargs_orig = copy.deepcopy(kwargs)
             # ensure not to pollute the config object with dtype="auto" - since it's
@@ -415,7 +415,7 @@ transformers 전용 키를 넣으면 LoRA 경로에서는 그 dict 가 `LoraConf
 
 3번의 근거 원문 — `TEV/src/tevatron/retriever/modeling/encoder.py:34-50`
 
-```python
+```text
     def __init__(self,
                  encoder: PreTrainedModel,
                  pooling: str = 'cls',
@@ -447,7 +447,7 @@ transformers 전용 키를 넣으면 LoRA 경로에서는 그 dict 가 `LoraConf
 
 `TEV/src/tevatron/retriever/modeling/encoder.py:52-87`
 
-```python
+```text
     def forward(self, query: Dict[str, Tensor] = None, passage: Dict[str, Tensor] = None):
         q_reps = self.encode_query(query) if query else None
         p_reps = self.encode_passage(passage) if passage else None
@@ -488,7 +488,7 @@ transformers 전용 키를 넣으면 LoRA 경로에서는 그 dict 가 `LoraConf
 
 그리고 그것이 부르는 것들 — `TEV/src/tevatron/retriever/modeling/dense.py:18-46`
 
-```python
+```text
     def encode_query(self, qry):
         query_hidden_states = self.encoder(**qry, return_dict=True)
         query_hidden_states = query_hidden_states.last_hidden_state
@@ -522,7 +522,7 @@ transformers 전용 키를 넣으면 LoRA 경로에서는 그 dict 가 `LoraConf
 
 `TEV/src/tevatron/retriever/modeling/encoder.py:95-115`
 
-```python
+```text
     def compute_similarity(self, q_reps, p_reps):
         return torch.matmul(q_reps, p_reps.transpose(0, 1))
 
@@ -584,7 +584,7 @@ transformers 전용 키를 넣으면 LoRA 경로에서는 그 dict 가 `LoraConf
 
 `trainbench/probe/steps.py:190-195`
 
-```python
+```text
     output = model(**batch, output_hidden_states=False)
     hidden = getattr(output, "last_hidden_state", None)
     if hidden is None:
@@ -595,7 +595,7 @@ transformers 전용 키를 넣으면 LoRA 경로에서는 그 dict 가 `LoraConf
 
 `trainbench/embedding.py:212-216`
 
-```python
+```text
     queries = F.normalize(queries, dim=-1)
     documents = F.normalize(documents, dim=-1)
     logits = queries @ documents.T / temperature
@@ -613,7 +613,7 @@ transformers 전용 키를 넣으면 LoRA 경로에서는 그 dict 가 `LoraConf
 (`trainbench/probe/steps.py:190`). 배치 키는 `input_ids` / `attention_mask` 다
 (`trainbench/probe/steps.py:198-202`). 그런데 `DenseModel` 이 상속한 forward 는
 
-```python
+```text
     def forward(self, query: Dict[str, Tensor] = None, passage: Dict[str, Tensor] = None):
 ```
 
@@ -636,7 +636,7 @@ probe 레인은 두 가지를 한 번에 준비해야 한다. (실제 예외 메
 
 `TEV/setup.py:1-20` 전문
 
-```python
+```text
 from setuptools import setup, find_packages
 
 setup(
@@ -677,7 +677,7 @@ lock 도 그대로 받아 적었다(`envs/tevatron/uv.lock:1047-1050` 의 `depen
 
 `modeling/__init__.py` 는 넷을 전부 끌어온다:
 
-```python
+```text
 from .encoder import EncoderModel, EncoderOutput
 from .dense import DenseModel, MultiModalDenseModel
 from .unicoil import UniCoilModel
@@ -705,7 +705,7 @@ from .splade import SpladeModel, SpladeModelForCausalLM
 
 기록하는 쪽 — `/Users/jwcho/Codes/train-comparison/trainbench/probe/types.py:96-105`
 
-```python
+```text
     def add_version(self, module: Any) -> None:
         """Record the framework's own version. Each image ships a different stack,
         so this travels with the result rather than being assumed."""
@@ -720,7 +720,7 @@ from .splade import SpladeModel, SpladeModelForCausalLM
 
 부르는 쪽 — `/Users/jwcho/Codes/train-comparison/trainbench/probe/tevatron.py:29-31`
 
-```python
+```text
     import tevatron
 
     report.add_version(tevatron)

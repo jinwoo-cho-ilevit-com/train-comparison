@@ -54,7 +54,7 @@ site-packages 의 `masking_utils.py` 는 5.13.1 이나 5.12.x 가 아니라 **5.
 
 `/Users/jwcho/Codes/train-comparison/.venv/lib/python3.13/site-packages/transformers/masking_utils.py:735-764`
 
-```python
+```text
 def find_packed_sequence_indices(position_ids: torch.Tensor) -> torch.Tensor | None:
     """
     Find the indices of the sequence to which each new query token in the sequence belongs when using packed
@@ -94,7 +94,7 @@ def find_packed_sequence_indices(position_ids: torch.Tensor) -> torch.Tensor | N
 
 `.../transformers/masking_utils.py:858-868`
 
-```python
+```text
     # We check the position_ids for potential packed sequence format (only if the 2D attention mask is explicitly None,
     # and we don't have past_key_values, i.e. generally a training setup)
     packed_sequence_mask = None
@@ -127,7 +127,7 @@ def find_packed_sequence_indices(position_ids: torch.Tensor) -> torch.Tensor | N
 
 `.../transformers/masking_utils.py:182-190`
 
-```python
+```text
 def packed_sequence_mask_function(packed_sequence_mask: torch.Tensor) -> Callable:
     """
     This return the mask_function function corresponding to a 2D packed sequence mask.
@@ -141,7 +141,7 @@ def packed_sequence_mask_function(packed_sequence_mask: torch.Tensor) -> Callabl
 
 `.../transformers/masking_utils.py:971-978`
 
-```python
+```text
     # If we detected packing format or blockwise overlay
     if packed_sequence_mask is not None:
         mask_factory_function = and_masks(mask_factory_function, packed_sequence_mask_function(packed_sequence_mask))
@@ -183,7 +183,7 @@ packing이 옳으려면 한 pack 안의 시퀀스가 서로의 문맥이 되지 
 
 `.../transformers/masking_utils.py:817-819`
 
-```python
+```text
     # If the mask is already 4D, simply return as-is (it was already prepared, or it is custom)
     if isinstance(attention_mask, (torch.Tensor, BlockMask)) and len(attention_mask.shape) == 4:
         return True, attention_mask, None, None, None, None, None
@@ -194,7 +194,7 @@ packing이 옳으려면 한 pack 안의 시퀀스가 서로의 문맥이 되지 
 
 `.../transformers/masking_utils.py:936-940`
 
-```python
+```text
     early_exit, attention_mask, packed_sequence_mask, q_length, kv_length, q_offset, kv_offset = (
         _preprocess_mask_arguments(config, inputs_embeds, attention_mask, past_key_values, position_ids, layer_idx)
     )
@@ -217,7 +217,7 @@ packing이 옳으려면 한 pack 안의 시퀀스가 서로의 문맥이 되지 
 
 `.../transformers/masking_utils.py:718-732`
 
-```python
+```text
 class AttentionMaskInterface(GeneralInterface):
     # Class instance object, so that a call to `register` can be reflected into all other files correctly, even if
     # a new instance is created (in order to locally override a given function)
@@ -239,7 +239,7 @@ ALL_MASK_ATTENTION_FUNCTIONS: AttentionMaskInterface = AttentionMaskInterface()
 
 `.../transformers/masking_utils.py:821-827`
 
-```python
+```text
     # For TGI/vLLM backends, or other custom attention without equivalent mask creation: we don't need a mask!
     # Note: it's not ideal to check the `_global_mapping` attribute instead of the object itself, however otherwise
     # full graph dynamo tracing (i.e. torch.export or compile with `fullgraph=True`) will fail on Python<3.11
@@ -287,7 +287,7 @@ ALL_MASK_ATTENTION_FUNCTIONS: AttentionMaskInterface = AttentionMaskInterface()
 
 `.../transformers/masking_utils.py:980-994`
 
-```python
+```text
     # We now create the mask
     causal_mask = mask_interface(
         batch_size=batch_size,
@@ -310,7 +310,7 @@ ALL_MASK_ATTENTION_FUNCTIONS: AttentionMaskInterface = AttentionMaskInterface()
 
 `.../transformers/masking_utils.py:490-518`
 
-```python
+```text
     # Potentially pad the 2D mask
     padding_mask = prepare_padding_mask(attention_mask, kv_length, kv_offset)
 
@@ -366,7 +366,7 @@ ALL_MASK_ATTENTION_FUNCTIONS: AttentionMaskInterface = AttentionMaskInterface()
 
 `.../transformers/masking_utils.py:588-611`
 
-```python
+```text
     # The masks for eager attention are simply boolean mask from sdpa, casted to 0 and -inf
     _ = kwargs.pop("allow_is_causal_skip", None)
     _ = kwargs.pop("allow_torch_fix", None)
@@ -387,7 +387,7 @@ FA 경로는 다르다 — 4D 를 만들지 않고 2D 를 그대로 돌려주거
 
 `.../transformers/masking_utils.py:645-654`
 
-```python
+```text
     if attention_mask is not None:
         # Here we need to slice from the right if using sliding or chunked (for full attention, this is equivalent to doing nothing)
         attention_mask = attention_mask[:, -kv_length:]
@@ -409,7 +409,7 @@ FA 경로는 다르다 — 4D 를 만들지 않고 2D 를 그대로 돌려주거
 
 `.../transformers/modeling_flash_attention_utils.py:757-767`
 
-```python
+```text
     # We will use `flash_varlen_fn` to prevent cross-example attention and also allow padding free approach under two cases:
     # Case 1. If position ids is provided and the position ids indicate packed sequences, see `_is_packed_sequence`.
     # Case 2. Some models pass directly pre-computed `cu_seqlens` so we don't need to infer it from position ids. It is safe to
@@ -429,7 +429,7 @@ FA 경로는 다르다 — 4D 를 만들지 않고 2D 를 그대로 돌려주거
 
 `.../transformers/modeling_flash_attention_utils.py:769-820`
 
-```python
+```text
     # Contains at least one padding token in the sequence
     if attention_mask is not None:
         q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
@@ -471,7 +471,7 @@ FA 경로는 다르다 — 4D 를 만들지 않고 2D 를 그대로 돌려주거
 
 `.../transformers/modeling_flash_attention_utils.py:534-547`
 
-```python
+```text
 def _is_packed_sequence(position_ids, batch_size):
     """
     Check the position ids whether packed sequences are indicated or not
@@ -492,7 +492,7 @@ def _is_packed_sequence(position_ids, batch_size):
 
 `.../transformers/modeling_flash_attention_utils.py:474-493`
 
-```python
+```text
     tensor_kwargs = {"dtype": torch.int32, "device": position_ids.device}
 
     position_ids = position_ids.reshape(-1)
@@ -521,7 +521,7 @@ def _is_packed_sequence(position_ids, batch_size):
 
 `.../transformers/utils/generic.py:800-839`
 
-```python
+```text
 class TransformersKwargs(TypedDict, total=False):
     """
     Keyword arguments to be passed to the forward pass of a `PreTrainedModel`.
@@ -582,7 +582,7 @@ class TransformersKwargs(TypedDict, total=False):
 
 `.../transformers/models/qwen3_5/modeling_qwen3_5.py:538-550`
 
-```python
+```text
         else:
             core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
                 query,
@@ -602,7 +602,7 @@ class TransformersKwargs(TypedDict, total=False):
 
 `.../transformers/models/qwen3_5/modeling_qwen3_5.py:492-499`
 
-```python
+```text
             if self.causal_conv1d_fn is not None:
                 mixed_qkv = self.causal_conv1d_fn(
                     x=mixed_qkv,
@@ -617,7 +617,7 @@ class TransformersKwargs(TypedDict, total=False):
 
 `.../transformers/models/qwen3_5/modeling_qwen3_5.py:441-448`
 
-```python
+```text
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -637,7 +637,7 @@ pack 전체를 한 시퀀스로 스캔하고, `seq_idx` 가 `None` 이면 causal
 
 `.../transformers/masking_utils.py:1447-1473`
 
-```python
+```text
 def create_recurrent_attention_mask(
     config: PreTrainedConfig,
     inputs_embeds: torch.Tensor,
@@ -673,7 +673,7 @@ def create_recurrent_attention_mask(
 
 `.../transformers/models/qwen3_5/modeling_qwen3_5.py:1193-1220`
 
-```python
+```text
         if not isinstance(causal_mask_mapping := attention_mask, dict):
             # Prepare mask arguments
             mask_kwargs = {
@@ -712,7 +712,7 @@ kwargs 로 넣으면 GatedDeltaNet 까지 도달한다. 마스크 dict 를 직�
 
 `.../transformers/models/qwen3_5/modeling_qwen3_5.py:1179-1191`
 
-```python
+```text
         # the hard coded `4` is for text, temporal, height and width.
         if position_ids is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -736,7 +736,7 @@ kwargs 로 넣으면 GatedDeltaNet 까지 도달한다. 마스크 dict 를 직�
 
 `.../transformers/models/qwen3_vl/modeling_qwen3_vl.py:795-815`
 
-```python
+```text
         # the hard coded `4` is for text, temporal, height and width.
         if position_ids is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -767,7 +767,7 @@ Qwen3-VL 의 vision tower 는 이미 varlen kwargs 를 직접 만들어 넘긴�
 
 `.../transformers/models/qwen3_vl/modeling_qwen3_vl.py:225-242`
 
-```python
+```text
         if is_flash_attention_requested(self.config):
             # Flash Attention: Use cu_seqlens for variable length attention
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -801,7 +801,7 @@ vision tower 는 FA 가 아니면 **이미지마다 텐서를 split 해서 따�
 
 `.../transformers/models/gemma4/modeling_gemma4.py:1694-1708`
 
-```python
+```text
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
             # Prepare mask arguments
@@ -837,7 +837,7 @@ vision tower 는 FA 가 아니면 **이미지마다 텐서를 split 해서 따�
 
 `.../transformers/modeling_utils.py:2176-2193`
 
-```python
+```text
     def set_attn_implementation(self, attn_implementation: str | dict, allow_all_kernels: bool = False):
         """
         Set the requested `attn_implementation` for this model.
@@ -864,7 +864,7 @@ vision tower 는 FA 가 아니면 **이미지마다 텐서를 split 해서 따�
 
 `.../transformers/modeling_utils.py:2229-2241`
 
-```python
+```text
                 else:
                     sub_implementation = requested_implementation
                     if isinstance(attn_implementation, dict):
@@ -884,7 +884,7 @@ config 쪽 setter 도 같은 규칙으로 재귀한다:
 
 `.../transformers/configuration_utils.py:401-417`
 
-```python
+```text
     @_attn_implementation.setter
     def _attn_implementation(self, value: str | dict | None):
         """We set it recursively on the sub-configs as well"""
@@ -927,7 +927,7 @@ dict 를 넘기는 것이 통하는지는 이 호스트에서 실행해 확인�
 
 `.../transformers/modeling_flash_attention_utils.py:63-71`
 
-```python
+```text
 # Mapping from flash attention implementations to their kernel fallback repositories.
 
 FLASH_ATTN_KERNEL_FALLBACK = {
@@ -941,7 +941,7 @@ FLASH_ATTN_KERNEL_FALLBACK = {
 
 `.../transformers/modeling_utils.py:1985-2036`
 
-```python
+```text
         requested_original_flash_attn = False
         if is_flash_attention_requested(requested_attention_implementation=base_implementation):
             # If FA not installed, do not fail but use kernels instead if possible
@@ -1026,7 +1026,7 @@ FLASH_ATTN_KERNEL_FALLBACK = {
 
 `.../transformers/processing_utils.py:2008-2024`
 
-```python
+```text
         processor_kwargs = processor_kwargs or {}
 
         if chat_template is None:
@@ -1076,7 +1076,7 @@ is None:` 밖으로 나가므로 프로세서에 템플릿이 없어도 된다. 
 
 `.../transformers/models/qwen2_vl/image_processing_qwen2_vl.py:194-230`
 
-```python
+```text
             batch_size, channel = patches.shape[:2]
             grid_h, grid_w = resized_height // patch_size, resized_width // patch_size
             patches = patches.reshape(
@@ -1132,7 +1132,7 @@ is None:` 밖으로 나가므로 프로세서에 템플릿이 없어도 된다. 
 
 `.../transformers/models/qwen3_vl/processing_qwen3_vl.py:76-79`
 
-```python
+```text
     def replace_image_token(self, image_inputs: dict, image_idx: int) -> str:
         merge_length = self.image_processor.merge_size**2
         num_image_tokens = image_inputs["image_grid_thw"][image_idx].prod() // merge_length

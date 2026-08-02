@@ -46,7 +46,7 @@
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/loader.py:2014-2019`
 
-```python
+```text
 class FastVisionModel(FastModel):
     pass
 
@@ -59,11 +59,11 @@ class FastTextModel(FastModel):
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/loader.py:1021`, `:1046-1056`
 
-```python
+```text
 class FastModel(FastBaseModel):
 ```
 
-```python
+```text
     @staticmethod
     @_offline_aware_load
     def from_pretrained(
@@ -81,7 +81,7 @@ class FastModel(FastBaseModel):
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/loader.py:335-347`
 
-```python
+```text
 class FastLanguageModel(FastLlamaModel):
     @staticmethod
     @_offline_aware_load
@@ -101,7 +101,7 @@ class FastLanguageModel(FastLlamaModel):
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/loader.py:411-421`
 
-```python
+```text
         # @_offline_aware_load already forced offline when needed; delegations inherit it.
         if load_in_8bit or full_finetuning or qat_scheme is not None:
             return FastModel.from_pretrained(
@@ -119,7 +119,7 @@ class FastLanguageModel(FastLlamaModel):
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/vision.py:807-819`
 
-```python
+```text
 class FastBaseModel:
     @staticmethod
     @_offline_aware_load
@@ -146,7 +146,7 @@ class FastBaseModel:
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/vision.py:1162-1187`
 
-```python
+```text
         elif load_in_16bit:
             bnb_config = None
         elif not load_in_4bit and not load_in_8bit and not full_finetuning:
@@ -181,7 +181,7 @@ class FastBaseModel:
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/vision.py:1749-1758`
 
-```python
+```text
         model._unsloth_trust_remote_code = trust_remote_code
         # Post patches
         model = FastBaseModel.post_patch_model(
@@ -200,7 +200,7 @@ class FastBaseModel:
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/vision.py:2086-2094`
 
-```python
+```text
     def post_patch_model(
         model,
         use_gradient_checkpointing = True,
@@ -214,7 +214,7 @@ class FastBaseModel:
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/vision.py:2122-2132`
 
-```python
+```text
         model = prepare_model_for_training(
             model,
             use_gradient_checkpointing = use_gradient_checkpointing,
@@ -232,7 +232,7 @@ class FastBaseModel:
 
 `/Users/jwcho/.cache/uv/archive-v0/PM921ZbVZCUP68sU/unsloth_zoo/training_utils.py:376-412`
 
-```python
+```text
     for name, param in model.named_parameters():
         original_name = name
         upcast = False
@@ -291,7 +291,7 @@ PEFT 모델이 아니면 애초에 열리지 않는다.
 
 `/Users/jwcho/.cache/uv/archive-v0/PM921ZbVZCUP68sU/unsloth_zoo/training_utils.py:477-485`
 
-```python
+```text
     # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
     if use_reentrant:
         if hasattr(model, "enable_input_require_grads"):
@@ -308,7 +308,7 @@ PEFT 모델이 아니면 애초에 열리지 않는다.
 
 `/Users/jwcho/.cache/uv/archive-v0/plcyRhzg-LE7LDvn/transformers/modeling_utils.py:2127-2158`
 
-```python
+```text
     def enable_input_require_grads(self):
         """
         Enables the gradients for the input embeddings. This is useful for fine-tuning adapter weights while keeping
@@ -368,7 +368,7 @@ trainable_params=0` 인데 `infonce_backward` 를 통과한 것이 정확히 이
 `padding_side = "left"` 가 인자로 박혀 있는 줄: `vision.py:694`, `:1507`, `:1522`, `:1533`, `:1638`, `:1674`, `:1683`.
 아래는 `:1506-1513` (`ForConditionalGeneration` 계열 프로세서 로드).
 
-```python
+```text
                     _tok = auto_processor.from_pretrained(
                         tokenizer_name,
                         padding_side = "left",
@@ -385,7 +385,7 @@ trainable_params=0` 인데 `infonce_backward` 를 통과한 것이 정확히 이
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/vision.py:1715-1727`
 
-```python
+```text
         # Save tokenizer for inference purposes
         tokenizer.padding_side = "left"  # Force inference
         if hasattr(tokenizer, "tokenizer"):
@@ -405,7 +405,7 @@ trainable_params=0` 인데 `infonce_backward` 를 통과한 것이 정확히 이
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/vision.py:2166-2175`
 
-```python
+```text
         # Patch tokenizer to pad to the left
         m = model
         while hasattr(m, "model"):
@@ -422,7 +422,7 @@ trainable_params=0` 인데 `infonce_backward` 를 통과한 것이 정확히 이
 
 `vision.py:2234-2236` (for_inference → `"left"`)
 
-```python
+```text
             # Pad tokenizer to the left
             if hasattr(m, "_saved_temp_tokenizer"):
                 m._saved_temp_tokenizer.padding_side = "left"
@@ -430,7 +430,7 @@ trainable_params=0` 인데 `infonce_backward` 를 통과한 것이 정확히 이
 
 `vision.py:2295-2297` (for_training → `"right"`, 주석은 "left" 라고 적혀 있으나 코드는 `"right"`)
 
-```python
+```text
             # Pad tokenizer to the left
             if hasattr(m, "_saved_temp_tokenizer"):
                 m._saved_temp_tokenizer.padding_side = "right"
@@ -452,7 +452,7 @@ unsloth 가 내놓는 학습 진입점은 셋이고, 셋 다 **HF/TRL Trainer �
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/vision.py:2279-2316`
 
-```python
+```text
     def for_training(model, use_gradient_checkpointing = True):
         if not hasattr(model, "parameters"):
             raise TypeError(
@@ -492,7 +492,7 @@ unsloth 가 내놓는 학습 진입점은 셋이고, 셋 다 **HF/TRL Trainer �
 그러나 **`from_pretrained` 가 자동으로 호출하지는 않는다**. 반대로 `for_inference()` 는
 전역 env 두 개를 건드린다 (`vision.py:2269-2272`):
 
-```python
+```text
         # Must disable returning hidden states in the case for GRPO
         os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
         # Must enable returning logits
@@ -503,14 +503,14 @@ unsloth 가 내놓는 학습 진입점은 셋이고, 셋 다 **HF/TRL Trainer �
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/trainer.py:326-330`, `:434-435`
 
-```python
+```text
 if Version(transformers_version) > Version("4.45.2"):
 
     def unsloth_train(trainer, *args, **kwargs):
         return trainer.train(*args, **kwargs)
 ```
 
-```python
+```text
 class UnslothTrainer(SFTTrainer):
     def create_optimizer(self):
 ```
@@ -524,17 +524,17 @@ class UnslothTrainer(SFTTrainer):
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/__init__.py:22`
 
-```python
+```text
 from .sentence_transformer import FastSentenceTransformer
 ```
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/sentence_transformer.py:499`, `:1440-1466`
 
-```python
+```text
 class FastSentenceTransformer(FastModel):
 ```
 
-```python
+```text
     def from_pretrained(
         model_name,
         max_seq_length = None,
@@ -566,7 +566,7 @@ class FastSentenceTransformer(FastModel):
 
 `sentence_transformers` 가 없으면 명시적으로 거부한다 (`sentence_transformer.py:1467-1474`):
 
-```python
+```text
         try:
             from sentence_transformers import SentenceTransformer
             from sentence_transformers.models import Transformer, Pooling, Normalize
@@ -600,7 +600,7 @@ class FastSentenceTransformer(FastModel):
 
 `/Users/jwcho/.cache/uv/archive-v0/IQlv5ILnkP_MC_J8/unsloth/models/vision.py:2157-2164`
 
-```python
+```text
         from transformers.trainer import Trainer
 
         if (
@@ -623,7 +623,7 @@ class FastSentenceTransformer(FastModel):
 
 `/Users/jwcho/.cache/uv/archive-v0/PM921ZbVZCUP68sU/unsloth_zoo/loss_utils.py:137-156`
 
-```python
+```text
     # Now patch the losses!
     import transformers.modeling_utils
     LOSS_MAPPING = transformers.loss.loss_utils.LOSS_MAPPING
@@ -640,7 +640,7 @@ class FastSentenceTransformer(FastModel):
 그리고 그 `UnslothForCausalLMLoss` 자체가 `labels is None` 이면 즉시 `None` 을 돌린다
 (`loss_utils.py:113-116`):
 
-```python
+```text
     def UnslothForCausalLMLoss(
         logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
     ):
@@ -656,12 +656,12 @@ InfoNCE 는 `labels` 를 넘기지 않는다. 따라서 이 패치는 **호출 �
 
 `/Users/jwcho/.cache/uv/archive-v0/PM921ZbVZCUP68sU/unsloth_zoo/compiler.py:1794-1795`, `:1818-1826`
 
-```python
+```text
 NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
 RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 ```
 
-```python
+```text
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -695,7 +695,7 @@ elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGIT
 
 `trainbench/probe/steps.py:190-195`
 
-```python
+```text
     output = model(**batch, output_hidden_states=False)
     hidden = getattr(output, "last_hidden_state", None)
     if hidden is None:
@@ -710,7 +710,7 @@ transformers 5.5.0 의 `ModelOutput` 은 `None` 이 아닌 필드만 튜플로 �
 
 `/Users/jwcho/.cache/uv/archive-v0/plcyRhzg-LE7LDvn/transformers/utils/generic.py:461-466`, `:488-492`
 
-```python
+```text
     def __getitem__(self, k):
         if isinstance(k, str):
             inner_dict = dict(self.items())
@@ -719,7 +719,7 @@ transformers 5.5.0 의 `ModelOutput` 은 `None` 이 아닌 필드만 튜플로 �
             return self.to_tuple()[k]
 ```
 
-```python
+```text
     def to_tuple(self) -> tuple:
         """
         Convert self to a tuple containing all the attributes/keys that are not `None`.

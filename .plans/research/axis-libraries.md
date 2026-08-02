@@ -105,7 +105,7 @@ OK   nvidia_dali_cuda130-2.2.0-py3-none-manylinux_2_28_x86_64.whl  a957b654bd851
 
 `/private/tmp/.../pins/liger-kernel-0.8.1/liger_kernel/transformers/monkey_patch.py:3057-3064`:
 
-```python
+```text
 def apply_liger_kernel_to_qwen3_5(
     rope: bool = False,
     cross_entropy: bool = False,
@@ -118,14 +118,14 @@ def apply_liger_kernel_to_qwen3_5(
 
 `liger_kernel/transformers/__init__.py:243` 의 `__all__`에도 있다:
 
-```python
+```text
             "apply_liger_kernel_to_qwen3_5",
             "apply_liger_kernel_to_qwen3_5_moe",
 ```
 
 `monkey_patch.py:3569-3570` 의 model_type 매핑에도 있다:
 
-```python
+```text
     "qwen3_5": apply_liger_kernel_to_qwen3_5,
     "qwen3_5_text": apply_liger_kernel_to_qwen3_5,
 ```
@@ -137,7 +137,7 @@ Qwen3-VL-Embedding-2B 이고, liger 0.8.1은 그 엔트리포인트를 갖고 �
 
 `monkey_patch.py:2044-2051`:
 
-```python
+```text
 def apply_liger_kernel_to_qwen3_vl(
     rope: bool = True,
     cross_entropy: bool = False,
@@ -150,7 +150,7 @@ def apply_liger_kernel_to_qwen3_vl(
 
 `monkey_patch.py:3573-3574`:
 
-```python
+```text
     "qwen3_vl": apply_liger_kernel_to_qwen3_vl,
     "qwen3_vl_text": apply_liger_kernel_to_qwen3_vl,
 ```
@@ -163,7 +163,7 @@ def apply_liger_kernel_to_qwen3_vl(
 
 `trainbench/axes.py:121-123`:
 
-```python
+```text
 LIGER_UNSUPPORTED = {
     "gemma4": "Liger-Kernel#1186 is open (PLAN.md), so gemma-4 has no Liger path",
 }
@@ -172,7 +172,7 @@ LIGER_UNSUPPORTED = {
 liger-kernel **0.8.1** (native 핀)에는 gemma4 경로가 두 개 있다.
 `monkey_patch.py:1392-1400`:
 
-```python
+```text
 def apply_liger_kernel_to_gemma4(
     rope: bool = False,
     cross_entropy: bool = False,
@@ -192,7 +192,7 @@ def apply_liger_kernel_to_gemma4(
 
 `monkey_patch.py:3540-3541`:
 
-```python
+```text
     "gemma4_text": apply_liger_kernel_to_gemma4_text,
     "gemma4": apply_liger_kernel_to_gemma4,
 ```
@@ -214,7 +214,7 @@ $ grep -n '"gemma4' liger-kernel-0.8.0/.../monkey_patch.py
 
 `trainbench/axes.py:332-339`는 엔트리포인트를 못 찾으면 `dir(module)`로 후보를 뽑아 보여준다:
 
-```python
+```text
     apply = getattr(module, entrypoint, None)
     if not callable(apply):
         exported = sorted(n for n in dir(module) if n.startswith("apply_liger_kernel_to_"))
@@ -225,7 +225,7 @@ $ grep -n '"gemma4' liger-kernel-0.8.0/.../monkey_patch.py
 
 `__init__.py:103-113`:
 
-```python
+```text
 def __getattr__(name: str):
     """
     Handles lazy access to transformer-dependent attributes.
@@ -261,7 +261,7 @@ dir(m) = []
 `rope=False, cross_entropy=False, fused_linear_cross_entropy=True, rms_norm=True, swiglu=True, model=None`
 이고, `model=None` 경로는 모듈 전역을 갈아끼운다 (`monkey_patch.py:3104-3128`):
 
-```python
+```text
     if rms_norm:
         modeling_qwen3_5.Qwen3_5RMSNorm = LigerRMSNormForQwen3Next
 ...
@@ -347,7 +347,7 @@ fla/utils
 
 두 배포판은 `pkgutil` 네임스페이스로 합쳐진다. `fla-core-0.5.2/fla/__init__.py:8-12`:
 
-```python
+```text
 import importlib
 from pkgutil import extend_path
 
@@ -358,14 +358,14 @@ __version__ = "0.5.2"
 transformers가 import하는 심볼은 전부 `fla-core` 쪽에 있다 (확인 완료):
 `fla/modules/__init__.py:17,36` 에 `FusedRMSNormGated`, `fla/ops/gated_delta_rule/__init__.py:8-9` 에
 
-```python
+```text
 from .chunk import chunk_gated_delta_rule, chunk_gdn
 from .fused_recurrent import fused_recurrent_gated_delta_rule, fused_recurrent_gdn
 ```
 
 **결론: 현재 lock들은 정상이다.** 다만 `axes.py:147`의
 
-```python
+```text
 FLA_DISTRIBUTIONS = ("flash-linear-attention", "fla")
 ```
 
@@ -376,7 +376,7 @@ FLA_DISTRIBUTIONS = ("flash-linear-attention", "fla")
 
 ### 2.3 `axes.py:143-145` 의 주장은 원문과 다르다
 
-```python
+```text
 # `fla` publishes no entry in transformers' `PACKAGE_DISTRIBUTION_MAPPING`, so
 # that predicate resolves the version by distribution name and falls back to
 # importing the package — the same two steps, in the same order, as below.
@@ -385,7 +385,7 @@ FLA_DISTRIBUTIONS = ("flash-linear-attention", "fla")
 `PACKAGE_DISTRIBUTION_MAPPING` 은 transformers가 관리하는 표가 아니다. import 시점에 설치 환경에서
 계산된다. `Kur5R2PrM3RUwEti/transformers/utils/import_utils.py:47`:
 
-```python
+```text
 PACKAGE_DISTRIBUTION_MAPPING = importlib.metadata.packages_distributions()
 ```
 
@@ -393,7 +393,7 @@ PACKAGE_DISTRIBUTION_MAPPING = importlib.metadata.packages_distributions()
 `packages_distributions()["fla"]` 에는 **엔트리가 존재한다**. 따라서 `import_utils.py:59-69` 의
 distribution-name 경로가 잡히고, 70-77행의 import 폴백은 돌지 않는다:
 
-```python
+```text
             distributions = PACKAGE_DISTRIBUTION_MAPPING[pkg_name]
             # Per PEP 503, underscores and hyphens are equivalent in package names.
             # Prefer the distribution that matches the (normalized) package name.
@@ -415,7 +415,7 @@ distribution-name 경로가 잡히고, 70-77행의 import 폴백은 돌지 않�
 
 `import_utils.py:869-877`:
 
-```python
+```text
 @lru_cache
 def is_flash_linear_attention_available():
     is_available, fla_version = _is_package_available("fla", return_version=True)
@@ -437,7 +437,7 @@ def is_causal_conv1d_available() -> bool:
 
 `Kur5R2PrM3RUwEti/transformers/models/qwen3_5/modeling_qwen3_5.py:68-78`:
 
-```python
+```text
 if is_causal_conv1d_available():
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 else:
@@ -453,7 +453,7 @@ else:
 
 `modeling_qwen3_5.py:219-221` — 네 심볼이 **전부** 있어야 fast path다:
 
-```python
+```text
 is_fast_path_available = all(
     (causal_conv1d_fn, causal_conv1d_update, chunk_gated_delta_rule, fused_recurrent_gated_delta_rule)
 )
@@ -461,7 +461,7 @@ is_fast_path_available = all(
 
 `modeling_qwen3_5.py:421-431` — 폴백 결선과, 예외 없는 경고 한 줄:
 
-```python
+```text
         self.causal_conv1d_fn = causal_conv1d_fn
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
         self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
@@ -477,7 +477,7 @@ is_fast_path_available = all(
 
 `causal_conv1d_fn` 만 `or` 폴백이 없다. 대신 forward에서 분기한다 (`modeling_qwen3_5.py:492-501`):
 
-```python
+```text
             if self.causal_conv1d_fn is not None:
                 mixed_qkv = self.causal_conv1d_fn(
                     x=mixed_qkv,
@@ -494,7 +494,7 @@ is_fast_path_available = all(
 
 정규화도 갈린다 (`modeling_qwen3_5.py:409-417`):
 
-```python
+```text
         self.norm = (
             Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
             if FusedRMSNormGated is None
@@ -524,14 +524,14 @@ liger와의 상호작용도 여기서 보인다. liger는 `Qwen3_5RMSNorm` 을 �
 
 `Kur5R2PrM3RUwEti/transformers/utils/import_utils.py:144-145`:
 
-```python
+```text
 KERNELS_MIN_VERSION = "0.15.2"
 KERNELS_MAX_VERSION = "0.16.0"
 ```
 
 `import_utils.py:693-701`:
 
-```python
+```text
 @lru_cache
 def is_kernels_available(MIN_VERSION: str = KERNELS_MIN_VERSION, MAX_VERSION: str = KERNELS_MAX_VERSION) -> bool:
     is_available, kernels_version = _is_package_available("kernels", return_version=True)
@@ -558,7 +558,7 @@ False
 `Kur5R2PrM3RUwEti/transformers/integrations/hub_kernels.py:61` 이 `if is_kernels_available():` 이고,
 `387-409` 가 그 else다:
 
-```python
+```text
 else:
     _kernels_enabled = False
 
@@ -587,14 +587,14 @@ kernels를 `>=0.15.2,<0.16.0` 으로 내리거나, transformers를 창이 넓어
 
 `hub_kernels.py:57-58` — **모듈 최상위**:
 
-```python
+```text
 _TRANSFORMERS_USE_HUB_KERNELS = os.environ.get("USE_HUB_KERNELS", "YES").upper()
 _kernels_enabled = _TRANSFORMERS_USE_HUB_KERNELS in ENV_VARS_TRUE_VALUES
 ```
 
 `kernels-0.16.0/kernels/layer/globals.py:6` — 마찬가지로 모듈 최상위:
 
-```python
+```text
 _DISABLE_KERNEL_MAPPING: bool = bool(int(os.environ.get("DISABLE_KERNEL_MAPPING", "0")))
 ```
 
@@ -606,7 +606,7 @@ _DISABLE_KERNEL_MAPPING: bool = bool(int(os.environ.get("DISABLE_KERNEL_MAPPING"
 
 반면 캐시/오버라이드 계열은 호출 시마다 읽는다 (`kernels/utils.py:171-181`):
 
-```python
+```text
 def _get_cache_dir() -> str | None:
     """Returns the kernels cache directory."""
     return os.environ.get("KERNELS_CACHE", None)
@@ -624,7 +624,7 @@ def _get_local_kernel_overrides() -> dict[str, Path]:
 
 `kernels-0.16.0/kernels/layer/layer.py:65-77` — `version`과 `revision`은 **배타적이고 둘 중 하나는 필수**:
 
-```python
+```text
     def __init__(
         self,
         repo_id: str,
@@ -643,7 +643,7 @@ def _get_local_kernel_overrides() -> dict[str, Path]:
 `version` 은 **`int`** 다 (semver 문자열이 아니다). transformers의 기본 매핑도 그렇게 쓴다
 (`hub_kernels.py:237-241`):
 
-```python
+```text
                     Mode.INFERENCE: LayerRepository(
                         repo_id="kernels-community/mlx_rmsnorm",
                         layer_name="RMSNorm",
@@ -653,7 +653,7 @@ def _get_local_kernel_overrides() -> dict[str, Path]:
 
 `kernels/utils.py:706-731` — `get_locked_kernel()`:
 
-```python
+```text
 def get_locked_kernel(repo_id: str, local_files_only: bool = False) -> ModuleType:
     """
     Get a kernel using a lock file.
@@ -686,7 +686,7 @@ def get_locked_kernel(repo_id: str, local_files_only: bool = False) -> ModuleTyp
 를 부른다. 런타임 fetch 금지를 강제하려면 `local_files_only=True` 를 넘기거나, 아래
 `load_kernel` 을 쓰는 쪽이 맞다 (`utils.py:646-652`) — 이건 **이미 받아둔 것만** 쓴다:
 
-```python
+```text
 def load_kernel(
     repo_id: str,
     *,
@@ -698,7 +698,7 @@ def load_kernel(
 
 `utils.py:697-702` 가 미다운로드 시의 거동:
 
-```python
+```text
     except FileNotFoundError as e:
         raise FileNotFoundError(
             f"Locked kernel `{repo_id}` was not downloaded or does not have an "
@@ -711,7 +711,7 @@ def load_kernel(
 
 `utils.py:734-750`:
 
-```python
+```text
 def _get_caller_locked_kernel(repo_id: str) -> str | None:
     for dist in _get_caller_distributions():
         lock_json = dist.read_text("kernels.lock")
@@ -735,7 +735,7 @@ def _get_locked_kernel(repo_id: str, lock_json: str) -> str | None:
 dist-info 안에** 들어가 있어야 한다 (`trainbench` 를 설치할 때 패키징되어야 한다는 뜻).
 스키마는 `kernels/lockfile.py:15-30`:
 
-```python
+```text
 class VariantLock:
     hash: str
     hash_type: str = "git_lfs_concat"
@@ -757,7 +757,7 @@ class KernelLock:
 
 `bitsandbytes-0.50.0/bitsandbytes/optim/__init__.py` 전문 중 관련부:
 
-```python
+```text
 from .adagrad import Adagrad, Adagrad8bit, Adagrad32bit
 from .adam import Adam, Adam8bit, Adam32bit, PagedAdam, PagedAdam8bit, PagedAdam32bit
 from .adamw import (
@@ -783,7 +783,7 @@ from .sgd import SGD, SGD8bit, SGD32bit
 
 `bitsandbytes/optim/adamw.py:62-75`:
 
-```python
+```text
 class AdamW8bit(Optimizer2State):
     def __init__(
         self,
@@ -802,7 +802,7 @@ class AdamW8bit(Optimizer2State):
 
 `optim_bits` 의 기본값이 **32**인데 이건 8bit를 끄지 않는다. `adamw.py:105-123`:
 
-```python
+```text
             raise ValueError("AdamW8bit does not support amsgrad=True")
 
         if optim_bits != 32:
@@ -835,7 +835,7 @@ class AdamW8bit(Optimizer2State):
 
 `Kur5R2PrM3RUwEti/transformers/utils/quantization_config.py:441-453`:
 
-```python
+```text
     def __init__(
         self,
         load_in_8bit=False,
@@ -867,7 +867,7 @@ class AdamW8bit(Optimizer2State):
 
 `deepspeed-0.19.3/deepspeed/__init__.py:93-107`:
 
-```python
+```text
 def initialize(
     args: Any = None,
     model: torch.nn.Module = None,
@@ -892,7 +892,7 @@ def initialize(
 
 `deepspeed/runtime/engine.py`:
 
-```python
+```text
 1110:    def zero_optimization(self):
 1111:        return self._config.zero_enabled
 
@@ -924,7 +924,7 @@ def initialize(
 
 값 도메인 (`deepspeed/runtime/zero/config.py:81-87`):
 
-```python
+```text
 class ZeroStageEnum(int, Enum):
     """ Enum class for possible zero stages """
     disabled = 0
@@ -936,7 +936,7 @@ class ZeroStageEnum(int, Enum):
 
 `deepspeed/runtime/zero/offload_config.py:14-18`:
 
-```python
+```text
 class OffloadDeviceEnum(str, Enum):
     """ Enum for valid offload devices """
     none = "none"
@@ -1036,7 +1036,7 @@ pytorch = [
 
 recipe 종류 판별은 클래스메서드다 (`__init__.py:136-144`):
 
-```python
+```text
     @classmethod
     def nvfp4(cls):
         """Whether the given recipe is NVFP4 1D block scaling."""
@@ -1052,7 +1052,7 @@ recipe 종류 판별은 클래스메서드다 (`__init__.py:136-144`):
 
 `transformer_engine/pytorch/quantization.py:931-959`:
 
-```python
+```text
 def fp8_autocast(
     enabled: bool = True,
     calibrating: bool = False,
@@ -1086,7 +1086,7 @@ def fp8_autocast(
 
 현행 API (`quantization.py:1012-1019`):
 
-```python
+```text
     def __init__(
         self,
         enabled: bool = True,
@@ -1107,7 +1107,7 @@ def fp8_autocast(
 
 `transformer_engine/pytorch/quantization.py:162-175`:
 
-```python
+```text
 def _compute_mxfp8_support() -> Tuple[bool, str]:
     """Return if fp8 support is available"""
     if get_device_compute_capability() >= (12, 0):
@@ -1131,7 +1131,7 @@ Blackwell)에서도 거부되므로 **정확히 CC 10.x** 가 필요하다.
 
 **추가 함정:** `check_recipe_support` 는 NVFP4를 검사하지 않는다 (`quantization.py:224-239`):
 
-```python
+```text
 def check_recipe_support(recipe: Recipe) -> None:
     """Check if the given recipe is supported."""
     if torch.compiler.is_compiling() and isinstance(recipe, DelayedScaling):
@@ -1169,7 +1169,7 @@ A100에서 "돌긴 돌았는데 nvfp4가 아닌" 숫자가 나온다 — 이 저
 
 `DALIGenericIterator.__init__` (`plugin/pytorch/__init__.py:132-144`):
 
-```python
+```text
     def __init__(
         self,
         pipelines: Union[List[Pipeline], Pipeline],

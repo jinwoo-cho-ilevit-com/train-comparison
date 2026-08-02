@@ -52,7 +52,7 @@ lock 이 요구하는 것은 `download.pytorch.org/whl/cu130` 의 `2.13.0+cu130`
 
 `swift/model/register.py:516-542` (시그니처 일부):
 
-```python
+```text
 def get_model_processor(
     model_id_or_path: str,
     *,
@@ -61,14 +61,14 @@ def get_model_processor(
     load_model: bool = True,
 ```
 
-```python
+```text
     quantization_config=None,
     max_memory: Union[str, Dict[str, Any]] = None,
     attn_impl: Optional[str] = None,
     experts_impl: Optional[str] = None,
 ```
 
-```python
+```text
     model_kwargs: Optional[Dict[str, Any]] = None,
     **kwargs,
 ) -> Tuple[Optional[PreTrainedModel], Processor]:
@@ -84,7 +84,7 @@ docstring 이 `model_kwargs` 를 정확히 그렇게 정의한다 — `swift/mod
 
 `swift/model/register.py:594-596` — 보증되는 dict:
 
-```python
+```text
     if model_kwargs is None:
         model_kwargs = {}
     if download_model is None:
@@ -92,7 +92,7 @@ docstring 이 `model_kwargs` 를 정확히 그렇게 정의한다 — `swift/mod
 
 `swift/model/register.py:612-630` — 로더에 그대로 전달:
 
-```python
+```text
     model_kwargs['device_map'] = device_map
     if quantization_config:
         model_kwargs['quantization_config'] = quantization_config
@@ -116,12 +116,12 @@ docstring 이 `model_kwargs` 를 정확히 그렇게 정의한다 — `swift/mod
 
 `swift/model/register.py:199-213` — 로더가 보관하고 dtype 만 덧쓴다:
 
-```python
+```text
         self.model_kwargs = model_kwargs
         self.patch_offload = kwargs.pop('patch_offload', False)
 ```
 
-```python
+```text
         if version.parse(transformers.__version__) >= version.parse('4.56'):
             model_kwargs['dtype'] = self.torch_dtype
         else:
@@ -130,7 +130,7 @@ docstring 이 `model_kwargs` 를 정확히 그렇게 정의한다 — `swift/mod
 
 `swift/model/register.py:463-467` — `load()` 가 그 복사본을 `get_model` 에 넘긴다:
 
-```python
+```text
     def _get_model_processor(self, model_dir, config):
         processor = self.get_processor(model_dir, config)
         model = None
@@ -140,7 +140,7 @@ docstring 이 `model_kwargs` 를 정확히 그렇게 정의한다 — `swift/mod
 
 `swift/model/register.py:315-317` — 종착지:
 
-```python
+```text
             with context():
                 model = auto_model_cls.from_pretrained(
                     model_dir, config=config, trust_remote_code=self.default_trust_remote_code, **model_kwargs)
@@ -151,13 +151,13 @@ docstring 이 `model_kwargs` 를 정확히 그렇게 정의한다 — `swift/mod
 `attn_impl` 은 `from_pretrained` 인자가 되지 않는다. config 속성으로 심긴다 —
 `swift/model/utils.py:26-52`:
 
-```python
+```text
 class AttnImpl:
     attn_impl_keys = ['_attn_implementation', 'attn_implementation', 'llm_attn_implementation']
     use_flash_attn_keys = ['_flash_attn_2_enabled', 'use_flash_attn', '_use_flash_attention_2']
 ```
 
-```python
+```text
     @staticmethod
     def update_attn_impl(config: PretrainedConfig,
                          attn_impl: Optional[str],
@@ -173,7 +173,7 @@ class AttnImpl:
 로더 생성자가 `attn_implementation` 이라는 이름의 자유 kwarg 도 같은 슬롯으로 받아준다 —
 `swift/model/register.py:204-206`:
 
-```python
+```text
         attn_impl = attn_impl or kwargs.get('attn_implementation')
         self.attn_impl = attn_impl
         self.attn_impl_keys = None
@@ -189,7 +189,7 @@ class AttnImpl:
 
 CLI/arguments 경로에는 정말로 통로가 없다. `swift/arguments/base_args/model_args.py:228-249`:
 
-```python
+```text
     def get_model_kwargs(self):
         return {
             'model_id_or_path': self.model,
@@ -224,7 +224,7 @@ CLI/arguments 경로에는 정말로 통로가 없다. `swift/arguments/base_arg
 
 `swift/model/models/qwen.py:1442-1448`:
 
-```python
+```text
 class Qwen3_5Loader(Qwen3VLLoader):
 
     def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
@@ -239,7 +239,7 @@ class Qwen3_5Loader(Qwen3VLLoader):
 
 등록 테이블이 `Qwen/Qwen3.5-0.8B` 를 여기에 넣는다 — `swift/model/models/qwen.py:1451-1480`:
 
-```python
+```text
 register_model(
     ModelMeta(
         MLLMModelType.qwen3_5,
@@ -250,7 +250,7 @@ register_model(
                     Model('Qwen/Qwen3.5-2B', 'Qwen/Qwen3.5-2B'),
 ```
 
-```python
+```text
         Qwen3_5Loader,
         model_arch=ModelArch.qwen2_vl,
         architectures=['Qwen3_5ForConditionalGeneration'],
@@ -260,7 +260,7 @@ register_model(
 
 `MLLMModelType` 에 있으면 멀티모달로 표시된다 — `swift/model/model_meta.py:92-93`:
 
-```python
+```text
         if self.model_type in MLLMModelType.__dict__:
             self.is_multimodal = True
 ```
@@ -271,7 +271,7 @@ register_model(
 
 **(b) 로더가 `model.visual` 을 만진다.** `swift/model/models/qwen.py:761-769`:
 
-```python
+```text
 class Qwen2VLLoader(ModelLoader):
 
     def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
@@ -286,7 +286,7 @@ class Qwen2VLLoader(ModelLoader):
 `.visual` 은 최상위 클래스에는 없다. 핀 transformers 5.12.1 에서
 `/Users/jwcho/.cache/uv/archive-v0/uOhIKcY-1QKGNf7V/transformers/models/qwen3_5/modeling_qwen3_5.py:1709-1719`:
 
-```python
+```text
 class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
     # Reference: fix gemma3 grad acc #37208
@@ -300,7 +300,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
 `.visual` 은 안쪽에 있다 — 같은 파일 `1236-1245`:
 
-```python
+```text
 class Qwen3_5Model(Qwen3_5PreTrainedModel):
     base_model_prefix = "model"
     # Reference: fix gemma3 grad acc #37208
@@ -316,7 +316,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
 ms-swift 가 그 간극을 transformers 5 호환 훅으로 메운다. `swift/model/register.py:329-331`
 (`super().get_model` 이 돌아오기 직전, 즉 `base_model.visual` 접근보다 **먼저** 실행된다):
 
-```python
+```text
         if transformers_5:
             self._compat_transformers5(model)
         return model
@@ -324,7 +324,7 @@ ms-swift 가 그 간극을 transformers 5 호환 훅으로 메운다. `swift/mod
 
 `swift/model/register.py:68-72`:
 
-```python
+```text
     def _compat_transformers5(self, model):
         if self.model_meta.is_multimodal:
             for key in ['language_model', 'vision_tower', 'multi_modal_projector', 'visual', 'vision_model']:
@@ -333,7 +333,7 @@ ms-swift 가 그 간극을 transformers 5 호환 훅으로 메운다. `swift/mod
 
 `swift/model/register.py:120-130`:
 
-```python
+```text
 def _set_property(model, key):
     if not hasattr(model, 'model'):
         return
@@ -354,7 +354,7 @@ def _set_property(model, key):
 
 **(c) LoRA `all-linear` 이 리스트가 아니라 정규식이 된다.** `swift/pipelines/train/tuner.py:91-110`:
 
-```python
+```text
 def get_target_modules(args, model) -> Union[str, List[str]]:
     """Replace all-linear to actual modules"""
     if isinstance(args.target_modules, str):
@@ -375,7 +375,7 @@ def get_target_modules(args, model) -> Union[str, List[str]]:
 
 `swift/utils/transformers_utils.py:208-225` — 기본값이 vit/aligner 를 얼린다:
 
-```python
+```text
 def get_multimodal_target_regex(
     model,
     *,
@@ -398,7 +398,7 @@ def get_multimodal_target_regex(
 
 `qwen2_vl` arch 의 실제 접두사 — `swift/model/model_arch.py:575-583`:
 
-```python
+```text
 if transformers_ge_4_52:
     register_model_arch(
         MultiModelKeys(
@@ -417,7 +417,7 @@ if transformers_ge_4_52:
 
 Qwen3-VL-Embedding-2B 는 별도 로더/템플릿을 갖는다 — `swift/model/models/qwen.py:2130-2153`:
 
-```python
+```text
 class Qwen3VLEmbLoader(Qwen3VLLoader):
 
     def _check_qwen_vl_utils(self):
@@ -427,7 +427,7 @@ class Qwen3VLEmbLoader(Qwen3VLLoader):
         super()._check_qwen_vl_utils()
 ```
 
-```python
+```text
         Qwen3VLEmbLoader,
         template=TemplateType.qwen3_vl_emb,
         model_arch=ModelArch.qwen3_vl,
@@ -441,7 +441,7 @@ class Qwen3VLEmbLoader(Qwen3VLLoader):
 
 gemma-4-E2B 도 등록되어 있다 — `swift/model/models/gemma.py:422-454`:
 
-```python
+```text
 class Gemma4Loader(ModelLoader):
 
     def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
@@ -452,13 +452,13 @@ class Gemma4Loader(ModelLoader):
         return model
 ```
 
-```python
+```text
             ModelGroup([
                 Model('google/gemma-4-E2B', 'google/gemma-4-E2B'),
                 Model('google/gemma-4-E2B-it', 'google/gemma-4-E2B-it'),
 ```
 
-```python
+```text
                        template=TemplateType.gemma4_nothinking),
 ```
 
@@ -475,7 +475,7 @@ AGENTS.md 가 기록한 "gemma-4-E2B 에 `chat_template.jinja` 가 없어 `apply
 
 `swift/model/models/qwen.py:1089-1093` (Qwen3.5 가 물려받는 판본):
 
-```python
+```text
 class Qwen3VLLoader(Qwen2VLLoader):
 
     def _check_qwen_vl_utils(self):
@@ -486,7 +486,7 @@ class Qwen3VLLoader(Qwen2VLLoader):
 `try` 가 없다. 그리고 프로세서 로드가 반드시 이걸 지난다 —
 `swift/model/models/qwen.py:782-789`:
 
-```python
+```text
     def get_processor(self, model_dir: str, config: PretrainedConfig) -> Processor:
         self._check_qwen_vl_utils()
         from qwen_vl_utils import vision_process
@@ -503,7 +503,7 @@ lock 이 `qwen-vl-utils 0.0.14` 를 고정하므로 (`envs/ms-swift/uv.lock:1661
 `require_version` 이 실제로 무엇을 던지는지 — 핀 transformers 5.12.1,
 `/Users/jwcho/.cache/uv/archive-v0/uOhIKcY-1QKGNf7V/transformers/utils/versions.py:100-111`:
 
-```python
+```text
     # check if any version is installed
     try:
         got_ver = importlib.metadata.version(pkg)
@@ -520,7 +520,7 @@ lock 이 `qwen-vl-utils 0.0.14` 를 고정하므로 (`envs/ms-swift/uv.lock:1661
 
 같은 파일 `36-45`:
 
-```python
+```text
 def _compare_versions(op, got_ver, want_ver, requirement, pkg, hint):
     if got_ver is None or want_ver is None:
         raise ValueError(
@@ -539,7 +539,7 @@ def _compare_versions(op, got_ver, want_ver, requirement, pkg, hint):
 
 `swift/model/model_meta.py:106-119`:
 
-```python
+```text
     def check_requires(self, model_info=None):
         extra_requires = []
         if model_info and model_info.quant_method:
@@ -559,7 +559,7 @@ def _compare_versions(op, got_ver, want_ver, requirement, pkg, hint):
 `except ImportError` 가 위의 두 예외를 **전부 삼키고 warning 한 줄만 남긴다.**
 호출 지점은 모델 적재 직전이다 — `swift/model/model_meta.py:327`:
 
-```python
+```text
     model_meta.check_requires(model_info)
 ```
 
@@ -578,7 +578,7 @@ def _compare_versions(op, got_ver, want_ver, requirement, pkg, hint):
 
 진입점 — `swift/template/register.py:55-75` (일부):
 
-```python
+```text
 def get_template(
     processor: Processor,
     default_system: Optional[str] = None,
@@ -587,24 +587,24 @@ def get_template(
     template_type: Optional[str] = None,
 ```
 
-```python
+```text
     # infer/deploy
     template_backend: Literal['swift', 'jinja'] = 'swift',
 ```
 
 같은 기본값이 Template 에 그대로 저장된다 — `swift/template/base.py:100`, `:140`:
 
-```python
+```text
         template_backend: Literal['swift', 'jinja'] = 'swift',
 ```
 
-```python
+```text
         self.template_backend = template_backend
 ```
 
 분기 — `swift/template/base.py:1485-1494`:
 
-```python
+```text
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         inputs.messages = deepcopy(inputs.messages)
         template_backend = self.template_backend
@@ -619,7 +619,7 @@ def get_template(
 
 `apply_chat_template` 은 오직 `_jinja_encode` 안에 있다 — `swift/template/base.py:1155-1159`:
 
-```python
+```text
         kwargs.update(self.chat_template_kwargs)
         kwargs.update(inputs.chat_template_kwargs)
         text = self.tokenizer.apply_chat_template(
@@ -634,7 +634,7 @@ causal_lm 인 경우. 우리 세 모델은 모두 등록되어 있어 `'dummy'` 
 swift 백엔드가 Qwen3.5 에서 무엇을 하는지는 템플릿이 직접 적어둔다 —
 `swift/template/templates/qwen.py:598-609`:
 
-```python
+```text
 class Qwen3_5Template(Qwen3VLTemplate):
     image_token_id = 248056
     video_token_id = 248057
@@ -658,7 +658,7 @@ class Qwen3_5Template(Qwen3VLTemplate):
 
 템플릿의 `task_type` 은 프로세서를 따라온다 — `swift/template/base.py:225-232`:
 
-```python
+```text
     def init_processor(self, processor: Processor) -> None:
         if processor is None or self._processor_inited:
             return
@@ -678,7 +678,7 @@ ms-swift 는 **loss 를 인자로 받는 자체 Trainer 계층**을 갖는다. �
 
 Trainer 선택 — `swift/trainers/trainer_factory.py:13-19`:
 
-```python
+```text
 class TrainerFactory:
     TRAINER_MAPPING = {
         'causal_lm': 'swift.trainers.Seq2SeqTrainer',
@@ -690,7 +690,7 @@ class TrainerFactory:
 
 loss 등록 테이블 — `swift/loss/mapping.py:6-16`:
 
-```python
+```text
 loss_map = {
     'cross_entropy': CustomCrossEntropyLoss,  # examples
     # embedding
@@ -706,7 +706,7 @@ loss_map = {
 
 주입 지점 — `swift/trainers/mixin.py:1046-1054`:
 
-```python
+```text
     def create_loss_and_eval_metric(self, args):
         res = {}
         if args.eval_metric is not None:
@@ -720,13 +720,13 @@ loss_map = {
 
 CLI 필드 — `swift/trainers/arguments.py:165`:
 
-```python
+```text
     loss_type: Optional[str] = field(default=None, metadata={'help': f'loss_func choices: {list(loss_map.keys())}'})
 ```
 
 `task_type` 필드 — `swift/arguments/base_args/model_args.py:72`:
 
-```python
+```text
     task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'reranker', 'generative_reranker'] = None
 ```
 
@@ -734,7 +734,7 @@ CLI 필드 — `swift/trainers/arguments.py:165`:
 
 `swift/model/register.py:324-326`:
 
-```python
+```text
         if model_info.task_type == 'embedding' and auto_model_cls.__name__ != 'AutoModel':
             from swift.model.patcher import patch_output_normalizer
             patch_output_normalizer(model, model_meta=model_meta)
@@ -742,7 +742,7 @@ CLI 필드 — `swift/trainers/arguments.py:165`:
 
 `swift/model/patcher.py:75-102`:
 
-```python
+```text
 def patch_output_normalizer(module: torch.nn.Module, model_meta):
 
     def lm_head_forward(self, hidden_states):
@@ -776,7 +776,7 @@ def patch_output_normalizer(module: torch.nn.Module, model_meta):
 `lm_head` 를 항등함수로 만들고, 마지막 유효 토큰을 뽑아 L2 정규화한 뒤 `last_hidden_state` 키로
 돌려준다. `InfonceLoss` 가 정확히 그 키를 읽는다 — `swift/loss/embedding.py:113-137`:
 
-```python
+```text
 class InfonceLoss(BaseLoss):
 
     def __call__(self, outputs, labels, **kwargs) -> torch.Tensor:
@@ -786,7 +786,7 @@ class InfonceLoss(BaseLoss):
         hard_negatives = os.environ.get('INFONCE_HARD_NEGATIVES', None)  # how many negative prompts kept in one sample
 ```
 
-```python
+```text
         # repeat of anchor(1)+positive(1)+negatives(n)
         sentences = outputs['last_hidden_state']
 ```
@@ -800,7 +800,7 @@ class InfonceLoss(BaseLoss):
 anchor/positive/negative 를 접두사로 나눠 인코딩하고 `labels` 를 `[1.0, 0.0, 0.0, ...]` 로 쌓으며,
 `swift/template/base.py:1773-1803` `_embedding_data_collator` 가 그걸 한 축으로 편다:
 
-```python
+```text
                 indexes = ['anchor_', 'positive_']
                 if max_neg is not None:
                     for i in range(0, max_neg):
@@ -818,7 +818,7 @@ anchor/positive/negative 를 접두사로 나눠 인코딩하고 `labels` 를 `[
 
 LoRA 쪽 특수 처리 — `swift/pipelines/train/tuner.py:169-175`:
 
-```python
+```text
         elif args.tuner_backend == 'peft':
             if task_type == 'EMBEDDING':
                 task_type = None
@@ -833,7 +833,7 @@ LoRA 쪽 특수 처리 — `swift/pipelines/train/tuner.py:169-175`:
 MRL 은 EmbeddingTrainer 가 loss 를 한 번 더 감싸서 구현한다 —
 `swift/trainers/embedding_trainer.py:11-35`:
 
-```python
+```text
 class EmbeddingTrainer(Trainer):
 
     def __init__(self, *args, **kwargs):
@@ -849,7 +849,7 @@ class EmbeddingTrainer(Trainer):
 `trainbench/probe/ms_swift.py:37` 은 `get_model_processor(config.model.hf_id)` 를 부른다.
 `task_type` 이 없다. 기본값 결정은 `swift/model/model_meta.py:295-303`:
 
-```python
+```text
     if task_type is None:
         if model_meta.is_reward:
             num_labels = 1
