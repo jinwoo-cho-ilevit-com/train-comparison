@@ -34,6 +34,33 @@ MIN_SETTING_SECONDS="${TRAINBENCH_MIN_SETTING_SECONDS:-${KILL_GRACE_SECONDS}}"
 BUDGET_EXHAUSTED=125
 mkdir -p "${RESULT_DIR}"
 
+# A container RunPod restarted must not redo work this pod already published.
+#
+# RunPod restarts a pod's container when it exits, whatever the exit code, and it
+# offers no way to ask it not to: `PodCreateInput` has 33 fields and none of them
+# is a restart policy (measured 2026-08-02 against rest.runpod.io's OpenAPI
+# document). So the first real pod ran its whole probe nine times in four minutes,
+# each iteration announcing, running and publishing from the top.
+#
+# Nothing showed, because a probe's result is deterministic and the second upload
+# had nothing to change. A timing run's is not: every restart would publish fresh
+# numbers over the last ones and the final container would silently win, with no
+# record of which container produced the number that survived. That is the reason
+# this guard is on the pod rather than only in the orchestrator's watch — the
+# watch can end a crashloop, but not before the second container has re-measured.
+#
+# The marker is written by an EXIT trap, so it covers every way out below,
+# including the two early refusals. It cannot cover SIGKILL, and that is the right
+# split: a container that was killed did not finish, and its plan is not published.
+DONE_MARKER="${RESULT_DIR}/.trainbench-done"
+if [[ -e "${DONE_MARKER}" ]]; then
+    echo "this pod already ran its plan and published it ($(cat "${DONE_MARKER}"));" \
+        "this container is a restart and will do nothing" >&2
+    exit 0
+fi
+trap 'printf "%s purpose=%s pod=%s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "${TRAINBENCH_PURPOSE:-probe}" "${RUNPOD_POD_ID:-unknown}" > "${DONE_MARKER}"' EXIT
+
 if [[ -z "${TRAINBENCH_CONFIG_JSON:-}" ]]; then
     echo "TRAINBENCH_CONFIG_JSON is not set; the orchestrator must pass the resolved config" >&2
     exit 2

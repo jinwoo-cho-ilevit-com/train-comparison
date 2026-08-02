@@ -8,8 +8,9 @@ pod that has finished look almost identical over the API — both report a null
 runtime — and the only thing separating them is whether a runtime was ever seen.
 Reading one snapshot cannot tell them apart, so this module keeps per-pod state.
 
-Two transports, on purpose. Creation goes over RunPod's REST API; reading and
-terminating stay on the `runpod` SDK's GraphQL calls. Neither half is a preference:
+Three transports, on purpose. Creation goes over RunPod's REST API; reading sends
+its own GraphQL document; terminating stays on the `runpod` SDK. None of that is a
+preference:
 
 - Creation cannot use the SDK. `runpod.api.mutations.pods` builds its mutation by
   f-string interpolation — `f'{{ key: "{k}", value: "{v}" }}'` for every env pair —
@@ -21,9 +22,11 @@ terminating stay on the `runpod` SDK's GraphQL calls. Neither half is a preferen
 - Reading cannot use REST. The REST `Pod` object has no `runtime` field, and
   `runtime` is the whole basis of the pending/running distinction below. Measured
   against the live account: 50 REST pod objects, not one carried the key, while
-  GraphQL `get_pod` returned a non-null runtime for a RUNNING pod and a null one
-  for an EXITED pod. Moving `get` to REST would make every pod read as pending
-  forever.
+  GraphQL returned a non-null runtime for a RUNNING pod and a null one for an
+  EXITED pod. Moving `get` to REST would make every pod read as pending forever.
+- Reading cannot use the SDK either, and that is the correction the first real pod
+  forced. `runpod.get_pod` selects `runtime { ports { … } }` and nothing else, so
+  the container clock this module is built on never arrived — see POD_QUERY.
 
 A restarting container is a third thing, and neither transport counts restarts.
 Measured 2026-08-02 against the live account, because guessing the field is how
@@ -45,6 +48,14 @@ hours to 8.9 days after it for six, while `lastStartedAt` equalled `createdAt`
 for every single pod. So the field resets under a pod that the rest of the API
 describes as continuously up, and that reset is the only restart this API will
 ever report. `observe` reads it; nothing else can.
+
+It is also *coarse*, which bounds what may be asked of it. Three healthy running
+pods, read five times twenty-two seconds apart (measured 2026-08-02): the value
+advanced in steps of exactly 29-31 seconds and stood still across a whole poll on
+every one of the three. So a fall is evidence and a *failure to climb* is not —
+"this clock has not moved in twenty seconds" describes a healthy pod here, and a
+liveness test built on it would terminate live pods. Only `restarted`'s fall test
+survives that measurement, and detection lags the restart by up to one refresh.
 """
 
 from __future__ import annotations
@@ -248,15 +259,61 @@ def create(spec: PodSpec, transport: Transport = send) -> dict[str, Any]:
     return pod
 
 
-def get(pod_id: str) -> dict[str, Any] | None:
-    """Read one pod. Stays on GraphQL because REST does not report a runtime.
+# The read, written out here rather than taken from the SDK, and the selection set
+# is the whole point. `runpod.get_pod` asks for `runtime { ports { … } }` — so the
+# runtime it returns is non-null, `container_uptime` finds no `uptimeInSeconds` in
+# it, and every container reads as `running` on its fortieth start. That is what
+# the first real pod did: nine probe runs in four minutes while the orchestrator
+# waited, and `uptime_seconds: null` in its ledger. Measured 2026-08-02 against
+# pod 0dw2kaljoo8pio in the same minute: the SDK's document returned `runtime`
+# keys `['ports']`, this one returned `uptimeInSeconds: 1188465`.
+#
+# Narrow on purpose beyond that. The SDK's document also selects `env`, which on
+# our pods carries an Infisical token, and `observe`'s payload is one traceback
+# away from a log. What is not asked for cannot leak.
+GRAPHQL_URL = "https://api.runpod.io/graphql"
+POD_QUERY = """
+query trainbenchPod($id: String!) {
+  pod(input: {podId: $id}) {
+    id
+    desiredStatus
+    runtime {
+      uptimeInSeconds
+    }
+  }
+}
+"""
+
+
+def read_request(pod_id: str) -> Request:
+    """The read on the wire. The id travels as a GraphQL variable.
 
     The SDK interpolates `pod_id` into its query the same unescaped way it
-    interpolates env values, so the defect is present here too — it is just not
-    reachable: the only value that reaches it is an id RunPod generated and handed
-    back from `create`, never anything this repository composes.
+    interpolates env values. That was never reachable here — the only value that
+    reaches it is an id RunPod generated — but a variable costs nothing and closes
+    the question rather than arguing it.
     """
-    return _client().get_pod(pod_id)
+    return Request(
+        method="POST",
+        url=GRAPHQL_URL,
+        headers={"Content-Type": "application/json"},
+        body=json.dumps({"query": POD_QUERY, "variables": {"id": pod_id}}).encode(),
+    )
+
+
+def get(pod_id: str, transport: Transport = send) -> dict[str, Any] | None:
+    """Read one pod, or None if the API no longer knows it.
+
+    GraphQL answers a failed query with HTTP 200 and an `errors` key, so the
+    envelope has to be unwrapped rather than returned: left alone, an error body
+    would reach `observe` as a pod with no `desiredStatus` and no `runtime` and be
+    read as `pending` — a pod that is still pulling its image, forever.
+    """
+    payload = transport(read_request(pod_id))
+    if errors := payload.get("errors"):
+        message = errors[0].get("message") if isinstance(errors[0], dict) else errors[0]
+        raise RuntimeError(f"RunPod GraphQL read of {pod_id}: {str(message)[:ERROR_BODY_CHARS]}")
+    return (payload.get("data") or {}).get("pod")
 
 
 def terminate(pod_id: str) -> None:

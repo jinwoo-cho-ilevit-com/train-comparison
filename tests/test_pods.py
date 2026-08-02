@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -261,6 +262,147 @@ def test_the_outcome_says_how_long_the_container_that_ended_it_had_lived():
     watch.track("p")
     watch.poll()
     assert watch.poll()[0].to_dict()["uptime_seconds"] == 11
+
+
+# --- the read has to ask for the clock the tests above are written on -------------
+#
+# Everything above hands `observe` a `runtime` dict with `uptimeInSeconds` in it.
+# The transport never did. `runpod.get_pod` selects `runtime { ports { … } }`, so
+# on a real pod `container_uptime` found nothing, `restarted` never fired, and the
+# first real pod (2026-08-02, `phase0-sentence_transformers-qwen3_5_0_8b`) ran its
+# whole probe nine times in four minutes while every reading said `running` — with
+# `uptime_seconds: null` in the ledger, the field that would have named it.
+#
+# So the shapes below are recorded from api.runpod.io on 2026-08-02 rather than
+# composed here, and the server stand-in honours a selection set instead of
+# answering whatever the test wants.
+
+# The `runtime` the SDK's document brings back for a RUNNING pod. Truthy, which is
+# why every reading said `running`, and clockless, which is why none said more.
+SDK_RUNTIME = {
+    "ports": [
+        {
+            "ip": "100.65.31.50",
+            "isIpPublic": False,
+            "privatePort": 19123,
+            "publicPort": 60216,
+            "type": "http",
+        },
+        {
+            "ip": "213.173.105.69",
+            "isIpPublic": True,
+            "privatePort": 22,
+            "publicPort": 28738,
+            "type": "tcp",
+        },
+    ]
+}
+# What the endpoint answers a document it will not run: HTTP 200 with `errors`.
+GRAPHQL_REJECTION = {
+    "errors": [
+        {
+            "message": 'Cannot query field "nope" on type "Pod".',
+            "locations": [{"line": 1, "column": 36}],
+            "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"},
+        }
+    ]
+}
+
+
+def graphql_server(uptime=None, exists=True):
+    """A stand-in for api.runpod.io that answers only what the document selects.
+
+    This is the part that has to be real. A transport returning a clock whichever
+    document arrives would pass just as happily against `runpod.get_pod`'s
+    document, which is the one that produced the incident — the endpoint gives you
+    the fields you asked for and no others, and both branches below were read off
+    the live API for the same pod in the same minute.
+    """
+
+    def transport(request):
+        assert request.url == pods.GRAPHQL_URL
+        assert request.method == "POST"
+        body = json.loads(request.body)
+        selection, pod_id = body["query"], body["variables"]["id"]
+        if not exists:
+            return {"data": {"pod": None}}
+        runtime = {}
+        if "ports" in selection:
+            runtime.update(SDK_RUNTIME)
+        if "uptimeInSeconds" in selection:
+            runtime["uptimeInSeconds"] = uptime
+        return {"data": {"pod": {"id": pod_id, "desiredStatus": "RUNNING", "runtime": runtime}}}
+
+    return transport
+
+
+def reading(uptime=None, previous=None, exists=True):
+    """One `observe` through the whole read path, transport included."""
+    return pods.observe(
+        "0dw2kaljoo8pio",
+        lambda pod_id: pods.get(pod_id, transport=graphql_server(uptime, exists)),
+        previous_uptime=previous,
+    )
+
+
+def test_the_sdk_read_this_replaced_never_asked_for_the_container_clock():
+    """Why `get` stopped delegating, pinned so the claim is checkable rather than told.
+
+    If this fails because the SDK started selecting the field, the fix here is
+    still correct — a narrow document is also what keeps the pod's env, and the
+    Infisical token in it, out of a payload one traceback away from a log.
+    """
+    queries = pytest.importorskip("runpod.api.queries.pods")
+    document = queries.generate_pod_query("abc123")
+    assert "runtime {" in document
+    assert "uptimeInSeconds" not in document, "the SDK document would have carried the clock"
+    assert re.search(r"^\s+env\s*$", document, re.M), "and it brings the pod's env back with it"
+
+
+def test_the_read_asks_for_the_clock_and_for_nothing_that_holds_a_secret():
+    assert "uptimeInSeconds" in pods.POD_QUERY
+    assert "desiredStatus" in pods.POD_QUERY
+    assert "env" not in pods.POD_QUERY
+
+
+def test_a_crashloop_is_visible_through_the_transport_the_orchestrator_actually_uses():
+    """The end-to-end shape of the defect: same assertion, real read path.
+
+    Point `POD_QUERY` back at `runtime { ports }` and this reads `running` again,
+    which is what the pod did for four minutes.
+    """
+    assert reading(uptime=3, previous=170).status == pods.RESTARTING
+    assert reading(uptime=190, previous=170).status == pods.RUNNING
+
+
+def test_a_healthy_pod_read_this_way_carries_its_clock_into_the_ledger():
+    assert reading(uptime=1188975).uptime_seconds == 1188975
+
+
+def test_the_pod_id_travels_as_a_variable_rather_than_into_the_document():
+    """The SDK interpolates it; this does not, so the question stops being an argument."""
+    body = json.loads(pods.read_request('"} injected {').body)
+    assert body["variables"] == {"id": '"} injected {'}
+    assert "injected" not in body["query"]
+
+
+def test_a_pod_the_api_no_longer_knows_reads_as_gone_through_the_envelope():
+    """`{"data": {"pod": null}}` — what the endpoint answered for an id that never existed."""
+    assert pods.get("nope", transport=graphql_server(exists=False)) is None
+    assert reading(exists=False).status == pods.GONE
+
+
+def test_a_rejected_document_is_a_non_answer_not_a_pod_still_pulling_its_image():
+    """GraphQL rejects with HTTP 200 and an `errors` key.
+
+    Returned whole, that envelope reaches `observe` as a pod with no
+    `desiredStatus` and no `runtime`, which reads as `pending` — a pod stuck
+    pulling its image until its deadline, with nothing in the ledger to say why.
+    """
+    rejected = lambda _: GRAPHQL_REJECTION  # noqa: E731
+    with pytest.raises(RuntimeError, match="Cannot query field"):
+        pods.get("p", transport=rejected)
+    assert pods.observe("p", lambda pid: pods.get(pid, transport=rejected)).status == pods.UNKNOWN
 
 
 # --- per-pod deadlines ---------------------------------------------------------
@@ -1671,6 +1813,54 @@ def test_a_probe_run_reaches_the_run_and_the_publish(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert any("verify_env.py" in line for line in logged)
     assert any("--mode start" in line for line in logged)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_restarted_container_does_not_run_the_pods_plan_a_second_time(tmp_path):
+    """The first real pod: exit 0, RunPod restarts the container, the probe runs again.
+
+    Nine times in four minutes, and nothing showed because a probe's result is
+    deterministic — the second upload had nothing to change. A timing run's is
+    not, so the second container would publish fresh numbers over the first's and
+    the ledger would name no container as the one that produced them.
+
+    Run twice against the same result directory, which is what a restarted
+    container sees, and the second run must announce nothing, measure nothing and
+    publish nothing.
+    """
+    env_dir = tmp_path / "envs" / "native"
+    env_dir.mkdir(parents=True)
+    env = {
+        "TRAINBENCH_CONFIG_JSON": json.dumps(resolved_config()),
+        "TRAINBENCH_ENV_DIR": str(env_dir),
+    }
+    first, logged = run_entrypoint(tmp_path, env)
+    assert first.returncode == 0, first.stderr
+    assert any("--mode start" in line for line in logged)
+    assert (tmp_path / "result" / ".trainbench-done").exists()
+
+    second, after = run_entrypoint(tmp_path, env)
+    assert second.returncode == 0, second.stderr
+    assert "this container is a restart and will do nothing" in second.stderr
+    assert "== announce ==" not in second.stdout
+    # `run_entrypoint` rebuilds the stubs but appends to the same log, so this is
+    # the second container having added no call of its own.
+    assert after == logged
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_pod_that_refused_its_own_config_is_also_not_run_again(tmp_path):
+    """The trap covers the early refusals too, which is where the loop is tightest.
+
+    A pod whose env is wrong fails in under a second, so RunPod restarts it far
+    faster than a working one — and no restart of it can end differently.
+    """
+    first, _ = run_entrypoint(tmp_path, {})
+    assert first.returncode == 2
+    assert "TRAINBENCH_CONFIG_JSON is not set" in first.stderr
+    second, _ = run_entrypoint(tmp_path, {})
+    assert second.returncode == 0
+    assert "this container is a restart" in second.stderr
 
 
 def test_a_started_file_alone_means_the_pod_ran_and_said_nothing(tmp_path):

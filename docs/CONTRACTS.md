@@ -862,6 +862,36 @@ class ProbeReport:
   - **다른 레인이 알아야 할 것**: `envs/*/pyproject.toml`이나 루트 `pyproject.toml`의
     의존성을 건드리면 해당 env에서 `uv lock`을 돌려야 게이트가 녹색이 된다.
 
+- 2026-08-02 **`pods.get`이 자기 GraphQL 문서를 보내고, 재시작한 컨테이너는 파드의
+  계획을 다시 돌리지 않는다** (`trainbench/pods.py`, `docker/entrypoint.sh`.
+  레인 C 소유. **원장의 `uptime_seconds`가 이제 실제로 채워지므로** 남긴다).
+  위 `pods.observe` 항목이 세운 재시작 판정은 **실 파드에서 한 번도 동작한 적이
+  없다.** 판정의 입력인 `runtime.uptimeInSeconds`를 `runpod.get_pod`가 요청하지 않기
+  때문이다 — SDK의 문서는 `runtime { ports { … } }`만 고른다. 그래서 `runtime`은
+  truthy이고(전부 `running`으로 읽힘) 시계는 항상 `None`이었다. 첫 실 파드
+  (`phase0-sentence_transformers-qwen3_5_0_8b`)가 4분간 프로브를 9번 다시 돌리는
+  동안 감시자는 계속 기다렸고, 원장에는 `uptime_seconds: null`이 남았다.
+  실측(2026-08-02, 같은 파드 `0dw2kaljoo8pio`, 같은 분): SDK 문서의 `runtime` 키는
+  `['ports']`, 이 저장소 문서는 `uptimeInSeconds: 1188465`.
+  - `pods.GRAPHQL_URL` / `pods.POD_QUERY` / `pods.read_request(pod_id)`가 생긴다.
+    `pods.get(pod_id, transport=send)`로 두 번째 인자가 늘었다(`create`와 같은 모양).
+    선택 필드는 `id` / `desiredStatus` / `runtime { uptimeInSeconds }` **뿐이다** —
+    SDK 문서가 함께 가져오던 `env`에는 파드의 Infisical 토큰이 들어 있다.
+  - GraphQL은 실패한 문서에 **HTTP 200 + `errors`**로 답한다. `get`이 봉투를 벗기고
+    `errors`면 예외를 던진다(→ `observe`가 `unknown`). 벗기지 않으면 그 봉투가
+    `desiredStatus`도 `runtime`도 없는 파드로 읽혀 **데드라인까지 `pending`**이다.
+  - `uptimeInSeconds`는 **30초 단위로 갱신된다**(실행 중 3대 x 5회, 22초 간격 실측:
+    증가폭 29~31초, 3대 모두 한 폴링 동안 정지). 떨어지면 증거이고 **안 오르는 것은
+    증거가 아니다** — 이 시계 위에 liveness 검사를 세우면 정상 파드를 죽인다.
+  - **파드 쪽**: `entrypoint.sh`가 `${RESULT_DIR}/.trainbench-done`을 EXIT trap으로
+    쓰고, 그 파일이 있으면 아무것도 하지 않고 exit 0 한다. RunPod은 종료 코드와
+    무관하게 컨테이너를 다시 띄우고 그러지 말라고 할 방법이 없다(`PodCreateInput`
+    33개 필드에 재시작 정책 없음, REST OpenAPI 실측). 감시자만 고치면 **두 번째
+    컨테이너가 이미 다시 측정한 뒤**에야 감시가 끝난다 — 프로브는 결정적이라 티가
+    안 나지만 timing 런은 매 재시작마다 새 숫자를 덮어쓰고 마지막 것이 조용히 남는다.
+  - **미확인으로 남는 것**: RunPod의 컨테이너 재시작이 컨테이너 디스크를 보존하는지
+    재지 못했다. 보존하지 않으면 이 sentinel은 무력하고 동작은 오늘과 같아진다.
+
 **새 레인 의무 — 파일을 추가하면 `PLAN.md` 구조 블록에 한 줄 추가한다.**
 위 반대 방향 때문에 생긴다. 열거되는 디렉터리(저장소 루트, `configs/`,
 `trainbench/`, `scripts/`, `tests/`, `docs/`)에 추적되는 파일이나 디렉터리를 새로
