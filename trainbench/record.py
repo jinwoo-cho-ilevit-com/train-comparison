@@ -13,6 +13,7 @@ import os
 import platform
 import socket
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -169,6 +170,11 @@ def build_record(
     """
     git = git_state()
     return {
+        # `time.time()`, not a monotonic clock: `scripts/report.py` sorts artifacts
+        # from different pods against each other, and a monotonic reading is only
+        # comparable within one process. The wall clock can step backwards under
+        # NTP, so ordering is correct to within that correction and no finer.
+        "recorded_at": time.time(),
         "git_commit": git["commit"],
         # A dirty tree means the recorded commit does not contain the measured code.
         "git_dirty": git["dirty"],
