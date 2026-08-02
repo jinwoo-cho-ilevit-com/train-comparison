@@ -340,11 +340,23 @@ def visual_token_count(
 def infonce_backward(
     model: Any, batch: dict[str, torch.Tensor], temperature: float, padding_side: str
 ) -> dict:
-    """One contrastive training step.
+    """One contrastive training step, refused when it trained nothing.
 
     This is the check that matters for framework support: patching that works for
     a language-modelling loss can still break when the loss is contrastive over
     pooled embeddings, because no LM head is involved.
+
+    A finite loss is not evidence that a step happened. Every framework here calls
+    something like `enable_input_require_grads`, which puts `requires_grad` on the
+    *embedding output* rather than on a parameter, so the graph stays
+    differentiable and `loss.backward()` returns normally even when every
+    parameter is frozen. The 2026-08-02 campaign recorded ok=True with
+    `trainable_params=0` on three cells for exactly that reason. The counts were
+    already in this detail and nothing read them, so they are asked here instead
+    of published for later.
+
+    Both counts are of parameter *tensors*, not elements; what they answer is
+    "did anything train", for which the number of elements is the wrong unit.
     """
     model.train()
     pooled = encode(model, batch, padding_side)
@@ -353,9 +365,25 @@ def infonce_backward(
     loss.backward()
     with_grad = sum(1 for p in model.parameters() if p.requires_grad and p.grad is not None)
     trainable = sum(1 for p in model.parameters() if p.requires_grad)
+    total = sum(1 for _ in model.parameters())
+    value = float(loss.detach())
     model.zero_grad(set_to_none=True)
+    if trainable == 0:
+        raise ValueError(
+            f"the backward ran and none of this model's {total} parameter tensors were "
+            f"trainable, so the step trained nothing; loss={value} is what a frozen graph "
+            "returns. This cell measures a model that cannot learn, and reporting it as "
+            "supported publishes a throughput figure for no training at all."
+        )
+    if with_grad == 0:
+        raise ValueError(
+            f"{trainable} of {total} parameter tensors are trainable and the backward "
+            f"reached none of them (loss={value}); the pooled embedding is detached from "
+            "every parameter this run would update."
+        )
     return {
-        "loss": float(loss.detach()),
+        "loss": value,
         "params_with_grad": with_grad,
         "trainable_params": trainable,
+        "total_params": total,
     }

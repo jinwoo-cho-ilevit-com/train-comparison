@@ -30,14 +30,28 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
     loaded: dict[str, Any] = {}
 
     def _load() -> dict[str, Any]:
+        # `full_finetuning` is not optional here. Its default is False, and with
+        # 4bit, 8bit and full all off unsloth switches to "16bit LoRA" and exports
+        # UNSLOTH_ENABLE_FULL_FINETUNING=0; `post_patch_model` then hands that to
+        # unsloth_zoo's `prepare_model_for_training`, which freezes every parameter
+        # whose name has no LoRA marker. Under `peft.mode=full` nothing attaches
+        # LoRA, so the whole model comes back frozen (unsloth 2026.7.6
+        # models/vision.py:1164-1187, 2094-2129; unsloth_zoo 2026.7.7
+        # training_utils.py:383).
+        full = config.peft.mode == "full"
         model, processor = FastVisionModel.from_pretrained(
             hf_id,
             load_in_4bit=config.peft.mode == "qlora",
+            full_finetuning=full,
             dtype=steps.dtype_for(device),
         )
         loaded["model"] = model
         loaded["processor"] = processor
-        return {"model_class": type(model).__name__, "processor_class": type(processor).__name__}
+        return {
+            "model_class": type(model).__name__,
+            "processor_class": type(processor).__name__,
+            "full_finetuning": full,
+        }
 
     if not report.run("fast_vision_model_load", _load)[0]:
         report.skip("infonce_backward", "model did not load")

@@ -370,6 +370,96 @@ def test_padding_side_alignment_passes_when_they_agree():
     assert detail["declared_before"] == {"tokenizer": "left", "processor": "left"}
 
 
+class _Encoder(torch.nn.Module):
+    """The smallest thing `steps.encode` accepts, with real parameters.
+
+    A counter set by the test would prove nothing about the shape under test, so
+    the freeze and the backward are the real ones.
+    """
+
+    def __init__(self, vocab=8, hidden=4):
+        super().__init__()
+        self.embed = torch.nn.Embedding(vocab, hidden)
+        self.proj = torch.nn.Linear(hidden, hidden)
+
+    def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
+        return types.SimpleNamespace(last_hidden_state=self.proj(self.embed(input_ids)))
+
+
+def _frozen_batch():
+    ids = torch.tensor([[1, 2, 3], [2, 3, 4], [3, 4, 5], [4, 5, 6]])
+    return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+
+def test_a_step_that_trained_nothing_is_not_a_step(monkeypatch):
+    """The 2026-08-02 campaign recorded `infonce_backward ok=True` with
+    `params_with_grad=0, trainable_params=0` on all three unsloth cells, because a
+    finite loss was the whole of the evidence.
+
+    The shape is reproduced rather than simulated. unsloth reaches it by calling
+    `FastVisionModel.from_pretrained` without `full_finetuning`, which makes
+    unsloth_zoo's `prepare_model_for_training` freeze every parameter with no LoRA
+    marker in its name (unsloth_zoo 2026.7.7 training_utils.py:383) — and the same
+    function calls `enable_input_require_grads` (:479-484), which puts
+    `requires_grad` on the embedding *output*. That is why `loss.backward()`
+    returns instead of raising "does not require grad", and why the cell passed.
+    """
+    from trainbench.probe.steps import infonce_backward
+
+    model = _Encoder()
+    model.requires_grad_(False)
+    model.embed.register_forward_hook(lambda module, args, output: output.requires_grad_(True))
+
+    with pytest.raises(ValueError, match="trained nothing"):
+        infonce_backward(model, _frozen_batch(), 0.02, "right")
+
+
+def test_the_frozen_graph_it_refuses_really_does_produce_a_finite_loss():
+    """The other half of the same claim: had the guard graded the loss, or had the
+    backward raised on its own, there would have been nothing to catch. This is
+    what the check used to record as a pass."""
+    from trainbench.embedding import info_nce
+
+    model = _Encoder()
+    model.requires_grad_(False)
+    model.embed.register_forward_hook(lambda module, args, output: output.requires_grad_(True))
+
+    hidden = model(**_frozen_batch()).last_hidden_state[:, -1]
+    loss = info_nce(hidden[:2], hidden[2:], 0.02)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert sum(1 for p in model.parameters() if p.requires_grad) == 0
+
+
+def test_a_step_that_did_train_still_passes():
+    from trainbench.probe.steps import infonce_backward
+
+    detail = infonce_backward(_Encoder(), _frozen_batch(), 0.02, "right")
+
+    # embedding weight, linear weight, linear bias
+    assert detail["trainable_params"] == detail["total_params"] == 3
+    assert detail["params_with_grad"] == 3
+
+
+def test_a_backward_that_reaches_no_trainable_parameter_is_refused():
+    """The other frozen shape: parameters marked trainable that the loss is not a
+    function of. `trainable_params` alone reads as a healthy run."""
+    from trainbench.probe.steps import infonce_backward
+
+    model = _Encoder()
+    detached = torch.nn.Module()
+    detached.forward = lambda **kwargs: types.SimpleNamespace(  # noqa: ARG005
+        last_hidden_state=torch.randn(4, 3, 4, requires_grad=True)
+    )
+    detached.parameters = model.parameters
+    detached.train = model.train
+    detached.zero_grad = model.zero_grad
+
+    with pytest.raises(ValueError, match="reached none of them"):
+        infonce_backward(detached, _frozen_batch(), 0.02, "right")
+
+
 def test_verify_axes_reports_the_adapter_that_ran_not_the_framework_requested(config_mapping):
     """docs/CONTRACTS.md §2: the framework literal an adapter passes is the evidence
     of which code path ran. A registry routing `framework=ms_swift` to another
@@ -663,6 +753,54 @@ def test_the_axolotl_probe_hands_it_a_config_it_accepts(config_mapping, monkeypa
     assert cfg["gradient_accumulation_steps"] == config.train.grad_accum
     assert cfg["learning_rate"] == config.optim.lr
     assert [d["path"] for d in cfg["datasets"]] == [config.data.repo_id]
+
+
+def _fake_unsloth(monkeypatch, seen):
+    """unsloth installs only inside its own image, so what is stood in for is the
+    one behaviour under test: `from_pretrained` recording what it was asked for."""
+    module = types.ModuleType("unsloth")
+
+    class _FastVisionModel:
+        @staticmethod
+        def from_pretrained(hf_id, **kwargs):
+            seen.update(kwargs)
+            raise RuntimeError("no checkpoint here; the kwargs are what was asked")
+
+    module.FastVisionModel = _FastVisionModel
+    module.FastSentenceTransformer = _FastVisionModel
+    module.__version__ = "0.0-stub"
+    monkeypatch.setitem(sys.modules, "unsloth", module)
+
+
+@pytest.mark.parametrize(
+    ("mode", "full_finetuning"), [("full", True), ("lora", False), ("qlora", False)]
+)
+def test_unsloth_is_told_whether_the_run_finetunes(
+    config_mapping, monkeypatch, mode, full_finetuning
+):
+    """`full_finetuning` defaults to False, and with 4bit, 8bit and full all off
+    unsloth switches to "16bit LoRA" and exports UNSLOTH_ENABLE_FULL_FINETUNING=0
+    (unsloth 2026.7.6 models/vision.py:1164-1187). `post_patch_model` reads that
+    back and unsloth_zoo freezes every parameter without a LoRA marker
+    (:2094-2129; unsloth_zoo 2026.7.7 training_utils.py:383) — and under
+    `peft.mode=full` nothing attaches LoRA, so nothing survives.
+
+    Passing it is not a preference: the three unsloth cells of the 2026-08-02
+    campaign trained zero parameters because it was left out. `infonce_backward`'s
+    guard catches the result; this is what stops it happening.
+    """
+    seen: dict[str, object] = {}
+    _fake_unsloth(monkeypatch, seen)
+    mapping = json.loads(json.dumps(config_mapping))
+    mapping["framework"]["name"] = "unsloth"
+    mapping["peft"]["mode"] = mode
+    if mode != "full":
+        mapping["peft"]["r"] = 32
+
+    run_probe(to_bench_config(mapping), get_device("cpu"))
+
+    assert seen.get("full_finetuning") is full_finetuning, seen
+    assert seen.get("load_in_4bit") is (mode == "qlora"), seen
 
 
 def test_the_load_axes_reach_from_pretrained_when_they_are_not_refused(config_mapping, monkeypatch):
