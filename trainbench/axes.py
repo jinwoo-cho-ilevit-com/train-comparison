@@ -95,31 +95,28 @@ KERNEL_MODULE_ROOTS = {
     "kernels": "kernels_hub",
 }
 
-# Liger's per-architecture entrypoint, by this repo's `model.arch`. The naming
-# form is the one the Liger README documents (`apply_liger_kernel_to_llama()`),
-# and the suffix is transformers' own `model_type`: `configuration_qwen3_5.py`,
+# How every Liger entrypoint is spelled, and the table of the three this study
+# needs. The suffix is transformers' own `model_type`: `configuration_qwen3_5.py`,
 # `configuration_qwen3_vl.py` and `configuration_gemma4.py` in transformers 5.14.1
-# declare exactly `qwen3_5`, `qwen3_vl` and `gemma4`, which is why `arch` can be
-# used as the suffix rather than mapped through a second table.
+# declare exactly `qwen3_5`, `qwen3_vl` and `gemma4`, so `arch` is the suffix
+# rather than a second table.
 #
-# UNVERIFIED, and deliberately so rather than silently: liger-kernel cannot be
-# installed on the machine this was written on — it depends on triton under a
-# `sys_platform == 'linux'` marker and triton publishes no macOS wheel — so the
-# spelling below is a hypothesis about a package that could not be imported to
-# check it. `_patch_liger` therefore refuses with the `apply_liger_kernel_to_*`
-# names the installed package really exports instead of failing with an
-# AttributeError, so the first pod that runs this either applies the kernel or
-# prints the name to write here.
+# Read off the pinned wheel rather than guessed (liger-kernel 0.8.1, the `native`
+# pin; `.plans/research/axis-libraries.md` §1). `monkey_patch.py` defines all three
+# — `:3057`, `:2044`, `:1392` — and its own `model_type` map carries them at
+# `:3569`, `:3573` and `:3541`.
+#
+# There is a version boundary inside this table and it is not recorded here,
+# because a table cannot hold it: liger-kernel **0.8.0**, the axolotl pin, has
+# `apply_liger_kernel_to_gemma4_text` and no multimodal `apply_liger_kernel_to_gemma4`
+# (§1.3). An image on that pin therefore refuses gemma-4 at the `getattr` below,
+# with the names the installed package really exports — which is the version that
+# is running, and not a claim written down months earlier.
+LIGER_ENTRYPOINT_PREFIX = "apply_liger_kernel_to_"
 LIGER_ENTRYPOINTS = {
-    # Liger-Kernel#1119 (PLAN.md).
-    "qwen3_5": "apply_liger_kernel_to_qwen3_5",
-}
-
-# Architectures Liger is known *not* to reach, with the reason. Separate from the
-# absence of an entrypoint above because "we know it does not work" and "nothing
-# is recorded either way" are different states, and only the first has a citation.
-LIGER_UNSUPPORTED = {
-    "gemma4": "Liger-Kernel#1186 is open (PLAN.md), so gemma-4 has no Liger path",
+    "qwen3_5": f"{LIGER_ENTRYPOINT_PREFIX}qwen3_5",
+    "qwen3_vl": f"{LIGER_ENTRYPOINT_PREFIX}qwen3_vl",
+    "gemma4": f"{LIGER_ENTRYPOINT_PREFIX}gemma4",
 }
 
 # Architectures whose transformers implementation takes its kernels from
@@ -140,11 +137,23 @@ FLA_ARCHS = frozenset({"qwen3_5"})
 # nothing, `_capture_kernel` reads `none` back off the model, and the run dies far
 # from the version that caused it.
 #
-# `fla` publishes no entry in transformers' `PACKAGE_DISTRIBUTION_MAPPING`, so
-# that predicate resolves the version by distribution name and falls back to
-# importing the package — the same two steps, in the same order, as below.
+# `PACKAGE_DISTRIBUTION_MAPPING` is not a table transformers maintains: it is
+# `importlib.metadata.packages_distributions()`, computed from the installed
+# environment at import (`utils/import_utils.py:47`). Both distributions below
+# declare top-level `fla`, so the mapping does have an entry and the
+# distribution-name branch is the one that runs; the import fallback is reached
+# only where neither is installed as a distribution. Same two steps as below,
+# same order.
 FLA_MIN_VERSION = (0, 2, 2)
-FLA_DISTRIBUTIONS = ("flash-linear-attention", "fla")
+# The distribution that actually ships `fla/ops`, `fla/modules` and `fla/__init__.py`.
+# `flash-linear-attention`'s own wheel carries only `fla/layers` and `fla/models`
+# — 154 entries, no `__init__.py` — and declares `fla-core==<same version>` for
+# the rest; the two are joined by a pkgutil namespace
+# (`.plans/research/axis-libraries.md` §2.1-2.2). Every symbol transformers
+# imports for Gated DeltaNet is on this side, so an image holding only the first
+# passes a version check and dies inside `modeling_qwen3_5`'s import.
+FLA_OPS_DISTRIBUTION = "fla-core"
+FLA_DISTRIBUTIONS = (FLA_OPS_DISTRIBUTION, "flash-linear-attention", "fla")
 
 # Columns whose presence means the rows arrived already tokenised. Read off the
 # dataset the loader was built around, because that is where `pretokenize` moves
@@ -199,16 +208,12 @@ PACKED_BOUNDARY_KEYS = ("cu_seqlens", "seq_lengths")
 # `applied._CAPTURES`: `audit_plan.py`'s `axis-wired` check enforces it, and
 # `tests/test_applied.py::test_applied_and_verified_sets_agree` pins it.
 #
-# `precision.name` and `train.offload` sit here on the same terms as
-# `dataloader.packing`: this module decides them by refusing every value it cannot
-# put into effect, and the inert value it does accept needs nothing done to it.
-# `step_context` refuses every precision but bf16, and bf16 needs no autocast
-# region only because the weights are already in it; `assemble` refuses every
-# offload but none, and none is an optimizer built where the model is. Both of
-# those are premises rather than actions, which is why they were left out until
-# `applied._capture_precision` and `_capture_offload` began reading them back off
-# the model and the optimizer. An axis is wired when something applies it and
-# something checks it, and for these two the checking half was the missing one.
+# `precision.name` and `train.offload` are the two whose *inert* value is a premise
+# rather than an action: bf16 needs no autocast region only because the weights are
+# already in it, and `offload=none` is an optimizer built where the model is. They
+# belong here anyway, because `applied._capture_precision` and `_capture_offload`
+# read both back off the recipe and the engine. An axis is wired when something
+# applies it and something checks it.
 IMPLEMENTED = frozenset(
     {
         "attn.name",
@@ -300,10 +305,17 @@ def _patch_liger(config: BenchConfig) -> list[str]:
     """Liger-Kernel, applied by replacing the transformers classes for one
     architecture before anything is instantiated.
 
-    The architecture is decided before the import, so an unsupported model is
-    refused for being unsupported rather than for whatever the environment happens
-    to be missing. gemma-4 is the case that matters: Liger-Kernel#1186 is open, and
-    a patcher that silently no-ops there would put a `liger` label on a stock run.
+    An architecture with no recorded entrypoint is refused before the import, so an
+    unrecorded model is refused for being unrecorded rather than for whatever the
+    environment happens to be missing.
+
+    There used to be a second table here — `LIGER_UNSUPPORTED`, holding gemma-4
+    against Liger-Kernel#1186 — and it was false against the pinned wheel: 0.8.1
+    defines `apply_liger_kernel_to_gemma4` and maps `gemma4` onto it
+    (`.plans/research/axis-libraries.md` §1.3). A refusal written from an issue
+    tracker outlived the issue and would have kept gemma-4 out of this axis for the
+    whole study. What replaces it is the `getattr` below, which asks the package
+    that is actually installed.
 
     transformers ships its own Liger integration, and it is not this one:
     `integrations/liger.py::apply_liger_kernel` takes a built model and calls
@@ -313,8 +325,6 @@ def _patch_liger(config: BenchConfig) -> list[str]:
     documents ("# 2. Instantiate patched model").
     """
     arch = config.model.arch
-    if reason := LIGER_UNSUPPORTED.get(arch):
-        raise UnappliedAxis(f"kernel=liger on arch={arch}: {reason}.")
     entrypoint = LIGER_ENTRYPOINTS.get(arch)
     if entrypoint is None:
         raise UnappliedAxis(
@@ -331,14 +341,29 @@ def _patch_liger(config: BenchConfig) -> list[str]:
         ) from exc
     apply = getattr(module, entrypoint, None)
     if not callable(apply):
-        exported = sorted(n for n in dir(module) if n.startswith("apply_liger_kernel_to_"))
         raise UnappliedAxis(
-            f"liger_kernel.transformers has no {entrypoint}(); it exports {exported}. "
-            "LIGER_ENTRYPOINTS holds a name that could not be checked against an installed "
-            "package — correct it from this list rather than patching a different model."
+            f"liger_kernel.transformers has no {entrypoint}(); it exports "
+            f"{_liger_exports(module)}. This pin does not reach arch={arch!r} — 0.8.0 has "
+            "gemma-4's text entrypoint and not its multimodal one, so which image is running "
+            "decides this. Read the list rather than patching a different model."
         )
     apply()
     return ["kernel.name"]
+
+
+def _liger_exports(module: Any) -> list[str]:
+    """The entrypoints an installed liger-kernel really offers.
+
+    `__all__` is read alongside `dir()` and not instead of it, because for this
+    package `dir()` alone answers `[]`. `liger_kernel/transformers/__init__.py`
+    keeps every `apply_liger_kernel_to_*` behind `if TYPE_CHECKING:` and a module
+    `__getattr__`, defines no `__dir__`, and CPython's `dir(module)` returns
+    `module.__dict__`'s keys — so a symbol nobody has touched yet is not in it
+    (`.plans/research/axis-libraries.md` §1.4). The refusal above exists to carry
+    the correction, and an empty list carries nothing.
+    """
+    names = {*(getattr(module, "__all__", None) or ()), *dir(module)}
+    return sorted(name for name in names if str(name).startswith(LIGER_ENTRYPOINT_PREFIX))
 
 
 def _patch_fla(config: BenchConfig) -> list[str]:
@@ -403,9 +428,23 @@ def _fla_binding() -> tuple[bool, str]:
             f"{'.'.join(map(str, FLA_MIN_VERSION))} transformers requires, so transformers "
             "binds nothing from it"
         )
+    if not _distribution_installed(FLA_OPS_DISTRIBUTION):
+        return False, (
+            f"{FLA_OPS_DISTRIBUTION} is not installed, and it is the distribution that ships "
+            "fla.ops and fla.modules — the two transformers imports for Gated DeltaNet. "
+            "flash-linear-attention alone answers the version check and then fails the import"
+        )
     if not torch.cuda.is_available():
         return False, "no CUDA device, and transformers gates the fla import on one"
     return True, ""
+
+
+def _distribution_installed(distribution: str) -> bool:
+    try:
+        importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
 
 
 def _fla_version() -> tuple[int, ...] | None:
@@ -520,25 +559,40 @@ def _environment_bound_refusal(config: BenchConfig, name: str, bound: str) -> st
 
 
 def _patch_kernels_hub(config: BenchConfig) -> list[str]:
-    """kernels-hub dispatch, refused because its entrypoints are not this call site.
+    """kernels-hub dispatch, dropped as an axis value. Two independent reasons.
 
-    transformers 5.14.1 turns hub kernels on in two places, both of which need the
-    model: `from_pretrained(use_kernels=True)`, which ends in
+    **The call site.** transformers 5.14.1 turns hub kernels on in two places, both
+    of which need the model: `from_pretrained(use_kernels=True)`, which ends in
     `model.set_use_kernels(...)` (`modeling_utils.py`), and
     `integrations/hub_kernels.py::kernelize(model)`, which reads `model.device` to
     pick the device-specific kernel to fetch. The one pre-construction knob,
     `USE_HUB_KERNELS`, is read when that module is first imported and only ever
-    turns dispatch *off*.
+    turns dispatch *off*. So the value cannot be applied from `patch` without
+    pretending, and moving it is a contract change (docs/CONTRACTS.md §2 assigns
+    `kernel.name` to this site).
 
-    So this value cannot be applied from `patch` without pretending, and moving it
-    to `load_kwargs` or `assemble` is a contract change (docs/CONTRACTS.md §2
-    assigns `kernel.name` to this site). Refused until that is decided, rather than
-    applied at a site the contract does not name.
+    **The pin.** Independently of where it would be applied, the native lock cannot
+    run it: `is_kernels_available()` requires `0.15.2 <= kernels < 0.16.0`
+    (`utils/import_utils.py:144`, upper bound exclusive) and `envs/native/uv.lock`
+    pins exactly `0.16.0`. False there makes `use_kernel_forward_from_hub` a silent
+    identity decorator (`integrations/hub_kernels.py:387`), so the axis would be a
+    label on a stock model rather than an error
+    (`.plans/research/axis-libraries.md` §3.1-3.2).
+
+    `configs/kernel/kernels_hub.yaml` is gone, so no composed run can select it.
+    This stays because `config_schema.py`'s Literal still offers it and a run built
+    straight from the schema — which `scripts/bench.py::preflight` is handed — must
+    be refused with the reason rather than with a `KeyError`. It goes when that
+    Literal does.
     """
     raise UnappliedAxis(
-        "kernel=kernels_hub is turned on by from_pretrained(use_kernels=True) and "
-        "integrations.hub_kernels.kernelize(model), both of which need a model; the patch site "
-        "this axis is assigned to (docs/CONTRACTS.md §2) runs before one exists."
+        "kernel=kernels_hub is dropped as an axis value, for two reasons that hold "
+        "separately. It is turned on by from_pretrained(use_kernels=True) and "
+        "integrations.hub_kernels.kernelize(model), both of which need a model, while the "
+        "patch site this axis is assigned to (docs/CONTRACTS.md §2) runs before one exists. "
+        "And envs/native pins kernels==0.16.0 against transformers' exclusive upper bound of "
+        "the same version, which turns hub dispatch into a silent no-op wherever it were "
+        "applied."
     )
 
 
@@ -582,10 +636,9 @@ def load_kwargs(config: BenchConfig) -> dict[str, Any]:
     quantises on CUDA, so on any other device this refuses instead of returning a
     config whose effect is unknown — an ignored quantisation is the outcome that
     matters, because the run would then train a full-precision base and report its
-    speed under the qlora label. The adapter half is refused separately and
-    unconditionally in `_peft`, so no qlora run starts from this checkout on any
-    device; this is the earlier of the two gates and the one that survives if that
-    refusal is ever lifted.
+    speed under the qlora label. `_peft` is the second gate: it refuses to attach
+    the adapter to a model that did not arrive quantised, which is what catches a
+    caller that never came through here.
     """
     kwargs: dict[str, Any] = {"attn_implementation": config.attn.impl}
     if config.peft.mode == "qlora":
@@ -649,22 +702,20 @@ def assemble(
     its own action cannot catch the case where the action did not take.
     """
     applied: list[str] = []
-    if config.parallel.strategy in ("zero2", "zero3") or config.train.offload != "none":
-        raise UnappliedAxis(
-            f"parallel={config.parallel.strategy} / offload={config.train.offload} needs "
-            "deepspeed.initialize, which returns the model, optimizer and dataloader "
-            "together; it has to be built here rather than by the pieces below."
-        )
-    if config.parallel.strategy != "single":
-        raise UnappliedAxis(
-            f"parallel.strategy={config.parallel.strategy} wraps the model (DDP, FSDP2) "
-            "and needs an initialised process group; not implemented."
-        )
+    recipe = _recorded_precision_recipe(config)
+    if recipe is not None:
+        applied.append("precision.name")
 
     model, names = _apply_to_model(model, config)
     applied += names
     optimizer, names = _optimizer(model.parameters(), config, device)
     applied += names
+    # After the optimizer, unlike every other axis that changes the model: ZeRO
+    # partitions optimizer state, so `deepspeed.initialize` takes the built
+    # optimizer and returns an engine wrapping both.
+    if config.parallel.strategy in ZERO_STAGES or config.train.offload != "none":
+        model, names = _deepspeed(model, optimizer, config)
+        applied += names
     # Before the loss is built, not after: an axis that no batch of this run's data
     # can turn on is refused here rather than named applied and crashed at step 1.
     if config.loss.name == "cached_mnrl":
@@ -680,24 +731,183 @@ def assemble(
         dataloader=loader,
         loss_fn=loss,
         framework=framework,
+        precision_recipe=recipe,
     )
     return built, [*applied, "framework.name"]
+
+
+# Transformer Engine, by module path rather than by import, because nothing in
+# this file may import it at module scope: it is absent from the orchestrator-side
+# environment and from five of the six framework images.
+#
+# `transformer-engine` on PyPI is a shim whose Python surface (recipes, autocast,
+# the support checks) is all that is read here; the compiled half arrives as
+# `transformer-engine-torch`, built from sdist on the pod
+# (`.plans/research/axis-libraries.md` §6.1).
+TE_TORCH_MODULE = "transformer_engine.pytorch"
+TE_RECIPE_MODULE = "transformer_engine.common.recipe"
+TE_QUANTIZATION_MODULE = "transformer_engine.pytorch.quantization"
+TE_AUTOCAST = "autocast"
+
+# The recipe class each precision is, and the support check that must pass before
+# it is entered. Class names from `common/recipe/__init__.py:337,479`; the checks
+# from `pytorch/quantization.py` (§6.2, §6.4). `applied.PRECISION_RECIPE_AXIS`
+# holds the same two class names on the reading side — that is the boundary this
+# axis crosses, and the recipe object travels on `Built.precision_recipe`.
+#
+# **The support check is not optional and not symmetric.** `check_recipe_support`
+# has an `elif` chain that covers MXFP8 and does not mention NVFP4, so an nvfp4
+# run on an unsupported device enters the region without complaint and produces a
+# number that is not fp4 (§6.4). Both are gated here instead, in one place, so
+# neither depends on TE noticing.
+TE_PRECISIONS = {
+    "mxfp8": ("MXFP8BlockScaling", "is_mxfp8_available"),
+    "nvfp4": ("NVFP4BlockScaling", "is_nvfp4_available"),
+}
+
+
+def _import_or_refuse(module_name: str, why: str) -> Any:
+    """Import a module, or turn the ImportError into this axis declining a value.
+
+    `UnappliedAxis` rather than the raw error for the reason `_patch_liger` gives:
+    the audit reads a refusal as the axis being unable to put a value into effect,
+    and anything else as a value that broke for an unrelated reason.
+    """
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as exc:
+        raise UnappliedAxis(f"{why}, and {module_name} is not importable here ({exc}).") from exc
+
+
+def _precision_supported(precision: str, checker: str) -> None:
+    """Refuse a precision this device cannot execute, in the checker's own words.
+
+    Two shapes are accepted because which one the pinned release returns is
+    확인 안 함 — the private `_compute_*_support` pair returns `(bool, str)` and the
+    public wrappers are read here for the first time on a pod. A `(False, reason)`
+    tuple is truthy, so reading the result as a bare bool would turn "this GPU
+    cannot do fp4" into "supported" — which is the one failure mode this gate
+    exists for. Anything the checker raises is a refusal too: a check that did not
+    answer has not said yes.
+    """
+    module = _import_or_refuse(
+        TE_QUANTIZATION_MODULE,
+        f"precision={precision} runs the step inside a Transformer Engine recipe and has to be "
+        "gated on the device that executes it",
+    )
+    check = getattr(module, checker, None)
+    if not callable(check):
+        raise UnappliedAxis(
+            f"{TE_QUANTIZATION_MODULE} has no {checker}(), so nothing here can tell whether "
+            f"this device executes {precision}. Transformer Engine's own check_recipe_support "
+            "does not cover NVFP4 at all, so an ungated run would report a bf16 number under "
+            f"the {precision} label."
+        )
+    try:
+        answer = check()
+    except Exception as exc:  # noqa: BLE001 - a check that raises has not said yes
+        raise UnappliedAxis(
+            f"precision={precision}: {checker}() raised {type(exc).__name__}: {exc}. "
+            "A support check that does not answer is not a device that supports it."
+        ) from exc
+    supported, reason = answer if isinstance(answer, tuple) else (answer, "")
+    if not supported:
+        raise UnappliedAxis(
+            f"precision={precision} is not executable on this device: "
+            f"{reason or f'{checker}() returned {supported!r}'}. Both block-scaling recipes "
+            "need compute capability 10.x, and this study's pods are A100 (8.0), so the axis "
+            "may be a hardware fact here rather than a missing implementation."
+        )
+
+
+def _precision_recipe(config: BenchConfig) -> Any:
+    """The recipe the step is wrapped with, or None where the weights are the answer.
+
+    bf16 returns None: the model is loaded in that dtype and an autocast region
+    would be a second answer to the same question. Everything else is a
+    block-scaling recipe that keeps bf16 parameters and casts inside the step,
+    which is why `applied._capture_precision` cannot read it off the weights and
+    reads `Built.precision_recipe` instead.
+    """
+    precision = config.precision.name
+    if precision == "bf16":
+        return None
+    named = TE_PRECISIONS.get(precision)
+    if named is None:
+        raise UnappliedAxis(
+            f"precision={precision} has no recipe recorded here; known: {sorted(TE_PRECISIONS)}."
+        )
+    class_name, checker = named
+    _precision_supported(precision, checker)
+    module = _import_or_refuse(
+        TE_RECIPE_MODULE, f"precision={precision} is a Transformer Engine block-scaling recipe"
+    )
+    recipe = getattr(module, class_name, None)
+    if recipe is None:
+        raise UnappliedAxis(
+            f"{TE_RECIPE_MODULE} has no {class_name}; this pin does not carry the recipe "
+            f"precision={precision} names."
+        )
+    return recipe()
+
+
+def _recorded_precision_recipe(config: BenchConfig) -> Any:
+    """The recipe object `Built` carries, or None where this site cannot build one.
+
+    The refusal belongs to `step_context`. docs/CONTRACTS.md §2 assigns the fp8
+    autocast to that call site, and `scripts/bench.py` enters it once before the
+    timer, so a recipe this environment cannot build stops the run outside the
+    timed window and is recorded against the site that decides it. Raising here
+    would move that record without changing the outcome.
+
+    What `assemble` does owe is the object, because `Built` can only be made here
+    and `applied._capture_precision` has nothing else to read: these recipes keep
+    bf16 parameters and cast inside the step. `None` is not an escape either — a
+    run that asked for mxfp8 and carries no recipe reads back as the dtype on its
+    weights, and `assert_matches` blocks it.
+    """
+    try:
+        return _precision_recipe(config)
+    except UnappliedAxis:
+        return None
 
 
 def step_context(config: BenchConfig) -> contextlib.AbstractContextManager:
     """Context wrapping one training step.
 
     bf16 needs none: the model is already loaded in that dtype, so an autocast
-    region would be a second, different answer to the same question. The fp8
-    recipes do need one, and refusing here is what keeps a bf16 step from being
-    measured under their name.
+    region would be a second, different answer to the same question. The fp8/fp4
+    recipes do need one, and it is Transformer Engine's `autocast` — the kind
+    `tests/contract/test_loader_bench.py` fixes as the only one this site can
+    establish.
+
+    `fp8_autocast` is deliberately not used. It is deprecated in the pinned release
+    and its parameters are named differently (`fp8_recipe`, `fp8_group` against
+    `recipe`, `amax_reduction_group`), so calling it would put a DeprecationWarning
+    inside every timed step and pin this module to the older spelling
+    (`transformer_engine/pytorch/quantization.py:931`,
+    `.plans/research/axis-libraries.md` §6.3).
+
+    A fresh recipe per step rather than one reused: entering the same `autocast`
+    instance twice is refused by TE (`quantization.py:1027`), and the recipe is a
+    settings object with no run state, so `assemble` and this site building one
+    each through `_precision_recipe` cannot disagree about which one is in effect.
     """
-    if config.precision.name != "bf16":
+    recipe = _precision_recipe(config)
+    if recipe is None:
+        return contextlib.nullcontext()
+    module = _import_or_refuse(
+        TE_TORCH_MODULE,
+        f"precision={config.precision.name} wraps the forward pass in a Transformer Engine recipe",
+    )
+    autocast = getattr(module, TE_AUTOCAST, None)
+    if not callable(autocast):
         raise UnappliedAxis(
-            f"precision={config.precision.name} needs a Transformer Engine recipe "
-            "around the forward pass, which is not implemented."
+            f"{TE_TORCH_MODULE} has no {TE_AUTOCAST}(), which is the current spelling of the "
+            "region an fp8 recipe is entered through. Without it the step would run in bf16 "
+            f"and be reported as {config.precision.name}."
         )
-    return contextlib.nullcontext()
+    return autocast(enabled=True, recipe=recipe)
 
 
 def _apply_to_model(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
@@ -722,6 +932,14 @@ def _apply_to_model(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
     finds them. Reversing the two leaves the suite green. Whether the reverse
     order costs anything at run time is unmeasured.
 
+    `_parallel` sits between the two for a real reason and an unmeasured one. Real:
+    FSDP2 replaces the parameters with sharded ones, so it has to run before
+    `assemble` builds the optimizer over them — which is the same constraint that
+    puts all of this ahead of the optimizer. Unmeasured: whether wrapping before or
+    after `torch.compile` costs anything. `compile.mode` and `parallel.strategy`
+    are crossed in the ablation and only a multi-rank pod can answer it; stated
+    rather than decided by a docstring.
+
     An axis whose configured value is the inert one — `compile=none`,
     `peft=full`, `freeze.*=false` — applies nothing and so is not named here.
     What it means is read back by `applied.capture`, which looks at the object
@@ -732,6 +950,8 @@ def _apply_to_model(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
     model, names = _peft(model, config)
     applied += names
     applied += _gradient_checkpointing(model, config)
+    model, names = _parallel(model, config)
+    applied += names
     model, names = _compile(model, config)
     applied += names
     return model, applied
@@ -768,18 +988,31 @@ def _peft(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
     combination outright instead of letting two identical models occupy two rows of
     the ablation table.
 
-    `qlora` stays refused. It is LoRA over a 4-bit base, so the adapter half is this
-    same call and the quantisation half is a `BitsAndBytesConfig` that belongs in
-    `load_kwargs` — and bitsandbytes only quantises on CUDA. Implementing it here
-    from a machine that cannot build one would mean shipping the path unrun.
+    `qlora` is this same call over a base that arrived quantised: the two halves are
+    the `BitsAndBytesConfig` `load_kwargs` builds and the adapter here, and the only
+    thing this site adds is the check that the first half actually happened. A model
+    that reached here in bf16 would be plain LoRA under a QLoRA label — and that is
+    the realistic failure, because the quantisation is requested somewhere else and
+    a caller that skipped `load_kwargs` gets no error from `from_pretrained`.
+
+    `prepare_model_for_kbit_training` is deliberately not called, and not for
+    convenience. It upcasts the norm layers to fp32, which
+    `applied._capture_precision` reads as `mixed(bf16,fp32)` against a run that
+    asked for bf16 — every qlora run would apply the axis and then be refused. And
+    it enables gradient checkpointing by default, which is a separate axis in this
+    study (`train.gradient_checkpointing`), so a qlora cell would silently carry a
+    setting its config left at `none`. What it buys is training stability, which is
+    not what this benchmark measures.
     """
     if config.peft.mode == "full":
         return model, []
-    if config.peft.mode == "qlora":
+    if config.peft.mode == "qlora" and not _base_is_quantised(model):
         raise UnappliedAxis(
-            "peft.mode=qlora needs a 4-bit base, which is a BitsAndBytesConfig passed to "
-            "from_pretrained and a CUDA device; neither is exercised here, so it is "
-            "refused rather than run as plain LoRA under a QLoRA label."
+            "peft.mode=qlora is LoRA over a 4-bit base, and this model carries no "
+            "quantisation: neither is_loaded_in_4bit nor config.quantization_config is set. "
+            "The base is quantised while the checkpoint is read, so a bf16 model cannot be "
+            "turned into one here — pass axes.load_kwargs(config) to from_pretrained. "
+            "Attaching the adapter anyway would measure plain LoRA under the QLoRA label."
         )
 
     from peft import LoraConfig, get_peft_model
@@ -797,6 +1030,20 @@ def _peft(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
         ),
     )
     return adapted, ["peft.mode"]
+
+
+def _base_is_quantised(model: Any) -> bool:
+    """Whether the base weights arrived quantised.
+
+    The same two readings `applied._capture_peft` uses to tell `qlora` from `lora`,
+    so the apply site and the capture site cannot disagree about what a quantised
+    base is. Which of the two a given transformers release sets is not asserted
+    here — either is the checkpoint having been read through a quantiser.
+    """
+    return bool(
+        getattr(model, "is_loaded_in_4bit", False)
+        or getattr(getattr(model, "config", None), "quantization_config", None)
+    )
 
 
 # Which operators `gradient_checkpointing=selective` keeps rather than recomputes.
@@ -913,6 +1160,169 @@ def _compile(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
     return torch.compile(model, mode=mode), ["compile.mode"]
 
 
+# Which ZeRO stage each strategy is, in `deepspeed.initialize`'s config spelling.
+# `applied.ZERO_STAGE_AXIS` holds the same pair on the reading side, which is where
+# the run is certified: one engine class stands for both stages, so the stage is
+# what tells them apart.
+ZERO_STAGES = {"zero2": 2, "zero3": 3}
+
+# Which `zero_optimization` sections each offload value turns on. These are the
+# two the engine answers about — `zero_offload_optimizer()` and
+# `zero_offload_param()` read `self._config.zero_config.<name>`
+# (`deepspeed/runtime/engine.py:1125-1129`,
+# `.plans/research/axis-libraries.md` §5.2) — so the request and the read-back are
+# the same two names, and `applied.OFFLOAD_TARGET_AXIS` maps the pair back to this
+# axis's value.
+OFFLOAD_SECTIONS = {
+    "none": (),
+    "optimizer": ("offload_optimizer",),
+    "param": ("offload_param",),
+    "both": ("offload_optimizer", "offload_param"),
+}
+# Where offloaded tensors go. `OffloadDeviceEnum` offers `none`/`cpu`/`nvme`
+# (`runtime/zero/offload_config.py:14`); nvme needs a configured path and this
+# study's pods write to container-local disk, so the axis means CPU here. A knob
+# for it would be a new schema field, which docs/CONTRACTS.md §5 makes a contract
+# change.
+OFFLOAD_DEVICE = "cpu"
+
+
+def _distributed_world(strategy: str) -> int:
+    """The number of ranks this run is spread over, or a refusal.
+
+    Every strategy that reaches this shards or replicates *across* ranks, so one
+    rank is not a smaller version of it — it is the single-GPU run under another
+    label. `_gather_with_grad` already refuses `world_size=1` on the same grounds,
+    and this is that rule for the wrappers.
+    """
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        raise UnappliedAxis(
+            f"parallel.strategy={strategy} needs an initialised process group and this "
+            "process has none. Nothing here starts one: a rendezvous invented by the harness "
+            "would decide the world size the run is measured at, which is the setting."
+        )
+    world = dist.get_world_size()
+    if world < 2:
+        raise UnappliedAxis(
+            f"parallel.strategy={strategy} with world_size=1 shards and replicates across one "
+            "rank, which is the single-GPU run. Measuring it would publish a single-GPU number "
+            f"under the {strategy} label."
+        )
+    return world
+
+
+def _parallel(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
+    """The wrappers that spread one model over several ranks.
+
+    ZeRO is not here: `deepspeed.initialize` takes the optimizer as well, so it
+    runs in `assemble` after that is built.
+
+    FSDP2 is `fully_shard`, which is why this axis is spelled `fsdp2` and not
+    `fsdp`. It mutates in place — the module keeps its identity and gains
+    `FSDPModule` in its MRO under a class renamed `FSDP<original>`
+    (`torch/distributed/fsdp/_fully_shard/_fsdp_init.py:404-430`, torch 2.13.0) —
+    so there is no object to return and nothing named `FullyShardedDataParallel`
+    anywhere in the result. That is FSDP1's wrapper class, and it is the name
+    `applied.PARALLEL_WRAPPERS` looks for; until the capture side reads
+    `FSDPModule` instead, an fsdp2 run applies the axis and is then refused for
+    being unreadable. Recorded in `.plans/notes/axes.md` rather than worked around
+    here: a wrapper chosen to satisfy a probe would be FSDP1 measured as FSDP2.
+    """
+    strategy = config.parallel.strategy
+    if strategy == "single" or strategy in ZERO_STAGES:
+        return model, []
+    _distributed_world(strategy)
+    if strategy == "ddp":
+        # `device_ids` only where there is an index to give: DDP takes it to mean
+        # the single device this rank's replica lives on, and CPU replicas have
+        # none. A guessed index would put every rank's replica on device 0.
+        device = next((p.device for p in model.parameters()), None)
+        ids = [device.index] if device is not None and device.index is not None else None
+        return torch.nn.parallel.DistributedDataParallel(model, device_ids=ids), [
+            "parallel.strategy"
+        ]
+    if strategy == "fsdp2":
+        from torch.distributed.fsdp import fully_shard
+
+        fully_shard(model)
+        return model, ["parallel.strategy"]
+    raise UnappliedAxis(f"parallel.strategy={strategy} has no implementation here.")
+
+
+def _deepspeed(model: Any, optimizer: Any, config: BenchConfig) -> tuple[Any, list[str]]:
+    """ZeRO, and the offload that lives inside it.
+
+    Returns the engine as the model. It is an `nn.Module`, so
+    `applied._deepspeed_engine` finds it by walking `built.model.named_modules()`,
+    and both `parallel.strategy` and `train.offload` are then read off its own
+    normalised config rather than off the dict handed in here.
+
+    **The optimizer that stays on `Built` is the one passed in, not the one
+    `initialize` returns.** deepspeed returns its own wrapper around it, whose
+    class name is neither `AdamW` nor anything `applied.OPTIM_CLASS_AXIS` names, so
+    recording it would report `optim.name` as `deepspeedzerooptimizer` and block
+    every ZeRO run on an axis that has nothing to do with ZeRO. What steps is still
+    this instance — deepspeed's wrapper holds it and delegates — and the engine on
+    `Built.model` is what carries the ZeRO evidence. That the record shows only one
+    of the two layers is a gap on the capture side, written up in
+    `.plans/notes/axes.md`.
+
+    **Offload needs a stage, and the stage is `parallel.strategy`.** `offload_optimizer`
+    and `offload_param` are sections of `zero_optimization`, so there is no offload
+    without ZeRO and no second field that could name one. `train.offload` crossed
+    with `parallel=single` is therefore refused here — which also means the audit,
+    composing one group at a time, can never see more than its inert value.
+    """
+    stage = ZERO_STAGES.get(config.parallel.strategy)
+    if stage is None:
+        raise UnappliedAxis(
+            f"train.offload={config.train.offload} is a section of deepspeed's "
+            "zero_optimization config, so it needs a ZeRO stage; "
+            f"parallel.strategy={config.parallel.strategy} names none. Cross it with "
+            f"parallel={'/'.join(sorted(ZERO_STAGES))} — a stage chosen here would be a "
+            "setting no config records."
+        )
+    _distributed_world(config.parallel.strategy)
+    deepspeed = _import_or_refuse(
+        "deepspeed",
+        f"parallel={config.parallel.strategy} / offload={config.train.offload} is built by "
+        "deepspeed.initialize",
+    )
+    engine, _, _, _ = deepspeed.initialize(
+        model=model, optimizer=optimizer, config=_deepspeed_config(config, stage)
+    )
+    applied = ["parallel.strategy"]
+    if config.train.offload != "none":
+        applied.append("train.offload")
+    return engine, applied
+
+
+def _deepspeed_config(config: BenchConfig, stage: int) -> dict[str, Any]:
+    """The `config` dict `deepspeed.initialize` is handed.
+
+    No `optimizer` section: the optimizer is passed as an object so that
+    `optim.name` keeps meaning the algorithm this repository selected. No
+    `training_data` either — deepspeed would return a `DeepSpeedDataLoader`, and
+    `applied._capture_dataloader_backend` decides `dataloader.backend` from the
+    loader's class, so the run would read back as neither `torch` nor `dali`. The
+    loader is built by `_dataloader` as it is for every other run.
+
+    `bf16` is on for every precision this schema offers: bf16 is the weights, and
+    the two block-scaling recipes keep bf16 parameters and cast inside the step.
+    """
+    zero: dict[str, Any] = {"stage": stage}
+    for section in OFFLOAD_SECTIONS[config.train.offload]:
+        zero[section] = {"device": OFFLOAD_DEVICE}
+    return {
+        "train_micro_batch_size_per_gpu": config.train.batch_size,
+        "gradient_accumulation_steps": config.train.grad_accum,
+        "zero_optimization": zero,
+        "bf16": {"enabled": True},
+    }
+
+
 def _optimizer(params: Any, config: BenchConfig, device: torch.device) -> tuple[Any, list[str]]:
     """`fused` follows the device: the fused AdamW kernel is CUDA-only and asking
     for it on CPU raises. The capture probe reports the unfused case as a
@@ -939,9 +1349,9 @@ def _optimizer(params: Any, config: BenchConfig, device: torch.device) -> tuple[
     gemma-4's PLE tables go *through* Newton-Schulz rather than around it, which is
     the opposite of the arrangement PLAN.md's gemma-4 hypothesis is about.
 
-    `adamw_8bit` stays refused on the same grounds as `peft.mode=qlora`:
-    bitsandbytes' 8-bit optimizer state is a CUDA kernel, so implementing it from a
-    machine that cannot run one would mean shipping the path unrun.
+    `adamw_8bit` is `_adamw_8bit` below, gated on CUDA for the same reason
+    `peft.mode=qlora` is: bitsandbytes' 8-bit state is a CUDA kernel and there is
+    none to run here.
     """
     if config.optim.name == "adamw_fused":
         built = torch.optim.AdamW(
@@ -951,13 +1361,10 @@ def _optimizer(params: Any, config: BenchConfig, device: torch.device) -> tuple[
             fused=device.type == "cuda",
         )
         return built, ["optim.name"]
+    if config.optim.name == "adamw_8bit":
+        return _adamw_8bit(params, config, device), ["optim.name"]
     if config.optim.name != "muon":
-        raise UnappliedAxis(
-            f"optim={config.optim.name} has no implementation here; adamw_8bit is "
-            "bitsandbytes' 8-bit optimizer state, which is a CUDA kernel — the package is "
-            "in envs/native but nothing here can run one, so it stays refused rather than "
-            "measured as plain AdamW under an 8-bit label."
-        )
+        raise UnappliedAxis(f"optim={config.optim.name} has no implementation here.")
 
     # `pytorch-optimizer` is pinned by `envs/native/pyproject.toml` and by the root
     # `native` extra, which the documented setup command installs — `doc-commands`
@@ -1016,14 +1423,60 @@ def _optimizer(params: Any, config: BenchConfig, device: torch.device) -> tuple[
     return Muon(groups), ["optim.name"]
 
 
+def _adamw_8bit(params: Any, config: BenchConfig, device: torch.device) -> Any:
+    """AdamW whose optimizer state is quantised to 8 bits.
+
+    Refused off CUDA rather than built: bitsandbytes' state lives in a CUDA kernel,
+    and an AdamW that kept 32-bit state would be measured under the 8-bit label —
+    which is also what `applied._capture_optim` would refuse, since it decides this
+    axis from the optimizer's class.
+
+    `optim_bits` is deliberately not passed. Its default is 32 and `AdamW8bit`
+    still quantises: the constructor hardcodes 8 and raises `ValueError` for any
+    other value of that argument, so the reflex of "passing 8 to be explicit" is
+    the one call that fails (`bitsandbytes/optim/adamw.py:105-123`,
+    `.plans/research/axis-libraries.md` §4.2). `amsgrad=True` is refused there too
+    and nothing here asks for it.
+
+    What the axis does *not* mean: `min_8bit_size=4096` is the library's default,
+    so every parameter with fewer elements keeps 32-bit state. Norms and biases are
+    all below it, so "the optimizer state is 8-bit" is true of the matrices and not
+    of the model. How many tensors that leaves is 측정 안 함 and belongs to a pod
+    (`.plans/research/axis-libraries.md` §9, question 6).
+    """
+    if device.type != "cuda":
+        raise UnappliedAxis(
+            f"optim=adamw_8bit keeps its state in a bitsandbytes CUDA kernel; device="
+            f"{device.type} would step a 32-bit AdamW and report it as 8-bit."
+        )
+    module = _import_or_refuse(
+        "bitsandbytes.optim", "optim=adamw_8bit is bitsandbytes' 8-bit optimizer state"
+    )
+    return module.AdamW8bit(params, lr=config.optim.lr, weight_decay=config.optim.weight_decay)
+
+
 def _dataloader(dataset: Any, config: BenchConfig) -> tuple[Any, list[str]]:
     """DALI replaces the DataLoader with its own iterator rather than configuring
     one (DALI docs: "replacing the standard DataLoader with DALIClassificationIterator"),
-    which is why this builds the loader instead of returning kwargs for it."""
+    which is why this builds the loader instead of returning kwargs for it.
+
+    `dali` is the one axis value in this module still refused for missing code, and
+    the refusal names what is missing rather than saying "not implemented".
+    `DALIGenericIterator(pipelines, output_map, ...)` is the easy half
+    (`.plans/research/axis-libraries.md` §7); the pipeline it iterates is the hard
+    one, and no pinned source read so far covers building an `external_source`
+    pipeline over an arbitrary `datasets` row. Writing one from memory is what
+    `AGENTS.md` forbids, and every probe failure of the first campaign was written
+    that way.
+    """
     if config.dataloader.backend != "torch":
         raise UnappliedAxis(
-            f"dataloader.backend={config.dataloader.backend} builds its own iterator; "
-            "not implemented."
+            f"dataloader.backend={config.dataloader.backend} replaces the DataLoader with its "
+            "own iterator, and the iterator needs a DALI pipeline over these rows that nothing "
+            "here builds. Two things have to be settled first, and both need the package: how "
+            "an external_source pipeline reads a datasets row, and what "
+            "applied._capture_dataloader_packing reads for dali_packed — a DALI iterator has "
+            "no collate_fn, which is the only place packing is visible today."
         )
     if dataset is None:
         return None, []
