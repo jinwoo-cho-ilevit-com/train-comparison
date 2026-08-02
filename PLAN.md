@@ -573,7 +573,7 @@ CPU에서 구현·검증이 끝나는 것과 GPU가 있어야 판정되는 것�
 
 | 축 값 | CPU/GPU | 비고 |
 |---|---|---|
-| `kernel=liger` / `fla` / `kernels_hub` | GPU 판정 | 패칭 자체는 CPU에서 확인 가능하나 커널 경로는 CUDA 전용 |
+| `kernel=liger` / `fla` | GPU 판정 | 패칭 자체는 CPU에서 확인 가능하나 커널 경로는 CUDA 전용 |
 | `precision=mxfp8` / `nvfp4` | **GPU** | Transformer Engine recipe + `step_context`. Blackwell 전용 |
 | `parallel=ddp` / `fsdp2` | GPU | 프로세스 그룹 필요 |
 | `parallel=zero2` / `zero3` + `train.offload` | **GPU** | `deepspeed.initialize`가 모델·옵티마이저·로더를 한 번에 만든다(`docs/CONTRACTS.md` §2) |

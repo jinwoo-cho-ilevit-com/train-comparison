@@ -600,6 +600,51 @@ def test_distribution_names_are_normalised_before_comparison():
     assert _normalise("hydra.core") == "hydra-core"
 
 
+# Commands AGENTS.md documents that `doc-commands` cannot execute: one launches
+# paid pods, one needs the results repo downloaded, one needs a resolved config and
+# a GPU. They are documented because a reader cannot derive them from the tree.
+DOCUMENTED_BUT_NOT_EXECUTED = ("scripts/orchestrate.py", "scripts/report.py", "scripts/bench.py")
+
+
+def test_the_documented_commands_doc_commands_never_runs_are_named_here(monkeypatch):
+    """`doc-commands` reports "every documented command runs as written".
+
+    It executes two shapes — `uv sync` lines and `scripts/env_report.py` lines —
+    and AGENTS.md documents three more. The gap is deliberate (launching a pod
+    from a gate would spend money, and the other two need artifacts this host does
+    not have), but the check's own wording does not say so, and this repository has
+    already shipped a `doc-commands` that described a scope it did not have. So the
+    three are pinned by name here instead of being inferred from that sentence.
+    """
+    agents = (REPO / "AGENTS.md").read_text()
+    missing = [name for name in DOCUMENTED_BUT_NOT_EXECUTED if name not in agents]
+    assert not missing, f"AGENTS.md no longer documents {missing}"
+
+    executed = []
+
+    def _record(argv, **kwargs):
+        executed.append([str(part) for part in argv])
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    modules = _demanded_imports()
+    locked = {_normalise(dist) for dist in audit_plan._distributions_for(modules).values()}
+    monkeypatch.setattr(audit_plan, "_locked_distributions", lambda flags: (locked, None))
+    monkeypatch.setattr(audit_plan.subprocess, "run", _record)
+    result = audit_plan.CHECKS["doc-commands"]()
+
+    assert result.ok, result.detail
+    # Both halves must be non-empty. A check that executed nothing would satisfy
+    # the exclusion below by having examined no command at all.
+    assert executed, "doc-commands executed no command; the scan found nothing to run"
+    for argv in executed:
+        assert any("env_report.py" in part for part in argv), argv
+    for name in DOCUMENTED_BUT_NOT_EXECUTED:
+        assert not any(name in part for argv in executed for part in argv), (
+            f"`doc-commands` now executes {name}; its wording covers it, so drop it from "
+            "DOCUMENTED_BUT_NOT_EXECUTED and from the note in AGENTS.md"
+        )
+
+
 def _dockerfile(tmp_path, *lines):
     path = tmp_path / "Dockerfile.framework"
     path.write_text("\n".join(lines) + "\n")
@@ -1047,8 +1092,10 @@ def test_an_anchor_whose_file_is_gone_does_not_close_an_item(anchored):
 
 
 def test_the_repositorys_own_ledger_has_open_items_and_names_them():
-    """The live state. Six conditional verdicts, and the gate says so out loud
-    rather than leaving it to whoever remembers reading them."""
+    """The live state: the ledger still has open items and the gate names them
+    out loud rather than leaving it to whoever remembers reading them. The count
+    is deliberately not asserted — `docs/audit-baseline.json` is the ratchet that
+    makes it move on purpose, and a second copy here would drift from it."""
     result = audit_plan.CHECKS["verdicts-closed"]()
 
     assert not result.ok
