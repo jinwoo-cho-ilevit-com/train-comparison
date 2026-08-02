@@ -37,10 +37,31 @@ a real bitsandbytes optimizer, a real deepspeed engine or a real Transformer Eng
 recipe. None of the three installs here — 확인 안 함. That is why the two foreign
 class-name tables below are pinned as *tables*: the spellings are a pod question,
 and a table keeps them in one reviewable place instead of inside a branch.
+
+**Twenty-one of these tests are deferred, not passing.** `trainbench/applied.py`
+carries none of the third state yet, and nine lanes fan out from the commit that
+adds this file: leaving those tests red would make every lane's own gate report a
+failure belonging to none of them. They are `xfail(strict=True)` instead, each
+naming what lane-c has not landed. `strict` is what stops lane-c from implementing
+the boundary and leaving the markers in place — a deferred test that starts passing
+is an error, not a quiet pass.
+
+The command that decides whether the deferral is over, which belongs in lane-c's
+completion criteria:
+
+    infisical run --env=dev -- uv run pytest tests/contract/test_applied_axes.py \\
+        --runxfail -k the_contract_defers_nothing
+
+Exit 0 means every marker is gone. `--runxfail` appears there for one reason only:
+it makes that single test report its real result instead of its expected one. It
+must never be used across the whole file to judge the contract — over the file it
+strips the deferral from all twenty-one and reports failures that are already
+known, which decides nothing. The `-k` is what keeps it honest.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -178,6 +199,10 @@ def full_state(config: BenchConfig, **replace: AxisState) -> AppliedState:
 # --- 1. the vocabulary: three states, not two --------------------------------
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed applied.AXIS_STATES; remove this marker when it does",
+)
 def test_the_state_vocabulary_names_three_states():
     """A named vocabulary rather than a trichotomy each reader re-derives from two
     nullable fields. `report.py` has to show a tevatron cell as having no loss axis
@@ -186,6 +211,10 @@ def test_the_state_vocabulary_names_three_states():
     assert set(applied_module.AXIS_STATES) == {APPLIED, FRAMEWORK_OWNED, UNDETERMINED}
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed applied.FRAMEWORK_OWNABLE; remove this marker when it does",
+)
 def test_ownership_is_bounded_by_a_declared_set():
     """An adapter that could own any axis could disclaim all of them, and capture
     would certify a run by declining to look at it."""
@@ -196,6 +225,10 @@ def test_ownership_is_bounded_by_a_declared_set():
     assert "framework.name" not in ownable, "an adapter may not disclaim being itself"
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed AxisState.owner; remove this marker when it does",
+)
 def test_a_framework_owned_axis_does_not_block_a_reportable_run(config_mapping):
     config = bench(config_mapping, **{"framework.name": "tevatron"})
     owned = AxisState(
@@ -220,6 +253,10 @@ def test_a_framework_owned_axis_does_not_block_a_reportable_run(config_mapping):
     assert_matches(state, config)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed AxisState.state; remove this marker when it does",
+)
 def test_the_same_axis_unowned_and_unread_still_blocks(config_mapping):
     """Paired with the test above: on its own that one passes even if
     `assert_matches` stopped enforcing anything at all."""
@@ -233,6 +270,10 @@ def test_the_same_axis_unowned_and_unread_still_blocks(config_mapping):
         assert_matches(state, config)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed Built.owned_axes; remove this marker when it does",
+)
 def test_ownership_comes_from_the_adapter_not_from_the_config(config_mapping):
     """The mirror failure in its new-state form.
 
@@ -262,6 +303,10 @@ def test_ownership_comes_from_the_adapter_not_from_the_config(config_mapping):
     assert owned.detail.get("reason"), "a disclaimed axis has to say whose it is and why"
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed Built.owned_axes; remove this marker when it does",
+)
 def test_an_axis_outside_the_declared_set_cannot_be_disclaimed(config_mapping):
     config = bench(config_mapping, **{"framework.name": "tevatron"})
 
@@ -271,6 +316,10 @@ def test_an_axis_outside_the_declared_set_cannot_be_disclaimed(config_mapping):
     assert axis(state, "kernel.name").state != FRAMEWORK_OWNED
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed Built.owned_axes; remove this marker when it does",
+)
 def test_ownership_without_a_declared_adapter_is_not_ownership(config_mapping):
     """`owner` names who computes the axis instead of us. A run where no adapter
     declared itself has nobody to name, and 'owned by nobody' must fall back to
@@ -419,6 +468,10 @@ def test_deliberately_unnameable_values_survive(config_mapping, name, build, exp
 # --- 3. the four axes that cannot currently equal their config value ---------
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed applied.OPTIM_CLASS_AXIS; remove this marker when it does",
+)
 def test_the_optimizer_class_table_only_maps_to_values_the_config_offers():
     """`kind.lower()` cannot produce an underscore, so `adamw_8bit` was unreachable
     and a run that requested it could never be certified. The fix is a table from
@@ -436,6 +489,10 @@ def test_the_optimizer_class_table_only_maps_to_values_the_config_offers():
     assert "adamw_8bit" in set(table.values())
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed applied.OPTIM_CLASS_AXIS; remove this marker when it does",
+)
 def test_the_optimizer_axis_is_decided_by_the_table(config_mapping):
     config = bench(config_mapping, **{"optim.name": "adamw_8bit"})
     class_name = next(
@@ -467,6 +524,10 @@ def test_an_optimizer_the_table_does_not_name_earns_no_config_value(config_mappi
     assert not entry.matches
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed applied.PRECISION_RECIPE_AXIS; remove this marker when it does",
+)
 def test_the_precision_recipe_table_only_maps_to_values_the_config_offers():
     """`_capture_precision` refuses to read an fp8 run's precision off bf16 weights,
     which is correct and is why the axis is permanently undetermined. The recipe is
@@ -482,6 +543,10 @@ def test_the_precision_recipe_table_only_maps_to_values_the_config_offers():
     assert {"mxfp8", "nvfp4"} <= set(table.values())
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed Built.precision_recipe; remove this marker when it does",
+)
 @pytest.mark.parametrize("wanted", ["mxfp8", "nvfp4"])
 def test_precision_is_read_off_the_recipe_the_step_actually_wrapped_with(config_mapping, wanted):
     config = bench(config_mapping, **{"precision.name": wanted})
@@ -501,6 +566,10 @@ def test_precision_is_read_off_the_recipe_the_step_actually_wrapped_with(config_
     assert entry.matches
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed Built.precision_recipe; remove this marker when it does",
+)
 def test_an_fp8_request_with_no_recipe_is_never_certified_from_the_weights(config_mapping):
     """The refusal that must survive the change: bf16 parameters are what an fp8 run
     has, so reading the dtype and calling it mxfp8 is exactly the failure this
@@ -520,6 +589,10 @@ def engine_model(engine_class: str = "DeepSpeedEngine", params=()):
     return model(modules=[("module", instance(engine_class))], params=params)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed applied.zero_stage; remove this marker when it does",
+)
 @pytest.mark.parametrize("stage,expected", [(2, "zero2"), (3, "zero3")])
 def test_the_zero_stage_is_read_off_the_engine_not_off_the_config(
     config_mapping, monkeypatch, stage, expected
@@ -543,6 +616,10 @@ def test_the_zero_stage_is_read_off_the_engine_not_off_the_config(
     assert entry.matches
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed applied.zero_stage; remove this marker when it does",
+)
 def test_an_engine_whose_stage_cannot_be_read_is_undetermined(config_mapping, monkeypatch):
     config = bench(config_mapping, **{"parallel.strategy": "zero3"})
     monkeypatch.setattr(applied_module, "zero_stage", lambda engine: None)
@@ -572,6 +649,10 @@ OFFLOAD_TARGETS = (
 )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed applied.offload_targets; remove this marker when it does",
+)
 @pytest.mark.parametrize("targets,expected", OFFLOAD_TARGETS, ids=[o[1] for o in OFFLOAD_TARGETS])
 def test_offload_is_read_off_the_engine_config(config_mapping, monkeypatch, targets, expected):
     """The docstring on `_capture_offload` concedes it: under deepspeed the setting
@@ -599,6 +680,10 @@ def test_offload_is_read_off_the_engine_config(config_mapping, monkeypatch, targ
     assert entry.matches
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed applied.offload_targets; remove this marker when it does",
+)
 def test_an_engine_that_does_not_say_where_it_offloads_is_undetermined(config_mapping, monkeypatch):
     """The direction that must not flip: reporting `none` because nothing looked is
     worse than reporting nothing."""
@@ -620,6 +705,10 @@ def test_an_engine_that_does_not_say_where_it_offloads_is_undetermined(config_ma
     assert entry.state == UNDETERMINED
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed applied.OPTIM_CLASS_AXIS; remove this marker when it does",
+)
 @pytest.mark.parametrize("name", CONTESTED)
 def test_every_contested_axis_can_reach_a_state_that_matches(config_mapping, name):
     """The reason this boundary exists at all: lane-h cannot implement an axis whose
@@ -646,6 +735,10 @@ def test_every_contested_axis_can_reach_a_state_that_matches(config_mapping, nam
 # --- 4. what travels ---------------------------------------------------------
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed applied.FRAMEWORK_OWNABLE; remove this marker when it does",
+)
 def test_the_stored_sample_is_itself_a_valid_instance_of_the_contract():
     """The fixture is the thing two lanes look at instead of reading prose the same
     way. A sample that has drifted out of the contract is worse than none."""
@@ -683,6 +776,11 @@ def test_the_stored_sample_is_itself_a_valid_instance_of_the_contract():
     assert set(CONTESTED) <= {entry["axis"] for entry in payload["axes"]}
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed the owner/state/framework_owned record keys; "
+    "remove this marker when it does",
+)
 def test_the_record_has_the_shape_the_sample_pins(config_mapping):
     """`build_record` writes this dict under `applied`, and it is the only thing a
     result file says about what actually ran. A key dropped here is a state that
@@ -695,6 +793,10 @@ def test_the_record_has_the_shape_the_sample_pins(config_mapping):
     assert json.loads(json.dumps(payload)) == payload
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed AppliedState.framework_owned; remove this marker when it does",
+)
 def test_a_framework_owned_axis_survives_the_round_trip():
     """Two runs that differ only in whether the loss was somebody else's must not
     serialise to the same record.
@@ -725,6 +827,10 @@ def test_a_framework_owned_axis_survives_the_round_trip():
     assert entry != other
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed AxisState.state; remove this marker when it does",
+)
 def test_the_three_states_are_distinguishable_from_the_record_alone(config_mapping):
     """report.py has to show a tevatron cell as having no loss axis rather than as
     having an unverified one, and it reads the file, not the objects."""
@@ -744,3 +850,93 @@ def test_the_three_states_are_distinguishable_from_the_record_alone(config_mappi
     assert by_axis["framework.name"]["state"] == APPLIED
     three = {by_axis[name]["state"] for name in ("loss.name", "kernel.name", "framework.name")}
     assert three == {FRAMEWORK_OWNED, UNDETERMINED, APPLIED}
+
+
+# --- 5. the deferral itself, and the check that keeps it from going quiet -----
+
+
+def deferred_expectations(source: str, guard: str) -> list[str]:
+    """Tests in this file still carrying `pytest.mark.xfail`, except `guard`.
+
+    Read out of the syntax tree rather than by grepping, because the word appears
+    in the prose above and a check that counts its own explanation is not counting
+    markers. Every `pytest.mark.xfail` expression is found wherever it sits — a
+    decorator, or `marks=` inside a `pytest.param` — and attributed to the test it
+    encloses, so deferring one parametrisation is caught the same way as deferring
+    a whole test.
+
+    `guard` is excluded on purpose, and that exclusion is what makes the state
+    machine terminate. Counting its own marker would leave a green state in which
+    every other marker is gone and this one is not: the assertion would still fail,
+    the marker would still be expected, and nothing would ever say so. Excluded, the
+    last marker removal makes this test pass under a strict xfail — an XPASS, which
+    is an error — and the only way out of that error is to delete this marker too.
+    """
+    tree = ast.parse(source)
+    functions = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            start = min([d.lineno for d in node.decorator_list] + [node.lineno])
+            functions.append((start, node.end_lineno, node.name))
+
+    found = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute) or _dotted(node) != "pytest.mark.xfail":
+            continue
+        enclosing = [
+            name for start, end, name in functions if start <= node.lineno <= (end or node.lineno)
+        ]
+        found.update(name for name in enclosing if name != guard)
+    return sorted(found)
+
+
+def _dotted(node: ast.AST) -> str:
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return ""
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="lane-c has not landed the boundary, so this file still defers 21 tests; "
+    "remove this marker last, once every other one is gone",
+)
+def test_the_contract_defers_nothing():
+    """The check that stops the deferral from becoming the vacuum it was meant to
+    avoid.
+
+    Every expectation in this file that lane-c has not met yet is marked
+    `xfail(strict=True)` rather than left red, because nine lanes fan out from this
+    commit and a base that is red for reasons belonging to none of them makes every
+    lane's own gate unreadable.
+
+    The cost of that choice is that `pytest tests/contract/test_applied_axes.py`
+    goes green while the contract is unmet, and green would then mean nothing. Three
+    things close that, and all three are needed:
+
+    - `strict=True` turns a deferred test that starts passing into an error, so
+      lane-c cannot land the boundary and leave the markers behind.
+    - This test names what is still deferred, so the debt is enumerable rather than
+      spread across twenty-one decorators. `-rx` prints it.
+    - It excludes its own marker from the count, so removing the last of the others
+      makes it XPASS — an error — and the only fix is to remove this marker too.
+      There is no green state with a marker left in the file.
+
+    What none of that can do is make the plain command decide it, because the plain
+    command has to be green today and the contract is unmet today. The command whose
+    exit code decides it is in the module docstring, and it is what belongs in
+    lane-c's completion criteria.
+    """
+    still_deferred = deferred_expectations(
+        Path(__file__).read_text(), "test_the_contract_defers_nothing"
+    )
+
+    assert not still_deferred, (
+        f"{len(still_deferred)} contract expectations are still deferred to lane-c: "
+        + ", ".join(still_deferred)
+    )
