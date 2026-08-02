@@ -1,0 +1,332 @@
+{
+  "applied": {
+    "all_determined": true,
+    "all_matched": true,
+    "axes": [
+      {
+        "applied": "sdpa",
+        "axis": "attn.name",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": "sdpa",
+        "state": "applied"
+      },
+      {
+        "applied": "none",
+        "axis": "compile.mode",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": "none",
+        "state": "applied"
+      },
+      {
+        "applied": "torch",
+        "axis": "dataloader.backend",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": "torch",
+        "state": "applied"
+      },
+      {
+        "applied": false,
+        "axis": "dataloader.packing",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": false,
+        "state": "applied"
+      },
+      {
+        "applied": false,
+        "axis": "dataloader.pretokenize",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": false,
+        "state": "applied"
+      },
+      {
+        "applied": "tevatron",
+        "axis": "framework.name",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": "tevatron",
+        "state": "applied"
+      },
+      {
+        "applied": false,
+        "axis": "freeze.ple",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": false,
+        "state": "applied"
+      },
+      {
+        "applied": false,
+        "axis": "freeze.vision_tower",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": false,
+        "state": "applied"
+      },
+      {
+        "applied": "none",
+        "axis": "kernel.name",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": "none",
+        "state": "applied"
+      },
+      {
+        "applied": "tevatron.DenseModel.forward",
+        "axis": "loss.name",
+        "detail": {
+          "owner": "tevatron"
+        },
+        "determined": true,
+        "matches": false,
+        "requested": "mnrl",
+        "state": "framework-owned"
+      },
+      {
+        "applied": "adamw_fused",
+        "axis": "optim.name",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": "adamw_fused",
+        "state": "applied"
+      },
+      {
+        "applied": "tevatron.DenseModel.forward",
+        "axis": "parallel.cross_device_negatives",
+        "detail": {
+          "owner": "tevatron"
+        },
+        "determined": true,
+        "matches": false,
+        "requested": false,
+        "state": "framework-owned"
+      },
+      {
+        "applied": "single",
+        "axis": "parallel.strategy",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": "single",
+        "state": "applied"
+      },
+      {
+        "applied": "full",
+        "axis": "peft.mode",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": "full",
+        "state": "applied"
+      },
+      {
+        "applied": "bf16",
+        "axis": "precision.name",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": "bf16",
+        "state": "applied"
+      },
+      {
+        "applied": "none",
+        "axis": "train.gradient_checkpointing",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": "none",
+        "state": "applied"
+      },
+      {
+        "applied": "none",
+        "axis": "train.offload",
+        "detail": {},
+        "determined": true,
+        "matches": true,
+        "requested": "none",
+        "state": "applied"
+      }
+    ],
+    "missing": []
+  },
+  "applied_axes": [],
+  "config": {
+    "attn": {
+      "name": "sdpa"
+    },
+    "compile": {
+      "mode": "none"
+    },
+    "data": {
+      "limit": 512,
+      "max_seq_len": 2048,
+      "num_workers": 8,
+      "push_subset": false,
+      "repo_id": "jinwoo-cho/mmeb-subset",
+      "revision": "55aafaf9bfe171c65a8131224d3791df379f1651",
+      "sample_seed": 1234,
+      "source_repo": "MrZilinXiao/MMEB_train_with_image",
+      "source_revision": "9d0fd31789c12a007442de52fe22509e46e49e7d",
+      "subset_rows": 2048
+    },
+    "dataloader": {
+      "backend": "torch",
+      "packing": false,
+      "pretokenize": false
+    },
+    "device": "cuda",
+    "framework": {
+      "name": "tevatron"
+    },
+    "freeze": {
+      "ple": false,
+      "vision_tower": false
+    },
+    "kernel": {
+      "name": "none"
+    },
+    "loss": {
+      "mini_batch": null,
+      "name": "mnrl",
+      "temperature": 0.02
+    },
+    "model": {
+      "add_generation_prompt": false,
+      "arch": "qwen3_5",
+      "hf_id": "Qwen/Qwen3.5-0.8B",
+      "instruction_prompt": null,
+      "max_tokens_per_image": null,
+      "name": "qwen3_5_0_8b",
+      "padding_side": "right",
+      "pooling": "lasttoken",
+      "prompt_format": "chat_template",
+      "revision": null
+    },
+    "optim": {
+      "lr": 1e-05,
+      "name": "adamw_fused",
+      "weight_decay": 0.01
+    },
+    "parallel": {
+      "cross_device_negatives": false,
+      "strategy": "single"
+    },
+    "peft": {
+      "alpha": 0,
+      "dropout": 0.0,
+      "mode": "full",
+      "r": 0
+    },
+    "precision": {
+      "name": "bf16"
+    },
+    "run": {
+      "profiler": false,
+      "purpose": "timing",
+      "trackio_project": "train-comparison",
+      "trackio_space_id": null
+    },
+    "train": {
+      "batch_size": 16,
+      "deterministic": false,
+      "grad_accum": 2,
+      "gradient_checkpointing": "none",
+      "offload": "none",
+      "seed": 1234,
+      "steps": 12,
+      "warmup_discard_steps": 2
+    }
+  },
+  "device": "cuda:0",
+  "git_commit": "0604684f0b7b3f5f0a1f1d7a6f4a1c9d2e5b8a30",
+  "git_dirty": false,
+  "git_source": "git",
+  "host": {
+    "cpu_count_host": 128,
+    "cpu_count_process": 16,
+    "cpu_model": "AMD EPYC 9554 64-Core Processor",
+    "cpu_quota": 16.0,
+    "cuda_runtime": "13.0",
+    "gpu": {
+      "driver_version": "580.65.06",
+      "memory.total": "81559 MiB",
+      "name": "NVIDIA H100 80GB HBM3",
+      "uuid": "GPU-0f7c1a3e-2b4d-4a6f-8c1e-3d5f7a9b1c3e"
+    },
+    "hostname": "a1b2c3d4e5f6",
+    "memory_total_gb": 1007.6,
+    "platform": "Linux-6.8.0-51-generic-x86_64-with-glibc2.39",
+    "python": "3.13.13",
+    "runpod_datacenter": "US-KS-2",
+    "runpod_pod_id": "pod-3f9a1c7e",
+    "torch_device_count": 1
+  },
+  "image": "ghcr.io/jinwoo-cho/trainbench-tevatron:0604684",
+  "image_digest": "sha256:9f1a4c2d6e8b0a37c5d9e1f2a4b6c8d0e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2",
+  "metrics": {
+    "grad_norm": 1.8437,
+    "images_dropped_per_second": 0.0,
+    "images_dropped_per_step": 0.0,
+    "images_dropped_total": 0,
+    "images_per_second": 33.28617791462096,
+    "images_per_step": 8.0,
+    "images_read_total": 80,
+    "loss_definition": "unscaled mnrl over one micro-batch, as computed by the loss built.loss_fn holds - not a separately recomputed InfoNCE. loss_first is the first micro-batch of the first measured step, loss_last the last micro-batch of the final step; warmup steps are excluded, as they are from every other figure here",
+    "loss_first": 2.8734,
+    "loss_last": 2.4102,
+    "metric_definitions": {
+      "images": "images actually handed to the processor per step",
+      "images_dropped": "images present in the rows that the processor could not take, per step. Non-zero means this model read a text-only view of an image corpus",
+      "padded_tokens": "every position the forward computed on, padding included (input_ids.numel())",
+      "rows": "sequences fed to the forward pass per step: queries + positives, so twice `samples`",
+      "samples": "(query, positive) pairs consumed per step, summed over grad_accum micro-batches. This is PLAN.md's samples/s",
+      "step": "fetching the micro-batches, moving them to the device, forward, backward and the optimizer step — everything one training step costs, including the data pipeline",
+      "tokens": "non-padding positions (attention_mask.sum()). Not what the forward computed on — padding goes through it too, see `padded_tokens` — and not free of a per-model constant: the query side carries config.model.instruction_prompt, which is non-null for exactly one model (docs/CONTRACTS.md §5)"
+    },
+    "mfu": null,
+    "mfu_reason": "no per-model FLOP formula is validated for GDN / PLE / sliding window",
+    "padded_tokens_per_second": 68170.09236914372,
+    "padded_tokens_per_step": 16384.0,
+    "peak_memory_bytes": 34359738368,
+    "profiled": false,
+    "rows_per_second": 266.28942331696766,
+    "rows_per_step": 64.0,
+    "samples_per_second": 133.14471165848383,
+    "samples_per_step": 32.0,
+    "step_seconds_mean": 0.24034,
+    "step_seconds_p50": 0.2402,
+    "step_seconds_p95": 0.2418,
+    "steps_discarded": 2,
+    "steps_measured": 10,
+    "steps_timed": 12,
+    "tokens_per_second": 46866.9385037863,
+    "tokens_per_step": 11264.0,
+    "total_params": 219,
+    "trainable_params": 219
+  },
+  "packages": {
+    "accelerate": "1.12.0",
+    "datasets": "4.5.0",
+    "flash-attn": "2.9.1",
+    "peft": "0.19.1",
+    "tevatron": "0.3.0",
+    "torch": "2.13.0",
+    "torchvision": "0.28.0",
+    "transformers": "5.14.1"
+  },
+  "recorded_at": 1785974400.0
+}
