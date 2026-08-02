@@ -1,0 +1,205 @@
+{
+  "_note": "The applied-axes boundary payload, as it lands in a result JSON under the 'applied' key (trainbench/record.py::build_record). One tevatron cell, chosen because it is the only shape that carries all three axis states at once. Keys are the contract; values are illustrative. Read by tests/contract/test_applied_axes.py.",
+  "axes": [
+    {
+      "axis": "attn.name",
+      "requested": "flash_attention_3",
+      "applied": "flash_attention_3",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {"implementations": {"flash_attention_3": 421}, "modules_checked": 421}
+    },
+    {
+      "axis": "compile.mode",
+      "requested": "none",
+      "applied": "none",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {"compiled_modules": 0, "dynamo_disabled": false}
+    },
+    {
+      "axis": "dataloader.backend",
+      "requested": "torch",
+      "applied": "torch",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {"class": "DataLoader", "package": "torch"}
+    },
+    {
+      "axis": "dataloader.packing",
+      "requested": "False",
+      "applied": "False",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {"collate": "PackedCollate"}
+    },
+    {
+      "axis": "dataloader.pretokenize",
+      "requested": "True",
+      "applied": null,
+      "owner": null,
+      "state": "undetermined",
+      "determined": false,
+      "matches": false,
+      "detail": {
+        "reason": "TevatronTrainDataset declares no column_names or features, so whether its rows are tokenised cannot be read back"
+      }
+    },
+    {
+      "axis": "framework.name",
+      "requested": "tevatron",
+      "applied": "tevatron",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {}
+    },
+    {
+      "axis": "freeze.ple",
+      "requested": "False",
+      "applied": "False",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {"matched": 0, "frozen": 0}
+    },
+    {
+      "axis": "freeze.vision_tower",
+      "requested": "False",
+      "applied": "False",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {"matched": 132, "frozen": 0, "arch": "qwen3_vl"}
+    },
+    {
+      "axis": "kernel.name",
+      "requested": "none",
+      "applied": "none",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {
+        "modules_checked": 1204,
+        "packages": [],
+        "kernel_modules": {},
+        "superseded": 0
+      }
+    },
+    {
+      "axis": "loss.name",
+      "requested": "mnrl",
+      "applied": null,
+      "owner": "tevatron",
+      "state": "framework_owned",
+      "determined": false,
+      "matches": false,
+      "detail": {
+        "reason": "tevatron's DenseModel.forward computes encoding, pooling, normalisation, scoring and InfoNCE itself (encoder.py:52-87, pinned dd06310), so this run's loss is not ours to read back"
+      }
+    },
+    {
+      "axis": "optim.name",
+      "requested": "adamw_8bit",
+      "applied": "adamw_8bit",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {"class": "AdamW8bit", "fused": false, "param_groups": 2}
+    },
+    {
+      "axis": "parallel.cross_device_negatives",
+      "requested": "True",
+      "applied": null,
+      "owner": "tevatron",
+      "state": "framework_owned",
+      "determined": false,
+      "matches": false,
+      "detail": {
+        "reason": "the distributed gather happens inside tevatron's DenseModel.forward, not in a loss this run built"
+      }
+    },
+    {
+      "axis": "parallel.strategy",
+      "requested": "zero3",
+      "applied": "zero3",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {
+        "world_size": 8,
+        "process_group": true,
+        "wrapper": "DeepSpeedEngine",
+        "at": "model",
+        "zero_stage": 3
+      }
+    },
+    {
+      "axis": "peft.mode",
+      "requested": "lora",
+      "applied": "lora",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {"wrapper_package": "peft", "adapters": ["lora"], "base_quantised": false}
+    },
+    {
+      "axis": "precision.name",
+      "requested": "mxfp8",
+      "applied": "mxfp8",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {
+        "base": {"bf16": 508},
+        "adapter": {"fp32": 224},
+        "recipe": "MXFP8BlockScaling"
+      }
+    },
+    {
+      "axis": "train.gradient_checkpointing",
+      "requested": "full",
+      "applied": "full",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {"modules_with_flag": 36, "enabled": 36, "selective": 0}
+    },
+    {
+      "axis": "train.offload",
+      "requested": "optimizer",
+      "applied": "optimizer",
+      "owner": null,
+      "state": "applied",
+      "determined": true,
+      "matches": true,
+      "detail": {
+        "optimizer": "DeepSpeedZeroOptimizer",
+        "engine": "DeepSpeedEngine",
+        "offload_optimizer": true,
+        "offload_param": false
+      }
+    }
+  ],
+  "all_determined": false,
+  "all_matched": true,
+  "framework_owned": ["loss.name", "parallel.cross_device_negatives"],
+  "missing": []
+}
