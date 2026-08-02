@@ -428,6 +428,7 @@ train-comparison/
 │   ├── device.py              # torch.accelerator 단일 헬퍼
 │   ├── seed.py                # 시드 단일 헬퍼
 │   ├── record.py              # run 기록 + 원자적 쓰기
+│   ├── collate.py             # 행 -> MicroBatch. collate-metrics 경계가 이 이름을 찾는다
 │   ├── embedding.py           # 풀링 + InfoNCE
 │   ├── prompt.py              # 모델의 prompt_format을 읽는 유일한 지점
 │   ├── axes.py                # 축을 켜는 유일한 지점
