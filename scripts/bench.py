@@ -40,8 +40,14 @@ from typing import Any, NamedTuple
 
 import torch
 
-from trainbench import axes, metrics
-from trainbench.applied import AppliedMismatch, AppliedState, assert_matches, capture
+from trainbench import axes, kernels, metrics
+from trainbench.applied import (
+    ENFORCED_PURPOSES,
+    AppliedMismatch,
+    AppliedState,
+    assert_matches,
+    capture,
+)
 from trainbench.collate import Encode, build_collate, load_pairs
 from trainbench.config import load_bench_config, to_bench_config
 from trainbench.config_schema import BenchConfig, axis_knobs
@@ -95,10 +101,20 @@ def pooled_embeddings(
     function pools unconditionally, so there is nothing there to reuse that stops
     short of pooling. It belongs in `trainbench/probe/steps.py` next to its twin
     the moment that lane wants it.
+
+    **`use_cache=False` is what makes the pack isolated.** `position_ids` alone do
+    not: `masking_utils._preprocess_mask_arguments` calls
+    `find_packed_sequence_indices` only when `past_key_values is None`, and every
+    model here ships `config.use_cache=True`, so the default forward builds a cache
+    and the mask comes back as one causal triangle over the whole pack — every
+    sequence reading the ones before it, with no exception and no warning.
+    Qwen3.5's linear-attention cache raises instead, so a packed run of that
+    architecture never starts. There is no cache to keep in a training step, which
+    is why this is a fix and not a trade.
     """
     if cu_seqlens is None:
         return steps.encode(model, tensors, padding_side)
-    output = model(**tensors, output_hidden_states=False)
+    output = model(**tensors, output_hidden_states=False, use_cache=False)
     hidden = getattr(output, "last_hidden_state", None)
     if hidden is None:
         hidden = getattr(output, "hidden_states", None)
@@ -373,7 +389,7 @@ def train(
 class RefusedSetting(RuntimeError):
     """A setting this pod cannot measure, tagged with where the refusal fired.
 
-    Wraps the two refusals construction can end on. They are not the same finding,
+    Wraps the refusals construction can end on. They are not the same finding,
     and the record says which:
 
     * `axes.UnappliedAxis` — nothing here can put the requested value into effect,
@@ -388,25 +404,62 @@ class RefusedSetting(RuntimeError):
       are told apart by *which* axes disagreed, so a mismatch record carries the
       whole `AppliedState` and a reader who cannot tell must not read it as a
       property of the hardware.
+    * `loader.AdapterRefusal` — the framework built something this loop must not
+      measure: a fully frozen graph, two training dtypes with no declared regime,
+      or a step this loop cannot drive. unsloth returning `trainable_params=0` is
+      the state three cells of the 2026-08-02 campaign published, so it is a
+      result of this study and has to reach the report as one.
+    * `kernels.KernelProvenanceError` — the kernel that would run cannot be named,
+      would still arrive over the network, or builds no isolation mask for a
+      packed batch. Each makes the number untraceable or wrong rather than absent.
 
     The stage matters for the same reason: `patch` fires before the model exists,
-    `assemble` during construction, `assert_matches` after. Only the last had a
-    model to read back, so the stage is what says whether `applied` in the record
-    means anything.
+    `binding` and `assemble` during construction, `assert_matches` after. Only the
+    last had a model to read back, so the stage is what says whether `applied` in
+    the record means anything. `fingerprint` is carried for the same reason the
+    measured record carries it: a refusal that happened after the model was built
+    can still say which kernel and which dtypes it was refusing.
     """
 
-    def __init__(self, stage: str, cause: Exception, state: AppliedState | None = None) -> None:
+    def __init__(
+        self,
+        stage: str,
+        cause: Exception,
+        state: AppliedState | None = None,
+        fingerprint: Any = None,
+    ) -> None:
         super().__init__(str(cause))
         self.stage = stage
         self.cause = cause
         self.state = state
+        self.fingerprint = fingerprint
+
+
+def refusal_types() -> tuple[type[BaseException], ...]:
+    """Every exception class that means "this setting is a result, not a crash".
+
+    `trainbench.loader` is resolved on use rather than imported at module scope,
+    for the reason `load_framework` gives. Read as a function so a refusal type
+    added there cannot be one this file forgets to catch — the alternative is a
+    literal tuple that goes stale silently, which is how `AdapterRefusal` came to
+    leave `main` uncaught and publish nothing at all.
+    """
+    loader = importlib.import_module("trainbench.loader")
+    return (
+        axes.UnappliedAxis,
+        AppliedMismatch,
+        loader.AdapterRefusal,
+        kernels.KernelProvenanceError,
+    )
 
 
 @contextmanager
-def refusing(stage: str, state: AppliedState | None = None) -> Iterator[None]:
+def refusing(
+    stage: str, state: AppliedState | None = None, fingerprint: Any = None
+) -> Iterator[None]:
     """Tag whichever refusal comes out of this region with the call site it fired at.
 
-    Only the two refusal types are caught. Everything else — a checkpoint that will
+    Only the `refusal_types` are caught. Everything else — a checkpoint that will
     not download, an OOM, a collate that cannot find a pad id — passes through
     untouched and leaves no result file, which is what makes docker/entrypoint.sh
     publish a fallback record rather than a result for it. Widening this to
@@ -415,8 +468,24 @@ def refusing(stage: str, state: AppliedState | None = None) -> Iterator[None]:
     """
     try:
         yield
-    except (axes.UnappliedAxis, AppliedMismatch) as exc:
-        raise RefusedSetting(stage, exc, state) from exc
+    except refusal_types() as exc:
+        raise RefusedSetting(stage, exc, state, fingerprint) from exc
+
+
+def fingerprint_payload(fingerprint: Any) -> dict[str, Any]:
+    """The build fingerprint under the key the `kernel-provenance` boundary names.
+
+    `loader.describe` computes it on every run — which kernel repo and revision
+    the build actually bound, which dtypes the framework changed behind us, which
+    parameters it left trainable — and until this reached `build_record` it died
+    with the pod. Two pods binding different revisions of the same fa2 request
+    produced indistinguishable result files, and `loader.fingerprint_diff`, whose
+    whole subject is that difference, had no input to read.
+
+    Empty when there is none: a refusal that fired before the model existed has
+    nothing to fingerprint, and a `null` under this key would claim it looked.
+    """
+    return {} if fingerprint is None else {kernels.RUN_RECORD_KEY: fingerprint}
 
 
 def refusal_record(
@@ -458,6 +527,7 @@ def refusal_record(
             "reason": str(refused.cause),
             "requested_axes": {knob: str(read(config)) for knob, read in axis_knobs().items()},
         },
+        **fingerprint_payload(refused.fingerprint),
     )
 
 
@@ -506,6 +576,91 @@ def load_framework(config: BenchConfig, device: torch.device) -> Binding:
     return loader.load(config, device)
 
 
+def close_kernel_fetch_doors(config: BenchConfig, stream: Any = None) -> list[str]:
+    """Shut every path a kernel could still arrive on, and name the ones that were open.
+
+    Called before the model exists, because that is when transformers rewrites a
+    `flash_attention_2` request into a Hub repo id and downloads it
+    (`modeling_utils.py:1997-2003`, gated on `is_kernels_available()` alone). A
+    kernel that arrives mid-run is not the kernel the image digest pins, and the
+    fetch itself lands inside the run the same way reading data off a network
+    volume does.
+
+    Only for the purposes whose axes are enforced. A probe exists to find out
+    whether a combination loads at all and is the branch that populates the cache
+    the measured run then reads; closing the door there would turn "this framework
+    cannot build this model" into "this pod had no cache", which is a different
+    finding. `open_fetch_doors` says the same in its own words: an empty list is
+    what a timing run has to start in.
+    """
+    if config.run.purpose not in ENFORCED_PURPOSES:
+        return []
+    # Resolved per call, not in the signature, for the reason `preflight` gives.
+    stream = sys.stdout if stream is None else stream
+    was_open = kernels.forbid_runtime_kernel_fetch()
+    for door in was_open:
+        print(f"kernel fetch door closed: {door}", file=stream)
+    return was_open
+
+
+def refuse_a_step_this_harness_cannot_drive(step: Any) -> None:
+    """Refuse an adapter whose declared step is not the one `train()` runs.
+
+    `train()` runs exactly one shape of step: this file's forward through
+    `pooled_embeddings`, `built.loss_fn` over the two halves, and
+    `built.optimizer.step()`, fed the keys `build_collate` builds. `AdapterOut`
+    declares what the framework's own step is, and nothing read that declaration.
+
+    Both halves of it decide something. `owner=framework` means the framework's
+    call computes the step, and `applied._owned` has already exempted the axes it
+    owns from the capture — so running the harness loop anyway publishes a harness
+    number labelled `framework_owned`, which is the `loss=cached_mnrl` shape:
+    a mislabelled number rather than a crash. `batch_keys` is the same fact one
+    step earlier: tevatron declares `("query", "passage")` and this collate builds
+    `input_ids`/`attention_mask`, so `DenseModel.forward` raises `TypeError` on
+    step 0 — after the checkpoint is loaded and the timer is open, and an uncaught
+    raise there leaves no result file at all.
+    """
+    loader = importlib.import_module("trainbench.loader")
+    harness = loader.HARNESS_STEP
+    if step is None:
+        raise loader.AdapterRefusal(
+            "the binding declares no step, so nothing says whether this harness loop or the "
+            "framework runs it; measuring it either way would be a guess"
+        )
+    if step.owner != harness.owner:
+        raise loader.AdapterRefusal(
+            f"the adapter declares a {step.owner}-owned step ({step.callable}), and this "
+            f"harness only drives a {harness.owner}-owned one. Running the loop anyway would "
+            "time this file's forward and loss and file the result under the axes the "
+            "framework was exempted from certifying"
+        )
+    unbuilt = sorted(set(step.batch_keys) - set(harness.batch_keys))
+    if unbuilt:
+        raise loader.AdapterRefusal(
+            f"the adapter's step needs batch keys {unbuilt} and trainbench/collate.py builds "
+            f"{sorted(harness.batch_keys)}; the forward would raise on the first micro-batch, "
+            "with the checkpoint loaded and the timer already open"
+        )
+
+
+def refuse_packing_the_mask_registry_cannot_isolate(binding: Binding, config: BenchConfig) -> None:
+    """Refuse `dataloader.packing` on a build whose implementation makes no mask.
+
+    The fingerprint says whether the resolved implementation is in
+    `AttentionMaskInterface`, and `kernels.assert_packing_is_isolated` is what
+    turns that into a refusal — it had no caller, so the one place holding both
+    the fingerprint and `config.dataloader.packing` never asked. An unregistered
+    implementation makes transformers skip mask creation entirely and pass
+    `attention_mask=None` down, with no exception and no warning, and the pack's
+    sequences become each other's context while the record certifies
+    `dataloader.packing=True` beside an ordinary throughput number.
+    """
+    if not config.dataloader.packing:
+        return
+    kernels.assert_packing_is_isolated(binding.fingerprint[kernels.BUILD_FINGERPRINT_KEY])
+
+
 def build_run(
     config: BenchConfig, device: torch.device
 ) -> tuple[Any, list[str], AppliedState, Binding]:
@@ -522,6 +677,7 @@ def build_run(
     filing it as a clean refusal would say a setting was declined when a loop had
     already run. `tests/test_smoke_cpu.py` pins that boundary.
     """
+    close_kernel_fetch_doors(config)
     with refusing("patch"):
         axes.patch(config)
     with refusing("load_kwargs"):
@@ -531,10 +687,21 @@ def build_run(
         # `peft.mode=qlora` raises would leave `main`'s broad `except` instead of
         # `refusal_record`, and the setting would produce no result file at all.
         binding = load_framework(config, device)
+    with refusing("binding", fingerprint=binding.fingerprint):
+        # Everything that can only be asked once the model exists, and all of it
+        # before a timer opens. The fetch doors are re-read rather than merely
+        # closed above: building the model imports whatever the framework needs,
+        # and a module that arrives after the close carries its own default —
+        # closing and never looking again is the shape of check this repository
+        # keeps shipping.
+        if config.run.purpose in ENFORCED_PURPOSES:
+            kernels.assert_no_runtime_kernel_fetch()
+        refuse_a_step_this_harness_cannot_drive(binding.step)
+        refuse_packing_the_mask_registry_cannot_isolate(binding, config)
     model, processor = binding.model, binding.processor
 
     dataset = load_pairs(config)
-    with refusing("assemble"):
+    with refusing("assemble", fingerprint=binding.fingerprint):
         if config.dataloader.pretokenize:
             # Before `assemble`, which is the whole of the axis: `_dataloader`
             # refuses `pretokenize=true` over rows that do not already carry token
@@ -553,7 +720,7 @@ def build_run(
             # to have applied the axis.
             owned_axes=binding.owned_axes or {},
         )
-    with refusing("step_context"):
+    with refusing("step_context", fingerprint=binding.fingerprint):
         # The fifth call site, and the only one the measured loop enters. Called
         # once here and the result dropped, so a precision value with no recipe is
         # refused before the timer starts. Left to the loop it would raise on step
@@ -576,7 +743,7 @@ def build_run(
     # which wraps it in `report.run(...)` and swallows the raise. The `refusing`
     # block does not swallow it either: it re-raises a tagged exception that
     # `main` writes to the result file and then exits non-zero on.
-    with refusing("assert_matches", state):
+    with refusing("assert_matches", state, fingerprint=binding.fingerprint):
         assert_matches(state, config)
     return built, applied, state, binding
 
@@ -843,12 +1010,22 @@ def main(argv: list[str] | None = None) -> int:
             applied=state,
             applied_axes=applied,
             **metrics.oom_status(exc, peak_bytes=metrics.peak_memory_bytes(device)),
+            **fingerprint_payload(binding.fingerprint),
         )
         write_json(args.out, record)
         print(record["status"], file=sys.stderr)
         print(f"wrote {args.out}")
         return OOM_EXIT
-    record = build_record(config, device, applied=state, metrics=summary, applied_axes=applied)
+    record = build_record(
+        config,
+        device,
+        applied=state,
+        metrics=summary,
+        applied_axes=applied,
+        # What the build turned out to be, beside what it was asked to be. Without
+        # it a result file cannot say which kernel revision produced the number.
+        **fingerprint_payload(binding.fingerprint),
+    )
     write_json(args.out, record)
 
     print(f"{config.model.name} x {config.framework.name}: {summary['steps_measured']} steps")
