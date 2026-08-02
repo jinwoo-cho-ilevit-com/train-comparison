@@ -73,7 +73,11 @@ FINGERPRINT_KEYS = frozenset(
         "attention",
     }
 )
-ATTENTION_KEYS = frozenset({"requested", "bound", "per_module", "mask_fn_registered"})
+# The `attention` block is the kernel fingerprint, and its shape belongs to the
+# `kernel-provenance` boundary — same object, one owner. This file pins only that
+# the build fingerprint carries it; `validate_kernel_fingerprint` there is what
+# decides whether it is well formed, and it reads this fixture to say so.
+ATTENTION_KEYS = frozenset({"requested", "resolved", "backbones"})
 ENTRY_POINT_KEYS = frozenset({"framework", "harness_uses", "differs", "source"})
 UNVERIFIED = "확인 안 함"
 
@@ -260,14 +264,7 @@ def _validate_fingerprint(name: str, payload: dict[str, Any]) -> list[str]:
             "framework does not use"
         )
 
-    attention = fingerprint["attention"]
-    if _keys(problems, f"{name}.fingerprint.attention", attention, ATTENTION_KEYS):
-        _text(problems, f"{name}.fingerprint.attention.requested", attention["requested"])
-        _text(problems, f"{name}.fingerprint.attention.bound", attention["bound"])
-        if not isinstance(attention["per_module"], dict):
-            problems.append(f"{name}.fingerprint.attention.per_module must be an object")
-        if not isinstance(attention["mask_fn_registered"], bool):
-            problems.append(f"{name}.fingerprint.attention.mask_fn_registered must be a bool")
+    _keys(problems, f"{name}.fingerprint.attention", fingerprint["attention"], ATTENTION_KEYS)
     return problems
 
 
@@ -376,9 +373,9 @@ MUTATIONS = {
         lambda p: p["fingerprint"].pop("parameter_dtypes"),
         "fingerprint: keys",
     ),
-    "fingerprint loses the bound attention fn": (
+    "fingerprint loses the resolved attention kernel": (
         "native",
-        lambda p: p["fingerprint"]["attention"].pop("bound"),
+        lambda p: p["fingerprint"]["attention"].pop("resolved"),
         "attention: keys",
     ),
     "fingerprint taken from a pre-peft object": (

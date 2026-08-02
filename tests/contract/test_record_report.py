@@ -573,7 +573,19 @@ def test_every_axis_carries_its_state_and_framework_owned_is_not_a_mismatch():
         )
     owned = [a for a in applied["axes"] if a["state"] == FRAMEWORK_OWNED]
     assert {a["axis"] for a in owned} == {"loss.name", "parallel.cross_device_negatives"}
-    assert all(a["matches"] is False for a in owned)
+    assert applied[FRAMEWORK_OWNED] == sorted(a["axis"] for a in owned)
+    for axis in owned:
+        # Ownership is a declaration that nobody read the axis, so the record must
+        # name who has it and must carry no applied value to render beside it.
+        assert axis["owner"], f"{axis['axis']} is owned by nobody"
+        assert axis["applied"] is None
+        assert axis["determined"] is False
+        assert axis["matches"] is False
+    # Derived, not asserted: a literal here would let the sample claim a summary its
+    # own axes contradict, which is how a refused run reads as a measurable one.
+    assert applied["all_matched"] is not any(
+        a["determined"] and not a["matches"] for a in applied["axes"]
+    )
     assert applied["all_matched"] is True, (
         "a framework-owned axis reads as a mismatch, which is what refuses the run"
     )

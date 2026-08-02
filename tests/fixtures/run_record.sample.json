@@ -9,6 +9,7 @@
         "detail": {},
         "determined": true,
         "matches": true,
+        "owner": null,
         "requested": "sdpa",
         "state": "applied"
       },
@@ -18,6 +19,7 @@
         "detail": {},
         "determined": true,
         "matches": true,
+        "owner": null,
         "requested": "none",
         "state": "applied"
       },
@@ -27,25 +29,28 @@
         "detail": {},
         "determined": true,
         "matches": true,
+        "owner": null,
         "requested": "torch",
         "state": "applied"
       },
       {
-        "applied": false,
+        "applied": "False",
         "axis": "dataloader.packing",
         "detail": {},
         "determined": true,
         "matches": true,
-        "requested": false,
+        "owner": null,
+        "requested": "False",
         "state": "applied"
       },
       {
-        "applied": false,
+        "applied": "False",
         "axis": "dataloader.pretokenize",
         "detail": {},
         "determined": true,
         "matches": true,
-        "requested": false,
+        "owner": null,
+        "requested": "False",
         "state": "applied"
       },
       {
@@ -54,25 +59,28 @@
         "detail": {},
         "determined": true,
         "matches": true,
+        "owner": null,
         "requested": "tevatron",
         "state": "applied"
       },
       {
-        "applied": false,
+        "applied": "False",
         "axis": "freeze.ple",
         "detail": {},
         "determined": true,
         "matches": true,
-        "requested": false,
+        "owner": null,
+        "requested": "False",
         "state": "applied"
       },
       {
-        "applied": false,
+        "applied": "False",
         "axis": "freeze.vision_tower",
         "detail": {},
         "determined": true,
         "matches": true,
-        "requested": false,
+        "owner": null,
+        "requested": "False",
         "state": "applied"
       },
       {
@@ -81,17 +89,19 @@
         "detail": {},
         "determined": true,
         "matches": true,
+        "owner": null,
         "requested": "none",
         "state": "applied"
       },
       {
-        "applied": "tevatron.DenseModel.forward",
+        "applied": null,
         "axis": "loss.name",
         "detail": {
-          "owner": "tevatron"
+          "reason": "tevatron's DenseModel.forward computes encoding, pooling, normalisation, scoring and InfoNCE itself (encoder.py:52-87, pinned dd06310), so this run's loss is not ours to read back"
         },
-        "determined": true,
+        "determined": false,
         "matches": false,
+        "owner": "tevatron",
         "requested": "mnrl",
         "state": "framework_owned"
       },
@@ -101,18 +111,20 @@
         "detail": {},
         "determined": true,
         "matches": true,
+        "owner": null,
         "requested": "adamw_fused",
         "state": "applied"
       },
       {
-        "applied": "tevatron.DenseModel.forward",
+        "applied": null,
         "axis": "parallel.cross_device_negatives",
         "detail": {
-          "owner": "tevatron"
+          "reason": "the distributed gather happens inside tevatron's DenseModel.forward, not in a loss this run built"
         },
-        "determined": true,
+        "determined": false,
         "matches": false,
-        "requested": false,
+        "owner": "tevatron",
+        "requested": "False",
         "state": "framework_owned"
       },
       {
@@ -121,6 +133,7 @@
         "detail": {},
         "determined": true,
         "matches": true,
+        "owner": null,
         "requested": "single",
         "state": "applied"
       },
@@ -130,6 +143,7 @@
         "detail": {},
         "determined": true,
         "matches": true,
+        "owner": null,
         "requested": "full",
         "state": "applied"
       },
@@ -139,6 +153,7 @@
         "detail": {},
         "determined": true,
         "matches": true,
+        "owner": null,
         "requested": "bf16",
         "state": "applied"
       },
@@ -148,6 +163,7 @@
         "detail": {},
         "determined": true,
         "matches": true,
+        "owner": null,
         "requested": "none",
         "state": "applied"
       },
@@ -157,13 +173,65 @@
         "detail": {},
         "determined": true,
         "matches": true,
+        "owner": null,
         "requested": "none",
         "state": "applied"
       }
     ],
+    "framework_owned": [
+      "loss.name",
+      "parallel.cross_device_negatives"
+    ],
     "missing": []
   },
   "applied_axes": [],
+  "build_fingerprint": {
+    "attention": {
+      "backbones": {
+        "text_config": {
+          "attn_implementation": "sdpa",
+          "mask_registered": true,
+          "requested": true
+        },
+        "vision_config": {
+          "attn_implementation": "sdpa",
+          "mask_registered": true,
+          "requested": true
+        }
+      },
+      "requested": {
+        "attn_implementation": "sdpa",
+        "axis": "attn.name",
+        "value": "sdpa"
+      },
+      "resolved": {
+        "attn_implementation": "sdpa",
+        "identity": {
+          "package": "transformers",
+          "package_version": "5.14.1",
+          "repo_id": null,
+          "requested_ref": null,
+          "revision": null,
+          "source": "builtin"
+        },
+        "mask_registered": true,
+        "mask_registry": "transformers.masking_utils.AttentionMaskInterface"
+      }
+    },
+    "buffer_dtypes": {},
+    "module_classes": {
+      "encoder": "Qwen3_5Model",
+      "model": "DenseModel"
+    },
+    "parameter_dtypes": {
+      "encoder.embed_tokens.weight": "bfloat16",
+      "encoder.layers.0.self_attn.q_proj.weight": "bfloat16"
+    },
+    "trainable_parameter_names": [
+      "encoder.embed_tokens.weight",
+      "encoder.layers.0.self_attn.q_proj.weight"
+    ]
+  },
   "config": {
     "attn": {
       "name": "sdpa"
