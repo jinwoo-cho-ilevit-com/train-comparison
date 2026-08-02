@@ -13,8 +13,11 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_leaves
 
 from trainbench.metrics import (
+    GATE_FIELDS,
     METRIC_DEFINITIONS,
     STATUS_OOM,
     StepTimer,
@@ -31,6 +34,7 @@ from trainbench.metrics import (
     summarise,
     training_verdict,
 )
+from trainbench.metrics.validity import _NORM_CHUNK_ELEMENTS
 
 from .test_config import compose_cfg as bench_config
 
@@ -183,29 +187,30 @@ def test_token_accounting_declares_which_count_is_the_throughput_denominator():
     """An undeclared denominator is how two adapters report incomparable
     throughputs under one column heading. It is a config knob, and the name of the
     chosen counter lands in the summary — not a third copy of one of the rates,
-    which would be one more number able to disagree with itself."""
-    padded = bench_config("+measurement.throughput_denominator=padded_tokens")
+    which would be one more number able to disagree with itself.
+
+    The knob is pinned to `tokens` until a report ranks on the other rate, so the
+    name recorded here is the one the published tables used."""
     summary = summarise(
         [0.5] * 4,
         discard=0,
         rows_per_step=8,
         tokens_per_step=1000,
         padded_tokens_per_step=4000,
-        config=padded,
+        config=bench_config(),
     )
 
-    assert summary["throughput_denominator"] == "padded_tokens"
-    assert summary["measurement"]["throughput_denominator"] == "padded_tokens"
+    assert summary["throughput_denominator"] == "tokens"
+    assert summary["measurement"]["throughput_denominator"] == "tokens"
     rates = [key for key in summary if key.endswith("_per_second")]
     assert sorted(rates) == ["padded_tokens_per_second", "rows_per_second", "tokens_per_second"]
 
 
 def test_token_accounting_refuses_a_declared_denominator_nothing_counted():
-    """`padded_tokens` as the denominator of a run that never counted them is a
-    result whose headline rate has no numerator."""
-    config = bench_config("+measurement.throughput_denominator=padded_tokens")
+    """A denominator the run never counted is a result whose headline rate has no
+    numerator."""
     with pytest.raises(ValueError, match="never measured"):
-        summarise([0.5], discard=0, rows_per_step=8, tokens_per_step=1000, config=config)
+        summarise([0.5], discard=0, rows_per_step=8, config=bench_config())
 
 
 def test_token_accounting_refuses_a_rate_handed_in_by_a_caller():
@@ -244,7 +249,6 @@ def test_statistics_are_read_from_config_and_recorded_with_the_figure():
     the harness. Two summaries produced under different values of any of them are
     not comparable, and the summary is where that is said."""
     config = bench_config(
-        "+measurement.repeats=10",
         "+measurement.aggregate=olympic",
         "+measurement.instrument=wall_clock",
         "train.warmup_discard_steps=2",
@@ -258,7 +262,9 @@ def test_statistics_are_read_from_config_and_recorded_with_the_figure():
     )
 
     assert summary["measurement"]["declared"] is True
-    assert summary["measurement"]["repeats"] == 10
+    # One, because one measured window is what the harness runs — see
+    # `tests/test_config.py` for the refusal that keeps any other value out.
+    assert summary["measurement"]["repeats"] == 1
     assert summary["measurement"]["aggregate"] == "olympic"
     assert summary["measurement"]["instrument"] == "wall_clock"
     assert summary["steps_discarded"] == 2
@@ -404,6 +410,118 @@ def test_the_validity_gate_passes_the_same_model_once_it_can_learn():
     assert (ok, reasons) == (True, [])
 
 
+class _WidestFloat64Promotion(TorchDispatchMode):
+    """The largest number of elements any single op promoted to float64.
+
+    A float64 output means the op materialised the promotion, so the widest tensor
+    it touched is what that promotion cost. Read below the dispatcher rather than
+    from RSS because a high-water mark is shared with the rest of the session and
+    would report whichever test ran before this one.
+    """
+
+    def __init__(self) -> None:
+        self.widest = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # noqa: ANN001
+        kwargs = kwargs or {}
+        out = func(*args, **kwargs)
+        leaves = [
+            leaf
+            for leaf in (*tree_leaves((args, kwargs)), *tree_leaves(out))
+            if isinstance(leaf, torch.Tensor)
+        ]
+        if any(leaf.dtype == torch.float64 for leaf in leaves):
+            self.widest = max(self.widest, *(leaf.numel() for leaf in leaves))
+        return out
+
+
+class _OneBigGradient(torch.nn.Module):
+    """One parameter whose gradient is wider than a float64 promotion may be."""
+
+    def __init__(self, rows: int, columns: int, *, transposed: bool = False) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(rows, columns, dtype=torch.bfloat16))
+        shape = (columns, rows) if transposed else (rows, columns)
+        grad = torch.full(shape, 0.5, dtype=torch.bfloat16)
+        self.weight.grad = grad.T if transposed else grad
+
+
+def test_the_gradient_norm_does_not_promote_a_whole_gradient_to_float64():
+    """`grad.to(torch.float64).pow(2).sum()` materialises eight bytes per element,
+    twice. On one Qwen3.5 embedding gradient that is 5 GB, and `scripts/bench.py`
+    calls this after `reset_peak_memory` and before `peak_memory_bytes`, inside the
+    block that files a failure as `status: oom` — so the allocation is reported as
+    the step's peak memory, and its own OOM as the hardware ceiling.
+
+    The bound is the finding, not the speed: what is asserted is that no single
+    operation promoted more than `_NORM_CHUNK_ELEMENTS` elements at once.
+    """
+    rows, columns = 4096, 2048
+    model = _OneBigGradient(rows, columns)
+    assert rows * columns > _NORM_CHUNK_ELEMENTS, "the gradient must exceed one chunk to bound it"
+
+    watcher = _WidestFloat64Promotion()
+    with watcher:
+        norm = gradient_norm(model)
+
+    # Every element is 0.5, exactly representable in bf16: sum of squares is
+    # numel/4 and the norm is its root, hand-checkable rather than golden.
+    assert norm == pytest.approx(math.sqrt(rows * columns * 0.25))
+    assert watcher.widest <= _NORM_CHUNK_ELEMENTS, (
+        f"one operation promoted {watcher.widest} elements to float64, over the "
+        f"{_NORM_CHUNK_ELEMENTS}-element bound; a gradient-sized promotion lands in "
+        "peak_memory_bytes and can OOM inside the block that files OOM as the ceiling"
+    )
+
+
+def test_the_gradient_norm_reads_a_non_contiguous_gradient_without_copying_it():
+    """Chunking along the first dimension slices any strided tensor into views.
+    Flattening first would copy a non-contiguous gradient whole — the same
+    allocation, arrived at from the other side."""
+    rows, columns = 4096, 2048
+    model = _OneBigGradient(rows, columns, transposed=True)
+    assert not model.weight.grad.is_contiguous()
+
+    watcher = _WidestFloat64Promotion()
+    with watcher:
+        norm = gradient_norm(model)
+
+    assert norm == pytest.approx(math.sqrt(rows * columns * 0.25))
+    assert watcher.widest <= _NORM_CHUNK_ELEMENTS
+
+
+def test_the_validity_gate_refuses_a_record_that_deleted_the_field_it_compares_against():
+    """`GATE_FIELDS` names `total_params` and says absence is a refusal rather than
+    a pass. Skipping the peft check when it is missing is the same silence: a
+    `peft.mode=full` run that trained 12 of N tensors — the partial freeze HAZARDS
+    records — would be published as a full finetune because nothing was there to
+    compare 12 against.
+
+    Deleted rather than set to a bad value: every other case in this file mutates a
+    field, and absence is the one the gate used to pass.
+    """
+    healthy = {
+        "grad_norm": 1.5,
+        "trainable_params": 12,
+        "total_params": 100,
+        "loss_first": 2.9,
+        "loss_last": 1.2,
+        "peak_memory_bytes": 1024,
+    }
+    assert "total_params" in GATE_FIELDS
+
+    for mode in ("full", "lora"):
+        without = {key: value for key, value in healthy.items() if key != "total_params"}
+        ok, reasons = training_verdict(without, peft_mode=mode, device="cuda:0")
+        assert ok is False, f"peft.mode={mode} passed with no `total_params` to compare against"
+        assert any("total_params" in reason for reason in reasons), reasons
+
+    # The same record with the field present is the contrast: the gate has an
+    # answer either way, and it is not "fine".
+    assert training_verdict(healthy, peft_mode="full", device="cuda:0")[0] is False
+    assert training_verdict({**healthy, "trainable_params": 100}, peft_mode="full", device="cuda:0")
+
+
 @pytest.mark.parametrize(
     ("name", "over", "peft_mode", "expected"),
     [
@@ -412,6 +530,7 @@ def test_the_validity_gate_passes_the_same_model_once_it_can_learn():
         ("a full finetune that froze part of itself", {"trainable_params": 2}, "full", "full"),
         ("a LoRA in which everything trains", {}, "lora", "did not narrow"),
         ("a CUDA run with no peak memory", {"peak_memory_bytes": None}, "full", "peak_memory"),
+        ("a total the gate cannot compare", {"total_params": None}, "full", "total_params"),
         ("an absent gradient norm", {"grad_norm": None}, "full", "grad_norm"),
         # On its own, with every other field healthy: this is the field-reported
         # shape — 46,000 tokens/second at a gradient norm of zero.

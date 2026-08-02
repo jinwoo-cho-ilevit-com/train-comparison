@@ -7,7 +7,11 @@ from hydra import compose, initialize_config_dir
 from pydantic import ValidationError
 
 from trainbench.compose import resolve
-from trainbench.config_schema import CORRUPT_DATA_REVISIONS, BenchConfig
+from trainbench.config_schema import (
+    BASELINE_DEVIATION_LIMIT,
+    CORRUPT_DATA_REVISIONS,
+    BenchConfig,
+)
 from trainbench.metrics import repeat_seeds
 
 from .conftest import CONFIG_DIR
@@ -251,39 +255,40 @@ def test_an_adapter_with_no_rank_is_refused():
 # ---------------------------------------------------------------------------
 
 
-def test_the_seed_policy_schema_can_express_a_distinct_seed_per_repeat():
-    """MLPerf CLOSED draws each run's seed from `/dev/urandom` and requires that no
-    two runs log the same one. Repeating a fixed seed re-measures a single point,
-    which is not the distribution a spread over those repeats claims to describe.
+def test_a_repeat_count_no_loop_repeats_is_refused_before_it_reaches_the_record():
+    """`scripts/bench.py` runs one measured window per process. A declared
+    `repeats=10` therefore changes nothing and still lands in the `measurement`
+    block of every record, beside a `step_seconds_stdev` that is the spread of the
+    steps within one run — a reader takes it for the spread over ten.
 
-    The study still runs `fixed`; changing that needs a pod's noise floor first.
-    What must exist now is the ability to express and record the other policy, so
-    that change is a config edit rather than a schema change.
+    This is the shape `_the_trim_and_the_aggregate_agree` already refuses one field
+    over. The refusal names the missing loop, so landing the loop and deleting the
+    refusal are the same change.
     """
-    config = compose_cfg("+measurement.repeats=4", "+measurement.seed_policy=per_repeat")
-    assert config.measurement.seed_policy == "per_repeat"
+    with pytest.raises(ValidationError, match="no repeat loop"):
+        compose_cfg("+measurement.repeats=10")
+    assert compose_cfg().measurement.repeats == 1
 
-    seeds = repeat_seeds("per_repeat", config.measurement.repeats, config.train.seed)
-    assert len(seeds) == 4
+
+def test_a_seed_policy_that_samples_nothing_is_refused_with_the_repeat_loop_absent():
+    """MLPerf CLOSED draws each run's seed from `/dev/urandom` and requires that no
+    two runs log the same one. With one measured window there is nothing to draw
+    for, so `per_repeat` in a record would name a sampling policy nothing sampled.
+
+    The schema keeps the literal and `metrics.repeat_seeds` keeps the behaviour, so
+    what is missing is the loop and not the ability to express the policy.
+    """
+    with pytest.raises(ValidationError, match="repeats > 1"):
+        compose_cfg("+measurement.seed_policy=per_repeat")
+    assert compose_cfg().measurement.seed_policy == "fixed"
+
+    seeds = repeat_seeds("per_repeat", 4, 1234)
     assert len(set(seeds)) == 4, f"two repeats share a seed: {seeds}"
-    assert seeds != repeat_seeds("per_repeat", 4, config.train.seed), (
+    assert seeds != repeat_seeds("per_repeat", 4, 1234), (
         "two draws produced the same four seeds, so the policy is deriving them from "
         "the base seed rather than sampling"
     )
-
-
-def test_the_fixed_seed_policy_records_that_it_re_measures_one_point():
-    """`fixed` is the current policy and it must not look like four samples.
-
-    Every repeat gets the configured seed, so the recorded seeds collapse to one
-    value — which is the honest reading of what the repeats measured.
-    """
-    config = compose_cfg("+measurement.repeats=4")
-    assert config.measurement.seed_policy == "fixed"
-
-    seeds = repeat_seeds("fixed", config.measurement.repeats, config.train.seed)
-    assert seeds == (config.train.seed,) * 4
-    assert len(set(seeds)) == 1
+    assert repeat_seeds("fixed", 4, 1234) == (1234,) * 4
 
 
 def test_an_unknown_seed_policy_is_refused_rather_than_defaulted():
@@ -293,21 +298,38 @@ def test_an_unknown_seed_policy_is_refused_rather_than_defaulted():
         repeat_seeds("urandom", 2, 1234)
 
 
-def test_the_seed_policy_travels_with_an_uncalibrated_deviation_threshold():
+def test_a_deviation_threshold_no_report_reads_cannot_be_declared_calibrated():
     """AGENTS.md's 3% has no source, and GPU contention alone has moved a step-time
-    standard deviation by 30x elsewhere. The number is read from config and carries
-    the fact that nothing derived it, so a reader is not left to assume it was."""
+    standard deviation by 30x elsewhere. Pod validity is nevertheless decided by
+    `scripts/report.py`'s own `BASELINE_DEVIATION_LIMIT`, which reads nothing from
+    here — so a pod that measured its noise floor and declared 8.1% would publish
+    records claiming a calibrated threshold beside a table that used 3%.
+
+    Until the report reads this field the schema pins it, and
+    `config_schema.BASELINE_DEVIATION_LIMIT` is the one value for the report to
+    read when it does.
+    """
     config = compose_cfg()
-    assert config.measurement.baseline_tolerance == 0.03
+    assert config.measurement.baseline_tolerance == BASELINE_DEVIATION_LIMIT
     assert config.measurement.baseline_tolerance_calibrated is False
     assert config.measurement.tolerance_status == "uncalibrated"
 
-    calibrated = compose_cfg(
-        "+measurement.baseline_tolerance=0.081",
-        "+measurement.baseline_tolerance_calibrated=true",
-    )
-    assert calibrated.measurement.baseline_tolerance == pytest.approx(0.081)
-    assert calibrated.measurement.tolerance_status == "calibrated"
+    with pytest.raises(ValidationError, match="BASELINE_DEVIATION_LIMIT"):
+        compose_cfg("+measurement.baseline_tolerance=0.081")
+    with pytest.raises(ValidationError, match="BASELINE_DEVIATION_LIMIT"):
+        compose_cfg("+measurement.baseline_tolerance_calibrated=true")
+
+
+def test_a_throughput_denominator_no_table_ranks_on_is_refused():
+    """Padding reaches 89% of a batch on some corpora, and which token count
+    divides the step time reverses the `dataloader.packing` ranking — which is why
+    the field exists. `scripts/report.py` ranks on `tokens_per_second`
+    unconditionally and renders no padded-token rate, so a declared
+    `padded_tokens` would put a denominator in the record that no published figure
+    used, invisibly to anyone reading the report."""
+    with pytest.raises(ValidationError, match="padded-token rate"):
+        compose_cfg("+measurement.throughput_denominator=padded_tokens")
+    assert compose_cfg().measurement.throughput_denominator == "tokens"
 
 
 def test_a_trim_fraction_and_an_aggregate_that_ignores_it_cannot_coexist():
