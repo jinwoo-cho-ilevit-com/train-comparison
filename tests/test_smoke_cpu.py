@@ -17,10 +17,13 @@ is that check.
 
 from __future__ import annotations
 
+import copy
+import importlib
 import importlib.util
 import inspect
 import io
 import json
+import os
 import pickle
 import subprocess
 import sys
@@ -31,7 +34,7 @@ from typing import Any
 import pytest
 import torch
 
-from trainbench import axes, collate
+from trainbench import axes, collate, kernels
 from trainbench.applied import AppliedMismatch, Built, assert_matches, capture
 
 from .conftest import REPO_ROOT
@@ -44,6 +47,10 @@ sys.modules["bench_entry"] = bench_entry
 _spec.loader.exec_module(bench_entry)
 
 CPU = torch.device("cpu")
+
+# Distinguishes "this module global was absent" from "it held None", so the fetch
+# doors are restored to absence rather than to a value they never had.
+ABSENT = object()
 
 
 class TinyEmbedder(torch.nn.Module):
@@ -1634,23 +1641,33 @@ def test_a_pod_wrong_in_both_ways_is_told_both(tmp_path, config_mapping, monkeyp
 # ends separately — that is how it stayed open through three lanes.
 
 
-def adapter_binding(monkeypatch, **declared):
-    """Run `main()` against a binding that declares what a real adapter would.
+def binding_rewritten(monkeypatch, rewrite):
+    """Run `main()` against the real binding, with `rewrite` applied to it first.
 
     Built on top of the real `load_framework` so the model and processor are the
     stubbed ones and only the declarations differ; the point under test is what
-    `build_run` does with the fields, not what any framework loads.
+    `build_run` does with the fields, not what any framework loads. `rewrite` also
+    runs at the moment the model exists, which is the only place a test can watch
+    what the build left behind it.
     """
     original = bench_entry.load_framework
 
     def patched(config, device):
-        loaded = original(config, device)
+        return rewrite(original(config, device))
+
+    monkeypatch.setattr(bench_entry, "load_framework", patched)
+
+
+def adapter_binding(monkeypatch, **declared):
+    """Run `main()` against a binding that declares what a real adapter would."""
+
+    def replace(loaded):
         # By field name, which is also an assertion: `Binding` and `AdapterOut`
         # carry the same eight, and the contract fixes them.
         carried = {name: getattr(loaded, name) for name in bench_entry.Binding._fields}
         return bench_entry.Binding(**carried | declared)
 
-    monkeypatch.setattr(bench_entry, "load_framework", patched)
+    binding_rewritten(monkeypatch, replace)
 
 
 def test_a_probe_record_carries_the_gradient_norm_and_the_parameter_counts(
@@ -1807,3 +1824,327 @@ def test_the_memory_ceiling_in_the_measured_loop_is_a_result_and_not_a_crash(
     assert record["status"] == "oom"
     assert record["oom"]["error_type"] == "OutOfMemoryError"
     assert "metrics" not in record
+
+
+# --- the declarations the run has to consume, and the doors it has to close ---
+# Every check below existed on one side only. `AdapterOut.step` and
+# `AdapterOut.fingerprint` were produced each run and read by nobody, while
+# `kernels.assert_packing_is_isolated`, `forbid_runtime_kernel_fetch` and
+# `assert_no_runtime_kernel_fetch` had no caller outside their own tests and
+# docs/methodology.md §11 described all three stopping runs. These go through
+# `main()`, because a declaration and its consumer tested apart is how the gap
+# stayed open.
+
+
+@pytest.fixture(autouse=True)
+def fetch_doors_restored():
+    """Leave the process's kernel-fetch doors as they were found.
+
+    `close_kernel_fetch_doors` writes to `os.environ` and to module globals that
+    were read once at import, and returning from `main()` undoes neither. Without
+    this, one timing test here would put every later test in the session — any
+    file, in whatever order pytest-randomly picked — behind `HF_HUB_OFFLINE=1`.
+    """
+    env = {name: os.environ.get(name) for name in kernels.RUNTIME_FETCH_ENV}
+    cached = [
+        (sys.modules[module], attribute, getattr(sys.modules[module], attribute, ABSENT))
+        for module, attribute, _ in kernels.CACHED_FETCH_SWITCHES
+        if module in sys.modules
+    ]
+    yield
+    for name, value in env.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    for module, attribute, value in cached:
+        if value is ABSENT:
+            delattr(module, attribute)
+        else:
+            setattr(module, attribute, value)
+
+
+def unregistered_mask(binding):
+    """The same binding, fingerprinted as a build whose kernel makes no mask.
+
+    Both flags move together because `validate_fingerprint` refuses a payload
+    where the covered backbone and `resolved` disagree — the state under test is
+    an implementation absent from the mask registry, not a malformed record.
+    """
+    fingerprint = copy.deepcopy(dict(binding.fingerprint))
+    attention = fingerprint[kernels.BUILD_FINGERPRINT_KEY]
+    attention["resolved"]["mask_registered"] = False
+    for entry in attention["backbones"].values():
+        entry["mask_registered"] = False
+    # `__replace__`, not `_replace`: `load_framework` returns `loader.AdapterOut`,
+    # a dataclass, and `Binding` is the NamedTuple it substitutes for.
+    return copy.replace(binding, fingerprint=fingerprint)
+
+
+def doors_seen_by_the_build(monkeypatch, config, pod_setting):
+    """The fetch doors still open at the moment the model exists.
+
+    Read from inside the build rather than after `main()` returns: after it is the
+    one place a late close would still look like an early one, and closing after
+    the model is built is exactly the vacuum this wiring is for. The environment
+    is cleared first so the answer is this run's and not the host's.
+    """
+    for name in kernels.RUNTIME_FETCH_ENV:
+        monkeypatch.delenv(name, raising=False)
+    seen = []
+
+    def watch(loaded):
+        seen.append(kernels.open_fetch_doors())
+        return loaded
+
+    binding_rewritten(monkeypatch, watch)
+    pod_setting(config, text_only_rows(8))
+
+    assert len(seen) == 1, "the build has to have happened exactly once"
+    return seen[0]
+
+
+def test_the_build_fingerprint_the_load_computed_reaches_the_result_file(
+    pod_setting,
+    config_mapping,  # noqa: F811
+):
+    """`loader.describe` fingerprints every build and `main` dropped it.
+
+    `kernels.RUN_RECORD_KEY` names where the `kernel-provenance` contract puts the
+    payload and `tests/fixtures/run_record.sample.json` carries it, so that
+    contract was green against a fixture while no run ever produced the key. Two
+    pods binding different revisions of one fa2 request were indistinguishable
+    from their result files, and `loader.fingerprint_diff` had no input.
+    """
+    config = timing_config(config_mapping, **{"run.purpose": "probe", "train.batch_size": 4})
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == 0
+    fingerprint = record[kernels.RUN_RECORD_KEY]
+    # The attention block validates on its own terms, so what landed is the
+    # payload the boundary froze rather than a dict shaped like it.
+    kernels.validate_fingerprint(fingerprint[kernels.BUILD_FINGERPRINT_KEY])
+    assert fingerprint["trainable_parameter_names"]
+    assert fingerprint["parameter_dtypes"]
+
+
+def test_a_refusal_after_the_model_exists_still_says_what_was_built(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """A refused setting is a result, and a result whose model was built can name
+    the kernel it was refusing."""
+    binding_rewritten(monkeypatch, unregistered_mask)
+    config = timing_config(config_mapping, **{"run.purpose": "probe", "dataloader.packing": True})
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == bench_entry.REFUSED_EXIT
+    assert kernels.RUN_RECORD_KEY in record
+
+
+def test_a_framework_owned_step_is_refused_instead_of_measured_by_this_loop(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """tevatron declares `DenseModel.forward` runs its step and `loss.name` is its
+    own (decision 5). Nothing read the declaration: `owned_axes` reached
+    `assemble` and exempted the axis from the capture while `train()` went on
+    computing InfoNCE with `built.loss_fn` — a harness number published under
+    `framework_owned`, which is the `loss=cached_mnrl` shape.
+    """
+    loader = importlib.import_module("trainbench.loader")
+    adapter_binding(
+        monkeypatch,
+        framework="tevatron",
+        step=loader.Step(
+            owner=loader.FRAMEWORK,
+            callable="tevatron.retriever.modeling.DenseModel.forward",
+            batch_keys=("query", "passage"),
+        ),
+        owned_axes={"loss.name": "DenseModel.forward computes it"},
+    )
+    config = timing_config(config_mapping, **{"run.purpose": "probe"})
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == bench_entry.REFUSED_EXIT
+    assert record["refusal"]["kind"] == "AdapterRefusal"
+    assert record["refusal"]["stage"] == "binding"
+    assert "framework-owned step" in record["refusal"]["reason"]
+    # No number at all is the point: a metrics block here would be this loop's own
+    # step time wearing the framework's label.
+    assert "metrics" not in record
+
+
+def test_a_step_needing_batch_keys_this_collate_never_builds_is_refused(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """`Step.batch_keys` is the other half of the same declaration. tevatron's
+    forward takes `query=`/`passage=` and `build_collate` builds
+    `input_ids`/`attention_mask`, so the harness loop raises `TypeError` on step 0
+    — after the checkpoint is loaded and the timer is open, where nothing catches
+    it and the pod publishes no result at all.
+    """
+    loader = importlib.import_module("trainbench.loader")
+    adapter_binding(
+        monkeypatch,
+        step=loader.Step(owner=loader.HARNESS, callable=None, batch_keys=("query", "passage")),
+    )
+    config = timing_config(config_mapping, **{"run.purpose": "probe"})
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == bench_entry.REFUSED_EXIT
+    assert record["refusal"]["kind"] == "AdapterRefusal"
+    assert "'passage', 'query'" in record["refusal"]["reason"]
+
+
+def test_an_adapter_refusal_is_filed_as_a_result_instead_of_escaping_main(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """unsloth returning a fully frozen graph is a finding of this study — three
+    cells of the 2026-08-02 campaign were published from one. `AdapterRefusal` is
+    how `loader` says so, and `refusing()` caught only `UnappliedAxis` and
+    `AppliedMismatch`, so the process died with a traceback, `--out` was never
+    written, and docker/entrypoint.sh filed the cell as one nobody attempted.
+    """
+    loader = importlib.import_module("trainbench.loader")
+
+    def refuse(framework, fingerprint, context):
+        raise loader.AdapterRefusal(f"{framework} built a model with no trainable parameter")
+
+    monkeypatch.setattr(loader, "_refuse_a_build_the_fingerprint_condemns", refuse)
+    config = timing_config(config_mapping, **{"run.purpose": "probe"})
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == bench_entry.REFUSED_EXIT
+    assert record["refusal"]["kind"] == "AdapterRefusal"
+    assert record["refusal"]["stage"] == "load_kwargs"
+    # It fired before the model was described, so there is nothing to fingerprint
+    # and the record says nothing rather than null.
+    assert kernels.RUN_RECORD_KEY not in record
+
+
+def test_packing_on_a_kernel_the_mask_registry_does_not_know_is_refused(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """An implementation absent from `AttentionMaskInterface` makes transformers
+    skip mask creation and pass `attention_mask=None` down — no exception, no
+    warning — so a pack's sequences become each other's context while the record
+    certifies `dataloader.packing=True` beside an ordinary throughput number.
+    `kernels.assert_packing_is_isolated` refuses that, and had no caller.
+    """
+    binding_rewritten(monkeypatch, unregistered_mask)
+    config = timing_config(config_mapping, **{"run.purpose": "probe", "dataloader.packing": True})
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == bench_entry.REFUSED_EXIT
+    assert record["refusal"]["kind"] == "UnsafePacking"
+    assert "metrics" not in record
+
+
+def test_a_registered_mask_lets_the_same_packed_run_through(
+    pod_setting,
+    config_mapping,  # noqa: F811
+):
+    """The control for the test above: `sdpa` is in the registry, so the identical
+    packed setting measures. Without it the refusal could be refusing packing."""
+    config = timing_config(config_mapping, **{"run.purpose": "probe", "dataloader.packing": True})
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == 0, record
+    assert record["metrics"]["steps_measured"] > 0
+
+
+def test_a_timing_run_closes_the_kernel_fetch_doors_before_the_model_is_built(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """A kernel that arrives during the run is not the kernel the image digest
+    pins, and the download lands inside the measured setting. The doors are read
+    from inside the build, because reading them after it is the one place a late
+    close would still look like an early one.
+    """
+    seen = doors_seen_by_the_build(monkeypatch, timing_config(config_mapping), pod_setting)
+
+    assert seen == [], seen
+
+
+def test_a_probe_is_not_put_behind_the_closed_doors(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """A probe is what populates the cache a measured run then reads, and it exists
+    to find out whether a combination builds at all. Closing the doors there would
+    turn "no cache on this pod" into "this framework cannot build this model",
+    which is a different finding.
+    """
+    config = timing_config(config_mapping, **{"run.purpose": "probe"})
+
+    seen = doors_seen_by_the_build(monkeypatch, config, pod_setting)
+
+    assert seen, "the probe's doors were closed"
+
+
+def test_a_door_reopened_while_the_model_was_built_stops_the_timing_run(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """Closing the doors once is not the check. Building the model imports
+    whatever the framework needs, and a module that arrives after the close
+    carries its own default — `kernels` caches `_DISABLE_KERNEL_MAPPING` at import
+    exactly that way. `assert_no_runtime_kernel_fetch` is what reads them again.
+    """
+    module, attribute, want = kernels.CACHED_FETCH_SWITCHES[-1]
+
+    def reopen(loaded):
+        monkeypatch.setitem(sys.modules, module, SimpleNamespace(**{attribute: not want}))
+        return loaded
+
+    binding_rewritten(monkeypatch, reopen)
+
+    code, record = pod_setting(timing_config(config_mapping), text_only_rows(8))
+
+    assert code == bench_entry.REFUSED_EXIT
+    assert record["refusal"]["kind"] == "RuntimeKernelFetch"
+    assert attribute in record["refusal"]["reason"]
+
+
+def test_a_packed_forward_is_told_not_to_build_a_cache(config_mapping):  # noqa: F811
+    """Packing isolation exists only when `past_key_values is None`:
+    `masking_utils._preprocess_mask_arguments` calls
+    `find_packed_sequence_indices` under that condition alone, and every model
+    here ships `config.use_cache=True`. Without this the mask is one causal
+    triangle over the whole pack and no exception says so.
+    """
+    seen = {}
+
+    class CacheWatching(torch.nn.Module):
+        def forward(self, input_ids, **kwargs):
+            seen.update(kwargs)
+            total = int(input_ids.shape[1])
+            return SimpleNamespace(last_hidden_state=torch.zeros(1, total, 4))
+
+    cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32)
+
+    bench_entry.pooled_embeddings(
+        CacheWatching(), {"input_ids": torch.ones(1, 7, dtype=torch.long)}, "left", cu_seqlens
+    )
+
+    assert seen["use_cache"] is False
