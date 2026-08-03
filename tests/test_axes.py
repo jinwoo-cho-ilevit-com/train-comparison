@@ -3053,7 +3053,13 @@ def test_gradcache_holds_less_activation_than_a_plain_backward_on_an_image_batch
     plain = held(lambda: whole_batch_backward(tiny_image_encoder(), batch, 0.05))
 
     def gradcached(size: int) -> int:
-        loss_fn, _ = axes._loss(cached(composed, **{"loss.mini_batch": size}))
+        # `train.batch_size` is pinned here rather than inherited: this test builds its
+        # own six-row batch above, and the knob only has to satisfy the schema's
+        # `mini_batch <= train.batch_size` guard. Inherited, the campaign moving its
+        # workload size would break a test about GradCache's mechanics.
+        loss_fn, _ = axes._loss(
+            cached(composed, **{"loss.mini_batch": size, "train.batch_size": 6})
+        )
         return held(
             lambda: loss_fn.gradcache_backward(
                 tiny_image_encoder(), batch, padding_side="right", images_per_row=counts

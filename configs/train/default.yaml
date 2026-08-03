@@ -15,7 +15,11 @@
 # *files* per group and skips `train` outright (`NON_AXIS_GROUPS`). It now reads
 # them off the schema's `Axis()` marks instead (`audit_plan.flag_knob_values`), so
 # a value here that stops applying moves its count.
-batch_size: 16
+# 16 OOMed on an A100 80GB (measured 2026-08-03: qwen3_5 baseline, peak 80.7GB with
+# 75.10GiB held by PyTorch). Every manifest that does not pin its own inherits this,
+# and the three `phase2-loss-*` pods did — they would have run the baseline at 4 and
+# then OOMed on both loss settings. `configs/loss/cached_mnrl.yaml` moves with it.
+batch_size: 4
 grad_accum: 1
 steps: 120
 warmup_discard_steps: 10

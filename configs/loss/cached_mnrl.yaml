@@ -12,4 +12,8 @@
 # would hand one row's pixels to another row.
 name: cached_mnrl
 temperature: 0.02
-mini_batch: 8
+# Half of `train.batch_size`, so the batch always cuts into four pieces — a batch of
+# N pairs is 2N rows through the model. Pinned to the batch rather than to a size:
+# the schema refuses `mini_batch > train.batch_size` (GradCache splits a batch, it
+# cannot grow one), so 8 stopped composing when the batch moved to 4.
+mini_batch: 2
