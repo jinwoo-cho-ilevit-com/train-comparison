@@ -37,12 +37,34 @@ _TRACKED_PACKAGES = (
     "sentence-transformers",
     "tevatron",
     "liger-kernel",
+    # `fla-core` is the distribution transformers actually imports for Gated
+    # DeltaNet — `fla.ops`, `fla.modules` — while `flash-linear-attention` is the
+    # thin wrapper (`fla.layers`, `fla.models`) that `==`-pins it
+    # (trainbench/axes.py's `FLA_OPS_DISTRIBUTION`/`FLA_DISTRIBUTIONS`, verified
+    # 2026-08-03 against `envs/native/uv.lock`: both resolve to 0.5.2). Both are
+    # tracked rather than one replacing the other: the pin is what makes them
+    # agree today, and the day a wheel breaks it, dropping either name would hide
+    # exactly the split this field exists to show.
     "flash-linear-attention",
+    "fla-core",
     # Axis-critical. flash-attn decides whether an fa2/3/4 request is real, and
     # causal-conv1d is required alongside fla for the Gated DeltaNet fast path —
     # recording only half of that pair records only half the evidence.
     "flash-attn",
     "causal-conv1d",
+    # Also axis-critical, and both silent substitutions if left unrecorded.
+    # `kernels` present without `flash-attn` makes transformers rewrite an
+    # `attn=fa2` request onto a Hub kernel instead of refusing it — pinned at
+    # `FLASH_ATTN_KERNEL_FALLBACK["flash_attention_2"] ==
+    # "kernels-community/flash-attn2"`
+    # (transformers/modeling_flash_attention_utils.py:65-66, verified against the
+    # installed 5.14.1 wheel) — so a run labelled fa2 can be measuring a
+    # different kernel depending only on whether this package is installed.
+    # `triton` is what `compile.mode` actually compiles through (torch inductor's
+    # CUDA backend); a version drift there is a `compile` axis confound the same
+    # way a torch version drift is a framework confound.
+    "kernels",
+    "triton",
     "bitsandbytes",
     "deepspeed",
     "torchvision",

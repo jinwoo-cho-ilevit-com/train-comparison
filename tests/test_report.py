@@ -256,6 +256,9 @@ def test_a_timing_record_reports_its_figures_instead_of_no_result(tmp_path):
     assert rows == [
         "| attn-fa3 | podA | native x gemma4_e2b | timing | 0.5000 | 0.5000 | 0.5000 "
         "| 64.00 | 16384.0 | 20.00 | 12/2/10 | 기준선 없음 |",
+        # The axis-confound table: no attn/compile/kernel config and no relevant
+        # packages here, so every column reads '-'.
+        "| attn-fa3 | podA | - | - | - | - | - | - | - | - | - |",
         "| attn-fa3 | podA | 64.0 | 9000.0 | 8192.0 | 4.00 | 0.00 | 0 | 없음 |",
     ]
 
@@ -458,6 +461,190 @@ def test_a_stack_the_record_cannot_name_is_ranked_with_nobody(tmp_path):
     section = rendered.index(f"해석 스택: {report.STACK_UNKNOWN}")
     assert rendered.index("| nameless |") > section
     assert rendered.index("| named |") < section
+
+
+# --- axis-critical packages sit next to the axis they confound -------------
+
+
+def test_the_axis_confound_table_puts_the_version_beside_the_axis_it_confounds(tmp_path):
+    """AGENTS.md: the resolved version is a confound that must be visible in
+    results. Dumping it at the bottom is not enough — a reader checking one run's
+    number must read attn/compile/kernel and their packages in the same table."""
+    payload = timing_payload("native", "gemma4_e2b", "podA", timing_metrics(0.5))
+    payload["config"]["attn"] = {"name": "fa2"}
+    payload["config"]["compile"] = {"mode": "default"}
+    payload["config"]["kernel"] = {"name": "fla"}
+    payload["packages"].update(
+        {
+            "flash-attn": "2.8.3",
+            "kernels": "0.16.0",
+            "triton": "3.7.1",
+            "flash-linear-attention": "0.5.2",
+            "fla-core": "0.5.2",
+            "causal-conv1d": "1.5.0",
+        }
+    )
+    write(tmp_path, "native", "gemma4_e2b", "podA", payload, label="attn-fa2")
+    _, _, _, rendered = merged(tmp_path)
+
+    assert "축을 흔드는 패키지" in rendered
+    row = next(line for line in rendered.splitlines() if line.startswith("| attn-fa2 | podA | fa2"))
+    assert row == (
+        "| attn-fa2 | podA | fa2 | 2.8.3 | 0.16.0 | default | 3.7.1 | fla | 0.5.2 | 0.5.2 | 1.5.0 |"
+    )
+
+
+def test_a_run_with_no_axis_confound_packages_installed_reads_as_absent_not_zero(tmp_path):
+    """`kernels`/`triton`/`fla-core` do not install on this host (axes.py's own
+    docstring), so a run with the inert axis values must show '-', not fabricate
+    a version nobody read."""
+    write(
+        tmp_path,
+        "native",
+        "gemma4_e2b",
+        "podA",
+        timing_payload("native", "gemma4_e2b", "podA", timing_metrics(0.5)),
+        label="attn-fa3",
+    )
+    _, _, _, rendered = merged(tmp_path)
+    row = next(line for line in rendered.splitlines() if line.startswith("| attn-fa3 | podA | -"))
+    assert row == "| attn-fa3 | podA | - | - | - | - | - | - | - | - | - |"
+
+
+# --- a refused or failed setting is not read as "launched, produced nothing" -
+
+
+def test_a_refused_axis_is_distinguished_from_a_pod_that_vanished_with_nothing(tmp_path):
+    """`scripts/bench.py::refusal_record` carries no `metrics`. Before this fix the
+    cell fell through to the ledger's generic `결과 없음(기동됨)` — indistinguishable
+    from a pod that started and produced no result file at all."""
+    write(
+        tmp_path,
+        "native",
+        "gemma4_e2b",
+        "podA",
+        timing_payload(
+            "native",
+            "gemma4_e2b",
+            "podA",
+            metrics=None,
+            status="axis-refused (bench_setup, UnappliedAxis) — kernel=fla on arch=gemma4",
+        ),
+        label="kernel-fla",
+    )
+    _, _, _, rendered = merged(tmp_path)
+    row = next(line for line in rendered.splitlines() if line.startswith("| native |"))
+    assert report.NO_RESULT not in row
+    assert report.AXIS_REFUSED in row
+    # The headline cell counts (matching how an OOM is counted, not detailed);
+    # the stage and reason still reach a reader through the detailed section.
+    assert "axis-refused (bench_setup, UnappliedAxis)" in rendered
+
+
+def test_a_diagnosable_failure_is_distinguished_from_a_refusal_and_from_no_result(tmp_path):
+    """`scripts/bench.py::failure_status` is a different outcome from a refusal —
+    a setting that crashed, not one declined before it tried — and from an OOM."""
+    write(
+        tmp_path,
+        "native",
+        "gemma4_e2b",
+        "podA",
+        timing_payload(
+            "native",
+            "gemma4_e2b",
+            "podA",
+            metrics=None,
+            status="run-failed (RuntimeError) — collate could not find a pad id",
+        ),
+        label="run-crash",
+    )
+    _, _, _, rendered = merged(tmp_path)
+    row = next(line for line in rendered.splitlines() if line.startswith("| native |"))
+    assert report.NO_RESULT not in row
+    assert report.AXIS_REFUSED not in row
+    assert report.RUN_FAILED in row
+    assert "run-failed (RuntimeError)" in rendered
+
+
+def test_a_probe_purpose_refusal_reaches_the_headline_cell_distinctly(tmp_path):
+    """A refusal during a `probe`-purpose run lands in the matrix lane, not
+    `measured` (its purpose is not in `MEASURING_PURPOSES`), so it goes through
+    `cell()`'s single-artifact branch rather than `_measured_cell`'s list branch.
+    Both must show the refusal instead of the generic `NO_RESULT`."""
+    write(
+        tmp_path,
+        "native",
+        "gemma4_e2b",
+        "podA",
+        {
+            "config": {
+                "framework": {"name": "native"},
+                "model": {"name": "gemma4_e2b"},
+                "run": {"purpose": "probe"},
+            },
+            "recorded_at": RECORDED_AT,
+            "packages": {"torch": "2.9.0", "transformers": "4.57.0"},
+            "status": "axis-refused (bench_setup, UnappliedAxis) — kernel=fla on arch=gemma4",
+        },
+    )
+    artifacts, skipped = report.load_artifacts(tmp_path)
+    lanes = report.split_lanes(artifacts)
+    assert lanes.measured == [], "a probe-purpose refusal belongs to the matrix lane, not measured"
+    chosen, duplicates = report.newest_per_combination(lanes.matrix)
+    assert chosen[("native", "gemma4_e2b")].refused
+
+    rendered = report.render(
+        chosen, {}, duplicates, skipped, measured=lanes.measured, baselines=lanes.baselines
+    )
+    row = next(line for line in rendered.splitlines() if line.startswith("| native |"))
+    assert report.AXIS_REFUSED in row
+    assert report.NO_RESULT not in row
+
+
+def test_refused_and_failed_settings_are_counted_beside_a_reported_one(tmp_path):
+    """The `_measured_cell` list path: reported, refused and failed settings on the
+    same combination must each be counted, not merged into one number."""
+    write(
+        tmp_path,
+        "native",
+        "gemma4_e2b",
+        "podA",
+        timing_payload("native", "gemma4_e2b", "podA", timing_metrics(0.5)),
+        label="attn-sdpa",
+    )
+    write(
+        tmp_path,
+        "native",
+        "gemma4_e2b",
+        "podA",
+        timing_payload(
+            "native",
+            "gemma4_e2b",
+            "podA",
+            metrics=None,
+            status="axis-refused (bench_setup, UnappliedAxis) — kernel=fla on arch=gemma4",
+        ),
+        label="kernel-fla",
+    )
+    write(
+        tmp_path,
+        "native",
+        "gemma4_e2b",
+        "podA",
+        timing_payload(
+            "native",
+            "gemma4_e2b",
+            "podA",
+            metrics=None,
+            status="run-failed (RuntimeError) — collate could not find a pad id",
+        ),
+        label="run-crash",
+    )
+    _, _, _, rendered = merged(tmp_path)
+    row = next(line for line in rendered.splitlines() if line.startswith("| native |"))
+    assert "측정 1건" in row
+    assert f"{report.AXIS_REFUSED} 1건" in row
+    assert f"{report.RUN_FAILED} 1건" in row
 
 
 # --- the baseline gate -----------------------------------------------------

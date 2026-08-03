@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 from dataclasses import dataclass
@@ -72,6 +73,23 @@ IDENTITY_FIELD = "recorded_at"
 # A run that hit the memory ceiling. It is a result — the setting does not fit on
 # this GPU — and it is neither "slow", "unsupported" nor "never attempted".
 STATUS_OOM = "oom"
+
+# `scripts/bench.py`'s `REFUSED_STATUS` / `FAILED_STATUS` prefixes, mirrored
+# rather than imported: that module pulls torch and every framework adapter to
+# run a training step, and this file runs in the merge environment, which has
+# none of that installed. Both are distinct from `STATUS_OOM` above and from
+# `publish_result.fallback_record`'s `"no_result"` — four different reasons a
+# setting can carry no figures, and `cell()` used to read only the first as
+# distinct and let the other three collapse into "launched, produced nothing".
+AXIS_REFUSED_PREFIX = "axis-refused"
+RUN_FAILED_PREFIX = "run-failed"
+AXIS_REFUSED = "축 거부됨"
+RUN_FAILED = "런 실패"
+
+# The parenthesised detail in a `bench.py` status string — `(stage,
+# ErrorType)` for a refusal, `(ErrorType)` for a failure — without the reason
+# sentence after the em dash, which can run long enough to break a table row.
+_STATUS_DETAIL_RE = re.compile(r"\(([^)]*)\)")
 
 # The record's own summary of which axes its framework took over. The vocabulary
 # belongs to the `applied-axes` boundary; this file only reads it back.
@@ -153,6 +171,26 @@ class Artifact:
     def oom(self) -> bool:
         """Whether the run ended at the memory ceiling rather than producing figures."""
         return str(self.payload.get("status") or "").lower() == STATUS_OOM
+
+    @property
+    def refused(self) -> bool:
+        """Whether an axis this run asked for could not be put into effect.
+
+        `scripts/bench.py::refusal_record` stamps this prefix and carries no
+        `metrics` (by that function's own contract), so this is never true at
+        the same time as `.metrics` being set.
+        """
+        return str(self.payload.get("status") or "").startswith(AXIS_REFUSED_PREFIX)
+
+    @property
+    def failed(self) -> bool:
+        """Whether a diagnosable failure stopped this run before it measured a window.
+
+        `scripts/bench.py::failure_status` stamps this prefix, distinct from an
+        OOM (`metrics.oom_status` files that under `STATUS_OOM` instead) and from
+        a refusal (a setting declined before it tried, not one that crashed).
+        """
+        return str(self.payload.get("status") or "").startswith(RUN_FAILED_PREFIX)
 
     @property
     def graded_here(self) -> bool:
@@ -624,7 +662,11 @@ def baseline_gate(
 
 
 def _measured_cell(
-    reported: list[Artifact], oom: list[Artifact], verdicts: dict[str, PodVerdict]
+    reported: list[Artifact],
+    oom: list[Artifact],
+    refused: list[Artifact],
+    failed: list[Artifact],
+    verdicts: dict[str, PodVerdict],
 ) -> str:
     """What a cell says when measuring ran on it but no probe ever did.
 
@@ -632,6 +674,10 @@ def _measured_cell(
     does not read as untried. The pod's standing and the training-validity gate
     are counted rather than folded in: a cell reading `측정 3건` while all three
     were frozen graphs is the same collapse as reading them as never attempted.
+
+    `refused` and `failed` are counted the same way `oom` is: each is a spent
+    pod-hour that answered something about the setting, and folding either into
+    `reported`'s count would claim a figure that was never produced.
     """
     parts = []
     if reported:
@@ -642,7 +688,35 @@ def _measured_cell(
         parts.append(f"측정 {len(reported)}건(probe 없음{suffix})")
     if oom:
         parts.append(f"{OOM} {len(oom)}건")
+    if refused:
+        parts.append(f"{AXIS_REFUSED} {len(refused)}건")
+    if failed:
+        parts.append(f"{RUN_FAILED} {len(failed)}건")
     return ", ".join(parts)
+
+
+def _status_detail(artifact: Artifact) -> str:
+    """The parenthesised `(stage, ErrorType)` / `(ErrorType)` a status string
+    carries, or the whole status if it carries no such detail."""
+    status = str(artifact.payload.get("status") or "")
+    match = _STATUS_DETAIL_RE.search(status)
+    return match.group(1) if match else status
+
+
+def _status_cell(artifact: Artifact) -> str | None:
+    """A distinct label for a refused or failed record with no probe checks.
+
+    `scripts/bench.py::refusal_record`'s own docstring says this file prints
+    `status` verbatim for such a record; until this existed nothing did — the
+    record has no `metrics` and no `checks`, so it fell through to the generic
+    `NO_RESULT`, indistinguishable from a pod that vanished with nothing at all.
+    Returns None for anything else, so the caller's existing `NO_RESULT` stands.
+    """
+    if artifact.refused:
+        return f"{AXIS_REFUSED} ({_status_detail(artifact)})"
+    if artifact.failed:
+        return f"{RUN_FAILED} ({_status_detail(artifact)})"
+    return None
 
 
 def cell(
@@ -655,21 +729,25 @@ def cell(
     verdicts = verdicts or {}
     # Only a run that reported figures says the combination trained. A measuring
     # run that produced none is a spent pod-hour, and the ledger's "launched,
-    # produced nothing" is the honest answer for the cell. An OOM is the one
-    # exception: it reports no figures and is still an answer about the setting.
+    # produced nothing" is the honest answer for the cell. OOM, an axis refusal
+    # and a diagnosable failure are the three exceptions: each reports no
+    # figures and is still its own answer about the setting, not one collapsed
+    # answer.
     oom = [a for a in measured or [] if a.oom]
+    axis_refused = [a for a in measured or [] if a.refused]
+    run_failed = [a for a in measured or [] if a.failed]
     reported = [a for a in measured or [] if a.metrics and not a.oom]
-    if (reported or oom) and (
+    if (reported or oom or axis_refused or run_failed) and (
         artifact is None or not artifact.produced_result or not checks_of(artifact)
     ):
-        return _measured_cell(reported, oom, verdicts)
+        return _measured_cell(reported, oom, axis_refused, run_failed, verdicts)
     if artifact is None:
         return launch_state(launched)
     if not artifact.produced_result:
-        return NO_RESULT
+        return _status_cell(artifact) or NO_RESULT
     checks = checks_of(artifact)
     if not checks:
-        return NO_RESULT
+        return _status_cell(artifact) or NO_RESULT
     # An expected failure is the answer the probe went looking for, so it does not
     # make the cell read as broken.
     graded = [c for c in checks if not c.get("expected_failure")]
@@ -714,6 +792,80 @@ def _verdict_cell(verdict: PodVerdict) -> str:
     if verdict.deviation is None:
         return verdict.status
     return f"{verdict.status} (편차 {verdict.deviation * 100:.2f}%)"
+
+
+# Which config field carries each axis's requested value, and which packages in
+# `record.package_versions` can silently change what that request actually ran
+# as. Keyed by the axis name so the caption and the table share one vocabulary.
+#
+#   attn    — `kernels` present without `flash-attn` makes transformers rewrite
+#             an `attn=fa2/3/4` request onto a Hub kernel instead of refusing it
+#             (`FLASH_ATTN_KERNEL_FALLBACK`, transformers/modeling_flash_attention_
+#             utils.py). Two runs both labelled `fa2` can be measuring different
+#             kernels depending only on whether `kernels` is installed.
+#   compile — `triton` is what `compile.mode` other than `none` actually compiles
+#             through (torch inductor's CUDA backend).
+#   kernel  — Gated DeltaNet's fused path needs both `fla-core` (the distribution
+#             that ships `fla.ops`/`fla.modules`) and `causal-conv1d`
+#             (`trainbench/axes.py::_fla_fast_path`); `flash-linear-attention` is
+#             the wrapper that pins the first, carried alongside it rather than
+#             instead of it (`trainbench/record.py::_TRACKED_PACKAGES`).
+AXIS_CONFOUND = {
+    "attn": (("attn", "name"), ("flash-attn", "kernels")),
+    "compile": (("compile", "mode"), ("triton",)),
+    "kernel": (("kernel", "name"), ("flash-linear-attention", "fla-core", "causal-conv1d")),
+}
+
+
+def _config_axis(config: dict[str, Any], group: str, field: str) -> str:
+    value = ((config.get(group) or {}).get(field)) if isinstance(config, dict) else None
+    return str(value) if value else "-"
+
+
+def _axis_confound_header() -> list[str]:
+    """One column per axis value, followed by that axis's own confound packages.
+
+    Built from `AXIS_CONFOUND` rather than spelled out a second time: a package
+    added there without a matching column here is a package this table cannot
+    have been checked against.
+    """
+    columns = []
+    for axis, (_, packages) in AXIS_CONFOUND.items():
+        columns.append(axis)
+        columns.extend(packages)
+    return columns
+
+
+def _axis_confound_row(artifact: Artifact) -> list[str]:
+    config = artifact.payload.get("config") or {}
+    packages = artifact.payload.get("packages") or {}
+    cells = []
+    for _axis, (field, package_names) in AXIS_CONFOUND.items():
+        cells.append(_config_axis(config, *field))
+        cells.extend(packages.get(name, "-") for name in package_names)
+    return cells
+
+
+def _axis_confound_table(rows: list[Artifact]) -> list[str]:
+    """The axis value beside the package(s) that can substitute what it asked for.
+
+    Rendered per stack, immediately under that stack's figures — not as a version
+    dump at the end of the document — so a reader checking one run's number reads
+    the confound in the same glance rather than cross-referencing a separate table.
+    """
+    header = ["런", "파드", *_axis_confound_header()]
+    out = [
+        "",
+        "축을 흔드는 패키지: 같은 스택 안에서도 이 값들에 따라 요청한 축이 실제로 무엇으로 "
+        "실행됐는지가 갈린다.",
+        "",
+        "| " + " | ".join(header) + " |",
+        "|" + "|".join(["---"] * len(header)) + "|",
+    ]
+    for artifact in rows:
+        cells = [artifact.run_name, artifact.pod, *_axis_confound_row(artifact)]
+        out.append("| " + " | ".join(cells) + " |")
+    return out
 
 
 def _figure_table(rows: list[Artifact], verdicts: dict[str, PodVerdict]) -> list[str]:
@@ -797,6 +949,7 @@ def _ranked_by_stack(
                 "잰 것인지 레코드가 답하지 못한다. 다른 스택과 같은 순위표에 넣지 않는다.",
             ]
         lines += _figure_table(group, verdicts)
+        lines += _axis_confound_table(group)
         if tables:
             lines += _counts_table(group)
     return lines
