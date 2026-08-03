@@ -1360,8 +1360,13 @@ def test_a_failure_inside_the_measured_loop_is_not_recorded_as_a_refusal(
     `try` ends, and a loop whose failures were recorded as refusals would file a
     half-run measurement as a setting that was declined.
 
-    `axes.step_context` is called per step, so the loop really can raise this type;
-    the assertion is that `main` does not catch it and writes nothing.
+    `axes.step_context` is called per step, so the loop really can raise a refusal
+    type after the timer is open — and *where* it was raised is the whole finding.
+    A refusal is a setting declined before anything was measured; this one broke
+    partway through. Both now write a record, so the two are told apart by what the
+    record says rather than by one of them being absent, which is the stronger
+    assertion: the reason reaches the report either way instead of staying in the
+    container log.
     """
     config = timing_config(config_mapping, **{"run.purpose": "probe"})
 
@@ -1370,9 +1375,17 @@ def test_a_failure_inside_the_measured_loop_is_not_recorded_as_a_refusal(
 
     monkeypatch.setattr(bench_entry, "train", raise_mid_loop)
 
-    with pytest.raises(axes.UnappliedAxis, match="after the loop had started"):
-        pod_setting(config, text_only_rows(8))
-    assert not pod_setting.out.exists()
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == bench_entry.FAILED_EXIT != bench_entry.REFUSED_EXIT
+    assert record["status"].startswith(bench_entry.FAILED_STATUS)
+    assert not record["status"].startswith(bench_entry.REFUSED_STATUS)
+    # The key `refusal_record` fills, and the one report.py reads to call a setting
+    # declined. A mid-loop failure must not carry it.
+    assert "refusal" not in record
+    assert record["failure"]["error_type"] == "UnappliedAxis"
+    assert "after the loop had started" in record["failure"]["error"]
+    assert "metrics" not in record
 
 
 def test_a_crash_that_is_not_a_refusal_still_leaves_no_result(
@@ -1882,6 +1895,66 @@ def test_the_memory_ceiling_in_the_measured_loop_is_a_result_and_not_a_crash(
     assert "metrics" not in record
 
 
+def test_a_failure_in_the_measured_loop_is_recorded_instead_of_only_logged(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """An ordinary failure writes a record too, carrying the reason.
+
+    `metrics.is_oom` is False for a plain `RuntimeError`, so the memory-ceiling
+    branch re-raised it and nothing was filed: a pod died on the `RuntimeError`
+    `trainbench/collate.py` raises for an image batch over `data.max_seq_len`, and
+    the only trace anywhere was docker/entrypoint.sh's "produced no result
+    (exit 1)". The message was in the container log the whole time.
+
+    Still no `metrics` block, for the same reason the OOM record has none, and a
+    distinct exit code because "declined", "ran out" and "broke" are three findings
+    in the pod log.
+    """
+    config = timing_config(config_mapping, **{"run.purpose": "probe"})
+
+    def collate_refusal(*_args, **_kwargs):
+        raise RuntimeError("a batch of 4 image(s) expanded to 9001 tokens, over max_seq_len=512")
+
+    monkeypatch.setattr(bench_entry, "train", collate_refusal)
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == bench_entry.FAILED_EXIT
+    assert code not in (0, bench_entry.REFUSED_EXIT, bench_entry.OOM_EXIT)
+    assert record["status"].startswith(bench_entry.FAILED_STATUS)
+    assert "9001 tokens" in record["status"]
+    assert record["failure"]["error_type"] == "RuntimeError"
+    # The traceback is what the two pod launches were spent recovering.
+    assert "collate_refusal" in record["failure"]["traceback"]
+    assert "metrics" not in record
+
+
+def test_an_interrupted_run_is_not_filed_as_a_failed_setting(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """A pod stopped from outside is not a property of the combination.
+
+    `except BaseException` around the measured loop catches `KeyboardInterrupt` and
+    `SystemExit` too, and a record for either would publish an operator's action as
+    this setting's result — the same mislabel the OOM branch avoids by refusing a
+    non-OOM error.
+    """
+    config = timing_config(config_mapping, **{"run.purpose": "probe"})
+
+    def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(bench_entry, "train", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        pod_setting(config, text_only_rows(8))
+    assert not pod_setting.out.exists(), "an interruption files nothing"
+
+
 # --- the declarations the run has to consume, and the doors it has to close ---
 # Every check below existed on one side only. `AdapterOut.step` and
 # `AdapterOut.fingerprint` were produced each run and read by nobody, while
@@ -2001,27 +2074,35 @@ def test_a_refusal_after_the_model_exists_still_says_what_was_built(
     assert kernels.RUN_RECORD_KEY in record
 
 
-def test_a_framework_owned_step_is_refused_instead_of_measured_by_this_loop(
+def test_a_framework_owned_step_with_no_registered_runner_is_refused_not_measured(
     pod_setting,
     config_mapping,  # noqa: F811
     monkeypatch,
 ):
-    """tevatron declares `DenseModel.forward` runs its step and `loss.name` is its
-    own (decision 5). Nothing read the declaration: `owned_axes` reached
-    `assemble` and exempted the axis from the capture while `train()` went on
-    computing InfoNCE with `built.loss_fn` — a harness number published under
-    `framework_owned`, which is the `loss=cached_mnrl` shape.
+    """An `owner=framework` step this loop has no runner for is refused, never timed.
+
+    `owned_axes` reaches `assemble` and exempts the axis from the capture, so
+    running the harness loop anyway publishes a harness number under
+    `framework_owned` — the `loss=cached_mnrl` shape, a mislabelled figure rather
+    than a crash.
+
+    `ms_swift` because the refusal is now narrow: `scripts/bench.py`'s
+    `FRAMEWORK_OWNED_STEP_RUNNERS` drives tevatron's own forward, so tevatron is no
+    longer the example of a step nothing can run. Any framework absent from that
+    registry still is, and registering this one would fail this test rather than
+    quietly emptying it.
     """
     loader = importlib.import_module("trainbench.loader")
+    assert "ms_swift" not in bench_entry.FRAMEWORK_OWNED_STEP_RUNNERS
     adapter_binding(
         monkeypatch,
-        framework="tevatron",
+        framework="ms_swift",
         step=loader.Step(
             owner=loader.FRAMEWORK,
-            callable="tevatron.retriever.modeling.DenseModel.forward",
+            callable="swift.trainers.EmbeddingTrainer.training_step",
             batch_keys=("query", "passage"),
         ),
-        owned_axes={"loss.name": "DenseModel.forward computes it"},
+        owned_axes={"loss.name": "the trainer's loss_map['infonce'] computes it"},
     )
     config = timing_config(config_mapping, **{"run.purpose": "probe"})
 

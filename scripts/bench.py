@@ -34,7 +34,8 @@ import inspect
 import json
 import os
 import sys
-from collections.abc import Iterable, Iterator
+import traceback
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -55,6 +56,7 @@ from trainbench.config_schema import BenchConfig, axis_knobs
 from trainbench.device import get_device
 from trainbench.embedding import packed_last_token_pool
 from trainbench.probe import steps
+from trainbench.probe.types import MAX_TRACEBACK_CHARS
 from trainbench.record import build_record, write_json
 from trainbench.seed import set_seed
 
@@ -77,6 +79,15 @@ PREFLIGHT_EXIT = 4
 # measured until the device ran out. Both write a result file.
 OOM_EXIT = 5
 
+# Exit code for a run a diagnosable failure stopped. Distinct from OOM_EXIT
+# because that one is the device's limit and this one is a defect, and from 1,
+# which leaves no result file at all — a pod died on a `RuntimeError` from
+# `trainbench/collate.py` and the only trace anywhere was the entrypoint's
+# "produced no result (exit 1)", which cost two launches to read a message that
+# was already in the container log. Distinct from `timeout`'s 124 and from
+# docker/entrypoint.sh's 125 and 127.
+FAILED_EXIT = 6
+
 # The GPUs this image's compiled kernels cover, written into the image by
 # `docker/Dockerfile.framework` beside the `FLASH_ATTN_CUDA_ARCHS` /
 # `NVTE_CUDA_ARCHS` it mirrors. flash-attn emits `code=sm_XX` and no PTX, so a pod
@@ -88,6 +99,12 @@ CUDA_ARCHS_ENV = "TRAINBENCH_CUDA_ARCHS"
 # `publish_result.fallback_record` and means no result file existed, which is the
 # case this exists to stop producing.
 REFUSED_STATUS = "axis-refused"
+
+# `status` prefix on a record for a run a failure stopped. Not `no_result` for
+# `REFUSED_STATUS`'s reason, and not `REFUSED_STATUS` either: a refusal is a
+# setting this pod declined to measure and this is a setting it tried to measure
+# and could not, which are different findings in the report.
+FAILED_STATUS = "run-failed"
 
 
 def pooled_embeddings(
@@ -121,6 +138,73 @@ def pooled_embeddings(
         hidden = getattr(output, "hidden_states", None)
         hidden = hidden[-1] if hidden else output[0]
     return packed_last_token_pool(hidden, cu_seqlens)
+
+
+def _tevatron_forward_loss(
+    model: Any, tensors: dict[str, Any], config: BenchConfig, built: Any
+) -> torch.Tensor:
+    """tevatron's own training step, not `pooled_embeddings` + `built.loss_fn`.
+
+    `DenseModel.forward(query=, passage=)` encodes, pools, normalises, scores and
+    computes InfoNCE itself (pinned dd06310 retriever/modeling/encoder.py:52-87,
+    dense.py:18-46), which is why `loss.name` is framework-owned for tevatron
+    (`trainbench/loader.py`'s tevatron `Adapter`). Mirrors
+    `trainbench/probe/tevatron.py::_backward`: the collate lays every query before
+    every positive, so the batch's first half is the query side.
+    """
+    half = tensors["input_ids"].shape[0] // 2
+    query = {key: value[:half] for key, value in tensors.items()}
+    passage = {key: value[half:] for key, value in tensors.items()}
+    output = model(query=query, passage=passage)
+    if output.loss is None:
+        raise RuntimeError(
+            "tevatron's forward returned loss=None: an empty query or passage dict took "
+            "its inference branch instead of training (dd06310 encoder.py:53-61)"
+        )
+    return output.loss
+
+
+def _sentence_transformers_pooled(model: Any, tensors: dict[str, Any]) -> torch.Tensor:
+    """sentence-transformers' forward takes one positional mapping, not `**tensors`.
+
+    Pinned 5.6.1 `SentenceTransformer.forward(self, input: dict, **kwargs)` — the
+    signature `refuse_a_forward_this_harness_cannot_call` refuses for every other
+    adapter. Pooling happens inside the module
+    (`trainbench/probe/sentence_transformers.py`), so this reads
+    `sentence_embedding` off the result rather than calling `pooled_embeddings`.
+
+    Returns pooled embeddings, not a loss: sentence_transformers does not own
+    `loss.name` (docs/CONTRACTS.md §2, `applied.FRAMEWORK_OWNABLE`), so `train()`
+    computes it from `built.loss_fn` itself — `scripts/audit_plan.py`'s
+    `assert-called` reads that call literally, and a loss returned from here
+    instead would be one hop too far for it to see.
+    """
+    return model(tensors)["sentence_embedding"]
+
+
+StepRunner = Callable[[Any, dict[str, Any], BenchConfig, Any], torch.Tensor]
+Pooler = Callable[[Any, dict[str, Any]], torch.Tensor]
+
+# tevatron's forward computes pooling, scoring and the loss itself — the
+# `owner=framework` half of `Step` (docs/CONTRACTS.md §2). Read by
+# `refuse_a_step_this_harness_cannot_drive` and `train()`, and only reached when
+# the binding's `step.owner` actually says so: a binding that merely names this
+# framework without declaring the owned step still runs the generic loop, which
+# is what lets `test_the_axes_an_adapter_owns_reach_the_record_instead_of_being_undetermined`
+# (tests/test_smoke_cpu.py) isolate axis ownership from step ownership.
+FRAMEWORK_OWNED_STEP_RUNNERS: dict[str, StepRunner] = {
+    "tevatron": _tevatron_forward_loss,
+}
+
+# sentence-transformers still leaves the step to the harness (it does not own
+# `loss.name`) but its forward will not bind as `model(**batch)` — a calling
+# convention `Step` has no field for. Read by
+# `refuse_a_forward_this_harness_cannot_call` and `train()` regardless of
+# `step.owner`. Maps to a pooler, not a full step runner, so `train()` is the one
+# place that calls `built.loss_fn` (see `_sentence_transformers_pooled`).
+NONSTANDARD_FORWARD_POOLERS: dict[str, Pooler] = {
+    "sentence_transformers": _sentence_transformers_pooled,
+}
 
 
 def micro_batches(loader: Iterable[Any]) -> Iterator[Any]:
@@ -169,6 +253,7 @@ def train(
     config: BenchConfig,
     device: torch.device,
     required_context: Any = None,
+    adapter_step: Any = None,
 ) -> dict[str, Any]:
     """The measured loop.
 
@@ -237,6 +322,17 @@ def train(
     `scale=1 / grad_accum` on the other, which multiplies the gradient and not the
     returned loss — so the two paths accumulate to one batch's gradient rather than
     to different effective learning rates.
+
+    A third shape exists for a framework this generic call cannot drive at all:
+    `adapter_step` (the binding's `AdapterOut.step`, `None` for every direct caller
+    that predates it) says whether `built.framework` owns the step, and
+    `FRAMEWORK_OWNED_STEP_RUNNERS`/`NONSTANDARD_FORWARD_POOLERS` name the two ways
+    that happens — tevatron's own forward computes the loss, sentence-transformers'
+    forward takes one positional mapping and pools inside its own module (its loss
+    still comes from `built.loss_fn`, read directly below rather than through a
+    step runner, so `scripts/audit_plan.py`'s `assert-called` can see it). Neither
+    combines with GradCache or `dataloader.packing`, refused below before the loop
+    opens.
     """
     if config.model.pooling != "lasttoken":
         raise RuntimeError(
@@ -265,6 +361,31 @@ def train(
             "one row whose boundaries live in cu_seqlens. It would pool the wrong positions "
             "and still report both axes as applied. Measure the two axes separately."
         )
+    # `adapter_step.owner == "framework"` only when the binding actually declared
+    # it — `adapter_step=None` (every pre-existing caller) and a harness-owned step
+    # both leave this False, so a run that merely names `built.framework` without
+    # the declaration still takes the generic path below.
+    framework_owns_step = False
+    if adapter_step is not None:
+        loader = importlib.import_module("trainbench.loader")
+        framework_owns_step = adapter_step.owner != loader.HARNESS_STEP.owner
+    step_runner = FRAMEWORK_OWNED_STEP_RUNNERS.get(built.framework) if framework_owns_step else None
+    pooler = None if step_runner is not None else NONSTANDARD_FORWARD_POOLERS.get(built.framework)
+    if step_runner is not None or pooler is not None:
+        if gradcache_backward is not None:
+            raise RuntimeError(
+                f"loss=cached_mnrl with framework={built.framework}: its own forward computes "
+                "pooling itself (and, for a framework-owned step, the loss too), so GradCache's "
+                "row-wise re-encoding would target a call this framework never makes. Measure "
+                "the two axes separately."
+            )
+        if config.dataloader.packing:
+            raise RuntimeError(
+                f"dataloader.packing=true with framework={built.framework}: its own forward "
+                "expects the padded batch this collate builds (queries then positives, split "
+                "in half); a packed batch is one row with no such split. Measure the two axes "
+                "separately."
+            )
     counted = dict.fromkeys(
         ("tokens", "padded_tokens", "rows", "samples", "images", "images_dropped"), 0
     )
@@ -295,7 +416,21 @@ def train(
                 # Caught by tests/test_smoke_cpu.py, which asserts the gradients
                 # are non-zero at the moment of the step. `encode` is reused
                 # unchanged.
-                if gradcache_backward is not None:
+                if step_runner is not None:
+                    # tevatron: its own forward computes pooling, scoring and
+                    # the loss itself. See `_tevatron_forward_loss` above.
+                    loss = step_runner(built.model, tensors, config, built)
+                    (loss / grad_accum).backward()
+                elif pooler is not None:
+                    # sentence_transformers: a nonstandard forward call, but the
+                    # harness's own loss still certifies `loss.name` — read
+                    # directly here, not through a step runner, for the reason
+                    # `_sentence_transformers_pooled`'s docstring gives.
+                    pooled = pooler(built.model, tensors)
+                    half = pooled.shape[0] // 2
+                    loss = built.loss_fn(pooled[:half], pooled[half:])
+                    (loss / grad_accum).backward()
+                elif gradcache_backward is not None:
                     # GradCache owns the whole forward/backward: it encodes the
                     # batch in pieces under no_grad, scores every row at once, then
                     # re-encodes each piece with a graph and seeds its backward
@@ -532,6 +667,41 @@ def refusal_record(
     )
 
 
+def failure_status(error: BaseException) -> dict[str, Any]:
+    """The record fields that make a diagnosable failure readable as its own outcome.
+
+    Shaped like `metrics.oom_status` and refusing for the same reason in reverse:
+    an out-of-memory condition filed here would publish the device's ceiling as a
+    defect, so the two cannot be confused in either direction.
+
+    **No `metrics` key, ever**, for `refusal_record`'s reason: a record carrying one
+    asserts that a measured window completed. What travels instead is the exception
+    and the tail of its traceback, which is what puts the reason in
+    `scripts/report.py`'s `지표 없음` list — that file prints `status` verbatim for a
+    record with no metrics, so the message reaches a reader who has no container log.
+
+    The traceback is kept from the end: the innermost frame and the message name the
+    defect, while the outermost frames are the same for every run.
+    """
+    if metrics.is_oom(error):
+        raise ValueError(
+            f"{type(error).__name__} is an out-of-memory condition; metrics.oom_status files "
+            "it as the ceiling it is, and filing it here would publish a hardware limit as a "
+            "defect in this harness"
+        )
+    reason = " ".join(str(error).split())
+    return {
+        "status": f"{FAILED_STATUS} ({type(error).__name__}) — {reason}",
+        "failure": {
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "traceback": "".join(
+                traceback.format_exception(type(error), error, error.__traceback__)
+            )[-MAX_TRACEBACK_CHARS:],
+        },
+    }
+
+
 class Binding(NamedTuple):
     """What built the model, and what it says about itself.
 
@@ -656,7 +826,7 @@ def fetch_the_pinned_inputs(config: BenchConfig, stream: Any = None) -> tuple[An
     return dataset, identities
 
 
-def refuse_a_forward_this_harness_cannot_call(step: Any, model: Any) -> None:
+def refuse_a_forward_this_harness_cannot_call(step: Any, model: Any, framework: str) -> None:
     """Refuse a model whose `forward` will not take the batch as keyword arguments.
 
     `train()` calls `model(**batch, ...)`. `Step` says who owns the step and which
@@ -669,12 +839,20 @@ def refuse_a_forward_this_harness_cannot_call(step: Any, model: Any) -> None:
     written. The ST cell then rendered as a combination nobody tried rather than one
     that was refused.
 
+    Skipped for a `framework` in `FRAMEWORK_OWNED_STEP_RUNNERS` or
+    `NONSTANDARD_FORWARD_POOLERS`: that entry calls the model its own way
+    (`query=`/`passage=` for tevatron, one positional mapping for
+    sentence_transformers) and is what `train()` actually drives it through, so
+    this generic `model(**batch)` check does not apply to it.
+
     Read off the live object with `inspect`, not from a declaration: the declaration
     is what was wrong. A `*args`/`**kwargs` forward binds anything and is left alone,
     so this refuses only what would actually raise. Only the declared `batch_keys`
     are bound — the collate adds more (`pixel_values`, `cu_seq_lens_*`) and which of
     those a model takes is per checkpoint, not per harness.
     """
+    if framework in FRAMEWORK_OWNED_STEP_RUNNERS or framework in NONSTANDARD_FORWARD_POOLERS:
+        return
     loader = importlib.import_module("trainbench.loader")
     forward = getattr(model, "forward", None)
     if forward is None:
@@ -697,23 +875,27 @@ def refuse_a_forward_this_harness_cannot_call(step: Any, model: Any) -> None:
         ) from exc
 
 
-def refuse_a_step_this_harness_cannot_drive(step: Any) -> None:
-    """Refuse an adapter whose declared step is not the one `train()` runs.
+def refuse_a_step_this_harness_cannot_drive(step: Any, framework: str) -> None:
+    """Refuse an adapter whose declared step is not one `train()` can run.
 
-    `train()` runs exactly one shape of step: this file's forward through
+    `train()` runs the generic step — this file's forward through
     `pooled_embeddings`, `built.loss_fn` over the two halves, and
-    `built.optimizer.step()`, fed the keys `build_collate` builds. `AdapterOut`
-    declares what the framework's own step is, and nothing read that declaration.
+    `built.optimizer.step()`, fed the keys `build_collate` builds — for any
+    `owner=framework` step whose `framework` is not in
+    `FRAMEWORK_OWNED_STEP_RUNNERS`, and that entry's own runner for one that is.
+    `AdapterOut` declares what the framework's own step is, and nothing used to
+    read that declaration.
 
     Both halves of it decide something. `owner=framework` means the framework's
     call computes the step, and `applied._owned` has already exempted the axes it
-    owns from the capture — so running the harness loop anyway publishes a harness
-    number labelled `framework_owned`, which is the `loss=cached_mnrl` shape:
-    a mislabelled number rather than a crash. `batch_keys` is the same fact one
-    step earlier: tevatron declares `("query", "passage")` and this collate builds
-    `input_ids`/`attention_mask`, so `DenseModel.forward` raises `TypeError` on
-    step 0 — after the checkpoint is loaded and the timer is open, and an uncaught
-    raise there leaves no result file at all.
+    owns from the capture — so running the generic loop anyway on an
+    unregistered framework would publish a harness number labelled
+    `framework_owned`, which is the `loss=cached_mnrl` shape: a mislabelled number
+    rather than a crash. A registered `framework` is exempted: its runner is what
+    calls the model, and `unbuilt` below has nothing to check because that runner
+    never goes through `build_collate`'s `harness.batch_keys` at all — tevatron's
+    runner derives `query`/`passage` from the batch itself
+    (`_tevatron_forward_loss`).
     """
     loader = importlib.import_module("trainbench.loader")
     harness = loader.HARNESS_STEP
@@ -723,11 +905,14 @@ def refuse_a_step_this_harness_cannot_drive(step: Any) -> None:
             "framework runs it; measuring it either way would be a guess"
         )
     if step.owner != harness.owner:
+        if framework in FRAMEWORK_OWNED_STEP_RUNNERS:
+            return
         raise loader.AdapterRefusal(
-            f"the adapter declares a {step.owner}-owned step ({step.callable}), and this "
-            f"harness only drives a {harness.owner}-owned one. Running the loop anyway would "
-            "time this file's forward and loss and file the result under the axes the "
-            "framework was exempted from certifying"
+            f"the adapter declares a {step.owner}-owned step ({step.callable}) for "
+            f"{framework!r}, and no FRAMEWORK_OWNED_STEP_RUNNERS entry drives it. Running the "
+            f"harness's {harness.owner}-owned loop anyway would time this file's forward and "
+            "loss and file the result under the axes the framework was exempted from "
+            "certifying"
         )
     unbuilt = sorted(set(step.batch_keys) - set(harness.batch_keys))
     if unbuilt:
@@ -791,8 +976,8 @@ def build_run(
         # keeps shipping.
         if config.run.purpose in ENFORCED_PURPOSES:
             kernels.assert_no_runtime_kernel_fetch()
-        refuse_a_step_this_harness_cannot_drive(binding.step)
-        refuse_a_forward_this_harness_cannot_call(binding.step, binding.model)
+        refuse_a_step_this_harness_cannot_drive(binding.step, binding.framework)
+        refuse_a_forward_this_harness_cannot_call(binding.step, binding.model, binding.framework)
         refuse_packing_the_mask_registry_cannot_isolate(binding, config)
     model, processor = binding.model, binding.processor
 
@@ -1111,32 +1296,44 @@ def main(argv: list[str] | None = None) -> int:
                 if device.type == "cuda"
                 else [torch.profiler.ProfilerActivity.CPU],
             ) as profile:
-                summary = train(built, built.dataloader, config, device, required)
+                summary = train(built, built.dataloader, config, device, required, binding.step)
             trace = args.out.with_suffix(".trace.json")
             profile.export_chrome_trace(str(trace))
             summary["trace_path"] = str(trace)
             print(f"wrote {trace}")
         else:
-            summary = train(built, built.dataloader, config, device, required)
-    except BaseException as exc:  # noqa: BLE001 - re-raised unless it is the memory ceiling
-        if not metrics.is_oom(exc):
-            raise
-        # A result file, and no `metrics` block. The memory ceiling is an answer to
-        # this study's question — this combination does not fit at this batch size
-        # on this device — and a record without it falls through report.py's cell
-        # logic and renders as a combination nobody attempted.
+            summary = train(built, built.dataloader, config, device, required, binding.step)
+    except (KeyboardInterrupt, SystemExit):
+        # Not a property of the setting: the pod was stopped from outside, and a
+        # record would publish an operator's action as this combination's result.
+        raise
+    except BaseException as exc:  # noqa: BLE001 - every outcome here is a result file
+        # A result file either way, and no `metrics` block in either. The memory
+        # ceiling is an answer to this study's question — this combination does not
+        # fit at this batch size on this device. A `RuntimeError` from the collate
+        # or a framework is not an answer, but it is diagnosable, and a record
+        # carrying its traceback is the difference between a named defect and a
+        # pod-hour that reads as a combination nobody attempted. Without one, both
+        # fall through report.py's cell logic identically.
+        if metrics.is_oom(exc):
+            outcome, code = (
+                metrics.oom_status(exc, peak_bytes=metrics.peak_memory_bytes(device)),
+                OOM_EXIT,
+            )
+        else:
+            outcome, code = failure_status(exc), FAILED_EXIT
         record = build_record(
             config,
             device,
             applied=state,
             applied_axes=applied,
-            **metrics.oom_status(exc, peak_bytes=metrics.peak_memory_bytes(device)),
+            **outcome,
             **fingerprint_payload(binding.fingerprint),
         )
         write_json(args.out, record)
         print(record["status"], file=sys.stderr)
         print(f"wrote {args.out}")
-        return OOM_EXIT
+        return code
     record = build_record(
         config,
         device,
