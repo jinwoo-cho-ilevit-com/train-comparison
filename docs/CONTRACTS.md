@@ -105,7 +105,6 @@ class UnappliedAxis(RuntimeError)                      # 구현 없음 -> 기본
 @dataclass(frozen=True)
 class Built:                          # 런이 만든 것. 축은 모델에만 있지 않다
     model / optimizer / dataloader / loss_fn / framework
-    precision_recipe     # 스텝 안에서 캐스팅하는 정밀도. dtype 으로는 영원히 미확인
     owned_axes           # 어댑터가 스스로 계산하는 축. 멤버십만 읽는다
 
 @dataclass(frozen=True)
@@ -154,8 +153,12 @@ Wave 3에 다른 레인이 만든다. 형태가 없으면 축을 추가하는 �
 새 객체를 돌려주고 FSDP/DeepSpeed는 감싼다. in-place 변형만 표현하는 시그니처로는
 이들을 담을 수 없다.
 
-`step_context`가 따로 있는 이유: precision은 구성 시점만의 선택이 아니다. fp8 recipe는
-forward를 감싼다. 갈 곳 없는 축은 검증되지 않는 어딘가에서 적용된다.
+`step_context`가 따로 있는 이유: 정밀도는 구성 시점만의 선택이 아니다. `precision.name`은
+`bf16` 하나뿐이라 자체 컨텍스트가 필요 없지만, 프레임워크가 상류에서 이미 다른 수치
+체제로 학습하면(axolotl은 `embed_tokens`/`lm_head`를 fp32로 두고 나머지를 bf16으로
+적재하므로 `torch.autocast` 없이는 그 사이 matmul이 죽는다) 어댑터는 그 요구를
+`AdapterOut.required_step_context`로만 표현하고 자기 `with`를 열지 않는다. 갈 곳 없는
+그 요구는 검증되지 않는 어딘가에서 적용된다.
 
 `capture`가 `Built`를 받는 이유: `optim.name`은 옵티마이저가, `dataloader.*`는
 데이터로더가, `loss.name`은 손실이, `framework.name`은 실제로 실행된 어댑터가
@@ -182,17 +185,20 @@ forward를 감싼다. 갈 곳 없는 축은 검증되지 않는 어딘가에서 
 | `assemble` -> 손실 | `loss.name`, `parallel.cross_device_negatives` |
 | `assemble` -> 공동 초기화 | `parallel.strategy` (FSDP2/DDP는 모델 래핑, ZeRO는 모델+옵티마이저+로더 동시) |
 | `assemble` -> `framework` 인자 | `framework.name` |
-| `step_context` | `precision.name`의 fp8 autocast, 그리고 어댑터의 `required_step_context` |
+| `step_context` | 어댑터의 `required_step_context`뿐(precision은 bf16 하나라 자체 항목 없음) |
 
 빠진 축이 없다. D가 이 표에서 벗어나는 축을 만나면 그것은 계약 변경이다.
 
-`step_context`는 축 하나가 아니라 **정밀도 컨텍스트를 세우는 유일한 자리**다. 프레임워크가
-상류에서 이미 다른 수치 체제로 학습하면(axolotl 은 `embed_tokens`/`lm_head` 를 fp32 로 두고
-나머지를 bf16 으로 적재하므로 `torch.autocast` 없이는 matmul 이 죽는다) 어댑터는
-`AdapterOut.required_step_context` 로 **요구만** 하고 자기 `with` 를 열지 않는다.
-`axes.step_context(config, required)` 가 그것을 세운다 — `scripts/bench.py` 가 넘긴다.
-둘이 동시에 요구되면 거부한다: fp8 recipe 와 bf16 autocast 는 같은 질문에 대한 두 답이고,
-겹쳐 켜면 한 라벨 아래 두 체제로 잰 숫자가 된다.
+`step_context`는 **어댑터가 요구하는 정밀도 컨텍스트를 세우는 유일한 자리**다.
+프레임워크가 상류에서 이미 다른 수치 체제로 학습하면(axolotl 은 `embed_tokens`/`lm_head`
+를 fp32 로 두고 나머지를 bf16 으로 적재하므로 `torch.autocast` 없이는 matmul 이 죽는다)
+어댑터는 `AdapterOut.required_step_context` 로 **요구만** 하고 자기 `with` 를 열지
+않는다. `axes.step_context(config, required)` 가 그것을 세운다 — `scripts/bench.py` 가
+넘긴다. `precision.name`은 `bf16` 하나뿐이라 그 자체로는 별도 컨텍스트가 필요 없고,
+`required`가 없는 호출은 `nullcontext()`를 돌려준다 — `bf16`이 아닌 값을 요청하면
+거부한다(스키마가 이미 막지만, 이 자리도 전제를 가정하지 않고 다시 읽는다). fp8
+recipe 경로는 mxfp8/nvfp4와 함께 코드에서 제거됐다(2026-08-03) — A100(CC 8.0)에서는
+원리적으로 열릴 수 없었다.
 
 그 결과 **native(순수 bf16)와 axolotl(autocast)은 다른 수치 체제에서 비교된다.** 이 사실은
 `documented_entry_point.differs` 와 `required_step_context` 양쪽에 남고, 결과를 읽는 쪽이
@@ -467,9 +473,11 @@ class ProbeReport:
   **다음 레인이 읽어야 할 것**: 축 하나를 켜는 일은 `axes.py`의 적용 지점 + `applied.py`의
   capture 확장 **두 개가 한 커밋**이다. `applied=None`은 불일치와 동일하게 timing을
   차단하므로(§2 불변식), 구현만 랜딩한 축은 "구현됐지만 영구히 측정 불가"라는 상태로
-  들어간다. 현재 그 상태가 예정된 것 3건(`optim=adamw_8bit`의 철자 불일치,
-  `train.offload`의 deepspeed undetermined, `precision=mxfp8/nvfp4`의 step-내 캐스팅)이며
-  `PLAN.md` Task 3.5가 표로 추적한다.
+  들어간다. 현재 그 상태가 예정된 것 2건(`optim=adamw_8bit`의 철자 불일치,
+  `train.offload`의 deepspeed undetermined)이며 `PLAN.md` Task 3.5가 표로 추적한다.
+  세 번째였던 `precision=mxfp8/nvfp4`의 step-내 캐스팅은 항목 자체가 코드에서
+  제거되면서 해소됐다(2026-08-03) — A100(CC 8.0)에서는 원리적으로 열릴 수
+  없었다.
 
 - 2026-08-02 **파드 시크릿 가드가 금지 목록에서 허용 목록으로 바뀐다**
   (`scripts/orchestrate.py`의 `ALLOWED_ON_POD` 신설, 레인 C). 결정이 아니라 측정으로
