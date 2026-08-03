@@ -1,275 +1,247 @@
-# 측정을 시작한다 — A100 통일, precision 제거, 6개 프레임워크
+# 측정을 시작한다 — 막고 있던 결함 셋을 걷어내고 첫 숫자를 낸다
 
-## Context
+## 현재 위치 (2026-08-03)
 
-Phase 0은 끝났다 (12 OK / 6 FAIL, 2026-08-03). 그러나 **이 프로젝트는 학습 속도
-벤치마크인데 속도 숫자가 하나도 없다.** A100에서 돈 59개 런의 축 설정이 전부
-바이트 단위로 동일한 기본값 baseline이고, 17개 축 중 하드웨어에서 변화시킨 축이
-0개다. 17개 축 중 스윕 매니페스트가 있는 축은 `loss` 하나뿐이다.
+이 프로젝트는 학습 속도 벤치마크인데 **속도 숫자가 아직 하나도 없다.** 파드 3대가
+오늘 그 이유를 답했다: A100에서 이 파이프라인은 한 번도 스텝을 완주한 적이 없다.
+첫 배치를 만들다가, 또는 첫 스텝에서 OOM으로 멈춘다.
 
-장치는 거의 다 만들어졌고 실험 계획서가 없는 상태다. 이 계획은 그것을 채운다.
+`main = e6b5f8f`. 게이트: pytest 1203, contract 117, audit 13/15 rc=0.
 
-### 확정된 결정 다섯
+### 오늘 파드가 답한 것 (전부 실측)
+
+| 런 | 결과 |
+|---|---|
+| gemma-4 full FT, batch 16 | OOM, peak 83.8GB |
+| gemma-4 full FT, batch 4 | OOM — 배치 문제가 아니다 |
+| qwen3_5 baseline, batch 16 | OOM, PyTorch 할당 75.10GB |
+| qwen3_5 baseline, batch 4 | `collate.py:330` 가드 — 이미지 4장이 4,057 토큰 |
+
+가드는 정상이었다. `shuffle=False`(`axes.py:1583-1588`)라 행 순서는 배치 크기와
+무관하고, 코퍼스 전체 스캔에서 첫 위반 구간은 `rows[136,140)`이다. batch 4에서는
+배치 34(`34%8=2` → 트레이스백의 worker 2와 일치), batch 16에서는 9번째 스텝.
+16은 그 전에 OOM으로 죽었다. 모순 없음.
+
+75GB의 원인은 토큰 수가 아니라 아키텍처다 — GDN 18층의 fp32 conv state와
+체크포인팅 없는 vision tower. `_baselines.yaml:44-48`이 이미 적어둔 그대로다.
+
+### 측정을 막고 있던 결함 셋
+
+1. **프로세서 픽셀 예산이 없다.** 워크로드가 데이터 draw의 함수가 되어 baseline의
+   3% 편차 게이트를 무너뜨린다. 코퍼스에 batch 1로도 넘치는 행이 있다
+   (`rows[180,184)` 16,281 토큰) — Lane I
+2. **`bench.py`가 OOM 외 예외에 아티팩트를 안 남긴다** (`bench.py:1121-1123`,
+   `is_oom`이 거짓이면 `raise`). 진단 가능한 실패가 "결과 없음"으로 보인다 — Lane F
+3. **`infisical run`이 모든 비영 종료 코드를 1로 뭉갠다.** 그리고
+   `tests/test_pods.py`의 공유 스텁이 `exec "$@"`였고 `run_entrypoint`가
+   `INFISICAL_TOKEN`을 안 넘겨, 테스트가 그 버그가 존재할 수 없는 세계를 재고
+   있었다 — **머지됨** (`0ecf77d`)
+
+**넷이 아니라 셋이다.** `HF_HUB_OFFLINE` 로그 세 줄은 실패 보고가 아니라 닫은 문의
+목록이고, 통합자가 그것을 오독했다. 제안했던 수정은 콜드 파드의 체크포인트·코퍼스
+fetch를 죽여 모든 timing 설정을 `no_result`로 만들었을 것이다 — `bench.py:629-635`가
+이미 기록한 사고다. 그 방향을 막는 가드가 `e6b5f8f`에 들어갔다.
+
+## 확정된 결정
 
 | 결정 | 내용 |
 |---|---|
-| 품질 축 | **안 한다.** Recall@k 구현 없음. 파레토는 2축(속도 × 메모리) |
-| `mxfp8` / `nvfp4` | **완전 제거.** transformer-engine 의존성까지 |
-| `fa4` | **포기.** Blackwell 전용 (TMEM, 2-CTA MMA). `fa3`도 Hopper 전용이라 자동 |
-| GPU | **A100 통일.** $1.49, 가용성 HIGH, 선행작업 0 |
-| 프레임워크 | **6개 전부 측정 가능하게.** 지금 타이밍은 4개만 돈다 |
+| 품질 축 | **안 한다.** Recall@k 구현 없음. 파레토는 2축(속도 × 메모리), 모델 내부 |
+| GPU | **A100 통일** (`NVIDIA A100-SXM4-80GB`) |
+| `precision` | **mxfp8/nvfp4 제거 완료.** `Literal["bf16"]`, transformer-engine 제거 |
+| `attn` | **fa3/fa4 스키마에 남기고 측정 안 함** — Hopper/Blackwell 전용 |
+| 모델 | **gemma-4 제외.** 2개 — `qwen3_vl_emb_2b`, `qwen3_5_0_8b` |
+| `peft` | **qlora 제외.** `{full, lora}` |
+| 픽셀 | `max_pixels=1310720`, `min_pixels=4096`, 두 모델 동일. `max_seq_len` 2048 유지 |
 
-`fa3`/`fa4`는 **스키마에 남긴다** — `ATTN_IMPL` 딕트의 문자열 두 개일 뿐이고 추가
-패키지가 없다. 매니페스트에서 선택하지 않고 리포트에 "미측정, 하드웨어 세대 전용"
-으로 적는다. `mxfp8`/`nvfp4`와 달라 지우는 이득이 없다.
+픽셀 값의 근거: 시각 토큰 1개 = `patch_size² × merge_size²` = 1,024 픽셀.
+1,310,720은 `Qwen3-VL-Embedding-2B`가 자기 리포에 선언한 값이고(우리 산술이 아니다),
+`Qwen3.5-0.8B`는 16,777,216 — **12.8배 차이가 닫으려는 confound다.** 텍스트 실측
+`max=270`이므로 최악 행 = 270 + 1,280 = 1,550 / 2,048, 여유 24%.
 
----
-
-## Step 0 — 게이트 (통합자가 직접, 레인 없음)
-
-**A100 통일과 gemma-4 full FT 가능성을 먼저 확정한다. 이 결과가 매니페스트 23개의
-내용을 바꾸므로 다른 무엇보다 먼저다.**
-
-1. `configs/experiment/phase2-loss-*.yaml` 3개의 `gpu_type_id`를 `NVIDIA B200` →
-   `NVIDIA A100-SXM4-80GB`. **이것이 먼저 없으면 어떤 A100 타이밍 매니페스트도
-   추가할 수 없다** — `check_one_baseline_one_gpu`가 baseline 코호트의 GPU 혼용을
-   거부하고, `load_experiments()`가 `--experiment` 필터보다 먼저 디렉터리 전체를
-   검증하므로 무관한 매니페스트를 지정해도 실패한다.
-2. 검증용 타이밍 매니페스트 1개 신설 — `gemma4_e2b` × `peft=full` × `run=timing`.
-3. 네 게이트 → 커밋 → 파드 1대 (약 6분, $0.15).
-
-**이 파드가 셋을 동시에 답한다:**
-
-- gemma-4 full FT가 A100 80GB에 들어가는가. **probe는 답한 적이 없다** —
-  `trainbench/probe/steps.py:476`이 `loss.backward()` 뒤에 `zero_grad`로 끝나고
-  `optimizer.step()`을 밟지 않으므로 Adam 상태(5.1B × 8 = 40.8GB)와 fp32 마스터
-  (20.4GB)가 **한 번도 할당된 적이 없다.** probe가 증명한 것은 가중치+그래디언트
-  약 20GB뿐이고 peak GPU 메모리를 기록하지도 않는다
-- 측정 파이프라인이 파드에서 실제로 도는가 — 타이머, metrics 블록,
-  baseline 3% 게이트. **한 번도 돌지 않았다**
-- 이 프로젝트 **최초의 속도 숫자**
-
-**OOM이면 멈추고 다시 정한다.** GPU를 바꾸거나 gemma-4를 `peft=lora` 기준으로
-재는 것을 확정해야 하고, 그것이 Lane D의 내용을 바꾼다. 밀어붙이지 않는다.
-
----
-
-## Wave A — 네 레인 병렬
-
-각 레인은 **자기 git worktree**에서 돌고, **개발 → 리뷰 → 개선**을 순서대로 밟는다.
+## 레인 — 파일 소유가 겹치지 않는다
 
 ```
-개발    executor 에이전트가 구현 + 테스트 + 변이 증거
-리뷰    code-reviewer 에이전트가 그 워크트리에 cd 해서 게이트를 재실행하고
-        적대적으로 검증        <- 개발한 에이전트가 아니다
-개선    확정된 발견만 수정. 되돌린 것은 이유와 함께 남긴다
-머지    통합자가 --no-ff, 게이트 재실행
+개발 → 리뷰 → 개선 → 머지. 리뷰어는 개발한 에이전트가 아니고, 레인의 워크트리에서
+게이트를 재실행한다. 통합자는 머지 전에 네 게이트를 스스로 다시 돌린다.
+레인은 커밋하지 않는다.
 ```
 
-리뷰어에게 **새 워크트리를 주지 않는다.** 레인의 작업이 없는 트리를 재고 그것을
-판정으로 보고한 전례가 있다.
+| 레인 | 소유 | 상태 |
+|---|---|---|
+| P | precision 제거 | **머지됨** `a8d913b` |
+| X | `entrypoint.sh`, `verify_env.py`, `test_pods.py`, `test_probe.py` | **머지됨** `0ecf77d`, `e6b5f8f` |
+| F | `bench.py`, `audit_plan.py`, `test_audit.py`, `test_smoke_cpu.py` | 게이트 검증 중 |
+| I | `configs/{data,model}`, `config_schema.py`, `probe/*` | 진행 |
+| C | `PLAN.md`, `docs/*.md`, 계약 docstring | 진행 |
+| L | `trainbench/pods.py`, `scripts/orchestrate.py` | 진행 |
+| G | gemma-4 + qlora 제외 | F·I·C 머지 후 |
+| D | `configs/experiment/` 스윕 매니페스트 | G 후 |
+| E | 잔해 제거 | 마지막 |
 
-### Lane P — precision 제거 (가장 큼)
+### Lane F — 결함 2와 만료된 전제 둘
 
-```
-소유  configs/precision/{mxfp8,nvfp4}.yaml          삭제
-      trainbench/config_schema.py                   Literal["bf16"], Axis() 유지
-      trainbench/axes.py                            약 165줄 삭제
-      trainbench/applied.py                         recipe 전용 표 셋
-      trainbench/record.py                          _TRACKED_PACKAGES
-      tests/test_axes.py test_applied.py            21개 삭제/편집
-      tests/test_smoke_cpu.py tests/test_pods.py
-      tests/contract/test_applied_axes.py           3개 삭제, CONTESTED 편집
-      tests/fixtures/axis_state.sample.json
-      scripts/audit_plan.py                         AXIS_PACKAGES 2줄
-      docs/audit-baseline.json                      --update-baseline + note 재작성
-      envs/native/pyproject.toml + uv.lock          transformer-engine 제거
-      docker/Dockerfile.framework                   NVTE_* ENV
-      README.md:38                                  깨진 예시 명령
-```
+`bench.py`에 **네 번째 기록 상태**를 만든다: 예외 타입 + 잘린 traceback,
+`metrics` 블록 없음(측정 창이 완료됐다는 주장이 되므로), 기존 3/4/5/124/125/127과
+겹치지 않는 종료 코드, `no_result`(= `publish_result.fallback_record` 소유)와
+구별되는 어휘. 선례가 둘 있다 — `REFUSED_STATUS`/`REFUSED_EXIT`와
+`oom_status`/`OOM_EXIT`.
 
-**`mixed(bf16,fp32)`를 건드리지 않는다.** `applied.py:1165-1176`의 그 경로는 recipe
-를 참조하지 않는 기본 경로이고, axolotl·unsloth 6칸이 거기 걸려 있다. 계약의
-`UNNAMEABLE` 표에 있는 precision 항목도 **그것에 관한 것이므로 그대로 둔다.**
+`assert-called`의 면제는 **`loader.py`의 `owned_axes` 선언에서 파생시킨다.**
+`FRAMEWORK_OWNED_STEP_RUNNERS` 등재만으로 면제하면, `loss.name` 소유를 선언하지
+않은 프레임워크를 레지스트리에 추가한 순간 하네스가 인증되지 않은 손실을 계산하고
+감사가 통과시킨다 — 그 검사가 막으려던 실패를 면제가 되살린다.
 
-**`Axis()` 마커를 유지한다.** 떼면 `axis-fields`와 `axis-wired`가 새로 깨지고, 더
-중요하게 **"bf16을 요청했는데 fp32로 적재된 것"을 잡는 검사가 사라진다** — 그것이
-이 축의 원래 일이고 fp8과 무관하다.
+### Lane I — 결함 1과 곁의 둘
 
-**함정 둘, 둘 다 CI에서만 조용히 터진다:**
+픽셀 상한은 `configs/data/`에 둔다. 두 모델이 **같은 값**을 쓰는 것이 핵심이고
+그건 모델의 속성이 아니라 워크로드의 속성이다. 컴포즈 시점 검증
+(`텍스트 상한 + ceil(max_pixels/1024) ≤ max_seq_len`)이 실제 속도 이득이다 —
+왕복 16분이 랩톱 2초가 된다.
 
-1. `tests/test_smoke_cpu.py` 5개가 `precision=mxfp8`을 "이 환경이 적용할 수 없는
-   축"의 대표로 쓴다 — `step_context` 단계에서 거부되는 유일한 사례였다.
-   **대체제가 오늘 생겼다**: CPU에서 `axes.step_context`가 axolotl의
-   `required_step_context`(cuda autocast)를 받으면 같은 단계에서 `UnappliedAxis`로
-   거부한다. 그것으로 바꾼다.
-2. `axis-values` count가 3 → 2로 **줄어 감사가 BLOCK한다**(`shrank`). 설계상
-   의도된 것이므로 `--update-baseline`을 함께 돌리고 note를 사실에 맞게 다시 쓴다.
-   지금 note는 TE가 import되지 않는다는 측정 기록을 담고 있어 통째로 낡는다.
+곁의 둘:
+- **padded 포워드가 KV 캐시를 끄지 않는다.** `bench.py:118`(packed)은
+  `use_cache=False`를 넘기고 `probe/steps.py:253`(padded, 기본이자 baseline 경로)은
+  안 넘긴다. 임베딩 학습에 그 캐시는 절대 읽히지 않는다
+- **세 모델 전부 `revision: null`.** 파드 로그의 `@2fc06364...`는 핀이 아니라
+  가져온 뒤 기록한 것이다(`git_source: "env"`와 같은 성질). 체크포인트가 갱신되면
+  같은 축의 파드가 다른 가중치를 잰다
 
-**빌드 시간 이득을 숫자로 주장하지 않는다.** `docs/support-matrix.md:804-806`이
-로그가 주는 것은 완료 시각이지 소요 시간이 아니라고 못박고 있고, TE는
-causal-conv1d와 동시에 돈다. **측정 안 함**으로 적는다.
+### Lane L — 증거를 잃지 않는다
 
-### Lane F — framework-owned 스텝 경로
+종료된 파드의 로그는 404다(직접 확인). `orchestrate.py:1024`가
+`pods.terminate()`를 부르고 그 전에 아무것도 로그를 가져오지 않는다. 종료 전에
+받아 결과 저장소에 남긴다. 로그 수집 실패가 종료를 막아서는 안 되고(돈이 탄다),
+없는 로그와 빈 로그는 구별돼야 한다. 파싱·분류는 이 레인이 아니다.
 
-```
-소유  scripts/bench.py                              framework 소유 스텝 분기
-      trainbench/collate.py                         query/passage 키 생성
-      trainbench/loader.py                          필요한 만큼
-      tests/test_bench*.py test_collate.py test_loader.py
-```
+곁: `build-images.yml`의 `paths:`에서 `trainbench/pods.py`와
+`scripts/orchestrate.py`를 빼면 오케스트레이터 수정이 8~9분을 안 쓴다. 그 둘은
+파드에서 실행되지 않는다.
 
-지금 `bench.py:725`가 `step.owner != harness.owner`면 무조건 거부한다. 거부 자체는
-정당하다 — 하네스 루프를 그냥 돌리면 우리 forward와 우리 손실을 재놓고 프레임워크가
-인증을 면제받은 축 아래에 발행한다. **문제는 `owner=framework`를 구동하는 경로가
-없다는 것**이고, 값이 둘인 enum에서 하나가 항상 거부다.
+### Lane G — 두 제외
 
-`Step`은 이미 `owner=framework`와 tevatron의 `batch_keys=("query","passage")`를
-선언하고 있고, `owned_axes`가 `loss.name`을 프레임워크 소유로 적어두었다. **계약이
-틀린 게 아니라 절반이 미구현이다.**
+**함정 셋, 전부 실측 확인:**
+1. gemma-4 매니페스트만 먼저 지울 수 없다. `tests/test_pods.py:1737,1775,1841,1907`이
+   `phase2-loss-gemma4_e2b`를 픽스처 실험 이름으로 하드코딩 — 8개를 지우면 5 failed
+2. `axes.load_kwargs` 안에서 non-CUDA를 거부하는 것은 **qlora가 유일**하다
+   (`axes.py:615-621`). `adamw_8bit`의 거부는 다른 함수이고 `preflight()`가 거기까지
+   가지 않는다. Lane P가 오늘 `test_smoke_cpu.py` 3개를 mxfp8 → qlora로 옮겼으므로
+   두 번째로 대표를 잃는다. **실제 축을 빌리는 대신 주입된 합성 거부로 바꾼다** —
+   불변식은 어떤 축이 이번 주에 적용 불가인지와 무관해야 한다
+3. `docs/open-verdicts.json`의 qlora 판정은 **이미 닫혀 있다.** `verdicts-closed`가
+   개수 변화에 BLOCK하므로 지우면 게이트가 막히고, 지우는 게 옳지도 않다
 
-probe 쪽에 이미 두 사례가 있다 — `probe/tevatron.py`의 `_backward`(오늘 만듦)와
-`probe/sentence_transformers.py:107-126`. **그 모양을 타이밍 경로로 올린다.**
-sentence_transformers는 `forward(input: dict)` 위치 인자를 요구하므로 두 프레임워크의
-호출 규약이 서로 다르다 — 하나로 뭉개지 않는다.
-
-`Step`/`AdapterOut`에 필드를 더해야 하면 **`boundaryRequests`로 올리고 고치지
-않는다.** `PAYLOAD_KEYS`/`ADAPTER_OUT_FIELDS`가 계약으로 동결돼 있다.
-
-### Lane X — axolotl × qwen3_5 회귀
-
-```
-소유  trainbench/probe/axolotl.py
-      tests/test_probe.py                           axolotl 구역만
-      .plans/notes/axolotl-probe.md
-```
-
-`no result file after the run (exit 1)`, `peak_uptime_seconds: 1`. 같은 칸이 같은 날
-앞선 웨이브에서 (같은 `kernel=fla`로) 전체 probe를 마쳤으므로 **매니페스트 변경은
-면책**되고 남은 변경은 probe의 autocast 배선 하나다. gemma4·qwen3_vl에서는 같은
-수정이 성공하므로 **qwen3_5 고유**다. 파이썬 예외였다면 `report.run`이 실패 체크로
-기록했을 텐데 그러지 않았다 — **파이썬 레벨 위에서 죽었다.**
-
-가설: `torch.autocast` 안에서 qwen3_5의 fla/Gated DeltaNet 경로가 프로세스를 죽인다.
-**확인 안 함** — 파드가 종료돼 로그가 없다.
-
-**첫 일은 로그 확보다.** 그 조합 1대를 띄우고 파드가 살아 있는 동안 로그를 받는다.
-원인을 보기 전에 고치지 않는다.
+**측정된 것은 지우지 않는다.** gemma-4의 파드 결과와 닫힌 판정은 역사다. "제외"로
+표시한다. `bitsandbytes`는 `adamw_8bit`이 계속 쓰므로 남는다.
 
 ### Lane D — 스윕 매니페스트
 
-```
-소유  configs/experiment/*.yaml                     신설 23개
-```
-
-**Step 0이 끝난 뒤 착수한다** — gemma-4의 `peft` 기준이 그 결과로 정해진다.
-
-| 축 | 값 | 모델 | 파드 |
+| 축 | 값 | 파드 | 설정 |
 |---|---|---|---|
-| `attn` | sdpa, fa2, flex | 3 | 3 |
-| `compile` | none, default, max_autotune | 3 | 3 |
-| `dataloader` | torch, packed, pretokenized, packed+pretok | 3 | 3 |
-| `optim` | adamw_fused, adamw_8bit, muon | 3 | 3 |
-| `peft` | full, lora, qlora | 3 | 3 |
-| `train.gradient_checkpointing` | none, full, selective | 3 | 3 |
-| `freeze` | vision_tower (gemma4는 ple 포함) | 3 | 3 |
-| `kernel` | none, liger | qwen3_vl, gemma4만 | 2 |
+| `attn` | sdpa, fa2, flex | 2 | 6 |
+| `compile` | none, default, max_autotune | 2 | 6 |
+| `dataloader` | torch, packed, pretokenized, packed+pretok | 2 | 8 |
+| `optim` | adamw_fused, adamw_8bit, muon | 2 | 6 |
+| `peft` | full, lora | 2 | 4 |
+| `train.gradient_checkpointing` | none, full, selective | 2 | 6 |
+| `freeze` | none, vision_tower | 2 | 4 |
+| `kernel` | none, liger | qwen3_vl만 | 2 |
+| | | **15** | **42** |
 
-**23파드 · 설정 69개 + baseline 23회 = 92런.**
+`kernel`이 1파드인 이유: `qwen3_5`는 `axes.FLA_ARCHS`라 `kernel=fla`가 강제다.
 
 지켜야 할 것:
-- 모든 측정 파드는 `baseline: canonical` + `gpu_type_id: NVIDIA A100-SXM4-80GB`
+- 모든 측정 파드는 `baseline: canonical` + A100
 - **qwen3_5 매니페스트는 `overrides`에 `kernel=fla`를 반드시 넣는다.** 없으면
-  `axes.patch`가 거부한다. 같은 값이므로 `held_constant`로 통과한다
-- **qwen3_5에 `kernel` 스윕 매니페스트를 만들지 않는다.** `axis: kernel`이
-  `AXIS_DECLARED`를 추가해 기존 7개 파드의 `kernel=fla` 상수를 split로 바꾼다
-- `compile=max_autotune`은 `train.warmup_discard_steps=20`을 함께 (기본 10)
-- `peft` 스윕과 `freeze` 스윕은 **합칠 수 없다** — 어댑터와 freeze 축의 교차가
-  스키마에서 거부된다
-- `axis:` 라벨은 오버라이드가 실제로 움직인 것과 일치해야 한다.
-  `train.gradient_checkpointing`은 **점 표기 전체**를 쓴다
+  `axes.patch`가 거부하고 파드가 부팅해 과금하고 아무것도 측정하지 않는다
+- **qwen3_5에 `kernel` 스윕을 만들지 않는다.** `axis: kernel`이 `AXIS_DECLARED`를
+  추가해 기존 파드들의 `kernel=fla` 상수를 split으로 바꾼다
+- `compile=max_autotune`은 `train.warmup_discard_steps=20`을 함께
+- `peft` 스윕과 `freeze` 스윕은 합칠 수 없다 — 스키마가 교차를 거부한다
 
----
+### Lane E — 잔해, 마지막
 
-## Wave B — Lane P 머지 후
+**착수 전에 결정해야 할 것:** `.plans/remaining-code/HAZARDS.md`가 삭제 목록에
+있는데 `AGENTS.md`와 모든 레인 브리프가 "먼저 읽어라"로 지목하는 파일이다. 이
+저장소가 실패에서 배운 것이 거기 모여 있다. 옮길 곳을 먼저 정한다.
 
-파일이 Lane P와 겹쳐 순서를 지킨다.
+`tests/contract/`의 "아무것도 단언하지 않는" 줄을 지우면 117 기준선이 내려간다.
+계약 수를 줄이는 것은 Lane P의 5개처럼 **항목별 근거**가 필요하다.
 
-### Lane C — 문서를 사실에 맞춘다
-
-```
-PLAN.md      3축 → 2축 파레토, MFU 제거, HTA·memory snapshot 제거,
-             파레토를 모델 내로, 이미지 토큰 예산 고정 요구 삭제,
-             fa3/fa4/precision을 "미측정 — A100 캠페인"으로
-docs/methodology.md    §9 kernel_modules 측정 안 함 → 18/533
-docs/support-matrix.md native·axolotl 이미지 빌드 failure → 오늘 7잡 성공
-                       precision 6칸 FAIL이 의도된 결과라는 문단
-tests/contract/*       "Twenty-one of these tests are deferred" 산문
-```
-
-### Lane E — 잔해 제거
+## 규모와 비용
 
 ```
-docs/evidence/env-report-cpu-*.json   trackio 필드 — 커밋된 아티팩트가
-                                      현재 스키마를 통과 못 한다. 이것만 우선
-envs/*/pyproject.toml + uv.lock       trackio 잔여, kernels>=0.10 핀
-.plans/review/ + remaining-code/      5,315줄
-tests/contract/*                      아무것도 단언 안 하는 것 약 900줄
-scripts/audit_plan.py                 plan-files 체크
+파드   14 (phase0 12 + phase2 2) + 15 (Lane D) = 29
+런     18 + 57 = 75
 ```
 
----
+타이밍 파드가 120스텝에 얼마나 걸리는지는 **측정 안 함** — 한 번도 완주한 적이 없다.
+그 숫자가 나오는 것이 baseline 파드의 두 번째 목적이다.
 
-## 경계 — 통합자 전용
+### 재빌드가 필요한 기준
 
-Wave A 동안 아래는 **어느 레인도 건드리지 않는다.** 필요하면 `boundaryRequests`로
-올리고 통합자가 개정 하나를 발행한다.
+`build-images.yml`의 `paths:`가 1층이다: `docker/**`, `envs/**`,
+`pyproject.toml`, `uv.lock`, `trainbench/**`, `scripts/**`. `configs/**`,
+`docs/**`, `tests/**`는 빌드를 안 태운다.
 
-```
-docs/CONTRACTS.md            Lane P와 Lane F가 둘 다 필요로 한다
-tests/contract/* 의 구조      Lane P의 precision 항목 삭제만 예외
-configs/experiment/          Lane D 전용 (Step 0의 4파일은 통합자)
-```
+2층은 `Dockerfile.framework`의 층 순서다:
 
-`docs/audit-baseline.json`은 **Lane P 전용**이다 — `--update-baseline`이 필요하고
-그 실행은 전체 감사를 요구한다(`--only`/`--skip`로는 거부됨).
+| 바뀐 것 | 무효화 | 비용 |
+|---|---|---|
+| `envs/*/{pyproject.toml,uv.lock}`, 루트 락 | 10–11 | 의존성 전체 — 20분+ (오늘 실측) |
+| `trainbench/**` | 62 | 8분 17초~8분 46초 (실측) |
+| `scripts/**`, `entrypoint.sh` | 66–67 | COPY + chmod |
+| `configs/**` | 없음 | 빌드 자체가 안 돈다 |
 
-## 레인 규율
+`COPY configs`가 없다. 그래서 축 조합 변경은 재빌드가 필요 없고, 오케스트레이터가
+랩톱에서 합성해 해석된 JSON을 환경변수로 넘긴다.
 
-- **핀된 소스를 읽고 나서 단언한다.** 이 저장소의 프로브 실패 전부가 "보통 그렇게
-  동작한다"에서 나왔다. `AGENTS.md`와 `.plans/remaining-code/HAZARDS.md`를 먼저 읽는다
-- **추가한 검사마다 변이 증거.** 사보타주 전에 `co_filename`/`co_firstlineno`로
-  실제 정의 위치를 확인하고, 출력을 그대로 인용하고, 복원한다
-- **자기가 내지 않은 숫자를 옮겨 적지 않는다.** 확인할 수 없으면 "확인 안 함"
-- **네 게이트.** `ruff check && ruff format --check`, `pytest`,
-  `pytest tests/contract -q`, `audit_plan.py`. **계약 수는 122가 기준선**이고
-  Lane P만 그것을 줄인다(3개 삭제 → 119). 다른 레인이 줄이면 계약을 약화한 것이다
-- **커밋하지 않는다.** 워크트리에 남기고 보고한다. 머지는 통합자가 한다
-- 이 호스트에 CUDA·TE·6개 프레임워크가 없다. 파드가 답할 것을
-  `.plans/notes/<lane>.md`에 축별로 한 문장씩 적는다
+빌드는 main push로 자동 트리거되고 파드는 `--tag <commit sha>`로 digest를 고정하므로
+**마지막 머지의 빌드만 완료되면** 된다.
+
+### 코드를 이미지에 굽지 않는 안 — 첫 숫자 이후
+
+파드가 코드를 내려받으면 `trainbench/**`·`scripts/**` 변경의 8~9분이 사라진다.
+`uv`가 부팅마다 로컬 `trainbench`를 다시 까므로 반영 기계는 이미 있다.
+
+막는 것은 시크릿이다. `ALLOWED_ON_POD`는 정확히 `HF_TOKEN` 하나이고 체크는
+Infisical 시크릿의 **이름만** 비교한다 — GitHub PAT의 스코프는 볼 수 없다.
+`GITHUB_TOKEN`을 넣으면 안전성이 기계가 검사하는 속성에서 사람이 기억하는 속성으로
+바뀐다. 반면 파드는 이미 `HF_TOKEN`으로 결과를 업로드하므로
+(`publish_result.py:162,171`) **HF로 코드를 배달하면 노출이 늘지 않는다.**
+
+함께 와야 하는 것: 코드가 다운로드로 도착하면 `image_digest`가 코드를 식별하지
+않으므로 파드가 받은 것을 스스로 해시해 기록해야 한다. 지금 `git_commit`은 런처가
+주장한 값(`git_source: "env"`)이고 `git_dirty: null`이다. 열린 판정
+`images-carry-a-code-snapshot-nothing-checks-is-current`가 이 문제다.
 
 ## 검증
 
-랩톱에서 죽일 수 있는 것을 파드로 보내지 않는다. 하드웨어 왕복 1회가 약 16분이다
-(코드만 바뀐 재빌드 8~9분 실측 + 파드 웨이브 약 7분).
-
-1. Step 0 파드가 gemma-4 full FT와 측정 파이프라인을 동시에 답한다
-2. Wave A 각 레인: 랩톱 네 게이트 + 변이 증거 + 리뷰어 재실행
-3. Lane P·F는 재빌드가 필요하다 → **한 번의 push에 묶는다**
-4. Lane D는 재빌드 불필요 — `configs/`는 이미지에 COPY되지 않는다
-5. 최종 파드 웨이브: `--experiment 'phase3-*' --max-concurrent 12`.
-   probe는 타이밍을 재지 않으므로 12 동시가 결과를 오염시키지 않고, 실측으로
-   18칸이 2웨이브 약 12분이었다
-6. `report.py`로 병합하고 **각 숫자를 아티팩트에서 직접 읽어 확인한다.**
+1. F·I·C·L 완료 → 통합자가 각 워크트리에서 네 게이트 재실행 → 머지 → main 재실행
+2. Lane G → Lane D
+3. **baseline 파드 1대. 이번에는 로그가 자동으로 남는다.** 그것이 셋을 답한다 —
+   픽셀 상한이 실제로 무는지, 타이머와 metrics 블록이 도는지, 이 프로젝트 최초의
+   속도 숫자
+4. 최종 웨이브: `--max-concurrent 12` (18칸이 2웨이브 약 12분이었다)
+5. `report.py`로 병합하고 **각 숫자를 아티팩트에서 직접 읽어 확인한다.**
    스위트가 초록인 것은 증거가 아니다
 
 ## 하지 않는 것
 
-- 품질 축(Recall@k) 구현 — 결정으로 제외
+- 품질 축(Recall@k) — 결정으로 제외
 - `mixed(bf16,fp32)`를 초록으로 만드는 시도 — 계약이 영구 불일치로 동결
-- `fa3`/`fa4`/`mxfp8`/`nvfp4` 매니페스트 — A100에서 값이 없다
+- `fa3`/`fa4` 매니페스트 — A100에서 값이 없다
 - `parallel.*`, `train.offload` 매니페스트 — `pods.py`가 `gpuCount: 1`로 고정해
-  world ≥ 2를 만들 수 없다. GPU 등급 문제가 아니라 파드 스펙 문제다
+  world ≥ 2를 만들 수 없다. GPU 등급이 아니라 파드 스펙 문제다
 - `dataloader=dali` — 파이프라인 구현이 없어 영구 거부
-- 리뷰 major 23 + minor 54 — 범위 밖
+- gemma-4, qlora — 결정으로 제외
+
+## 규율
+
+- **핀된 소스를 읽고 나서 단언한다.** 이 저장소의 프로브 실패 전부가 "보통 그렇게
+  동작한다"에서 나왔다
+- **로그를 실패 보고로 읽기 전에 그것을 출력하는 코드를 읽는다.** 오늘 통합자가
+  성공 로그를 결함으로 읽고 캠페인 전체를 회귀시킬 뻔했다
+- **추가한 검사마다 변이 증거.** 사보타주 → 실제 출력 인용 → 복원 → 바이트 동일 확인
+- **자기가 내지 않은 숫자를 옮겨 적지 않는다.** 확인할 수 없으면 "확인 안 함"
+- **파드를 띄우면 로그를 받는다.** 오늘 결함 셋 중 둘이 로그에 있었다

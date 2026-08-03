@@ -35,7 +35,7 @@ kernel fetch door closed: huggingface_hub.constants.HF_HUB_OFFLINE=False, want T
 
 **이것은 실패 보고가 아니라 닫은 문의 목록이다. 과거형이다.**
 `forbid_runtime_kernel_fetch` 는 열려 있던 문을 **반환하고 전부 닫으며**,
-`scripts/bench.py:603` 이 반환값을 그대로 찍는다. 실측(이 세션, 프로덕션 적재 경로 +
+`scripts/bench.py::close_kernel_fetch_doors` 가 반환값을 그대로 찍는다. 실측(이 세션, 프로덕션 적재 경로 +
 transformers import 후): 호출 뒤 `open_fetch_doors()` 는 `[]`, env 는 `1`, const 는
 `True`, `assert_no_runtime_kernel_fetch()` 통과. 세 번째 줄은 캐시된 상수 **도** 닫혔다는
 기록이지 안 닫혔다는 뜻이 아니다.
@@ -53,13 +53,13 @@ load_pairs           -> ConnectionError Couldn't reach 'jinwoo-cho/mmeb-subset' 
 설정이 `no_result` 로 올라간다 — B1 이 없애려던 그 증상이다.
 
 읽는 순서를 바꿔 주는 사실 하나: **문이 열린 채로는 측정이 진행되지 않는다.**
-`build_run` 이 모델을 지은 **뒤** 다시 읽고(`scripts/bench.py:792-793`,
+`build_run` 이 모델을 지은 **뒤** 다시 읽고(`scripts/bench.py` 의 `load_framework` 직후,
 `ENFORCED_PURPOSES` 한정) 하나라도 열려 있으면 거부한다. 그러므로 "커널 fetch 가 조용히
 타이밍 숫자에 섞였다" 는 이 배선에서 성립하지 않는다 — 섞였다면 숫자가 아니라 refusal 이
 나온다.
 
 `tests/test_smoke_cpu.py` 의 순서 체크 다섯은 이것을 못 잡는다. 두 헬퍼가 시작 상태를
-고정하려고 `RUNTIME_FETCH_ENV` 를 `monkeypatch.delenv` 하므로(`:1948`, `:2220`),
+고정하려고 `RUNTIME_FETCH_ENV` 를 `monkeypatch.delenv` 하므로,
 **환경이 그 변수를 들고 도착하는 경우가 원리적으로 안 보인다** — ambient `HF_HUB_OFFLINE=1`
 로 다섯을 돌려도 그대로 통과하는 것을 실측했다. 그 구멍은
 `tests/test_pods.py::test_the_pod_hands_bench_an_environment_with_the_fetch_doors_still_open`
@@ -67,12 +67,16 @@ load_pairs           -> ConnectionError Couldn't reach 'jinwoo-cho/mmeb-subset' 
 비어 있는지 본다.
 
 **파드 실측 하나(이 세션에서 확인 안 함 — 파드 로그 보유자 판독):** A100 파드
-`aib8xamhmrb312` 는 `train()` 안에서 죽었고(`scripts/bench.py:288`, collate 의
-`RuntimeError` 재발생) `train()` 은 `:793` 보다 뒤이므로, 그 setting 에서
+`aib8xamhmrb312` 는 `train()` 안에서 죽었고(`micro = next(stream)` 에서 collate 의
+`RuntimeError` 재발생) `train()` 은 그 재확인보다 뒤이므로, 그 setting 에서
 `assert_no_runtime_kernel_fetch()` 는 **실 하드웨어에서 실행되어 통과했다.** 오프라인
 게이트가 랩톱 밖에서도 성립한다는 첫 근거다. 위 "파드가 답해야 하는 것" 2번은 이것으로
 닫히지 않는다 — 그 항목은 프레임워크 넷의 자체 로더가 오프라인에서 캐시를 집는지를 묻고,
 이 파드는 `native` 한 셀이다.
+
+
+> 이 문서는 줄 번호를 쓰지 않는다. 심볼로 가리킨다 — 여기 있던 네 개가
+> `scripts/bench.py` 에 실패 레코드 경로가 들어간 머지 하나로 전부 밀렸다.
 
 ## 파드가 답해야 하는 것 — 이 호스트에서 확인 안 함
 
