@@ -511,13 +511,39 @@ class _Encoder(torch.nn.Module):
         self.embed = torch.nn.Embedding(vocab, hidden)
         self.proj = torch.nn.Linear(hidden, hidden)
 
-    def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
+    def forward(self, input_ids, attention_mask=None, output_hidden_states=False, use_cache=None):
         return types.SimpleNamespace(last_hidden_state=self.proj(self.embed(input_ids)))
 
 
 def _frozen_batch():
     ids = torch.tensor([[1, 2, 3], [2, 3, 4], [3, 4, 5], [4, 5, 6]])
     return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+
+def test_encode_turns_the_kv_cache_off():
+    """`steps.encode` pools one hidden state and stops; nothing here ever reads
+    `past_key_values`. Every model ships `config.use_cache=True`, so the default
+    forward allocates a cache none of this file's callers use — the packed path
+    (`scripts/bench.py::pooled_embeddings`) already turns this off for the
+    identical reason; this pins that the padded path (`steps.encode` itself, which
+    `scripts/bench.py:117` calls for the default `dataloader.packing=false` case)
+    does too."""
+    from trainbench.probe.steps import encode
+
+    seen: dict[str, object] = {}
+
+    class _KwargSpy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(8, 4)
+
+        def forward(self, input_ids, attention_mask=None, **kwargs):
+            seen.update(kwargs)
+            return types.SimpleNamespace(last_hidden_state=self.embed(input_ids))
+
+    encode(_KwargSpy(), _frozen_batch(), "right")
+
+    assert seen.get("use_cache") is False, seen
 
 
 def test_a_step_that_trained_nothing_is_not_a_step(monkeypatch):

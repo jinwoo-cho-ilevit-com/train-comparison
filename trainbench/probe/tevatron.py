@@ -110,7 +110,11 @@ def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any])
 
     model, _ = load_dense_model(config)
     model.to(device)
-    processor = AutoProcessor.from_pretrained(config.model.hf_id, revision=config.model.revision)
+    processor = AutoProcessor.from_pretrained(
+        config.model.hf_id,
+        revision=config.model.revision,
+        **steps.pixel_budget_kwargs(config),
+    )
     return model, processor
 
 
@@ -147,7 +151,9 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
         from transformers import AutoProcessor
 
         loaded["processor"] = AutoProcessor.from_pretrained(
-            config.model.hf_id, revision=config.model.revision
+            config.model.hf_id,
+            revision=config.model.revision,
+            **steps.pixel_budget_kwargs(config),
         )
         return {"processor_class": type(loaded["processor"]).__name__}
 

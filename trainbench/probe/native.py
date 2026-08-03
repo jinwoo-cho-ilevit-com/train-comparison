@@ -19,7 +19,11 @@ from trainbench.probe.types import ProbeReport
 def load_processor(config: BenchConfig) -> Any:
     from transformers import AutoProcessor
 
-    return AutoProcessor.from_pretrained(config.model.hf_id, revision=config.model.revision)
+    return AutoProcessor.from_pretrained(
+        config.model.hf_id,
+        revision=config.model.revision,
+        **steps.pixel_budget_kwargs(config),
+    )
 
 
 def load_model(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any]) -> Any:

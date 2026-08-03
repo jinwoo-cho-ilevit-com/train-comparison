@@ -24,10 +24,16 @@ from trainbench.probe.types import ProbeReport
 
 def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any]) -> tuple[Any, Any]:
     """`get_model_processor` owns the `from_pretrained` call, so `load_kwargs` has
-    nowhere to go here and is left unapplied rather than guessed at a keyword."""
+    nowhere to go here and is left unapplied rather than guessed at a keyword.
+
+    `revision` is a named parameter of `get_model_processor` itself (ms-swift
+    4.4.2 swift/model/register.py:525), threaded into `get_model_info_meta(...,
+    revision=revision, ...)` at :603, which is what resolves the local snapshot
+    both the model and the processor load from — so passing it here pins both.
+    """
     from swift import get_model_processor
 
-    model, processor = get_model_processor(config.model.hf_id)
+    model, processor = get_model_processor(config.model.hf_id, revision=config.model.revision)
     model.to(device)
     return model, processor
 

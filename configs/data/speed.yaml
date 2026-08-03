@@ -33,3 +33,18 @@ limit: 2048
 max_seq_len: 2048
 num_workers: 8
 push_subset: false
+# Both models' processor budget (see trainbench/config_schema.py's DataConfig
+# docstring for why this lives here, and why 1310720 is qwen3_vl's own shipped
+# value rather than our arithmetic). Verified on this host: with the cap on, a
+# full scan of this revision's 2048 rows tops out at 1327 tokens for
+# qwen3_vl_emb_2b and 1312 for qwen3_5_0_8b, both under max_seq_len — and before
+# the cap, qwen3_5_0_8b alone reached 16281 on rows[180,184).
+max_pixels: 1310720
+min_pixels: 4096
+# The whole corpus's text side (query + positive, no image, no truncation, each
+# model's own prompt format), measured 2026-08-03 against this revision:
+# qwen3_5_0_8b min=6 p50=15 p95=135 p99=172 max=270; qwen3_vl_emb_2b min=21 p50=30
+# p95=150 p99=187 max=285 — higher throughout because of its instruction-prompt
+# system turn. 285 is the worst case across both and what the field carries. A
+# corpus regenerated under a new revision invalidates this number.
+text_token_ceiling: 285

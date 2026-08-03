@@ -28,3 +28,18 @@ limit: null
 max_seq_len: 2048
 num_workers: 8
 push_subset: false
+# Same budget as speed.yaml — see trainbench/config_schema.py's DataConfig
+# docstring for why this lives per data group and stays identical across both.
+max_pixels: 1310720
+min_pixels: 4096
+# Not measured on *this* corpus: a full-corpus scan here timed out on this host
+# ("The read operation timed out" against this revision's first parquet shard,
+# 2026-08-03 — image bytes are embedded in every row, and this repo is 32x
+# speed's row count). Carried over from speed.yaml's measurement instead of
+# guessed: same upstream (source_repo/source_revision above), same two models'
+# prompt formats, and a 65536-row draw from the same population is unlikely to
+# be *shorter*-tailed than speed's 2048-row draw, so reusing speed's max is a
+# floor, not an invention. `trainbench/collate.py`'s own runtime check still
+# refuses any row this underestimates. See .plans/notes/lane-pixels.md — this
+# corpus's own ceiling is an open question for a host with more bandwidth or a pod.
+text_token_ceiling: 285

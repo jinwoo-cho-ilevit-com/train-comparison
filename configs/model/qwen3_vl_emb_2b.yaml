@@ -1,7 +1,17 @@
 name: qwen3_vl_emb_2b
 hf_id: Qwen/Qwen3-VL-Embedding-2B
 arch: qwen3_vl
-revision: null
+# Pinned rather than null: with null, every probe/loader that passes
+# `revision=config.model.revision` to `from_pretrained` resolves `main` fresh at
+# each fetch, so a push to the Hub mid-campaign would let two pods in the same
+# axis measure different weights and still look comparable (the same reason
+# `data.revision` is pinned). This is the Hub's `sha` for this repo's default
+# branch tip, read via `GET https://huggingface.co/api/models/Qwen/Qwen3-VL-Embedding-2B`
+# on 2026-08-03 (lastModified 2026-04-16, months before any pod in this campaign
+# ran) — not invented, and not read off a result artifact because no artifact in
+# `jinwoo-cho/trainbench-results` records the resolved revision (config.model.revision
+# there is itself null; see results/native/qwen3_vl_emb_2b/udt814eokzll0r/result.json).
+revision: 9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda
 # Official embedding model: sentence_bert_config.json sets add_generation_prompt
 # true, and config_sentence_transformers.json sets the default prompt.
 add_generation_prompt: true

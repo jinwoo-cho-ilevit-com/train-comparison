@@ -34,6 +34,13 @@ def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any])
     (axolotl 0.18.0 cli/config.py:303-322). Filling those two keys by hand does not
     fix it — the next unfilled key is `context_parallel_size`, compared against 1
     in loaders/patch_manager.py. Only validation puts defaults on all of them.
+
+    `revision_of_model` is the cfg key, not `revision`: `ModelLoader` reads
+    `cfg.revision_of_model` into its own `model_kwargs["revision"]`
+    (axolotl 0.18.0 loaders/model.py:223-224), and `load_tokenizer` /
+    `loaders/processor.py` read the same key for the tokenizer and processor
+    (loaders/tokenizer.py:144-177, loaders/processor.py:24-25) — one field pins
+    all three loads.
     """
     from axolotl.loaders.model import ModelLoader
     from axolotl.loaders.tokenizer import load_tokenizer
@@ -43,6 +50,7 @@ def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any])
     cfg = DictDefault(
         {
             "base_model": config.model.hf_id,
+            "revision_of_model": config.model.revision,
             "sequence_len": config.data.max_seq_len,
             "bf16": True,
             "load_in_4bit": config.peft.mode == "qlora",

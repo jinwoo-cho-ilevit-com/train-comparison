@@ -2476,7 +2476,7 @@ class TinyEncoder(torch.nn.Module):
         self.calls = 0
         self.widest = 0
 
-    def forward(self, input_ids, attention_mask, output_hidden_states=False):
+    def forward(self, input_ids, attention_mask, output_hidden_states=False, use_cache=None):
         self.calls += 1
         self.widest = max(self.widest, int(input_ids.shape[0]))
         return SimpleNamespace(last_hidden_state=self.drop(self.proj(self.embed(input_ids))))
@@ -2558,6 +2558,7 @@ class TinyImageEncoder(TinyEncoder):
         pixel_values=None,
         image_grid_thw=None,
         output_hidden_states=False,
+        use_cache=None,
     ):
         self.calls += 1
         self.widest = max(self.widest, int(input_ids.shape[0]))

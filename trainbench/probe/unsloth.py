@@ -33,6 +33,12 @@ def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any])
     `load_kwargs` has nowhere to go: `FastVisionModel.from_pretrained` owns the
     call and takes its own keywords, so the axis is left unapplied and the capture
     side reports the mismatch rather than a guessed keyword succeeding.
+
+    `revision` is not one of `FastBaseModel.from_pretrained`'s named parameters
+    (unsloth 2026.7.6 models/vision.py:810-841), but the call reads it out of
+    `**kwargs` explicitly (`kwargs.get("revision")` at models/vision.py:1103,
+    :1316, :1469), so passing it here does reach the checkpoint fetch rather than
+    being silently dropped.
     """
     from unsloth import FastVisionModel
 
@@ -41,6 +47,7 @@ def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any])
         load_in_4bit=config.peft.mode == "qlora",
         full_finetuning=config.peft.mode == "full",
         dtype=steps.dtype_for(device),
+        revision=config.model.revision,
     )
 
 
