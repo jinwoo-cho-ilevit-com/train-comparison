@@ -33,10 +33,12 @@ owned by the `applied-axes` boundary; this one pins that the record carries it),
 and the scope a figure is true within - a framework's speed ratio inverts with
 sequence length and GPU count.
 
-The `xfail(strict=True)` tests are the parts of this contract the tree does not
-satisfy today. They run, they fail for a named reason, and they turn into errors
-the moment a lane implements them - which is how the lane learns to drop the
-marker rather than leaving a green test that asserts nothing.
+This file originally shipped with parts of the contract marked `xfail(strict=True)`
+where the tree did not satisfy them yet - each ran, failed for a named reason, and
+would have turned into an error the moment a lane implemented it, which is how a
+lane would have learned to drop the marker rather than leave a green test that
+asserts nothing. All of them have since been closed; no `xfail` marker remains in
+this file.
 """
 
 from __future__ import annotations

@@ -2,9 +2,14 @@
 
 ## 목적
 
-Qwen3-VL-Embedding-2B / Qwen3.5-0.8B / gemma-4-E2B 세 모델에 대해 텍스트+이미지
-임베딩(contrastive) 학습의 속도 최적화 기법을 실측 비교하고, 모델별 권장 레시피와
-throughput x memory x 품질 Pareto frontier를 리포트로 산출한다.
+Qwen3-VL-Embedding-2B / Qwen3.5-0.8B 두 모델에 대해 텍스트+이미지 임베딩(contrastive)
+학습의 속도 최적화 기법을 실측 비교하고, 모델별 권장 레시피와 **모델 내부**의
+throughput x peak memory 2축 Pareto frontier를 리포트로 산출한다. (gemma-4-E2B는
+2026-08-03 캠페인에서 제외됐다 — 아래 "gemma-4-E2B 제외" 참조.)
+
+품질(Recall@k) 축은 구현되지 않았고 계획에도 없다. Pareto는 speed x memory 2축이며,
+모델 간 절대 수치 비교는 애초에 근거가 약하므로(`docs/model-spec.md` 결정 3) 모델
+내부에서만 그린다.
 
 ## 핵심 가설
 
@@ -15,16 +20,32 @@ throughput x memory x 품질 Pareto frontier를 리포트로 산출한다.
 1. **축별 효과** — attention backend, 커널, precision, compile, 옵티마이저,
    데이터 파이프라인, GradCache, freeze, PEFT, 병렬화 각각이 임베딩 학습의
    throughput / peak memory에 얼마를 기여하는가
-2. **모델별 병목** — 같은 축이 세 아키텍처에서 다른 크기의 효과를 낸다
+2. **모델별 병목** — 같은 축이 두 아키텍처에서 다른 크기의 효과를 낸다
 
-세 모델의 병목 추정:
+두 모델의 병목 추정:
 
 - Qwen3-VL-Embedding-2B: attention (28/28 레이어 full attention)
 - Qwen3.5-0.8B: linear attention 커널 (18/24가 Gated DeltaNet)
-- gemma-4-E2B: 옵티마이저 메모리 (전체 5.104B 중 PLE 2.390B(46.8%),
-  주 `embed_tokens`까지 합친 전체 embedding은 2.751B — `docs/model-spec.md` 실측)
 
 따라서 "모델 무관 최적 레시피"는 존재하지 않는다는 것이 예상 결론이다.
+
+### gemma-4-E2B 제외 (2026-08-03, 측정으로 확정)
+
+gemma-4-E2B는 캠페인에서 제외됐다. 옵티마이저 메모리 가설(전체 5.104B 중 PLE
+2.390B(46.8%) — `docs/model-spec.md` 실측)을 검증할 기회 자체가 없어졌다.
+
+이유는 추측이 아니라 실측이다: full finetuning이 A100 80GB 한 장에 들어가지
+않는다. `train.batch_size=16`에서 peak 83,800,236,544 bytes(83.8GB, canonical
+baseline도 같은 파드에서 80.7GB로 함께 OOM — `configs/experiment/_baselines.yaml`),
+배치를 4로 낮춘 뒤에도 여전히 OOM(2026-08-03 파드 재확인). 이 모델은 24층 중 18층이
+Gated DeltaNet이고 그 층의 `conv_dim`이 hidden의 6배에 chunk 상태를 fp32로 들며,
+비전 타워 12층도 checkpointing 없이 돈다 — 항목별 하한만으로도 A100 80GB에 여유가
+없다.
+
+`configs/model/gemma4_e2b.yaml`과 `configs/experiment/*gemma4*` 매니페스트 8개는
+이 문서 작성 시점에 코드에서 아직 제거되지 않았다 — 제거는 다른 레인의 작업이며,
+저장소 구조 블록은 실제 파일과 일치해야 하므로 그대로 남겨 둔다. 이 절이 말하는
+것은 캠페인의 범위이지 트리의 상태가 아니다.
 
 ### SFT 대비 주장은 철회했다 (2026-08-01)
 
@@ -66,55 +87,42 @@ Entropy도 같은 이유로 CE 경로만 해당한다. 따라서 `kernel` 축은
 - 모달리티: 텍스트 + 이미지 (오디오 제외)
 - 산출물: 벤치마크 리포트 중심 + 측정 하네스
 
-### GPU 3단 전략
+### GPU — A100으로 통일 (2026-08-03 결정)
 
-개발 단계를 저가 GPU로 내려 비용과 재고 리스크를 동시에 줄인다.
+캠페인 전 구간이 **NVIDIA A100-SXM4-80GB** 한 종류에서 돈다. Phase 0부터 Phase 3까지
+GPU 전환이 없다 — 하나의 baseline 코호트가 두 GPU 타입에 걸치는 것을 스키마가
+거부한다(`trainbench/pods.py`의 `check_one_baseline_one_gpu`).
 
-| | A100 SXM 80GB | H200 SXM 141GB | B200 180GB |
-|---|---|---|---|
-| $/GPU-hr (secure) | 1.49 | 4.39 | 5.89 |
-| 가용성 (2026-07-31) | HIGH | MEDIUM | LOW |
-| FA2 / FA3 / FA4 | O / X / X | O / O / X | O / O / O |
-| fp8 (E4M3/E5M2) | X | O | O |
-| MXFP8 / NVFP4 | X | X | O |
-| Liger, fla, torch.compile, GradCache, Muon, packing, PEFT | O | O | O |
+이전 계획은 A100(개발) -> B200(본 측정) -> H200(대체)의 3단 구조였다. mxfp8/nvfp4와
+FA4를 포기하기로 하면서 Blackwell/Hopper가 주는 것이 남지 않았고, A100은 $1.49/GPU-hr
+(secure)에 가용성 HIGH다. 그래서 단일화했다 — 두 번 전환하고 스모크 테스트를 반복할
+이유가 없어졌다.
 
-- **Phase 0~1 (환경 검증 + 하네스 개발) -> A100.** "로드되는가 / Unsloth 패칭이
-  깨지는가 / Axolotl이 Qwen3-VL을 받는가"는 GPU 아키텍처와 무관하다. 재고 LOW인
-  B200을 개발 중에 점유하는 것이 더 큰 손해다.
-  단 **A100 80GB로는 gemma-4-E2B full FT가 안 들어간다** (5.1B x 16 bytes 약 82GB,
-  활성값 제외). full FT 적재 확인만 B200에서 별도 수행.
-- **Phase 2~3 (본 측정) -> B200.** A100에서 돌던 것이 Blackwell 빌드에서 그대로
-  돈다는 보장이 없으므로 스모크 테스트 1회 필수.
-- **B200 확보 실패 시 -> H200 전면 전환.** FA4/MXFP8/NVFP4를 리포트에 "미측정"으로
-  명시. **혼용 금지** — 비교가 무효화된다.
+FA3/FA4는 스키마에 값으로 남지만 이 캠페인에서는 **측정하지 않는다** — 아래
+"미측정 축" 참조. FA4는 Blackwell 전용이다(TMEM, 5세대 비동기 텐서코어, 2-CTA MMA
+등 원문이 명시). FA3는 Hopper 전용으로 Ampere(A100)에서 동작하지 않는다.
 
-FA4는 Blackwell 전용이다. 원문이 TMEM(SM당 256KB), 5세대 비동기 텐서코어, 2-CTA MMA
-등 Blackwell 전용 기능 의존을 명시한다. FA3는 Hopper 전용으로 Ampere에서 동작하지
-않는다. ("FlexAttention이 Hopper에서 FA4 백엔드 지원"이라는 2차 요약이 있으나
-1차 출처와 배치되어 채택하지 않음.)
+### 미측정 축 — 하드웨어 세대 전용이거나 파이프라인이 없어서
 
-### 데이터센터 제약 (2026-07-31 스냅샷)
+아래는 config 스키마에 값으로 남아 있으나(컨벤션 02 — 코드가 아니라 config가 축을
+정의한다) 이 캠페인에서는 측정되지 않는다. 스윕에서 골라도 결과가 안 나온다는
+뜻이 아니라, 이 캠페인의 리포트에 실릴 수치가 없다는 뜻이다.
 
-재고가 있는 DC가 GPU 타입별로 **완전히 분리**되어 있다. 교집합 0.
-
-| GPU | 재고 보유 DC (전부 LOW) |
+| 축 값 | 이유 |
 |---|---|
-| B200 | EU-RO-1, US-NC-2, US-NE-1 (31개 중 3개) |
-| H200 | AP-JP-1, EU-FR-1, EUR-IS-4, US-CA-2, US-GA-2, US-NC-1 |
-| A100 SXM 80GB | EUR-IS-1, US-KS-2, US-MD-1, US-MO-1, US-WA-1 |
+| `attn=fa3` | Hopper 전용 — 미측정, 하드웨어 세대 전용 |
+| `attn=fa4` | Blackwell 전용 — 미측정, 하드웨어 세대 전용 |
+| `precision=mxfp8` / `nvfp4` | 코드에서 제거됨(2026-08-03) — 둘 다 CC 10.x 전용이라 A100(CC 8.0)에서 원리적으로 열릴 수 없었다 |
+| `dataloader=dali` / `dali_packed` | 파이프라인 구현이 없다. `nvidia-dali-cuda130`은 이미지에 설치되지만(`docs/support-matrix.md`) DALI 이터레이터로 로더를 교체하는 코드가 없어 **영구 거부** 대상이다 |
+| `parallel.strategy=ddp/fsdp2/zero2/zero3` | `trainbench/pods.py`가 `"gpuCount": 1`을 고정한다. world size 2 이상이 존재할 수 없으므로 이 캠페인에서 측정 불가 — GPU 세대와 무관한 이유다 |
+| `train.offload` | 위와 같은 이유로 병렬 전략 자체가 없고, 그 축이 의미를 갖는 `zero2/zero3` 경로도 없다 |
 
-**DC 종속은 해소되었다.** network volume이 pod을 특정 DC에 고정시키는 유일한
-요인이었는데, 아래 "스토리지" 절의 결정으로 볼륨을 쓰지 않게 되었다. 따라서:
+### 데이터센터
 
-- B200 재고가 있는 3개 DC를 **모두** 후보로 쓸 수 있다. 어느 한 곳이 마르면 다른
-  곳으로 그냥 옮기면 된다
-- A100(Phase 0~1) -> B200(Phase 2~3) 전환에 사전 준비가 필요 없다
-- H200 fallback이 실제로 즉시 전환 가능하다
-
-남는 주의점: A100의 집계 가용성은 HIGH로 표기되나 개별 DC는 전부 LOW다.
-**표기 불일치이므로 실행 시점에 재확인**한다. H200도 스냅샷 간 MEDIUM -> LOW로
-변동했다. 위 표는 스냅샷이지 보장이 아니다.
+network volume을 쓰지 않으므로(아래 "스토리지") DC 종속이 없다. A100 SXM 80GB
+재고 보유 DC(2026-07-31 스냅샷, 전부 LOW): EUR-IS-1, US-KS-2, US-MD-1, US-MO-1,
+US-WA-1. 집계 가용성은 HIGH로 표기되나 개별 DC는 전부 LOW다 — **표기 불일치이므로
+실행 시점에 재확인**한다. 위 목록은 스냅샷이지 보장이 아니다.
 
 ### 다중 pod 병렬 실행
 
@@ -127,10 +135,10 @@ pod이 다르면 물리 호스트가 다르다. CPU 모델, 메모리 대역폭,
 워크로드 노이즈가 전부 달라진다. 특히 **데이터로딩이 CPU 바운드일 때 호스트 vCPU
 수 차이가 그대로 throughput 차이로 잡힌다.**
 
-1. **같은 축 내 설정은 절대 pod을 가르지 않는다.** attention backend 4종 비교는
-   반드시 한 pod에서 연속 실행한다.
-   - 허용: pod A = Qwen3-VL 전 축 / pod B = Qwen3.5 전 축 / pod C = gemma-4 전 축
-   - 허용: pod A = attention 축(3모델 전부) / pod B = precision 축(3모델 전부)
+1. **같은 축 내 설정은 절대 pod을 가르지 않는다.** attention backend 비교(sdpa/fa2 —
+   fa3/fa4는 위 "미측정 축" 참조)는 반드시 한 pod에서 연속 실행한다.
+   - 허용: pod A = Qwen3-VL 전 축 / pod B = Qwen3.5 전 축
+   - 허용: pod A = attention 축(2모델 전부) / pod B = precision 축(2모델 전부)
    - **금지**: pod A = FA2 / pod B = FA3
 2. **분할 단위는 모델 또는 축 블록 전체**로 한다.
 3. **canonical baseline run.** 모든 pod에서 동일한 baseline 설정 1개를 반드시
@@ -152,7 +160,7 @@ RunPod network volume은 통상 200~400 MB/s의 네트워크 연결형 스토리
   프레임워크별 얇은 레이어. 레이어 공유로 레지스트리 저장량과 호스트 캐시가
   재사용된다. 셋업 편차가 사라지는 것이 이미지를 쓰는 진짜 이유다.
   빌드는 amd64 네이티브(RunPod CPU pod)에서 한다
-- **모델·데이터 = HF Hub -> pod-local NVMe.** 모델 3종은 공식 repo에서, 전처리한
+- **모델·데이터 = HF Hub -> pod-local NVMe.** 모델 2종은 공식 repo에서, 전처리한
   MMEB 고정 서브셋은 private dataset repo에서 받는다. repo revision이 곧 데이터
   버전이 되어 컨벤션 07의 데이터 버전 기록 요건을 자연히 충족한다
 - `HF_XET_HIGH_PERFORMANCE=1`을 쓴다. `HF_HUB_ENABLE_HF_TRANSFER`는 현재
@@ -166,26 +174,28 @@ pod 개수 제한은 없으나, pod을 잘게 쪼갤수록 (a) pod마다 canonic
 
 | 입도 | pod 수 | baseline 오버헤드 | pod 간 편차 리스크 |
 |---|---|---|---|
-| 모델당 1개 | 3 | 최소 | 최소 |
-| 축 그룹당 1개 (권장) | 12~18 | 중간 | 중간 |
-| 축당 1개 | 36 | 최대 (~6 GPU-h 추가) | 최대 |
+| 모델당 1개 | 2 | 최소 | 최소 |
+| 축 그룹당 1개 (권장) | 8~12 | 중간 | 중간 |
+| 축당 1개 | 24 | 최대 | 최대 |
 
-**축 그룹 단위 12~18개**를 기본으로 한다. wall-clock 이득의 대부분을 가져가면서
+**축 그룹 단위 8~12개**를 기본으로 한다. wall-clock 이득의 대부분을 가져가면서
 baseline 오버헤드가 감당 가능한 지점이다.
 
-**예상 wall-clock**
+**예상 wall-clock** — 아래 시간 추정치는 세 모델 기준으로 잡았던 예전 값이 그대로다.
+gemma-4 제외와 품질 축 폐기로 pod 수(구조적 곱셈)는 갱신했으나 시간 자체는
+재추정하지 않았다 — 실행 시점에 다시 잡는다.
 
 | 구간 | 순차 | 병렬 | 분할 |
 |---|---|---|---|
-| Phase 0 환경 검증 | 8h | ~0.7h | 프레임워크 x 모델 = 18 pod |
+| Phase 0 환경 검증 | 8h | ~0.7h | 프레임워크 x 모델 = 12 pod |
 | Phase 1 하네스 | 10h | 10h | 사람 작업이라 병렬 이득 없음 |
-| Phase 2 ablation | 35h | ~3h | 모델 x 축그룹 = 12~18 pod |
-| Phase 3 프레임워크 | 15h | ~1h | 프레임워크 x 모델 = 18 pod |
-| 품질 검증 런 | 30h | ~3h | Pareto 후보별 |
-| **합계** | ~98h | **~18h** | |
+| Phase 2 ablation | 35h | ~3h | 모델 x 축그룹 = 8~12 pod |
+| Phase 3 프레임워크 | 15h | ~1h | 프레임워크 x 모델 = 12 pod |
+| **합계** | ~68h | **~15h** | |
 
-B200 재고 LOW 상황에서 12~18개 pod 동시 확보가 되는지는 실행 시점에 확인한다.
-확보 실패 시 **확보된 수만큼 실행하고 나머지는 큐잉**하도록 오케스트레이션을 설계한다
+품질 검증 런은 위 표에서 뺐다 — Recall@k 축이 구현되지 않았고 계획에도 없다(위
+"목적" 참조). A100 통일 이후 pod 확보가 되는지는 실행 시점에 확인한다. 확보 실패
+시 **확보된 수만큼 실행하고 나머지는 큐잉**하도록 오케스트레이션을 설계한다
 (전량 순차 폴백이 아니라 부분 병렬).
 
 ---
@@ -194,20 +204,21 @@ B200 재고 LOW 상황에서 12~18개 pod 동시 확보가 되는지는 실행 �
 
 여기서 막히면 이후가 전부 무너지므로 최우선. 모든 항목은 가정이 아니라 실측 대상.
 
-- [ ] 세 모델이 **동일 단일 transformers 환경**(5.14.x)에서 로드/학습되는가.
+- [ ] 두 모델이 **동일 단일 transformers 환경**(5.14.x)에서 로드/학습되는가.
       실패 시 모델별 환경 분리 -> 비교 공정성 훼손 -> 설계 변경 필요
 - [ ] `sentence-transformers` v5.5 x transformers v5 호환
 - [ ] Qwen3.5 GDN 레이어가 `fla` 없이 학습되는가 / `fla`·FlashQLA 설치 시 커널 경로
-- [ ] gemma-4-E2B PLE 파라미터의 freeze 가능 여부 및 LoRA target module 인식
-- [ ] Unsloth 일반 VLM 경로 + 커스텀 InfoNCE loss에서 패칭이 깨지지 않는가 (모델 3종)
+- [ ] Unsloth 일반 VLM 경로 + 커스텀 InfoNCE loss에서 패칭이 깨지지 않는가 (모델 2종)
 - [ ] Unsloth `FastSentenceTransformer`가 VLM 체크포인트를 거부하는가 (문서에 언급
       없음 != 동작 안 함)
 - [ ] Axolotl의 Qwen3-VL 지원 여부 (Qwen2-VL까지만 문서 확인됨)
-- [ ] Tevatron 2.0의 세 모델 지원 여부
+- [ ] Tevatron 2.0의 두 모델 지원 여부
 - [ ] 모델별 동일 이미지의 실제 visual token 수 (patch 16 공통이나 merge/pooling 상이)
 
-**산출물**: `docs/support-matrix.md` — 최적화 축 x 모델 3종, 셀마다 근거 URL +
+**산출물**: `docs/support-matrix.md` — 최적화 축 x 모델 2종, 셀마다 근거 URL +
 검증 버전 + 실측 로그. 미확인 셀은 "미확인"으로 명시하고 추측으로 채우지 않는다.
+gemma-4-E2B 행은 캠페인 제외 이전에 실측된 것이므로 지우지 않고 "캠페인 제외"로
+표시한다(위 "gemma-4-E2B 제외" 참조, `docs/support-matrix.md`도 동일 규칙).
 
 ## Phase 1 — 측정 하네스
 
@@ -218,13 +229,27 @@ B200 재고 LOW 상황에서 12~18개 pod 동시 확보가 되는지는 실행 �
   모델마다 step 수가 달라져 step 단위 속성(peak VRAM, step 시간 분포)을 비교할 수
   없다. 그래서 `train.steps`를 단위로 두고 **소비된 토큰 수를 측정해 결과에 남긴다** —
   정규화는 리포트 단계에서 하고 측정 단계에서 하지 않는다 (2026-08-01 확정)
-- **이미지 토큰 예산 고정.** 미고정 시 나머지 측정이 전부 오염됨
+- **모델 간 이미지 토큰 예산 고정은 포기했다.** 두 모델의 토큰 예산을 동시에
+  고정하는 것은 원리적으로 불가능하다는 것이 `docs/model-spec.md` 결정 3의
+  결론이다 — Qwen 두 모델은 픽셀 비례 방식이되 서로 다른 픽셀 범위를 갖는다.
+  대신 **픽셀 입력 분포를 고정하고 모델별 실제 visual token 분포를 실측해
+  기록**한다. 픽셀 캡 자체는 아래 "이미지 픽셀 캡" 참조
 - **타이밍 런과 프로파일링 런 분리.** 숫자는 프로파일러 off 상태에서만 측정하고,
   프로파일은 원인 분석 전용이다. 부풀림 폭은 **미측정**이며 출처도 확보하지
   못했다 — `docs/methodology.md` 참조. 규율 자체는 폭과 무관하게 유지한다
 - warmup step 폐기, 명시적 CUDA sync, 동일 seed 및 동일 데이터 순서
 
-### 소수 샘플 정책 (속도 런과 품질 런의 분리)
+### 이미지 픽셀 캡 (결정: 2026-08-03)
+
+측정 유효성 문제로 픽셀 상한/하한을 둔다 — `max_pixels=1310720`,
+`min_pixels=4096`, 두 모델에 동일 적용. `data.max_seq_len`은 2048로 그대로 둔다.
+근거와 코퍼스 실측(worst-case 1550/2048 토큰 등)은 `docs/methodology.md`에
+있다 — 이 항목은 측정 하네스가 아니라 측정 유효성의 문제이므로 그 문서가
+정본이다. **이 결정은 코드에 아직 반영되지 않았다** — 이 문서를 쓴 시점(worktree
+기준, `trainbench/config_schema.py`와 `configs/model/`에 `max_pixels`/`min_pixels`
+필드가 없음을 확인) 다른 레인이 구현 중이다.
+
+### 소수 샘플 정책
 
 throughput은 steady-state 속성이고 peak VRAM은 step 단위 속성이다. 따라서
 **속도·메모리 측정은 소수 샘플로 충분하며 그것이 정석**이다. 전체 데이터셋 불필요.
@@ -233,9 +258,8 @@ throughput은 steady-state 속성이고 peak VRAM은 step 단위 속성이다. �
 
 1. **분포는 실제 MMEB를 따른다.** 시퀀스 길이·이미지 해상도 분포가 달라지면 속도
    수치가 왜곡된다. 무작위 서브샘플은 OK, "짧은 것만 골라 빠르게"는 금지
-2. **품질 가드레일은 소수 샘플로 불가.** loss curve와 Recall@k는 학습이 어느 정도
-   진행돼야 의미가 생긴다. 속도 런(소수 샘플)과 품질 런(장기)을 완전히 분리하고,
-   품질 런은 Pareto 후보로 좁혀진 소수 설정에만 돌린다
+2. **품질 축(Recall@k)은 구현되지 않았고 계획에도 없다** (아래 "품질 가드레일"
+   참조). 이 캠페인은 속도 런(소수 샘플)만 낸다
 3. **GradCache / 배치 스케일링 축은 예외.** effective batch 16k를 재려면 샘플 수가
    배치보다 훨씬 커야 한다
 4. **torch.compile max-autotune은 warmup이 길다.** 소수 샘플이면 warmup이 전체를
@@ -244,52 +268,48 @@ throughput은 steady-state 속성이고 peak VRAM은 step 단위 속성이다. �
 
 ### 지표
 
-samples/s, tokens/s, MFU(Megatron-LM/NeMo 구현 참고), peak VRAM,
-step time p50/p95, torch.profiler 커널 breakdown(별도 런), memory snapshot,
-HTA 트레이스 분석
+samples/s, tokens/s, peak VRAM, step time p50/p95, torch.profiler 커널
+breakdown(별도 런). MFU는 리포트하지 않는다 — 품질 축과 마찬가지로 축소됐다.
+memory snapshot과 HTA 트레이스 분석은 계획에서 뺐다: 둘 다 프로파일링 런
+전용이고 이 캠페인은 프로파일 런을 원인 분석에만 쓰지(위 "측정 규율") 리포트
+지표의 산출 경로로 쓰지 않는다.
 
-### 품질 가드레일
+### 품질 가드레일 — 구현되지 않았고 계획에도 없다
 
-loss curve + MMEB-eval 서브셋 Recall@k. 속도만 재면 "빠른데 망가진" 설정을 못 거른다.
-
-**주의**: Unsloth 문서상 멀티모달 gemma-4 E2B/E4B는 학습 loss가 13~15로 나오는 것이
-정상이다(텍스트 전용은 1~3). loss 절대값으로 품질을 판정하면 안 된다.
+**Recall@k는 이 캠페인에 존재하지 않는다.** MMEB-eval 기반 품질 측정 하네스는
+만들어진 적이 없고 만들 계획도 없다. Pareto frontier가 throughput x peak memory
+2축인 이유가 이것이다(위 "목적"). loss curve 자체는 학습이 정상 진행되는지의
+최소 확인으로 남아 있을 수 있으나, 이 프로젝트의 게이트나 리포트 지표는 아니다.
 
 ### 데이터로딩 병목 판정 (선행 필수)
 
 MMEB는 이미지 헤비다. CPU 디코딩이 GPU를 굶기면 커널/attention 최적화가 측정에
-잡히지 않는다. Phase 2 시작 전 dataloader가 병목인지 판정하고, 병목이면
-DALI(GPU 디코딩) 또는 사전 디코딩/캐싱으로 해소한 뒤 진행한다.
+잡히지 않는다. Phase 2 시작 전 dataloader가 병목인지 판정하고, 병목이면 사전
+디코딩/캐싱으로 해소한 뒤 진행한다. `dataloader=dali`는 스키마에 값으로 남아
+있으나 로더를 교체하는 파이프라인이 없어 **영구 거부** 대상이다(위 "미측정 축").
 
 ## Phase 2 — 축별 ablation
 
-1xB200 단일 GPU. 베이스라인에서 one-factor-at-a-time 스크리닝 후 상위 인자만
+1xA100 단일 GPU. 베이스라인에서 one-factor-at-a-time 스크리닝 후 상위 인자만
 상호작용 검증. 전수 조합은 비용상 불가.
 
 | 축 | 모델별 예상 차별점 |
 |---|---|
-| attention backend (sdpa/FA2/FA3/FA4/Flex) | Qwen3-VL 28/28, Qwen3.5 6/24, gemma-4 sliding 512 |
-| 커널 (Liger / kernels hub / fla·FlashQLA) | Qwen3.5 Liger 지원, gemma-4 미지원(#1186 open) |
-| precision (bf16 / MXFP8, 여유 시 NVFP4) | Blackwell 전용 이득 |
-| torch.compile (off/default/max-autotune/regional) | GDN·PLE 컴파일 호환성 |
+| attention backend (sdpa/FA2, fa3/fa4는 미측정 — 위 "미측정 축") | Qwen3-VL 28/28 full attention, Qwen3.5 6/24 |
+| 커널 (Liger / kernels hub / fla·FlashQLA) | Qwen3.5 Liger 지원 |
+| precision (bf16만 — mxfp8/nvfp4는 코드에서 제거됨, A100 CC 8.0에서 원리적으로 열릴 수 없었다) | |
+| torch.compile (off/default/max-autotune/regional) | GDN 컴파일 호환성 |
 | gradient checkpointing (full/selective) + offload | |
-| 옵티마이저 (AdamW fused / 8-bit / Muon) | gemma-4-E2B 가설 검증에 한정 (아래) |
-| **데이터 파이프라인** (packing, 사전 토크나이즈, DALI) | ms-swift "100%+" 주장 검증 |
+| 옵티마이저 (AdamW fused / 8-bit / Muon) | |
+| **데이터 파이프라인** (packing, 사전 토크나이즈 — dali는 파이프라인 없음, 영구 거부) | ms-swift "100%+" 주장 검증 |
 | **GradCache on/off + batch size 스케일링** | 오버헤드 주장이 20% vs 2~2.4배로 상충 |
-| **vision tower freeze / unfreeze** | 속도-품질 trade-off 곡선 |
-| **gemma-4-E2B PLE freeze / train** | 이 모델 결과를 지배하는 축 |
+| **vision tower freeze / unfreeze** | 속도-메모리 trade-off (품질 축 없음 — 위 "품질 가드레일") |
 | PEFT (full / LoRA rank sweep / QLoRA) | |
-| 병렬화 (DDP / FSDP2 / ZeRO / cross-device negative) | 별도 멀티 GPU 섹션 |
+| 병렬화 (DDP / FSDP2 / ZeRO / cross-device negative) | `trainbench/pods.py`가 `gpuCount=1`을 고정하므로 이 캠페인에서는 측정 불가 — 위 "미측정 축" |
 
-### Muon 가설 (좁게 검증)
-
-NVIDIA GB300 실측상 Muon의 throughput은 AdamW와 거의 동등하고(Kimi K2: 1,080 vs
-1,051 TFLOPs/s/GPU) 이득은 수렴 속도 + optimizer state 메모리(2D weight ~45% 절감)다.
-
-Muon은 통상 embedding을 제외하고 AdamW에 맡긴다. gemma-4-E2B는 파라미터의 절반
-이상이 PLE embedding 테이블이므로 **Muon 이득이 이 모델에서만 유독 작을 가능성**이
-있다. 이는 검증되지 않은 추론이며, 전 모델 전 설정 조합이 아니라 이 가설 검증
-목적으로만 좁게 측정한다.
+gemma-4-E2B PLE freeze/train 축과 그에 딸린 Muon 가설(PLE embedding이 절반 이상을
+차지해 Muon 이득이 유독 작을 것이라는 추론)은 gemma-4-E2B가 캠페인에서 빠지면서
+검증 대상 모델이 없어졌다. 가설 자체의 기록은 git 이력에 남아 있다.
 
 ## Phase 3 — 프레임워크 베이스라인
 
@@ -299,11 +319,11 @@ Muon은 통상 embedding을 제외하고 AdamW에 맡긴다. gemma-4-E2B는 파�
 | 프레임워크 | 포함 근거 | 리스크 |
 |---|---|---|
 | 자체 얇은 하네스 | 축 분리 기준선 | - |
-| Unsloth | Gemma4 E2B 멀티모달 FFT/LoRA, B200 지원, "FA2 대비 1.5x / VRAM 60% 절감" 주장 | 임베딩 경로는 encoder-only. VLM 임베딩 미지원 가능성 |
-| ms-swift v4.0 | infonce 임베딩 학습, Qwen3-VL/Gemma4 지원, packing | - |
+| Unsloth | 멀티모달 FFT/LoRA, "FA2 대비 1.5x / VRAM 60% 절감" 주장 | 임베딩 경로는 encoder-only. VLM 임베딩 미지원 가능성 |
+| ms-swift v4.0 | infonce 임베딩 학습, Qwen3-VL 지원, packing | - |
 | sentence-transformers v5.5 | VLM 임베딩 학습 정식 지원, GradCache 내장 | transformers v5 호환 미확인 |
-| Tevatron 2.0 | 검색/임베딩 전용, 멀티모달, LoRA + DeepSpeed + FlashAttention | 세 모델 지원 미확인 |
-| Axolotl v0.8+ | 멀티모달 first-class, Cut Cross Entropy, Sequence Parallelism, FSDP2, Gemma4 | Qwen3-VL 지원 미확인 |
+| Tevatron 2.0 | 검색/임베딩 전용, 멀티모달, LoRA + DeepSpeed + FlashAttention | 두 모델 지원 미확인 |
+| Axolotl v0.8+ | 멀티모달 first-class, Cut Cross Entropy, Sequence Parallelism, FSDP2 | Qwen3-VL 지원 미확인 |
 
 Phase 0에서 동작하지 않는 조합은 "미지원"으로 기록한다. 그 자체가 리포트의 결과다.
 
@@ -313,12 +333,13 @@ LlamaFactory(SFT 중심), 커스텀 커널 DSL(Helion/ThunderKittens/CuTe, 스�
 
 ## Phase 4 — 리포트
 
-- throughput x peak memory x 품질 3축 Pareto frontier
+- throughput x peak memory 2축 Pareto frontier, **모델 내부**에서 (품질 축 없음,
+  모델 간 절대 비교는 한정 — 위 "목적")
 - 모델별 권장 레시피
 - full FT vs LoRA 손익분기점
-- 공개 주장 수치(Unsloth 1.5~3.3x, ms-swift packing 100%+, FlashQLA 2~3x,
-  NVFP4 1.73x)는 **참고 수치로만 병기**한다. 하드웨어·데이터·시퀀스 길이가 달라
-  대조군이 아니므로 "얼마나 남는가"라는 비교로 쓰지 않는다
+- 공개 주장 수치(Unsloth 1.5~3.3x, ms-swift packing 100%+, FlashQLA 2~3x)는
+  **참고 수치로만 병기**한다. 하드웨어·데이터·시퀀스 길이가 달라 대조군이 아니므로
+  "얼마나 남는가"라는 비교로 쓰지 않는다
 
 ---
 
@@ -326,37 +347,35 @@ LlamaFactory(SFT 중심), 커스텀 커널 DSL(Helion/ThunderKittens/CuTe, 스�
 
 | 구간 | GPU | 시간 | 비용 |
 |---|---|---|---|
-| Phase 0 환경 검증 (6 프레임워크 x 3 모델) | A100 $1.49 | 8h | ~$12 |
+| Phase 0 환경 검증 (6 프레임워크 x 2 모델) | A100 $1.49 | 8h | ~$12 |
 | Phase 1 하네스 + 데이터로딩 판정 | A100 | 10h | ~$15 |
-| gemma-4-E2B full FT 적재 확인 | B200 | 1h | ~$6 |
-| Phase 2 속도·메모리 ablation (소수 샘플) | B200 | ~35h | ~$206 |
-| Phase 3 프레임워크 6종 (소수 샘플) | B200 | ~15h | ~$88 |
-| 품질 검증 런 (Pareto 후보 한정) | B200 | ~30h | ~$177 |
-| 멀티 GPU 섹션 | 8xB200 | 8 GPU-h | ~$47 |
-| 다중 pod 셋업 오버헤드 (~10%) | | | ~$55 |
+| Phase 2 속도·메모리 ablation (소수 샘플) | A100 | ~35h | ~$52 |
+| Phase 3 프레임워크 6종 (소수 샘플) | A100 | ~15h | ~$22 |
+| 다중 pod 셋업 오버헤드 (~10%) | | | ~$10 |
 | 이미지 빌드용 CPU pod | | | 소액 |
-| 버퍼 15% | | | ~$91 |
-| **합계** | | | **~$700** |
+| 버퍼 15% | | | ~$17 |
+| **합계** | | | **~$130** |
 
-다중 pod 병렬화는 GPU-hour 총합을 바꾸지 않는다. wall-clock만 약 98h -> 33h로
-줄고, 비용 증가분은 pod별 셋업 오버헤드뿐이다.
+gemma-4-E2B full FT 적재 확인, 품질 검증 런, 멀티 GPU 섹션은 표에서 뺐다 —
+gemma-4는 캠페인 제외(위 "gemma-4-E2B 제외"), 품질 축은 미구현(위 "품질
+가드레일"), 병렬화는 `gpuCount=1`로 측정 불가(위 "미측정 축")이기 때문이다.
+시간 추정치 자체는 재추정하지 않았다 — 위 "예상 wall-clock"과 같은 조건이다.
 
-품질 런은 Pareto 후보로 좁힌 소수 설정에만 돌리는 전제. 전 설정을 수렴까지 학습하면
-수 배가 된다. H200 전면 전환 시 GPU 단가는 25% 낮으나 FA4/MXFP8/NVFP4 축을 잃는다.
+다중 pod 병렬화는 GPU-hour 총합을 바꾸지 않는다. wall-clock만 위 "예상
+wall-clock" 표의 순차/병렬 합계만큼 줄고, 비용 증가분은 pod별 셋업 오버헤드뿐이다.
 
 ## 리스크
 
-1. **B200 재고 LOW + DC 3곳 한정.** 캠페인 중간 pod 손실 시 비교가 깨진다. 완화책:
-   (a) Phase 0~1을 A100으로 내려 B200 점유 시간 최소화,
-   (b) 소수 샘플 정책으로 축별 런을 짧게 쪼개 재개 가능하게 설계,
-   (c) 다중 pod 확보 실패 시 순차 실행으로 자동 폴백,
-   (d) 최후에는 H200 전면 전환 + 해당 축 "미측정" 명시.
-   GPU 혼용은 어떤 경우에도 금지
+1. **A100 개별 DC 재고 LOW.** 집계 가용성은 HIGH로 표기되나 개별 DC는 전부 LOW다
+   (위 "데이터센터"). 완화책:
+   (a) 소수 샘플 정책으로 축별 런을 짧게 쪼개 재개 가능하게 설계,
+   (b) 다중 pod 확보 실패 시 순차 실행으로 자동 폴백.
+   단일 GPU 캠페인이므로 GPU 혼용 자체가 성립하지 않는다
 2. **다중 pod 간 하드웨어 편차.** pod마다 호스트 CPU/메모리대역폭/스토리지가 달라
    throughput이 흔들린다. 완화: 같은 축은 한 pod에 묶고, 전 pod에서 canonical
    baseline을 돌려 편차 3% 초과 시 폐기·재실행. pod spec 전량 기록
 3. **transformers 버전 단일화 실패 가능성** (Phase 0에서 판명). 모델별 환경 분리가
-   필요하면 "동일 조건 3자 비교" 전제 자체를 조정해야 한다
+   필요하면 "동일 조건 2자 비교" 전제 자체를 조정해야 한다
 4. **데이터로딩이 병목이면** Phase 2 전체가 무의미해진다. Phase 1에서 반드시 선판정
 
 ---
@@ -374,12 +393,12 @@ LlamaFactory(SFT 중심), 커스텀 커널 DSL(Helion/ThunderKittens/CuTe, 스�
 | 03 Environment | **전면** | uv + uv.lock + ruff. torch platform marker로 macOS(CPU/MPS) <-> RunPod(CUDA) 무수정 이식. device는 `torch.accelerator` 기반 단일 헬퍼로만 선택, 인라인 `.cuda()` 금지 |
 | 04 Pipeline | **전면** | 모든 stage `--limit N` 소수 샘플 지원, atomic save(temp -> `os.replace`), resume. 소수 샘플 정책 및 pod 손실 대비와 정확히 일치 |
 | 05 Performance | **전면** | GPU util/VRAM/RAM/CPU + throughput 구조화(JSON) 로그. 이 프로젝트의 산출물 자체 |
-| 07 ML | **전면** | seed 단일 헬퍼, run별 config+commit 기록, **중단을 가정한 설계**(재개 가능). B200 재고 LOW에서 필수 |
+| 07 ML | **전면** | seed 단일 헬퍼, run별 config+commit 기록, **중단을 가정한 설계**(재개 가능). A100 개별 DC 재고 LOW에서 필수 |
 | 08 LLM | **적용** | FSDP2 + bf16 기본, 평가 harness/task 버전 기록. 컨벤션이 **torchtune을 deprecated로 금지** — 앞서의 제외 판단과 독립적으로 일치 |
 | 16 Research | **이미 적용 중** | 근거 없는 사실 금지. support-matrix의 "미확인" 규칙이 이것 |
 | 17 Commit | **전면** | Conventional Commits 영문 헤더 + 한국어 Why/What/How/Result 본문. 측정 안 한 수치는 "측정 안 함" |
 | 01 Structure | **적용** | flat layout(src/ 아님), 시맨틱 네이밍, `_v2` 금지, 주석 최소, 코드 주석 이모지 금지 |
-| 06 Testing | **경량** | config 스키마 + MFU 계산 유닛 테스트 + **CPU 소수 샘플 E2E 스모크 1개**. 그 이상은 안 만든다 |
+| 06 Testing | **경량** | config 스키마 유닛 테스트 + **CPU 소수 샘플 E2E 스모크 1개**. 그 이상은 안 만든다 |
 | 13 Secret | **경량** | RunPod API key / HF token만 대상. `.env.example` + gitignore + 런타임 env 주입. Infisical은 이미 쓰고 있을 때만 |
 | 09 Agentic | **경량** | 하네스 코드에 작성자와 분리된 리뷰 1레인 |
 | 15 Doc tracking | **미적용** | 4계층 + docsync 마커 + ADR은 단기 리포트 프로젝트에 과함. `PLAN.md`(설계) + `docs/`(계약·규격·방법론·결과) 평면 구성으로 간다 |
@@ -457,6 +476,7 @@ train-comparison/
 │   ├── test_applied.py
 │   ├── test_audit.py
 │   ├── test_axes.py
+│   ├── test_bench_framework_step.py  # framework 소유 스텝을 하네스가 구동하는 경로
 │   ├── test_data.py
 │   ├── test_device_seed.py
 │   ├── test_embedding.py
@@ -497,7 +517,7 @@ Wave 2~3에서 이 목록에 있던 `tests/test_axes.py`, `configs/experiment/`,
 
 **설계 결정**
 
-- ablation은 `bench.py model=gemma4_e2b attn=fa4 freeze=ple` 조합으로만 표현한다.
+- ablation은 `bench.py model=qwen3_5_0_8b attn=fa2 kernel=fla` 조합으로만 표현한다.
   축을 추가할 때 코드를 고치면 컨벤션 위반이다
 - 상호배타 변형이 3개 이상인 축만 config group으로 만든다. 단일 플래그
   (gradient checkpointing 등)는 `train.yaml`의 필드로 둔다
@@ -516,7 +536,7 @@ Wave 2~3에서 이 목록에 있던 `tests/test_axes.py`, `configs/experiment/`,
 - [ ] config group 골격 + Pydantic 스키마 + fail-fast 검증
 - [ ] `test_config.py` (잘못된 조합이 실행 전에 죽는지)
 
-### Task 2 — Phase 0 검증 하네스 (A100, 18 pod 병렬)
+### Task 2 — Phase 0 검증 하네스 (A100, 12 pod 병렬)
 
 - [ ] `verify_env.py`: 프레임워크 x 모델 적재/1-step 학습 검증
 - [ ] `orchestrate.py`: RunPod pod 기동(이미지 지정), 결과를 HF repo의 pod별 경로에
@@ -527,15 +547,17 @@ Wave 2~3에서 이 목록에 있던 `tests/test_axes.py`, `configs/experiment/`,
 
 ### Task 3 — Phase 1 측정 하네스 (A100)
 
-- [ ] MMEB 로더 + `--limit N` + **이미지 토큰 예산 고정** (모델별 실측 후 보정)
-- [ ] 3종 모델 어댑터 (풀링 + 임베딩 헤드), InfoNCE / GradCache
-- [ ] 지표 수집: throughput, MFU, peak VRAM, step p50/p95, 구조화 JSON 로그
+- [ ] MMEB 로더 + `--limit N` + **이미지 픽셀 캡**(`max_pixels`/`min_pixels`, 위
+      "이미지 픽셀 캡" 참조 — 모델 간 토큰 예산 고정은 포기했다)
+- [ ] 2종 모델 어댑터 (풀링 + 임베딩 헤드), InfoNCE / GradCache
+- [ ] 지표 수집: throughput, peak VRAM, step p50/p95, 구조화 JSON 로그
 - [ ] **타이밍 런 / 프로파일 런 분리** + 축별 warmup 폐기 구간 설정
 - [ ] **canonical baseline run** + pod 간 편차 3% 게이트
 - [ ] pod spec 자동 기록 (GPU UUID, vCPU, RAM, 드라이버/CUDA, DC)
 - [ ] atomic save + resume
 - [ ] `test_smoke_cpu.py` (CPU + 소수 샘플 E2E)
-- [ ] **데이터로딩 병목 선판정** — 병목이면 DALI/사전 디코딩으로 해소 후 진행
+- [ ] **데이터로딩 병목 선판정** — 병목이면 사전 디코딩/캐싱으로 해소 후 진행
+      (`dataloader=dali`는 파이프라인이 없어 영구 거부)
 - [ ] 리뷰 게이트: 하네스 코드를 작성자와 분리된 레인에서 리뷰
 
 ### Task 3.5 — 축 구현 (Phase 2의 선행 조건, 대부분 GPU 불필요)
@@ -602,34 +624,32 @@ CPU에서 구현·검증이 끝나는 것과 GPU가 있어야 판정되는 것�
 `precision=mxfp8`/`nvfp4`도 같은 형태였으나 Transformer Engine 의존성째 제거됐다 — A100
 (CC 8.0)에서는 둘 다(CC 10.x 전용) 원리적으로 열릴 수 없었다.
 
-### Task 4 — Phase 2 ablation (B200, 12~18 pod 병렬)
+### Task 4 — Phase 2 ablation (A100, 8~12 pod 병렬)
 
-- [ ] B200 스모크 테스트 1회 (A100에서 돌던 것이 Blackwell 빌드에서 도는지)
-- [ ] gemma-4-E2B full FT 적재 확인
 - [ ] `configs/experiment/`에 축 그룹별 조합 정의 후 실행
 - [ ] **`attn` 축 매니페스트.** 지금 21개 매니페스트 중 `attn`을 스윕하는 것이 0개이고
-      전부 `configs/config.yaml`의 기본값 `sdpa`로 돈다. 5개 값이 전부 적용 가능한
-      유일한 축인데(2026-08-02 `axis-values` 5/5) 한 번도 비교된 적이 없다.
-      Qwen3-VL의 병목 가설이 attention이므로 이 축이 빠지면 핵심 가설 하나가 미검증으로
-      남는다. FA3는 Hopper·FA4는 Blackwell 전용이므로 GPU 선택과 함께 정한다
+      전부 `configs/config.yaml`의 기본값 `sdpa`로 돈다. Qwen3-VL의 병목 가설이
+      attention이므로 이 축이 빠지면 핵심 가설 하나가 미검증으로 남는다. 이
+      캠페인에서 실제로 측정 가능한 값은 `sdpa`/`fa2`뿐이다 — `fa3`는 Hopper,
+      `fa4`는 Blackwell 전용이라 A100에서는 하드웨어 세대상 원리적으로 열릴 수
+      없다(위 "미측정 축")
 - [ ] baseline 편차 게이트 통과 여부 확인, 실패 pod 재실행
 
-### Task 5 — Phase 3 프레임워크 (B200, 18 pod 병렬)
+### Task 5 — Phase 3 프레임워크 (A100, 12 pod 병렬)
 
 - [ ] 프레임워크 어댑터 6종
 - [ ] 동작하지 않는 조합은 "미지원"으로 기록 (그 자체가 결과)
 
-### Task 6 — 품질 검증 + Phase 4 리포트
+### Task 6 — Phase 4 리포트
 
-- [ ] Pareto 후보 선별 -> 장기 품질 런 (loss curve + MMEB-eval Recall@k)
 - [ ] `report.py`로 집계, `docs/report.md` 작성
 - [ ] 공개 주장 수치 대비 실측 비교표
 
 ## 착수 순서
 
 Task 1은 GPU가 필요 없으므로 즉시 시작 가능하다. Task 2의 이미지 빌드부터 RunPod
-접근이 필요하고, 실행 시점에 A100/B200 재고를 재확인한다. DC 종속이 없으므로
-재고가 있는 곳 아무 데나 배치하면 된다.
+접근이 필요하고, 실행 시점에 A100 재고를 재확인한다. DC 종속이 없으므로 재고가
+있는 곳 아무 데나 배치하면 된다.
 
 ## 근거 출처
 

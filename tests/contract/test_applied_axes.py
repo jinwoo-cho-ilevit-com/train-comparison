@@ -38,25 +38,18 @@ a real bitsandbytes optimizer or a real deepspeed engine. Neither installs here 
 the spellings are a pod question, and a table keeps them in one reviewable place
 instead of inside a branch.
 
-**Twenty-one of these tests are deferred, not passing.** `trainbench/applied.py`
-carries none of the third state yet, and nine lanes fan out from the commit that
-adds this file: leaving those tests red would make every lane's own gate report a
-failure belonging to none of them. They are `xfail(strict=True)` instead, each
-naming what lane-c has not landed. `strict` is what stops lane-c from implementing
-the boundary and leaving the markers in place — a deferred test that starts passing
-is an error, not a quiet pass.
+**The deferral is closed.** This file originally shipped with twenty-one of its
+tests `xfail(strict=True)`, each naming a piece of the third state
+(`trainbench/applied.py`) that lane-c had not landed yet — nine lanes fanned out
+from the commit that added this file, and leaving those tests red would have made
+every lane's own gate report a failure belonging to none of them. Lane-c has since
+landed all of it, and every `xfail` marker is gone from this file.
 
-The command that decides whether the deferral is over, which belongs in lane-c's
-completion criteria:
-
-    infisical run --env=dev -- uv run pytest tests/contract/test_applied_axes.py \\
-        --runxfail -k the_contract_defers_nothing
-
-Exit 0 means every marker is gone. `--runxfail` appears there for one reason only:
-it makes that single test report its real result instead of its expected one. It
-must never be used across the whole file to judge the contract — over the file it
-strips the deferral from all twenty-one and reports failures that are already
-known, which decides nothing. The `-k` is what keeps it honest.
+`test_the_contract_defers_nothing` below still runs, as a permanent regression
+guard rather than a temporary gate: it asserts the file carries no
+`pytest.mark.xfail` (besides its own, excluded from the count so the last removal
+does not leave a marker referring to nothing). If someone reintroduces a deferral
+here, that test turns red and names which test carries it.
 """
 
 from __future__ import annotations
@@ -766,30 +759,20 @@ def _dotted(node: ast.AST) -> str:
 
 
 def test_the_contract_defers_nothing():
-    """The check that stops the deferral from becoming the vacuum it was meant to
-    avoid.
+    """Permanent regression guard: this file carries no active deferral.
 
-    Every expectation in this file that lane-c has not met yet is marked
-    `xfail(strict=True)` rather than left red, because nine lanes fan out from this
-    commit and a base that is red for reasons belonging to none of them makes every
-    lane's own gate unreadable.
+    The file originally shipped with twenty-one `xfail(strict=True)` tests, each
+    naming a piece of the third state that lane-c had not landed yet — nine lanes
+    fanned out from that commit, and a base red for reasons belonging to none of
+    them would have made every lane's own gate unreadable. `strict=True` meant a
+    deferred test that started passing became an error rather than a quiet pass,
+    so lane-c could not land the boundary and leave the markers behind.
 
-    The cost of that choice is that `pytest tests/contract/test_applied_axes.py`
-    goes green while the contract is unmet, and green would then mean nothing. Three
-    things close that, and all three are needed:
-
-    - `strict=True` turns a deferred test that starts passing into an error, so
-      lane-c cannot land the boundary and leave the markers behind.
-    - This test names what is still deferred, so the debt is enumerable rather than
-      spread across twenty-one decorators. `-rx` prints it.
-    - It excludes its own marker from the count, so removing the last of the others
-      makes it XPASS — an error — and the only fix is to remove this marker too.
-      There is no green state with a marker left in the file.
-
-    What none of that can do is make the plain command decide it, because the plain
-    command has to be green today and the contract is unmet today. The command whose
-    exit code decides it is in the module docstring, and it is what belongs in
-    lane-c's completion criteria.
+    That deferral is closed now — every one of those markers is gone. This test
+    stays on as the guard against a new one appearing: it walks the syntax tree
+    for `pytest.mark.xfail`, excludes its own marker from the count (so removing
+    the last other one does not leave this one XPASS — an error — with nothing
+    left to explain it), and fails naming whichever test still carries one.
     """
     still_deferred = deferred_expectations(
         Path(__file__).read_text(), "test_the_contract_defers_nothing"

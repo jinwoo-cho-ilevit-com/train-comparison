@@ -3,6 +3,13 @@
 프레임워크 x 모델 조합의 실제 동작 여부. 셀마다 근거와 검증 버전을 남긴다.
 **확인하지 못한 것은 "미확인"으로 두고 추측으로 채우지 않는다** (컨벤션 16).
 
+**gemma-4-E2B는 2026-08-03 캠페인에서 제외됐다** — full FT가 A100 80GB에
+`train.batch_size=16`(83.8GB)과 4 어느 쪽에서도 들어가지 않는다는 실측이 근거다
+(`PLAN.md` "gemma-4-E2B 제외"). 이 문서 안의 gemma-4 행과 실측은 **전부 제외
+이전에 실제 pod에서 측정된 것**이므로 지우지 않는다 — 지우면 측정을 없었던
+일로 만드는 것과 같다. 아래에서 gemma-4 관련 셀·표를 만나면 **캠페인 제외,
+측정 자체는 유효**로 읽는다.
+
 **이 문서는 손으로 쓴 부분과 생성되는 부분이 마커 하나로 갈린다.** 파일 맨 아래
 생성 마커(`scripts/report.py`의 `MARKER`) 아래는 pod 결과에서 만들어지고 매 실행마다
 통째로 덮어쓰인다. 마커 위는 전부 손으로 쓴 것이고 병합이 보존한다.
@@ -278,6 +285,22 @@ revision을 `configs/data/speed.yaml`에 고정했다. 이 값이 모든 run의 
 `uv sync --frozen`이 실제 linux/CUDA 환경에서 설치까지 도달한다는 첫 증거다. 지금까지는
 해석(`uv lock`)만 확인했었다. **5/7** — 실패한 둘은 서로 다른 원인이고 아래 두 절에서
 각각 다룬다.
+
+**현재 상태 (2026-08-03 정정): 두 실패 모두 이후 해소됐다.** 위 표는 이 실패가
+처음 관측된 시점의 기록이고, 이 문서 자신이 이후 절에서 둘 다 근본 원인을 고치는
+과정을 남긴다 — native는 flash-attn을 소스 빌드에서 미리 빌드한 휠로 바꿔
+컴파일러가 죽던 지점 자체를 없앴고("flash-attn을 소스 빌드에서 직접 만든 휠로
+바꿨다" 절), axolotl은 `no-build-isolation-package` + `cffi>=1.17` build 그룹으로
+zstandard의 낡은 빌드 핀을 우회했다("axolotl 실패 원인 — 근접 원인 뒤에 하나가 더
+있었다" 절). 그 이후 native와 axolotl 이미지는 실제로 pod에 올라가 Phase 0 probe를
+실행했다 — 아래 "2차 Phase 0 캠페인" 표의 native 행(13/13, 12/12 OK)과 axolotl
+행(적재·축 검증·패딩·토크나이즈까지 통과, `infonce_backward`에서 막힘)이 그
+증거다. 이 시점 이후 이미지가 만들어지지 않고서는 그 probe들이 애초에 돌 수
+없었다.
+
+**확인 안 함**: native/axolotl이 정확히 어느 커밋의 CI 런에서 처음 빌드에
+성공했는지, 그리고 그 빌드가 몇 분 걸렸는지. 이 문서에 그 시점의 빌드 로그가
+남아 있지 않다 — 새 숫자를 지어내지 않는다.
 
 ### native 실패 — 러너가 죽었고 로그는 이유를 말하지 않는다
 
@@ -1187,6 +1210,27 @@ axolotl 칸에는 하나가 더 붙는다. `required_step_context`(autocast, cud
 **native(순수 bf16)와 axolotl(autocast)은 다른 수치 체제에서 비교된다.** 그 사실은
 `documented_entry_point.differs` 와 `required_step_context` 양쪽에 남는다. autocast 를
 켠 axolotl 과 끄고 잰 axolotl 의 속도 차는 **측정 안 함** — 이 호스트에 CUDA 가 없다.
+
+### precision 6칸 FAIL은 의도된 결과다
+
+아래 생성 구역의 "실패 상세"에 `precision.name: requested 'bf16', applied
+'mixed(bf16,fp32)'` AppliedMismatch가 여섯 칸(axolotl 3종, unsloth 3종)에서
+나온다. 이것은 결함이 아니라 **영구히 동결된, 의도된 불일치**다.
+
+axolotl과 unsloth 둘 다 `embed_tokens`/`lm_head`류 파라미터를 fp32로 둔 채
+나머지를 bf16으로 적재한다(위 "어댑터 여섯의 진입점 대조" 참조, axolotl은 결정
+1의 autocast로 그 위에서 matmul한다). 요청은 `precision=bf16`이지만 실제로
+빌드된 모델은 fp32/bf16이 섞여 있으므로 `applied._capture_precision`은 정직하게
+`mixed(bf16,fp32)`로 읽는다 — `bf16`으로 뭉개면 섞인 정밀도를 순정 bf16으로
+잘못 보고하는 것이 된다.
+
+`tests/contract/test_applied_axes.py`의 `UNNAMEABLE` 테이블이 이 값을
+`precision.name`의 고정 기대값으로 못박는다(`mixed(bf16,fp32)`, 다른 값으로
+변할 수 없음을 계약이 보증). 즉 이 여섯 칸은 두 어댑터가 고쳐질 수 있는
+버그가 아니라 **어댑터의 문서화된 로딩 방식과 순정 bf16 요청 사이의 구조적
+불일치**이고, `assert_matches`가 그것을 timing 런 차단으로 정직하게 반영한다.
+붉은 여섯 칸이 이 프로젝트가 원하는 상태다 — 초록으로 만들려면 어댑터가 아니라
+계약을 속여야 한다.
 
 ---
 
