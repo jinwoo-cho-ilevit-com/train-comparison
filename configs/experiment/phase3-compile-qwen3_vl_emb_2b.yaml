@@ -1,0 +1,22 @@
+# Phase 3 pod: the compile-mode axis on Qwen3-VL-Embedding-2B.
+#
+# All three settings run here, on one host, so compilation overhead is not folded
+# into host-to-host variance.
+phase: phase3
+description: no compile against default compile against max-autotune on Qwen3-VL-Embedding-2B
+model: qwen3_vl_emb_2b
+framework: native
+run: timing
+gpu_type_id: NVIDIA A100-SXM4-80GB
+baseline: canonical
+axis: compile
+settings:
+  none:
+    - compile=none
+  default:
+    - compile=default
+  max_autotune:
+    - compile=max_autotune
+    # max-autotune spends its first steps benchmarking kernels; the schema
+    # requires those be discarded (audit_plan.AXIS_VALUE_COMPANIONS).
+    - train.warmup_discard_steps=20

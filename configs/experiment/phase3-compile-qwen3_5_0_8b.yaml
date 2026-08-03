@@ -1,0 +1,28 @@
+# Phase 3 pod: the compile-mode axis on Qwen3.5-0.8B.
+#
+# All three settings run here, on one host, so compilation overhead is not folded
+# into host-to-host variance.
+phase: phase3
+description: no compile against default compile against max-autotune on Qwen3.5-0.8B
+model: qwen3_5_0_8b
+framework: native
+run: timing
+gpu_type_id: NVIDIA A100-SXM4-80GB
+baseline: canonical
+axis: compile
+# Required on every qwen3_5_0_8b pod: transformers binds fla while importing the
+# Qwen3.5 modelling module whenever the package, version floor and CUDA are all
+# present, so kernel=none (the default every run inherits) is unsatisfiable here.
+# Full reasoning: configs/experiment/_baselines.yaml, phase2-loss-qwen3_5_0_8b.yaml.
+overrides:
+  - kernel=fla
+settings:
+  none:
+    - compile=none
+  default:
+    - compile=default
+  max_autotune:
+    - compile=max_autotune
+    # max-autotune spends its first steps benchmarking kernels; the schema
+    # requires those be discarded (audit_plan.AXIS_VALUE_COMPANIONS).
+    - train.warmup_discard_steps=20
