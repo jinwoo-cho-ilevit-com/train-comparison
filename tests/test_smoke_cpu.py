@@ -1238,6 +1238,12 @@ def stub_checkpoint(monkeypatch):
     monkeypatch.setattr(
         transformers.AutoModel, "from_pretrained", staticmethod(lambda *a, **k: TinyEmbedder())
     )
+    # The snapshot a timing run pulls before it goes offline. Stubbed for the same
+    # reason `from_pretrained` is — it is a 2B download — and named here so a test
+    # that cares *when* it happens can wrap this one function.
+    monkeypatch.setattr(
+        bench_entry, "prefetch_checkpoint", lambda config: f"{config.model.hf_id}@{'0' * 40}"
+    )
     return processor
 
 
@@ -2037,6 +2043,71 @@ def test_a_step_needing_batch_keys_this_collate_never_builds_is_refused(
     assert "'passage', 'query'" in record["refusal"]["reason"]
 
 
+class SentenceTransformerLike(torch.nn.Module):
+    """The pinned `SentenceTransformer.forward` signature, and nothing else.
+
+    sentence-transformers 5.6.1 `base/model.py`:
+    `def forward(self, input: dict[str, Tensor], **kwargs) -> dict[str, Tensor]` —
+    one positional mapping in, a `{"sentence_embedding": ...}` mapping out. The
+    package is not installed on this host (it lives in `envs/sentence-transformers`),
+    so the signature is restated rather than imported; what makes the restatement
+    honest is that the refusal below is about the signature alone.
+    """
+
+    def __init__(self) -> None:
+        # A trainable parameter, so removing the guard reaches the step-0 TypeError
+        # rather than an optimizer built over nothing. What is under test is where
+        # the run stops, and a stub that cannot get that far cannot show it.
+        super().__init__()
+        self.dense = torch.nn.Linear(4, 4)
+
+    def forward(self, input: dict, **kwargs) -> dict:  # noqa: A002
+        pooled = torch.zeros(input["input_ids"].shape[0], 4)
+        return {"sentence_embedding": self.dense(pooled)}
+
+
+def test_a_forward_that_takes_the_batch_positionally_is_refused_before_the_timer(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """sentence-transformers declares the harness step and cannot serve it.
+
+    `Step` says `owner=harness` and `batch_keys=('input_ids','attention_mask')`,
+    both true, and neither says the forward takes the batch as one positional
+    mapping. `train()` calls `model(**batch, ...)`, so the ST cell died with
+    `TypeError` on step 0 — checkpoint loaded, timer open, `refusal_types()` does
+    not include `TypeError`, no result file — and `docker/entrypoint.sh` filed the
+    combination as one nobody tried.
+    """
+    binding_rewritten(
+        monkeypatch, lambda loaded: copy.replace(loaded, model=SentenceTransformerLike())
+    )
+    config = timing_config(config_mapping, **{"run.purpose": "probe"})
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == bench_entry.REFUSED_EXIT
+    assert record["refusal"]["kind"] == "AdapterRefusal"
+    assert record["refusal"]["stage"] == "binding"
+    assert "cannot be called as model(**batch)" in record["refusal"]["reason"]
+    assert "metrics" not in record
+
+
+def test_a_forward_that_takes_the_batch_as_keywords_is_left_alone(
+    pod_setting,
+    config_mapping,  # noqa: F811
+):
+    """The control. The refusal above has to be about the signature and not about
+    every model, or it would decline the five adapters that do drive this loop."""
+    config = timing_config(config_mapping, **{"run.purpose": "probe", "train.batch_size": 4})
+
+    code, record = pod_setting(config, text_only_rows(8))
+
+    assert code == 0, record
+    assert record["metrics"]["steps_measured"] > 0
+
+
 def test_an_adapter_refusal_is_filed_as_a_result_instead_of_escaping_main(
     pod_setting,
     config_mapping,  # noqa: F811
@@ -2120,6 +2191,112 @@ def test_a_timing_run_closes_the_kernel_fetch_doors_before_the_model_is_built(
     seen = doors_seen_by_the_build(monkeypatch, timing_config(config_mapping), pod_setting)
 
     assert seen == [], seen
+
+
+def doors_at_each_stage(monkeypatch, config, pod_setting):
+    """The open fetch doors read at the corpus, at the checkpoint, and at the build.
+
+    One recording, three points, because the two facts under test are an ordering
+    and reading them from separate runs cannot show an ordering at all.
+    """
+    for name in kernels.RUNTIME_FETCH_ENV:
+        monkeypatch.delenv(name, raising=False)
+    seen: dict[str, list[list[str]]] = {"corpus": [], "checkpoint": [], "build": []}
+
+    fetch = bench_entry.fetch_the_pinned_inputs
+    checkpoint = bench_entry.prefetch_checkpoint
+
+    def watch_checkpoint(cfg):
+        seen["checkpoint"].append(kernels.open_fetch_doors())
+        return checkpoint(cfg)
+
+    def watch_fetch(cfg, stream=None):
+        # `pod_setting` rebinds `load_pairs` when the run starts, so the wrapper
+        # goes on from inside — putting it on earlier would be the stub's own
+        # replacement of it that gets observed, and never the corpus read.
+        inner = bench_entry.load_pairs
+
+        def watch_corpus(config_):
+            seen["corpus"].append(kernels.open_fetch_doors())
+            return inner(config_)
+
+        bench_entry.load_pairs = watch_corpus
+        try:
+            return fetch(cfg, stream)
+        finally:
+            bench_entry.load_pairs = inner
+
+    def watch_build(loaded):
+        seen["build"].append(kernels.open_fetch_doors())
+        return loaded
+
+    monkeypatch.setattr(bench_entry, "prefetch_checkpoint", watch_checkpoint)
+    monkeypatch.setattr(bench_entry, "fetch_the_pinned_inputs", watch_fetch)
+    binding_rewritten(monkeypatch, watch_build)
+    code, record = pod_setting(config, text_only_rows(8))
+    return code, record, seen
+
+
+def test_a_timing_run_fetches_the_pinned_inputs_before_it_goes_offline(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """Both directions of the same ordering, in one run.
+
+    Closing the doors first shut the checkpoint and the corpus out with them:
+    `from_pretrained` raised `OSError` and `load_pairs` raised
+    `OfflineModeIsEnabled` on a cold pod, neither of them a refusal type, so the
+    setting produced no result file at all. On a warm one it was worse —
+    `datasets` answers an offline pinned request with whatever build is cached and
+    the record still names the pinned revision.
+
+    So the assertion is not "the doors are shut" and not "the inputs arrived", it
+    is that the inputs arrived *first* and the doors were shut *anyway*. Asserting
+    one alone is how the next round finds the other end reopened.
+    """
+    code, record, seen = doors_at_each_stage(
+        monkeypatch, timing_config(config_mapping), pod_setting
+    )
+    offline = f"$HF_HUB_OFFLINE={None!r}"
+
+    # This stub model cannot satisfy `assert_matches`, so the setting is refused
+    # after the build. That is the state under test all the same: the refusal is
+    # a written record, and everything this test reads happened before it.
+    assert code == bench_entry.REFUSED_EXIT, record
+    stages = (seen["corpus"], seen["checkpoint"], seen["build"])
+    assert [len(stage) for stage in stages] == [1, 1, 1]
+    # Before: the network is still reachable, so the pinned identity is what answered.
+    assert any(door.startswith(offline) for door in seen["corpus"][0]), seen["corpus"]
+    assert any(door.startswith(offline) for door in seen["checkpoint"][0]), seen["checkpoint"]
+    # After: nothing was given back. The kernel door is shut by the time the model
+    # — the one thing that rewrites `flash_attention_2` into a Hub fetch — is built.
+    assert seen["build"][0] == [], seen["build"]
+
+
+def test_the_corpus_is_read_once_and_before_the_doors_rather_than_warmed(
+    pod_setting,
+    config_mapping,  # noqa: F811
+    monkeypatch,
+):
+    """One read, on the open side of the doors, and the rows the loop trains on.
+
+    Warming the cache and reading it again would leave the second read offline,
+    where `datasets` answers a pinned request with whatever build is cached —
+    measured here, the D1-corrupt subset `CORRUPT_DATA_REVISIONS` refuses — and
+    logs the substitution instead of raising it. A second call is therefore a
+    failure whatever it returns.
+    """
+    code, record, seen = doors_at_each_stage(
+        monkeypatch, timing_config(config_mapping), pod_setting
+    )
+
+    assert code == bench_entry.REFUSED_EXIT, record
+    assert len(seen["corpus"]) == 1, seen["corpus"]
+    assert any(door.startswith(f"$HF_HUB_OFFLINE={None!r}") for door in seen["corpus"][0])
+    # The rows reached `axes.assemble`: the run got as far as `assert_matches`,
+    # which is downstream of the loader this dataset built.
+    assert record["refusal"]["stage"] == "assert_matches"
 
 
 def test_a_probe_is_not_put_behind_the_closed_doors(

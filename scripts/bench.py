@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import json
 import os
 import sys
@@ -603,6 +604,99 @@ def close_kernel_fetch_doors(config: BenchConfig, stream: Any = None) -> list[st
     return was_open
 
 
+def prefetch_checkpoint(config: BenchConfig) -> str:
+    """Materialise the checkpoint in the local cache and return the sha it resolved to.
+
+    `from_pretrained` downloads and builds in one call, so the doors cannot be shut
+    between those two — and they have to be, because the `flash_attention_2` ->
+    Hub-repo rewrite fires while the model is being built. Pulling the snapshot
+    first is what makes both true: the weights arrive over an open network, and the
+    build that follows reads them off disk with the network shut.
+
+    The returned identity is the resolved commit, not the ref that was asked for.
+    `configs/model/*.yaml` all pin `revision: null`, so what a run loaded is
+    otherwise recoverable only from whatever `main` happened to point at that day.
+    """
+    from huggingface_hub import snapshot_download
+
+    snapshot = Path(snapshot_download(config.model.hf_id, revision=config.model.revision))
+    return f"{config.model.hf_id}@{snapshot.name}"
+
+
+def fetch_the_pinned_inputs(config: BenchConfig, stream: Any = None) -> tuple[Any, dict[str, str]]:
+    """The corpus and the checkpoint, fetched while the network is still open.
+
+    Both used to be read *after* `close_kernel_fetch_doors`, and offline mode has a
+    different answer for each of them. `huggingface_hub` refuses: a cold pod died
+    with `OSError("We couldn't connect to ...")` inside `from_pretrained` and
+    `ConnectionError(OfflineModeIsEnabled)` inside `load_pairs`, neither of them a
+    `refusal_types()`, so every timing and quality setting exited 1 with no result
+    file and `docker/entrypoint.sh` filed the pod as having produced nothing.
+    `datasets` does something worse: an offline `load_dataset(..., revision=...)`
+    answers with whatever build is already cached and only logs it — measured on
+    this host, that was the D1-corrupt subset `CORRUPT_DATA_REVISIONS` exists to
+    refuse — while `build_record` still writes the pinned revision beside the
+    number. The corpus is therefore read here rather than merely warmed: a
+    substitution cannot happen on a request that was answered before the door shut.
+
+    The order this establishes is the whole of the fix — pinned inputs, then the
+    doors, then the model — and `tests/test_smoke_cpu.py` asserts both ends of it,
+    because a later round finding the other end reopened is how this file got here.
+    """
+    stream = sys.stdout if stream is None else stream
+    dataset = load_pairs(config)
+    identities = {"corpus": f"{config.data.repo_id}@{config.data.revision}"}
+    if config.run.purpose in ENFORCED_PURPOSES:
+        # Same gate as `close_kernel_fetch_doors`: a probe leaves the doors open, so
+        # it has nothing to get ahead of and stays on the plain `from_pretrained`
+        # path that populates the cache this branch later reads.
+        identities["checkpoint"] = prefetch_checkpoint(config)
+    for name, identity in sorted(identities.items()):
+        print(f"pinned input fetched before the doors closed: {name}={identity}", file=stream)
+    return dataset, identities
+
+
+def refuse_a_forward_this_harness_cannot_call(step: Any, model: Any) -> None:
+    """Refuse a model whose `forward` will not take the batch as keyword arguments.
+
+    `train()` calls `model(**batch, ...)`. `Step` says who owns the step and which
+    keys the batch needs; it has no way to say that a framework's forward takes the
+    batch as one positional mapping, so an adapter can declare the harness step
+    truthfully by both of those fields and still be undrivable. sentence-transformers
+    is that case — pinned 5.6.1 `SentenceTransformer.forward(self, input: dict,
+    **kwargs)` — and it died with `TypeError` on step 0, after the checkpoint was
+    loaded and the timer was open, where nothing catches it and no result file is
+    written. The ST cell then rendered as a combination nobody tried rather than one
+    that was refused.
+
+    Read off the live object with `inspect`, not from a declaration: the declaration
+    is what was wrong. A `*args`/`**kwargs` forward binds anything and is left alone,
+    so this refuses only what would actually raise. Only the declared `batch_keys`
+    are bound — the collate adds more (`pixel_values`, `cu_seq_lens_*`) and which of
+    those a model takes is per checkpoint, not per harness.
+    """
+    loader = importlib.import_module("trainbench.loader")
+    forward = getattr(model, "forward", None)
+    if forward is None:
+        return
+    try:
+        signature = inspect.signature(forward)
+    except (TypeError, ValueError):
+        # A builtin or a C-level callable exposes no signature. Refusing here would
+        # decline a model on the grounds that this check cannot read it.
+        return
+    try:
+        signature.bind(**dict.fromkeys(step.batch_keys))
+    except TypeError as exc:
+        raise loader.AdapterRefusal(
+            f"{type(model).__name__}.forward{signature} cannot be called as "
+            f"model(**batch) with the declared batch keys {sorted(step.batch_keys)}: {exc}. "
+            "The harness loop drives exactly that call, so this build would raise on the "
+            "first micro-batch with the checkpoint loaded and the timer already open, and "
+            "the setting would be published as a pod that produced nothing"
+        ) from exc
+
+
 def refuse_a_step_this_harness_cannot_drive(step: Any) -> None:
     """Refuse an adapter whose declared step is not the one `train()` runs.
 
@@ -677,6 +771,7 @@ def build_run(
     filing it as a clean refusal would say a setting was declined when a loop had
     already run. `tests/test_smoke_cpu.py` pins that boundary.
     """
+    dataset, _ = fetch_the_pinned_inputs(config)
     close_kernel_fetch_doors(config)
     with refusing("patch"):
         axes.patch(config)
@@ -697,10 +792,10 @@ def build_run(
         if config.run.purpose in ENFORCED_PURPOSES:
             kernels.assert_no_runtime_kernel_fetch()
         refuse_a_step_this_harness_cannot_drive(binding.step)
+        refuse_a_forward_this_harness_cannot_call(binding.step, binding.model)
         refuse_packing_the_mask_registry_cannot_isolate(binding, config)
     model, processor = binding.model, binding.processor
 
-    dataset = load_pairs(config)
     with refusing("assemble", fingerprint=binding.fingerprint):
         if config.dataloader.pretokenize:
             # Before `assemble`, which is the whole of the axis: `_dataloader`

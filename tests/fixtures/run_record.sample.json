@@ -304,9 +304,7 @@
     },
     "run": {
       "profiler": false,
-      "purpose": "timing",
-      "trackio_project": "train-comparison",
-      "trackio_space_id": null
+      "purpose": "timing"
     },
     "train": {
       "batch_size": 16,
