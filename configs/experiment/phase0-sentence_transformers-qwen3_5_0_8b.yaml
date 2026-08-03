@@ -17,3 +17,8 @@ baseline: none
 overrides:
   - data.limit=8
   - train.batch_size=8
+  # `kernel=none`, the schema default, is unsatisfiable on this architecture —
+  # `_baselines.yaml` carries the reason and the source. A probe is not an enforced
+  # purpose, so `axes.patch()` admits it and the mismatch lands on `axes_verified`
+  # instead: measured 2026-08-03, that alone failed all six qwen3_5 cells.
+  - kernel=fla
