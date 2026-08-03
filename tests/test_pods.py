@@ -2666,7 +2666,16 @@ if args.config is None or args.out is None:
     parser.error("--config and --out are required unless --preflight is given")
 
 payload = json.loads(args.config.read_text())
-entry = {"out": args.out.name, "config": payload, "error": None}
+entry = {
+    "out": args.out.name,
+    "config": payload,
+    "error": None,
+    # What the entrypoint handed this process, before it closes anything itself.
+    # The real bench.py fetches the pinned corpus and checkpoint over an open
+    # network first and only then goes offline, so either of these arriving
+    # already set is a cold pod that cannot read its own inputs.
+    "fetch_doors": {name: os.environ.get(name) for name in RUNTIME_FETCH_ENV},
+}
 try:
     BenchConfig.model_validate(payload)
 except Exception as exc:
@@ -2931,6 +2940,28 @@ def test_a_setting_killed_by_a_signal_publishes_that_code_and_not_infisicals(tmp
     assert "exit 139" in by_setting[killed]["probe"]["checks"][0]["error"]
     assert sorted(b["status"] for s, b in by_setting.items() if s != killed) == ["ok", "ok"]
     assert "run exited 139" in sweep.proc.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_the_pod_hands_bench_an_environment_with_the_fetch_doors_still_open(tmp_path):
+    """The entrypoint must not close the kernel-fetch doors on `bench.py`'s behalf.
+
+    `bench.py` closes them itself, and only after `fetch_the_pinned_inputs` has read
+    the pinned corpus and pulled the checkpoint. Exporting `HF_HUB_OFFLINE=1` here
+    puts that fetch behind the door and returns every timing and quality setting to
+    `no_result` — why the pod log's "kernel fetch door closed" lines invite exactly
+    that change, and what it costs, is `.plans/notes/blockerfix.md`.
+
+    The check belongs in this file because the order checks in
+    `tests/test_smoke_cpu.py` `monkeypatch.delenv` both names to fix their own
+    starting state, so an environment that arrives with one set is invisible there.
+    """
+    plan = sweep_plan()
+    sweep = sweep_pod(tmp_path, plan)
+    seen = [entry["fetch_doors"] for entry in sweep.bench]
+    assert seen and all(value is None for doors in seen for value in doors.values()), (
+        f"the entrypoint closed a fetch door before bench.py could read its inputs: {seen}"
+    )
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
