@@ -178,11 +178,35 @@ def peak_memory_bytes(device: torch.device) -> int | None:
 def synchronize(device: torch.device) -> None:
     """Wait for the device before reading a clock.
 
-    CUDA kernels are queued asynchronously, so timing without this measures how
-    fast Python got to the next line.
+    An accelerator queues kernels asynchronously, so timing without this measures
+    how fast Python got to the next line rather than how long the device took.
+    `device.type == "cuda"` used to be the only branch here, which made every step
+    time silently meaningless on any other accelerator: `trainbench/device.py`
+    resolves `mps` via `torch.accelerator.current_accelerator()` on this laptop,
+    and the old body no-opped on it exactly as it does on `cpu` — where a no-op is
+    correct, because CPU ops are synchronous already.
+
+    `torch.accelerator.synchronize` is the device-agnostic form (cuda, mps, xpu),
+    so one call covers every accelerator this process could resolve to instead of
+    one `torch.cuda`-shaped branch per kind. It raises if `device` is not the kind
+    of accelerator this process actually has (`ValueError: ... doesn't match the
+    current accelerator ...`), which this function turns into a named refusal
+    rather than letting it read as an obscure crash: a `StepTimer` built for a
+    device this process cannot synchronize must refuse to time it, not report a
+    wall-clock number under a device-measurement label.
     """
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
+    if device.type == "cpu":
+        return
+    current = torch.accelerator.current_accelerator() if torch.accelerator.is_available() else None
+    if current is None or current.type != device.type:
+        raise RuntimeError(
+            f"cannot synchronize device={device}: torch.accelerator reports "
+            f"{current!r} as the current accelerator. Timing {device} here would "
+            "either no-op (wrong: kernels queued on it would not be drained before "
+            "the clock reads) or synchronize the wrong device — StepTimer must not "
+            "be used to time a device this process cannot actually synchronize."
+        )
+    torch.accelerator.synchronize(device)
 
 
 class StepTimer:

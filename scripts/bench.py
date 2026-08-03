@@ -36,7 +36,7 @@ import os
 import sys
 import traceback
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -54,7 +54,7 @@ from trainbench.collate import Encode, build_collate, load_pairs
 from trainbench.config import load_bench_config, to_bench_config
 from trainbench.config_schema import BenchConfig, axis_knobs
 from trainbench.device import get_device
-from trainbench.embedding import packed_last_token_pool
+from trainbench.embedding import packed_last_token_pool, padding_preverified
 from trainbench.probe import steps
 from trainbench.probe.types import MAX_TRACEBACK_CHARS
 from trainbench.record import build_record, write_json
@@ -367,8 +367,14 @@ def train(
     # the declaration still takes the generic path below.
     framework_owns_step = False
     if adapter_step is not None:
-        loader = importlib.import_module("trainbench.loader")
-        framework_owns_step = adapter_step.owner != loader.HARNESS_STEP.owner
+        # Not `loader`: that name is this function's own DataLoader parameter
+        # (see its docstring), and reassigning it here would only be harmless by
+        # accident — `stream = micro_batches(loader)` above already captured the
+        # real one, so nothing downstream reads the shadowed name back. A second
+        # caller added later that reads `loader` after this line would not get
+        # that accident twice.
+        loader_module = importlib.import_module("trainbench.loader")
+        framework_owns_step = adapter_step.owner != loader_module.HARNESS_STEP.owner
     step_runner = FRAMEWORK_OWNED_STEP_RUNNERS.get(built.framework) if framework_owns_step else None
     pooler = None if step_runner is not None else NONSTANDARD_FORWARD_POOLERS.get(built.framework)
     if step_runner is not None or pooler is not None:
@@ -392,90 +398,110 @@ def train(
     first_loss: torch.Tensor | None = None
     last_loss: torch.Tensor | None = None
 
-    for step in range(total):
-        if step == discard:
-            metrics.reset_peak_memory(device)
-        measured = step >= discard
-        with timer, axes.step_context(config, required_context):
-            # Opens the step: see the docstring. The gradients this clears are the
-            # previous step's, and the last step's are left standing for the
-            # validity read below.
-            built.optimizer.zero_grad(set_to_none=True)
-            for _ in range(grad_accum):
-                # `grad_accum` distinct micro-batches, not the same one N times.
-                # Feeding one batch repeatedly gives identical sequence lengths,
-                # identical padding and a warm cache, and nothing in the result
-                # would say so.
-                micro = next(stream)
-                tensors = to_device(micro.tensors, device, dtype)
-                # Not `steps.infonce_backward`: it ends with
-                # `model.zero_grad(set_to_none=True)`, which is right for a probe
-                # (one step, nothing after it) and wrong here — the optimizer
-                # would step on gradients that had just been wiped, and the loop
-                # would time a forward and a backward while calling it training.
-                # Caught by tests/test_smoke_cpu.py, which asserts the gradients
-                # are non-zero at the moment of the step. `encode` is reused
-                # unchanged.
-                if step_runner is not None:
-                    # tevatron: its own forward computes pooling, scoring and
-                    # the loss itself. See `_tevatron_forward_loss` above.
-                    loss = step_runner(built.model, tensors, config, built)
-                    (loss / grad_accum).backward()
-                elif pooler is not None:
-                    # sentence_transformers: a nonstandard forward call, but the
-                    # harness's own loss still certifies `loss.name` — read
-                    # directly here, not through a step runner, for the reason
-                    # `_sentence_transformers_pooled`'s docstring gives.
-                    pooled = pooler(built.model, tensors)
-                    half = pooled.shape[0] // 2
-                    loss = built.loss_fn(pooled[:half], pooled[half:])
-                    (loss / grad_accum).backward()
-                elif gradcache_backward is not None:
-                    # GradCache owns the whole forward/backward: it encodes the
-                    # batch in pieces under no_grad, scores every row at once, then
-                    # re-encodes each piece with a graph and seeds its backward
-                    # from the cache. `scale` multiplies the gradient rather than
-                    # the returned loss, so the loss recorded below is the unscaled
-                    # one on this path too.
-                    #
-                    # `images_per_row` is what lets it cut `pixel_values` at a row
-                    # boundary instead of refusing the batch. It is passed even
-                    # when it is None — a text-only batch needs no map, and a
-                    # multimodal one whose collate recorded none is refused rather
-                    # than split by position.
-                    loss = gradcache_backward(
-                        built.model,
-                        tensors,
-                        padding_side=side,
-                        scale=1.0 / grad_accum,
-                        images_per_row=micro.images_per_row,
-                    )
-                else:
-                    # `micro.cu_seqlens` is None unless `dataloader.packing=true`,
-                    # and it is what selects the pooling: a packed batch is one row
-                    # with no attention_mask, which `last_token_pool` refuses.
-                    pooled = pooled_embeddings(built.model, tensors, side, micro.cu_seqlens)
-                    half = pooled.shape[0] // 2
-                    # `built.loss_fn`, not `info_nce`: the temperature and any
-                    # cross-rank gather are already closed over by the callable
-                    # `axes.assemble` built, and that callable is the one
-                    # `applied.capture` reads to certify `loss.name`.
-                    loss = built.loss_fn(pooled[:half], pooled[half:])
-                    # Scaled so N micro-batches accumulate to one batch's gradient
-                    # rather than N times it. The recorded loss is the unscaled one,
-                    # so it stays comparable across grad_accum settings.
-                    (loss / grad_accum).backward()
-                if measured:
-                    detached = loss.detach()
-                    first_loss = detached if first_loss is None else first_loss
-                    last_loss = detached
-                    # Counted from the micro-batch that was actually fed, not from
-                    # the config: with distinct micro-batches the padding differs
-                    # per batch, so multiplying one batch's token count by
-                    # grad_accum is wrong.
-                    for name in counted:
-                        counted[name] += getattr(micro, name)
-            built.optimizer.step()
+    # True exactly when the loop below reaches `last_token_pool` at all: the
+    # generic path and GradCache both pool the padded convention through
+    # `pooled_embeddings`/`encode`; `step_runner`/`pooler` pool inside the
+    # framework's own forward, and `dataloader.packing=true` has no
+    # `attention_mask` to check in the first place (`packed_last_token_pool`
+    # is a separate function with its own, still-synchronous checks — out of
+    # scope here). Only in this case is there a per-call host-sync guard worth
+    # skipping.
+    #
+    # Nothing here re-proves the mask conforms: `trainbench/collate.py`'s
+    # `Collate`/`PretokenizedCollate` already called `assert_padding_conforms` on
+    # every micro-batch's `attention_mask` while building it, on CPU, in the
+    # DataLoader worker — before this batch ever reached `loader`. That is what
+    # earns `padding_preverified()` here: not a separate pass over this run's
+    # data, but the batch this loop is about to pool having already been through
+    # the one place its mask was constructed.
+    uses_last_token_pool = step_runner is None and pooler is None and not config.dataloader.packing
+    padding_guard: Any = padding_preverified() if uses_last_token_pool else nullcontext()
+
+    with padding_guard:
+        for step in range(total):
+            if step == discard:
+                metrics.reset_peak_memory(device)
+            measured = step >= discard
+            with timer, axes.step_context(config, required_context):
+                # Opens the step: see the docstring. The gradients this clears are the
+                # previous step's, and the last step's are left standing for the
+                # validity read below.
+                built.optimizer.zero_grad(set_to_none=True)
+                for _ in range(grad_accum):
+                    # `grad_accum` distinct micro-batches, not the same one N times.
+                    # Feeding one batch repeatedly gives identical sequence lengths,
+                    # identical padding and a warm cache, and nothing in the result
+                    # would say so.
+                    micro = next(stream)
+                    tensors = to_device(micro.tensors, device, dtype)
+                    # Not `steps.infonce_backward`: it ends with
+                    # `model.zero_grad(set_to_none=True)`, which is right for a probe
+                    # (one step, nothing after it) and wrong here — the optimizer
+                    # would step on gradients that had just been wiped, and the loop
+                    # would time a forward and a backward while calling it training.
+                    # Caught by tests/test_smoke_cpu.py, which asserts the gradients
+                    # are non-zero at the moment of the step. `encode` is reused
+                    # unchanged.
+                    if step_runner is not None:
+                        # tevatron: its own forward computes pooling, scoring and
+                        # the loss itself. See `_tevatron_forward_loss` above.
+                        loss = step_runner(built.model, tensors, config, built)
+                        (loss / grad_accum).backward()
+                    elif pooler is not None:
+                        # sentence_transformers: a nonstandard forward call, but the
+                        # harness's own loss still certifies `loss.name` — read
+                        # directly here, not through a step runner, for the reason
+                        # `_sentence_transformers_pooled`'s docstring gives.
+                        pooled = pooler(built.model, tensors)
+                        half = pooled.shape[0] // 2
+                        loss = built.loss_fn(pooled[:half], pooled[half:])
+                        (loss / grad_accum).backward()
+                    elif gradcache_backward is not None:
+                        # GradCache owns the whole forward/backward: it encodes the
+                        # batch in pieces under no_grad, scores every row at once, then
+                        # re-encodes each piece with a graph and seeds its backward
+                        # from the cache. `scale` multiplies the gradient rather than
+                        # the returned loss, so the loss recorded below is the unscaled
+                        # one on this path too.
+                        #
+                        # `images_per_row` is what lets it cut `pixel_values` at a row
+                        # boundary instead of refusing the batch. It is passed even
+                        # when it is None — a text-only batch needs no map, and a
+                        # multimodal one whose collate recorded none is refused rather
+                        # than split by position.
+                        loss = gradcache_backward(
+                            built.model,
+                            tensors,
+                            padding_side=side,
+                            scale=1.0 / grad_accum,
+                            images_per_row=micro.images_per_row,
+                        )
+                    else:
+                        # `micro.cu_seqlens` is None unless `dataloader.packing=true`,
+                        # and it is what selects the pooling: a packed batch is one row
+                        # with no attention_mask, which `last_token_pool` refuses.
+                        pooled = pooled_embeddings(built.model, tensors, side, micro.cu_seqlens)
+                        half = pooled.shape[0] // 2
+                        # `built.loss_fn`, not `info_nce`: the temperature and any
+                        # cross-rank gather are already closed over by the callable
+                        # `axes.assemble` built, and that callable is the one
+                        # `applied.capture` reads to certify `loss.name`.
+                        loss = built.loss_fn(pooled[:half], pooled[half:])
+                        # Scaled so N micro-batches accumulate to one batch's gradient
+                        # rather than N times it. The recorded loss is the unscaled one,
+                        # so it stays comparable across grad_accum settings.
+                        (loss / grad_accum).backward()
+                    if measured:
+                        detached = loss.detach()
+                        first_loss = detached if first_loss is None else first_loss
+                        last_loss = detached
+                        # Counted from the micro-batch that was actually fed, not from
+                        # the config: with distinct micro-batches the padding differs
+                        # per batch, so multiplying one batch's token count by
+                        # grad_accum is wrong.
+                        for name in counted:
+                            counted[name] += getattr(micro, name)
+                built.optimizer.step()
 
     # Outside the timer, before anything clears the gradients. Without these the
     # `record-report` validity gate is true of the fixture and of nothing else: a

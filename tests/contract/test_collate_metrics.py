@@ -189,19 +189,36 @@ class StubProcessor:
         return encoded
 
 
-def _config(packing: bool = False, pretokenize: bool = False) -> SimpleNamespace:
+def _config(
+    packing: bool = False, pretokenize: bool = False, padding_side: str = "right"
+) -> SimpleNamespace:
     """The fields the collates read off `BenchConfig`, and nothing else.
 
     `prompt_format='raw'` with no instruction prompt keeps this test out of
     lane-f's prompt decision: whichever way the Qwen instruction prompt ends up
     being passed, the payload's shape is what is frozen here.
+
+    `padding_side` now has to agree with what the collate under test actually
+    builds, because `Collate`/`PretokenizedCollate` call
+    `embedding.assert_padding_conforms` on the mask they build — inert until that
+    change, so nothing here had ever needed to agree with it before. The two
+    collates disagree with each other: `StubTokenizer` does not read
+    `padding_side` at all and always right-pads
+    (`[1] * len(row) + [0] * (width - len(row))`), which is what
+    `padded_multimodal`/`padded_text_only` (`Collate`) need declared.
+    `PretokenizedCollate` places each sequence itself from `padding_side` and its
+    frozen `pretokenized_padded` fixture is genuinely left-padded (see
+    `microbatch.sample.json`), which is what `_micro_batch`'s pretokenize branch
+    passes explicitly. One shared default cannot be right for both, because the
+    two collates were never built to agree with each other on this axis in the
+    first place — only on the `MicroBatch` shape this file actually pins.
     """
     return SimpleNamespace(
         model=SimpleNamespace(
             instruction_prompt=None,
             prompt_format="raw",
             add_generation_prompt=False,
-            padding_side="left",
+            padding_side=padding_side,
         ),
         data=SimpleNamespace(max_seq_len=SPEC["max_seq_len"]),
         dataloader=SimpleNamespace(packing=packing, pretokenize=pretokenize),
@@ -219,7 +236,12 @@ def _micro_batch(case: str) -> Any:
     if case == "packed":
         collate = build_collate(StubProcessor(accepts_images=False), _config(packing=True))
         return collate(SPEC["rows"])
-    collate = build_collate(StubProcessor(accepts_images=False), _config(pretokenize=True))
+    # `pretokenized_padded`'s frozen fixture is genuinely left-padded
+    # (`microbatch.sample.json`) — `PretokenizedCollate` places each sequence
+    # itself from `padding_side`, unlike `StubTokenizer` above, which ignores it.
+    collate = build_collate(
+        StubProcessor(accepts_images=False), _config(pretokenize=True, padding_side="left")
+    )
     return collate(entry["encoded_rows"])
 
 
