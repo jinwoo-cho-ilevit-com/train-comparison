@@ -11,11 +11,10 @@ Two axes reach their inert value here and nowhere else, and both are now read
 back by a probe in `trainbench/applied.py` rather than assumed:
 
 * `precision.name` — bf16 is not chosen here. The load dtype is decided by
-  `trainbench/probe/steps.py::dtype_for` from the device, so `axes.py` only
-  refuses the values it cannot put into effect: mxfp8/nvfp4 need
-  transformer-engine, absent from every environment. What makes bf16 a claim
-  rather than a hope is `applied._capture_precision`, which reads the dtype off
-  the weights — a run loaded in fp32 is refused however the config reads.
+  `trainbench/probe/steps.py::dtype_for` from the device, and `axes.py` has no
+  other value to apply. What makes bf16 a claim rather than a hope is
+  `applied._capture_precision`, which reads the dtype off the weights — a run
+  loaded in fp32 is refused however the config reads.
 * `train.offload` — inseparable from ZeRO: `deepspeed.initialize` returns the
   engine, optimizer and dataloader from one call, and deepspeed is absent from
   every environment. `assemble` therefore refuses everything but `none`, and
@@ -58,7 +57,6 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from trainbench import axes
 from trainbench.applied import (
-    PRECISION_RECIPE_AXIS,
     AppliedMismatch,
     Built,
     assert_matches,
@@ -245,12 +243,12 @@ def test_qlora_gates_on_the_device_the_run_resolves_to(composed, monkeypatch):
 
 
 def test_the_qlora_compute_dtype_stays_a_precision_a_run_can_reach(composed):
-    """`QLORA_4BIT` fixes bf16 compute on the grounds that `step_context` refuses
-    every other precision. That is one constant resting on another function's
-    refusal with nothing between them: the day `mxfp8` or `nvfp4` becomes
-    reachable, a qlora run under it computes in bf16 and the study prints the fp8
-    recipe's name over a bf16 number. Nothing else pins the pair together, so this
-    does — it is the notice, not the fix."""
+    """`QLORA_4BIT` fixes bf16 compute on the grounds that `precision.name` has no
+    other value to reach. That is one constant resting on another module's
+    schema with nothing between them: the day a second precision value is added,
+    a qlora run under it still computes in bf16 and the study prints that value's
+    name over a bf16 number. Nothing else pins the pair together, so this does —
+    it is the notice, not the fix."""
     reachable = []
     for name in get_args(PrecisionConfig.model_fields["name"].annotation):
         try:
@@ -4604,215 +4602,6 @@ def test_a_muon_optimizer_under_an_adamw_request_stops_the_run(composed):
         assert_matches(state, requested_adamw)
 
 
-# --- precision.name ----------------------------------------------------------
-#
-# transformer-engine does not import here: the shim wheel carries the Python
-# surface but the compiled half (`transformer-engine-torch`) is sdist-only and
-# built on the pod. So these run against a stand-in shaped like the pinned
-# release's surface — the two recipe classes, the two availability checks, and
-# `autocast` — and what they pin is which of those this module calls and in which
-# order. Whether an A100 refuses is a hardware fact, not a code one, and it is the
-# gate below that turns it into a refusal instead of a wrong number.
-
-
-def install_transformer_engine(monkeypatch, *, available=True, tuples=True):
-    """A stand-in for the three Transformer Engine modules this axis reads.
-
-    `available` decides what the support checks answer, and `tuples` decides in
-    which of the two shapes — the private `_compute_*_support` pair returns
-    `(bool, str)` and whether the public wrappers do is 확인 안 함, so both are
-    exercised. A `(False, reason)` tuple is truthy, which is exactly how an
-    unsupported device would be read as a supported one.
-    """
-    entered = []
-    recipes = ModuleType("transformer_engine.common.recipe")
-    for name in ("MXFP8BlockScaling", "NVFP4BlockScaling"):
-        setattr(recipes, name, type(name, (), {}))
-    quantization = ModuleType("transformer_engine.pytorch.quantization")
-    answer = (available, "" if available else "compute capability 10.0 or higher required")
-    for name in ("is_mxfp8_available", "is_nvfp4_available"):
-        setattr(quantization, name, lambda answer=answer: answer if tuples else answer[0])
-
-    @contextlib.contextmanager
-    def autocast(enabled=True, recipe=None):
-        entered.append({"enabled": enabled, "recipe": recipe})
-        yield
-
-    pytorch = ModuleType("transformer_engine.pytorch")
-    pytorch.autocast = autocast
-    pytorch.Linear = _TELinear
-    for name, module in {
-        "transformer_engine.common.recipe": recipes,
-        "transformer_engine.pytorch.quantization": quantization,
-        "transformer_engine.pytorch": pytorch,
-    }.items():
-        monkeypatch.setitem(sys.modules, name, module)
-    return entered
-
-
-class _TELinear(torch.nn.Linear):
-    """A layer whose defining package is the recipe's, which is what
-    `applied._module_roots` reads to tell a swapped model from a plain torch one."""
-
-    __module__ = "transformer_engine.pytorch"
-
-
-def recipe_model() -> torch.nn.Module:
-    """The regime the fp8 recipes actually run in: bf16 base weights, and modules
-    the recipe package defines.
-
-    `plain_model()` is neither — fp32 parameters and no Transformer Engine module —
-    and `applied._capture_precision` reads both back, so a recipe over it is
-    undetermined rather than mxfp8. Asserting the recipe's name off that model
-    asserted the defect where a recipe object alone certified the axis.
-    """
-    model = torch.nn.Sequential(_TELinear(2, 2)).to(torch.bfloat16)
-    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
-    return model
-
-
-@pytest.mark.parametrize(
-    "precision,recipe_class", [("mxfp8", "MXFP8BlockScaling"), ("nvfp4", "NVFP4BlockScaling")]
-)
-def test_an_fp8_recipe_wraps_the_step_and_is_what_the_run_is_read_by(
-    composed, monkeypatch, precision, recipe_class
-):
-    """These recipes keep bf16 parameters and cast inside the step, so the weights
-    cannot say which one ran. `Built.precision_recipe` is the only thing that can
-    name the value, which is why `assemble` builds one as well as `step_context`.
-
-    Naming is not certifying, so the model has to be one an fp8 run is loaded as:
-    `recipe_model()` gives bf16 base weights and Transformer Engine modules. Over
-    `plain_model()` — fp32, no recipe module — capture is undetermined, and it is
-    the test below that pins that.
-    """
-    entered = install_transformer_engine(monkeypatch)
-    config = bench(composed, **{"precision.name": precision})
-
-    built, names = axes.assemble(recipe_model(), config, CPU, framework="native")
-    with axes.step_context(config):
-        pass
-
-    assert "precision.name" in names
-    assert type(built.precision_recipe).__name__ == recipe_class
-    assert type(entered[0]["recipe"]).__name__ == recipe_class
-    assert entered[0]["enabled"] is True
-    assert axis(capture(built, config), "precision.name").applied == precision
-
-
-@pytest.mark.parametrize("precision", ["mxfp8", "nvfp4"])
-def test_a_recipe_over_a_model_no_fp8_run_is_loaded_as_is_undetermined(
-    composed, monkeypatch, precision
-):
-    """The recipe object is built from the same config the state is checked
-    against, so a capture that read only its class name would hand the request
-    back. `plain_model()` is fp32 with no Transformer Engine module — the state
-    `_capture_precision`'s dtype refusals exist for — and a run over it must not
-    be published as mxfp8.
-    """
-    install_transformer_engine(monkeypatch)
-    config = bench(composed, **{"precision.name": precision})
-
-    built, _ = axes.assemble(plain_model(), config, CPU, framework="native")
-
-    entry = axis(capture(built, config), "precision.name")
-    assert type(built.precision_recipe).__name__ in PRECISION_RECIPE_AXIS
-    assert entry.applied is None
-    assert entry.matches is False
-
-
-@pytest.mark.parametrize("tuples", [True, False], ids=["tuple", "bool"])
-@pytest.mark.parametrize("precision", ["mxfp8", "nvfp4"])
-def test_a_device_that_cannot_execute_the_recipe_is_refused(
-    composed, monkeypatch, precision, tuples
-):
-    """The failure this gate exists for. `check_recipe_support` covers MXFP8 and its
-    `elif` chain never mentions NVFP4, so an ungated nvfp4 run on an A100 enters the
-    region without complaint and prints a bf16 number under the fp4 label. Both are
-    gated here instead, and in both answer shapes — `(False, reason)` is truthy, so
-    a gate that read the result as a bool would let every unsupported device
-    through.
-
-    `assemble` does not raise: docs/CONTRACTS.md §2 gives the fp8 decision to
-    `step_context`, and `scripts/bench.py` enters it before the timer. What
-    `assemble` must not do is hand back a recipe, because that is the one thing
-    `applied._capture_precision` would certify the run on.
-    """
-    install_transformer_engine(monkeypatch, available=False, tuples=tuples)
-    config = bench(composed, **{"precision.name": precision})
-
-    built, names = axes.assemble(plain_model(), config, CPU, framework="native")
-
-    assert built.precision_recipe is None
-    assert "precision.name" not in names
-    assert axis(capture(built, config), "precision.name").applied != precision
-    with pytest.raises(axes.UnappliedAxis, match="not executable on this device"):
-        axes.step_context(config)
-
-
-def test_both_fp8_precisions_are_gated_and_neither_is_left_to_transformer_engine():
-    """The table read as a table: a value here with no checker would be entered
-    ungated, and that is the state NVFP4 is in inside Transformer Engine itself."""
-    assert axes.TE_PRECISIONS == {
-        "mxfp8": ("MXFP8BlockScaling", "is_mxfp8_available"),
-        "nvfp4": ("NVFP4BlockScaling", "is_nvfp4_available"),
-    }
-    assert set(axes.TE_PRECISIONS) | {"bf16"} == set(
-        get_args(PrecisionConfig.model_fields["name"].annotation)
-    )
-
-
-def test_a_support_check_that_will_not_answer_is_not_a_device_that_supports_it(
-    composed, monkeypatch
-):
-    """A raising check and a missing one are both "unknown", and unknown has to be
-    a refusal: the alternative is a region entered on a device nobody asked."""
-    install_transformer_engine(monkeypatch)
-    quantization = sys.modules["transformer_engine.pytorch.quantization"]
-    config = bench(composed, **{"precision.name": "nvfp4"})
-
-    def raises():
-        raise RuntimeError("no CUDA device")
-
-    monkeypatch.setattr(quantization, "is_nvfp4_available", raises)
-    with pytest.raises(axes.UnappliedAxis, match="raised RuntimeError"):
-        axes.step_context(config)
-
-    monkeypatch.delattr(quantization, "is_nvfp4_available")
-    with pytest.raises(axes.UnappliedAxis, match="has no is_nvfp4_available"):
-        axes.step_context(config)
-
-
-def test_without_transformer_engine_the_fp8_precisions_are_refused_as_axes(composed):
-    """What this host is, stated rather than stubbed. The refusal is `UnappliedAxis`
-    rather than an ImportError so the audit reads it as the axis declining a value
-    it cannot put into effect, and it names the recipe so a pod record says which
-    of the four call sites gave up and why."""
-    assert importlib.util.find_spec("transformer_engine") is None
-
-    for precision in ("mxfp8", "nvfp4"):
-        config = bench(composed, **{"precision.name": precision})
-        with pytest.raises(axes.UnappliedAxis, match="Transformer Engine recipe") as refusal:
-            axes.step_context(config)
-        assert "not importable here" in str(refusal.value)
-
-
-def test_bf16_still_enters_no_region_and_carries_no_recipe(composed, monkeypatch):
-    """The other half of the pair: a recipe built for every run would put an fp8
-    region around the study's baseline, and `_capture_precision` would then read
-    every bf16 run as the recipe's name."""
-    entered = install_transformer_engine(monkeypatch)
-    config = bench(composed)
-
-    built, names = axes.assemble(plain_model(), config, CPU, framework="native")
-    with axes.step_context(config):
-        pass
-
-    assert built.precision_recipe is None
-    assert "precision.name" not in names
-    assert entered == []
-
-
 # --- the last two to be wired ------------------------------------------------
 
 
@@ -4972,19 +4761,15 @@ def test_a_kind_this_site_cannot_establish_is_refused_by_name(composed):
         axes.step_context(bench(composed), required)
 
 
-def test_an_fp8_recipe_and_a_required_context_cannot_both_be_in_effect(composed):
-    """Two answers to what precision the step runs in. Nesting them would report an
-    fp8 number for a step that also ran under bf16 autocast, and the axis would
-    still read back as applied because the recipe object exists either way.
-
-    Decided on the requested precision rather than on whether the recipe can be
-    built, which is what makes it reachable on a host with no Transformer Engine —
-    asking the recipe first put this branch behind an import that fails here.
-    """
-    required = SimpleNamespace(
-        kind="autocast", device_type="cpu", dtype="bfloat16", reason="axolotl trains in autocast"
+def test_a_value_the_schema_can_no_longer_hold_is_still_refused_here(composed):
+    """`PrecisionConfig.name` is `Literal["bf16"]`, so no config built through
+    validation can carry anything else — but `step_context` reads the value rather
+    than assuming it, on the same no-silent-substitution ground the rest of this
+    module stands on. `model_construct` is the only way to hand it one; that is
+    the point, not a realistic config."""
+    config = bench(composed).model_copy(
+        update={"precision": PrecisionConfig.model_construct(name="mxfp8")}
     )
-    config = bench(composed, **{"precision.name": "mxfp8"})
 
-    with pytest.raises(axes.UnappliedAxis, match="two regimes"):
-        axes.step_context(config, required)
+    with pytest.raises(axes.UnappliedAxis, match="no region recorded here"):
+        axes.step_context(config)

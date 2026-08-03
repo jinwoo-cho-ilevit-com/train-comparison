@@ -791,8 +791,6 @@ AXIS_PACKAGES = {
     "attn/fa4": ("flash-attn",),
     "kernel/liger": ("liger-kernel",),
     "kernel/fla": ("flash-linear-attention", "causal-conv1d"),
-    "precision/mxfp8": ("transformer-engine",),
-    "precision/nvfp4": ("transformer-engine",),
     "optim/adamw_8bit": ("bitsandbytes",),
     "optim/muon": ("pytorch-optimizer",),
     "parallel/zero2": ("deepspeed",),

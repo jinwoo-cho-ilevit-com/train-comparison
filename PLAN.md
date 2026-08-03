@@ -412,7 +412,7 @@ train-comparison/
 │   ├── experiment/            # orchestrate.py가 읽는 매니페스트. defaults에 없어 합성되지 않음
 │   ├── attn/                  # sdpa, fa2, fa3, fa4, flex
 │   ├── kernel/                # none, liger, fla
-│   ├── precision/             # bf16, mxfp8, nvfp4
+│   ├── precision/             # bf16 (mxfp8/nvfp4 제거— A100은 CC 8.0, 둘 다 CC 10.x 전용)
 │   ├── compile/               # none, default, max_autotune, regional
 │   ├── optim/                 # adamw_fused, adamw_8bit, muon
 │   ├── loss/                  # mnrl, cached_mnrl
@@ -497,7 +497,7 @@ Wave 2~3에서 이 목록에 있던 `tests/test_axes.py`, `configs/experiment/`,
 
 **설계 결정**
 
-- ablation은 `bench.py model=gemma4_e2b attn=fa4 precision=mxfp8` 조합으로만 표현한다.
+- ablation은 `bench.py model=gemma4_e2b attn=fa4 freeze=ple` 조합으로만 표현한다.
   축을 추가할 때 코드를 고치면 컨벤션 위반이다
 - 상호배타 변형이 3개 이상인 축만 config group으로 만든다. 단일 플래그
   (gradient checkpointing 등)는 `train.yaml`의 필드로 둔다
@@ -574,7 +574,6 @@ CPU에서 구현·검증이 끝나는 것과 GPU가 있어야 판정되는 것�
 | 축 값 | CPU/GPU | 비고 |
 |---|---|---|
 | `kernel=liger` / `fla` | GPU 판정 | 패칭 자체는 CPU에서 확인 가능하나 커널 경로는 CUDA 전용 |
-| `precision=mxfp8` / `nvfp4` | **GPU** | Transformer Engine recipe + `step_context`. Blackwell 전용 |
 | `parallel=ddp` / `fsdp2` | GPU | 프로세스 그룹 필요 |
 | `parallel=zero2` / `zero3` + `train.offload` | **GPU** | `deepspeed.initialize`가 모델·옵티마이저·로더를 한 번에 만든다(`docs/CONTRACTS.md` §2) |
 | `dataloader=dali` / `dali_packed` | **GPU** | 하드웨어 JPEG 디코드가 이 축의 측정 대상 |
@@ -586,7 +585,7 @@ CPU에서 구현·검증이 끝나는 것과 GPU가 있어야 판정되는 것�
 - [ ] **capture probe를 같은 커밋에서 확장** — 아래 3건은 구현만으로 측정이 열리지 않는다
 - [ ] `axis-values`가 그룹당 2개 이상을 보고하는지 확인 후 Task 4 착수
 
-**capture probe 확장이 구현과 한 세트인 3건.** `applied=None`(미확인)은 불일치와
+**capture probe 확장이 구현과 한 세트인 2건.** `applied=None`(미확인)은 불일치와
 동일하게 timing 런을 차단하므로(`docs/CONTRACTS.md` §2 불변식), 구현만 하고 probe를
 두면 그 축은 **영구히 측정 불가**다.
 
@@ -594,13 +593,14 @@ CPU에서 구현·검증이 끝나는 것과 GPU가 있어야 판정되는 것�
 |---|---|---|
 | `optim=adamw_8bit` | `_capture_optim`이 클래스명을 `kind.lower()`로 돌려준다 → `AdamW8bit` → `"adamw8bit"` | config 값 `adamw_8bit`와 철자가 다르다. `_REQUESTED_OVERRIDES`나 capture 쪽에서 맞춰야 영구 불일치가 안 된다 |
 | `train.offload` | deepspeed 아래에서는 **의도적으로** undetermined (`_capture_offload` docstring) | deepspeed config를 읽어내는 경로가 없으면 offload는 켜자마자 차단된다 |
-| `precision=mxfp8` / `nvfp4` | fp8 recipe는 weight가 아니라 step 안에서 캐스팅하므로 파라미터로 읽을 수 없다 → undetermined | recipe 객체에서 읽어내는 probe가 필요하다 |
 
 `train.gradient_checkpointing=selective`도 같은 형태였으나 **양쪽 다 랜딩됐다**
 (`axes.py`의 `create_selective_checkpoint_contexts` + `_capture_gradient_checkpointing`이
 `context_fn`이 실어나르는 **정책의 동일성**으로 `full`과 구분한다 — `context_fn`의 존재
 자체는 근거가 아니다. 같은 팩토리로 만든 남의 정책은 `none`이나 `full`의 backward를
-`selective` 라벨 아래 넣으므로 undetermined로 거부된다). 남은 것은 위 3건이다.
+`selective` 라벨 아래 넣으므로 undetermined로 거부된다). 남은 것은 위 2건이다.
+`precision=mxfp8`/`nvfp4`도 같은 형태였으나 Transformer Engine 의존성째 제거됐다 — A100
+(CC 8.0)에서는 둘 다(CC 10.x 전용) 원리적으로 열릴 수 없었다.
 
 ### Task 4 — Phase 2 ablation (B200, 12~18 pod 병렬)
 

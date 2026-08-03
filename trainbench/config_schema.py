@@ -181,7 +181,7 @@ class KernelConfig(Strict):
 
 
 class PrecisionConfig(Strict):
-    name: Literal["bf16", "mxfp8", "nvfp4"] = Axis()
+    name: Literal["bf16"] = Axis()
 
 
 class CompileConfig(Strict):

@@ -160,8 +160,8 @@
     },
     {
       "axis": "precision.name",
-      "requested": "mxfp8",
-      "applied": "mxfp8",
+      "requested": "bf16",
+      "applied": "bf16",
       "owner": null,
       "state": "applied",
       "determined": true,
@@ -169,7 +169,7 @@
       "detail": {
         "base": {"bf16": 508},
         "adapter": {"fp32": 224},
-        "recipe": "MXFP8BlockScaling"
+        "recipe_modules": []
       }
     },
     {

@@ -8,8 +8,8 @@ requires-python = ">=3.13,<3.14"
 # This env carries the ablation packages because the ablation runs here: every
 # phase2 manifest in configs/experiment/ sets `framework: native`. A framework
 # image gets an axis package only when its own default path needs it, which keeps
-# five of the six images off the CUDA source builds below (deepspeed and
-# transformer-engine-torch; the multi-hour one, flash-attn, is prebuilt now).
+# five of the six images off the CUDA source build below (deepspeed; flash-attn,
+# the multi-hour one, is prebuilt now).
 dependencies = [
     "trainbench[native]",
     # attn/fa2, attn/fa3, attn/fa4. Pinned exactly because the wheel installed for
@@ -24,11 +24,6 @@ dependencies = [
     # now, which meant the axis was offered to a native run that could not do it.
     "liger-kernel>=0.6",
     "kernels>=0.10",
-    # precision/mxfp8, precision/nvfp4. The bare `transformer-engine` distribution
-    # is a shim whose entire content sits behind extras, so installing it without
-    # them would satisfy a name check and provide no kernels. core-cu13 matches
-    # the CUDA 13 base image and the cu130 torch index.
-    "transformer-engine[core-cu13,pytorch]>=2.17",
     # optim/adamw_8bit and peft/qlora. Was in 2 of 6 envs, never in this one.
     "bitsandbytes>=0.48",
     # optim/muon
@@ -51,8 +46,8 @@ dependencies = [
 # isolation cannot work for it, hence no-build-isolation-package below — and that
 # ban means the environment itself has to supply the build dependencies. The image
 # installs this group first for exactly that reason.
-# causal-conv1d and transformer-engine-torch declare torch in build-system.requires
-# and so build under isolation unaided; they are left alone.
+# causal-conv1d declares torch in build-system.requires and so builds under
+# isolation unaided; it is left alone.
 build = ["torch", "setuptools>=77", "packaging", "wheel", "ninja"]
 
 [tool.uv]
