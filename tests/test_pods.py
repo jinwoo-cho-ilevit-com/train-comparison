@@ -1363,11 +1363,19 @@ def test_a_measuring_pod_that_names_no_gpu_is_refused():
 
 
 def test_the_shipped_manifests_pass_both_guards():
-    """A guard nothing exercises is a guard nobody has read the output of."""
+    """A guard nothing exercises is a guard nobody has read the output of.
+
+    One cohort, one GPU — asserted as the invariant rather than as the name of
+    whichever GPU the campaign currently uses. Naming it made a GPU decision look
+    like a regression: the 2026-08-03 move off B200 (mxfp8/nvfp4 and fa4 dropped,
+    so Blackwell offered nothing) failed here while both guards passed.
+    """
     experiments = orchestrate.load_experiments()
     measured = [e for e in experiments if e.baseline != orchestrate.NO_BASELINE]
     assert measured, "no manifest produces a number for the GPU cohort rule to hold together"
-    assert {e.gpu_type_id for e in measured} == {"NVIDIA B200"}
+    cohort = {e.gpu_type_id for e in measured}
+    assert len(cohort) == 1, f"one baseline, two GPU types: {sorted(cohort)}"
+    assert None not in cohort
     assert any(orchestrate.axes_touched(e) for e in experiments), "no manifest moves an axis"
 
 

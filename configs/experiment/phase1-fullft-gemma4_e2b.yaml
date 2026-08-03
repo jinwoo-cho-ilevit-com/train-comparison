@@ -1,0 +1,26 @@
+# Phase 1 pod: does gemma-4-E2B full finetuning fit one A100, and does the
+# measurement path run at all?
+#
+# The Phase 0 probe answered neither, and it could not have. `probe/steps.py`
+# ends its step at `loss.backward()` and `model.zero_grad()` — it never calls
+# `optimizer.step()`, so AdamW's lazily allocated state (5.1B params x 8 bytes)
+# and the fp32 master copy (x 4) have never existed on a pod. What the probe
+# proved is weights plus gradients, roughly 20GB of the ~82GB a full step needs.
+# It also records no peak GPU memory. PLAN.md scheduled this check on B200; an
+# A100 answers it for a quarter of the price, and an OOM is as useful as a fit.
+#
+# The second question is the measurement harness itself: no timing run has ever
+# executed on a pod, so the timer, the metrics block and the canonical baseline's
+# 3% deviation gate are all unexercised. This pod runs the baseline as well, which
+# is what makes it exercise them.
+phase: phase1
+description: gemma-4-E2B full finetuning on one A100 — does it fit, and does the timer run
+model: gemma4_e2b
+framework: native
+run: timing
+gpu_type_id: NVIDIA A100-SXM4-80GB
+baseline: canonical
+# Explicit rather than inherited. `peft=full` is what this pod exists to test, and
+# a default that moves would silently change the question.
+overrides:
+  - peft=full

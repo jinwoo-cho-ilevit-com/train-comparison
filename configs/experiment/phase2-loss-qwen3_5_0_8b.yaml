@@ -8,7 +8,10 @@ description: MNRL against cached MNRL (GradCache) on Qwen3.5-0.8B
 model: qwen3_5_0_8b
 framework: native
 run: timing
-gpu_type_id: NVIDIA B200
+# A100 rather than B200. The campaign gave up `precision=mxfp8`/`nvfp4` and
+# `attn=fa4`, which were everything Blackwell offered here, and one baseline may
+# not span two GPU types (`orchestrate.check_one_baseline_one_gpu`).
+gpu_type_id: NVIDIA A100-SXM4-80GB
 baseline: canonical
 axis: loss
 # Not part of the comparison, and not optional either. transformers binds fla
