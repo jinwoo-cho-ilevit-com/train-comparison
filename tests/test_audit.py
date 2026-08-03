@@ -506,6 +506,47 @@ def test_a_harness_that_never_calls_the_loss_it_built_is_reported(tmp_path, monk
     assert "computes loss outside built.loss_fn" in result.detail
 
 
+def test_a_step_runner_whose_framework_declares_no_loss_ownership_is_reported(
+    tmp_path, monkeypatch
+):
+    """The framework-owned-loss exemption is derived from two facts, and the second
+    one is the load-bearing half.
+
+    Presence in `FRAMEWORK_OWNED_STEP_RUNNERS` is an edit to `scripts/bench.py`;
+    `owned_axes` in `trainbench/loader.py` is what `applied._owned` acts on when it
+    exempts `loss.name` from the capture. A framework registered without that
+    declaration returns a loss nothing certified while `capture` reads the requested
+    value off a `built.loss_fn` the runner never called — the exact mislabel this
+    check exists to catch, and an exemption keyed on registry membership alone would
+    wave it through.
+
+    The real entry point either way, with only the declaration swapped, so the pass
+    and the failure differ in one fact and nothing else.
+    """
+    source = audit_plan.BENCH_ENTRY_POINT.read_text()
+    assert audit_plan.STEP_RUNNER_REGISTRY in source, "the entry point registers no step runner"
+    monkeypatch.setattr(audit_plan, "REPO", tmp_path)
+    monkeypatch.setattr(audit_plan, "BENCH_ENTRY_POINT", _entry_point(tmp_path, source))
+
+    def declaring(name, axis):
+        path = tmp_path / f"{name}.py"
+        path.write_text(f'Adapter(name="tevatron", owned_axes={{"{axis}": "because"}})\n')
+        return path
+
+    monkeypatch.setattr(
+        audit_plan, "ADAPTER_SOURCE", declaring("declares", audit_plan.OWNED_LOSS_AXIS)
+    )
+    assert audit_plan.CHECKS["assert-called"]().ok
+
+    monkeypatch.setattr(
+        audit_plan, "ADAPTER_SOURCE", declaring("silent", "parallel.cross_device_negatives")
+    )
+    result = audit_plan.CHECKS["assert-called"]()
+
+    assert not result.ok
+    assert "computes loss outside built.loss_fn" in result.detail
+
+
 def test_a_harness_that_binds_no_loss_from_the_built_one_is_reported(tmp_path, monkeypatch):
     """The other half of the same hole, and the one the hooks hide best: every
     named call is there, and the loss is another function's from the first line.

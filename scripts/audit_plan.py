@@ -473,6 +473,59 @@ ENTRY_POINT_CALLS = ("patch", "load_kwargs", "assemble", "step_context", "assert
 LOSS_BINDING = "loss"
 BUILT_LOSS = "loss_fn"
 
+# The one legitimate way a `loss` binding in the entry point does not read
+# `built.loss_fn`: a framework whose own forward computes it. Two facts have to
+# agree before that is exempt below — the entry point's registry names the
+# framework, and the adapter declares it owns the axis. The registry is an edit;
+# the declaration is what is true about the framework, and it is what
+# `applied._owned` acts on when it exempts the axis from the capture.
+STEP_RUNNER_REGISTRY = "FRAMEWORK_OWNED_STEP_RUNNERS"
+OWNED_LOSS_AXIS = "loss.name"
+ADAPTER_DECLARATION = "Adapter"
+OWNED_AXES_FIELD = "owned_axes"
+# Read as source next to the entry point, not imported: this check is an AST walk
+# over a file it is handed, and the declaration has to be pointable somewhere else
+# the same way `BENCH_ENTRY_POINT` is.
+ADAPTER_SOURCE = REPO / "trainbench" / "loader.py"
+
+
+def _frameworks_declaring_loss_ownership(path: Path) -> set[str]:
+    """Every adapter in `path` whose `owned_axes` claims it computes the loss itself.
+
+    Read off the `Adapter(...)` declarations rather than a list here, for
+    `applied.py`'s reason: a hand-written list fails open, and an adapter missing
+    from it would read as exempt instead of as undeclared.
+    """
+    try:
+        tree = ast.parse(path.read_text())
+    except (OSError, SyntaxError):
+        return set()
+    owners: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or getattr(node.func, "id", None) != ADAPTER_DECLARATION:
+            continue
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+        name, owned = keywords.get("name"), keywords.get(OWNED_AXES_FIELD)
+        if not isinstance(name, ast.Constant) or not isinstance(owned, ast.Dict):
+            continue
+        declared = {key.value for key in owned.keys if isinstance(key, ast.Constant)}
+        if OWNED_LOSS_AXIS in declared:
+            owners.add(name.value)
+    return owners
+
+
+def _registered_step_runner_frameworks(tree: ast.AST) -> set[str]:
+    """The framework names `STEP_RUNNER_REGISTRY` maps to a runner, off its literal."""
+    registered: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign | ast.AnnAssign) or not isinstance(node.value, ast.Dict):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(isinstance(t, ast.Name) and t.id == STEP_RUNNER_REGISTRY for t in targets):
+            continue
+        registered |= {key.value for key in node.value.keys if isinstance(key, ast.Constant)}
+    return registered
+
 
 def _loss_bindings(path: Path) -> tuple[list[int], bool]:
     """`(lines binding `loss` from something other than `.loss_fn`, was it used)`.
@@ -482,6 +535,15 @@ def _loss_bindings(path: Path) -> tuple[list[int], bool]:
     outside the timed window and calls that, so a name whose value was derived from
     `.loss_fn` counts as the same object. Everything else binding `loss` is a loss
     the run computed for itself under a label `capture` certified off `built.loss_fn`.
+
+    One exemption, and it is derived rather than declared here: a loss returned by
+    something the entry point read out of `STEP_RUNNER_REGISTRY` is a framework's
+    own, and only if every framework in that registry has declared
+    `OWNED_LOSS_AXIS` in `ADAPTER_SOURCE`. A framework added to the registry that
+    declares nothing leaves the binding flagged, which is the point — the check
+    would otherwise wave through exactly the uncertified loss it exists to catch.
+    Kept out of `derived`: an exempt binding suppresses `stray`, and it is not
+    evidence that `built.loss_fn` was consumed, so `used` still has to be earned.
     """
     try:
         tree = ast.parse(path.read_text())
@@ -507,6 +569,25 @@ def _loss_bindings(path: Path) -> tuple[list[int], bool]:
             isinstance(child, ast.Name) and child.id in derived for child in ast.walk(value)
         )
 
+    registered = _registered_step_runner_frameworks(tree)
+    exempt: set[str] = set()
+    if registered and registered <= _frameworks_declaring_loss_ownership(ADAPTER_SOURCE):
+        exempt = {
+            target.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign | ast.AnnAssign)
+            and node.value is not None
+            and any(
+                isinstance(child, ast.Name) and child.id == STEP_RUNNER_REGISTRY
+                for child in ast.walk(node.value)
+            )
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            if isinstance(target, ast.Name)
+        }
+
+    def from_a_framework_owned_runner(value: ast.expr) -> bool:
+        return any(isinstance(child, ast.Name) and child.id in exempt for child in ast.walk(value))
+
     stray: list[int] = []
     used = False
     for node in ast.walk(tree):
@@ -517,7 +598,7 @@ def _loss_bindings(path: Path) -> tuple[list[int], bool]:
             continue
         if from_built_loss(node.value):
             used = True
-        else:
+        elif not from_a_framework_owned_runner(node.value):
             stray.append(node.lineno)
     return sorted(stray), used
 
