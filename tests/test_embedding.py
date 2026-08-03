@@ -11,7 +11,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from trainbench.embedding import align_padding_side, info_nce, last_token_pool
+from trainbench.embedding import (
+    align_padding_side,
+    assert_padding_conforms,
+    info_nce,
+    last_token_pool,
+    padding_preverified,
+)
 
 # Positions 0..3 are distinguishable, so a wrong index is visible in the value.
 HIDDEN = torch.tensor([[[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]]])
@@ -163,3 +169,91 @@ def test_info_nce_is_lower_when_pairs_align():
     shuffled = torch.eye(4).flip(0)
 
     assert info_nce(aligned, aligned, 0.02) < info_nce(aligned, shuffled, 0.02)
+
+
+# --- padding_preverified: the host-sync guard, proved once instead of per call ---
+
+
+def _watch_for_host_reads(monkeypatch) -> dict:
+    """Patch the two primitives `assert_padding_conforms` calls to raise if used,
+    so a test can prove a code path never reaches them rather than trusting that
+    it doesn't."""
+    tripped: dict = {"bool": False, "equal": False}
+    orig_bool = torch.Tensor.__bool__
+    orig_equal = torch.equal
+
+    def patched_bool(self):
+        tripped["bool"] = True
+        return orig_bool(self)
+
+    def patched_equal(a, b):
+        tripped["equal"] = True
+        return orig_equal(a, b)
+
+    monkeypatch.setattr(torch.Tensor, "__bool__", patched_bool)
+    monkeypatch.setattr(torch, "equal", patched_equal)
+    return tripped
+
+
+def test_last_token_pool_reads_the_mask_back_by_default(monkeypatch):
+    """The guard this whole fix is about: the two host-syncing primitives really
+    do run on every call outside `padding_preverified()` — the behaviour every
+    caller had before this change and every caller still has unless it opens the
+    block explicitly."""
+    tripped = _watch_for_host_reads(monkeypatch)
+    mask = torch.tensor([[1, 1, 0, 0]])
+
+    last_token_pool(HIDDEN, mask, padding_side="right")
+
+    assert tripped["bool"] and tripped["equal"]
+
+
+def test_padding_preverified_skips_the_host_read_and_still_pools_correctly(monkeypatch):
+    """Inside the block, neither primitive runs, and the pooled result is
+    unchanged — the block changes what is proved and when, not what is computed."""
+    tripped = _watch_for_host_reads(monkeypatch)
+    mask = torch.tensor([[1, 1, 0, 0]])
+
+    with padding_preverified():
+        pooled = last_token_pool(HIDDEN, mask, padding_side="right")
+
+    assert not tripped["bool"] and not tripped["equal"]
+    assert torch.equal(pooled, torch.tensor([[2.0, 2.0]]))
+
+
+def test_padding_preverified_resets_after_the_block_even_on_a_raise():
+    """A leaked `True` would make every later call in the same process — a
+    different test, a different config's real defect — skip the check that
+    exists to stop it."""
+    with pytest.raises(RuntimeError):
+        with padding_preverified():
+            raise RuntimeError("boom")
+
+    with pytest.raises(ValueError, match="not right-padded"):
+        last_token_pool(HIDDEN, torch.tensor([[0, 0, 1, 1]]), padding_side="right")
+
+
+def test_assert_padding_conforms_refuses_an_all_padding_row():
+    """The same defect `last_token_pool` refuses, exercised directly: this is
+    the function `scripts/bench.py::validate_padding_before_timing` calls once
+    over the whole dataset instead of once per micro-batch."""
+    mask = torch.tensor([[1, 1, 0, 0], [0, 0, 0, 0]]).bool()
+    lengths = mask.sum(dim=1)
+
+    with pytest.raises(ValueError, match="no attended token"):
+        assert_padding_conforms(mask, lengths, padding_side="right")
+
+
+def test_assert_padding_conforms_refuses_a_mask_on_the_wrong_side():
+    mask = torch.tensor([[0, 0, 1, 1]]).bool()
+    lengths = mask.sum(dim=1)
+
+    with pytest.raises(ValueError, match="not right-padded"):
+        assert_padding_conforms(mask, lengths, padding_side="right")
+
+
+def test_assert_padding_conforms_passes_conforming_batches_silently():
+    mask = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]).bool()
+    lengths = mask.sum(dim=1)
+
+    assert assert_padding_conforms(mask, lengths, padding_side="right") is None

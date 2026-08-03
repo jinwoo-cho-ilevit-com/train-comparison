@@ -34,7 +34,7 @@ from typing import Any
 import pytest
 import torch
 
-from trainbench import axes, collate, kernels
+from trainbench import axes, collate, embedding, kernels, metrics
 from trainbench.applied import AppliedMismatch, Built, assert_matches, capture
 
 from .conftest import REPO_ROOT
@@ -329,6 +329,166 @@ def test_the_data_pipeline_is_inside_the_timed_window(probe_config):
     assert summary["samples_per_second"] <= summary["samples_per_step"] / delay
 
 
+def test_no_host_read_happens_inside_the_timed_window(probe_config, monkeypatch):
+    """Mechanical proof for the padding-sync fix, not prose: nothing inside
+    `with timer:` may read a device tensor into Python (`train()`'s own
+    docstring, AGENTS.md's measurement rules). `last_token_pool` used to violate
+    this on every micro-batch via `bool((lengths > 0).all())` and
+    `torch.equal(mask, expected)` — both force a host read — and both are still
+    exactly what runs when `padding_preverified()` is bypassed, which the second
+    half of this test proves by sabotage rather than by re-reading the diff.
+    """
+    watch = {"active": False}
+    orig_enter = metrics.StepTimer.__enter__
+    orig_exit = metrics.StepTimer.__exit__
+
+    def patched_enter(self):
+        result = orig_enter(self)
+        watch["active"] = True
+        return result
+
+    def patched_exit(self, *exc):
+        watch["active"] = False
+        return orig_exit(self, *exc)
+
+    monkeypatch.setattr(metrics.StepTimer, "__enter__", patched_enter)
+    monkeypatch.setattr(metrics.StepTimer, "__exit__", patched_exit)
+
+    orig_bool = torch.Tensor.__bool__
+
+    def patched_bool(self):
+        if watch["active"]:
+            raise RuntimeError("host read (Tensor.__bool__) happened inside the timed window")
+        return orig_bool(self)
+
+    monkeypatch.setattr(torch.Tensor, "__bool__", patched_bool)
+
+    orig_equal = torch.equal
+
+    def patched_equal(a, b):
+        if watch["active"]:
+            raise RuntimeError("host read (torch.equal) happened inside the timed window")
+        return orig_equal(a, b)
+
+    monkeypatch.setattr(torch, "equal", patched_equal)
+
+    # With the fix in place: these batches are already well-formed (as anything
+    # `trainbench/collate.py` would have produced), so `train()` opens
+    # `padding_preverified()` unconditionally and `last_token_pool` takes that
+    # branch throughout, reading nothing back.
+    bench_entry.train(
+        built_with(TinyEmbedder(), probe_config),
+        list(padded_batches(2, count=8)),
+        probe_config,
+        CPU,
+    )
+
+    # Sabotage: make `padding_preverified()` a no-op, as if this fix did not
+    # exist. `last_token_pool` then falls back to the per-call host-sync guard on
+    # every micro-batch, and the same instrumented run above must now catch it —
+    # otherwise this test would not actually be checking anything.
+    class _NeverPreverified:
+        def get(self):
+            return False
+
+        def set(self, value):
+            return None
+
+        def reset(self, token):
+            pass
+
+    monkeypatch.setattr(embedding, "_PADDING_PREVERIFIED", _NeverPreverified())
+
+    with pytest.raises(RuntimeError, match="host read"):
+        bench_entry.train(
+            built_with(TinyEmbedder(), probe_config),
+            list(padded_batches(2, count=8)),
+            probe_config,
+            CPU,
+        )
+
+
+class _AllPaddingRowProcessor(FakeProcessor):
+    """A processor whose first row is always entirely padding — every mask this
+    builds has nothing for `last_token_pool` to pool at that row."""
+
+    def __call__(self, *args, **kwargs):
+        encoded = super().__call__(*args, **kwargs)
+        if "attention_mask" in encoded:
+            encoded["attention_mask"][0, :] = 0
+        return encoded
+
+
+class _WrongSideMaskProcessor(FakeProcessor):
+    """A processor that pads its first row on the side `padding_side` did not
+    declare — content at the front instead of the back, the shape a tokeniser
+    that silently flipped sides would produce."""
+
+    def __call__(self, *args, **kwargs):
+        encoded = super().__call__(*args, **kwargs)
+        mask = encoded.get("attention_mask")
+        if mask is not None:
+            row = mask[0]
+            length = int(row.sum())
+            width = row.numel()
+            mask[0] = torch.tensor([0] * (width - length) + [1] * length)
+        return encoded
+
+
+def test_the_run_still_stops_on_an_all_padding_row_now_that_collate_checks_it(
+    config_mapping,  # noqa: F811
+):
+    """The guard moved from a pre-pass in `scripts/bench.py` into
+    `trainbench/collate.py`, where the mask is built — this is the mutation
+    evidence that the move did not lose the guard. `harness_loader` wires a real
+    `built.dataloader` through `collate.build_collate`, so `train()`'s first
+    `next(stream)` calls the real `Collate.__call__` on real rows."""
+    config = axis_config(config_mapping)
+    built = harness_loader(
+        config, _AllPaddingRowProcessor(accepts_images=False), source=text_only(8)
+    )
+
+    with pytest.raises(ValueError, match="no attended token"):
+        bench_entry.train(built, built.dataloader, config, CPU)
+
+
+def test_the_run_still_stops_on_a_wrongly_padded_mask_now_that_collate_checks_it(
+    config_mapping,  # noqa: F811
+):
+    config = axis_config(config_mapping)
+    # Deliberately different lengths: flipping row 0 onto the wrong side only
+    # changes anything (and so only exercises the check) when its own content is
+    # shorter than the batch's longest row and therefore actually carries padding.
+    uneven_rows = collate.PairDataset(
+        [
+            {"qry": "a", "pos_text": "a"},
+            {"qry": "abcdefghij", "pos_text": "abcdefghij"},
+        ]
+    )
+    built = harness_loader(
+        config, _WrongSideMaskProcessor(accepts_images=False), source=uneven_rows
+    )
+
+    with pytest.raises(ValueError, match="not right-padded"):
+        bench_entry.train(built, built.dataloader, config, CPU)
+
+
+def test_pretokenized_collate_still_stops_on_an_empty_sequence(config_mapping):  # noqa: F811
+    """`PretokenizedCollate` builds its mask directly from each sequence's own
+    length (`trainbench/collate.py::PretokenizedCollate.__call__`), which rules
+    out a wrong-side mask by construction — the one defect construction alone
+    does not rule out is an empty sequence, which pads its whole row."""
+    config = axis_config(config_mapping, pretokenize=True)
+    processor = FakeProcessor(accepts_images=False)
+    rows_with_one_empty = [
+        {"input_ids": [], "positive_input_ids": [1, 2, 3], "images_dropped": 0},
+        {"input_ids": [4, 5], "positive_input_ids": [6, 7], "images_dropped": 0},
+    ]
+
+    with pytest.raises(ValueError, match="no attended token"):
+        collate.build_collate(processor, config)(rows_with_one_empty)
+
+
 def test_grad_accum_consumes_distinct_micro_batches(config_mapping):  # noqa: F811
     """Accumulation over one batch repeated N times gives identical sequence
     lengths, identical padding and a warm cache, and nothing in the result JSON
@@ -356,7 +516,12 @@ def test_grad_accum_consumes_distinct_micro_batches(config_mapping):  # noqa: F8
 
     bench_entry.train(built_with(TinyEmbedder(), config), CountingLoader(), config, CPU)
 
-    assert served == [0, 1, 2, 3, 4, 5]
+    # `validate_padding_before_timing` reads the whole loader once, before any
+    # timer opens, so the six rows are served twice: once for that pass, once for
+    # the six draws these settings need (`steps=2 * grad_accum=3`). What this test
+    # asserts about is the second pass, which is what the measured loop actually
+    # consumed — the last six served indices, in order and each exactly once.
+    assert served[-6:] == [0, 1, 2, 3, 4, 5]
 
 
 def test_the_loop_does_not_spin_on_a_loader_that_yields_nothing(probe_config):

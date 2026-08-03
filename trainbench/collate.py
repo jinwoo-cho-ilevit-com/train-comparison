@@ -18,6 +18,7 @@ import torch
 
 from trainbench import axes
 from trainbench.config_schema import BenchConfig
+from trainbench.embedding import assert_padding_conforms
 from trainbench.probe import steps
 from trainbench.prompt import format_prompt
 
@@ -335,6 +336,15 @@ class Collate:
                 "processor's pixel budget) rather than measuring a truncated multimodal batch."
             )
 
+        # Here, not in the training step: this is where `attention_mask` is built,
+        # on CPU, in the DataLoader worker — validating it costs nothing beyond
+        # constructing the batch the run needed anyway. `scripts/bench.py::train()`
+        # opens `embedding.padding_preverified()` around its loop on exactly that
+        # premise: every batch reaching it already passed through here first.
+        mask = encoded["attention_mask"].bool()
+        lengths = mask.sum(dim=1)
+        assert_padding_conforms(mask, lengths, padding_side=self.config.model.padding_side)
+
         return MicroBatch(
             tensors=dict(encoded),
             tokens=int(encoded["attention_mask"].sum()),
@@ -568,6 +578,16 @@ class PretokenizedCollate:
             )
             input_ids[index, span] = sequence.to(torch.long)
             attention_mask[index, span] = 1
+
+        # Same guard as `Collate.__call__`, for the same reason: this is where
+        # the mask is built. An empty `input_ids`/`positive_input_ids` list (a
+        # length-0 sequence) pads its whole row here, and the span assignment
+        # above places it correctly by construction on every non-empty row — the
+        # check is what catches the one case construction alone does not rule out.
+        mask = attention_mask.bool()
+        lengths = mask.sum(dim=1)
+        assert_padding_conforms(mask, lengths, padding_side=self.padding_side)
+
         return MicroBatch(
             tensors={"input_ids": input_ids, "attention_mask": attention_mask},
             tokens=int(attention_mask.sum()),

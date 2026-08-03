@@ -11,6 +11,8 @@ and the measurement harness needs it as much as the probe does.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 from typing import Any
 
 import torch
@@ -18,36 +20,72 @@ import torch.nn.functional as F
 
 PADDING_SIDES = ("left", "right")
 
+# Set only by `padding_preverified()`, read only by `last_token_pool`. A
+# ContextVar rather than a plain module global so the state cannot leak across an
+# unrelated call stack sharing the interpreter (a probe run, a future async
+# harness) — it is scoped to the block that set it and nothing outside that block
+# observes it.
+_PADDING_PREVERIFIED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_PADDING_PREVERIFIED", default=False
+)
 
-def last_token_pool(
-    hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor,
-    *,
-    padding_side: str,
-) -> torch.Tensor:
-    """Embedding = last non-padded position, the convention these decoder-based
-    embedding models are trained with.
 
-    hidden_states: (batch, seq, dim), attention_mask: (batch, seq).
+@contextlib.contextmanager
+def padding_preverified() -> Any:
+    """Skip `last_token_pool`'s per-call host-sync guard for the duration of this block.
 
-    `padding_side` comes from `model.padding_side` (config), not from `arch`: only
-    gemma-4 pads left, and branching on the architecture would hide that fact from
-    whoever reads this function. It has no default — the earlier version assumed
-    right padding while claiming to handle both, and returned position 1 instead of
-    3 for the mask [0,0,1,1]. A default would let that mistake back in silently.
+    Safe only when every batch pooled inside this block already had its
+    `attention_mask` proved by `assert_padding_conforms` somewhere upstream of
+    here. `trainbench/collate.py`'s `Collate.__call__` and
+    `PretokenizedCollate.__call__` are that proof: both call it right after
+    building the mask, on CPU, in the DataLoader worker process — before the
+    batch ever reaches `scripts/bench.py::train()`'s loop, let alone `to_device`
+    or the timer. Nothing separate has to run first and nothing has to assume
+    anything about how the loader orders or shuffles rows: every `MicroBatch`
+    those two collates hand out has already passed. `last_token_pool` still
+    computes `mask`/`lengths` inside this block (pooling needs them); it only
+    stops reading either of them back into Python, because collate already did.
 
-    The mask is checked against the declared side rather than trusted. Both
-    branches used to pool a PAD position, silently and without an exception, when
-    the tokeniser padded the other way: right pooled `sum-1`, which for [0,0,1,1]
-    is a PAD, and left read the last column, which for [1,1,0,0] is a PAD. Nothing
-    downstream can tell a PAD embedding from a real one, so the disagreement has
-    to stop the run here.
+    A caller that pools a batch which did **not** come through one of those two
+    collates — `trainbench/probe/steps.py::encode`'s direct calls with a
+    hand-built batch, or any future caller — must not open this block: nothing
+    upstream of it has run the guard, and `last_token_pool`'s own per-call check
+    is what still protects it. This block is for `train()`'s loop alone, which is
+    the one caller whose batches are known to come from `build_collate`.
+
+    This is the trade this repository accepted rather than a nameless async
+    assert: `torch._assert_async`'s own docs warn a failed one "will trash your
+    CUDA context" and say plainly it is "NOT intended to be used for regular error
+    checking" — an unsuitable price for a guard whose whole purpose is a readable
+    stop.
     """
-    if padding_side not in PADDING_SIDES:
-        raise ValueError(f"padding_side must be 'left' or 'right', got {padding_side!r}")
+    token = _PADDING_PREVERIFIED.set(True)
+    try:
+        yield
+    finally:
+        _PADDING_PREVERIFIED.reset(token)
 
-    mask = attention_mask.bool()
-    lengths = mask.sum(dim=1)
+
+def assert_padding_conforms(
+    mask: torch.Tensor, lengths: torch.Tensor, *, padding_side: str
+) -> None:
+    """Host-syncing guard: an all-padding row, or a mask that disagrees with
+    `padding_side`, would otherwise be pooled at a PAD position with nothing
+    downstream able to tell.
+
+    Split out of `last_token_pool` so it can be called where the mask is
+    actually built — `trainbench/collate.py`'s `Collate.__call__` and
+    `PretokenizedCollate.__call__` both call it on CPU, in the DataLoader
+    worker, as part of constructing the batch the run needed anyway — instead
+    of once per micro-batch inside the timed window: `bool((lengths > 0).all())`
+    and `torch.equal(mask, expected)` both return a Python bool, and both force a
+    blocking device-to-host copy every time they run on a device tensor.
+
+    `mask`/`lengths` are taken as already computed (`attention_mask.bool()`,
+    `mask.sum(dim=1)`) rather than recomputed here: `last_token_pool` needs both
+    either way, for pooling as much as for this check, so there is one place they
+    are derived from the mask instead of two that could disagree.
+    """
     if not bool((lengths > 0).all()):
         empty = (lengths == 0).nonzero().flatten().tolist()
         raise ValueError(
@@ -67,6 +105,52 @@ def last_token_pool(
             f"padding_side={padding_side!r} came from config.model.padding_side while the "
             "tokeniser padded the other way, and pooling would have returned a PAD embedding."
         )
+
+
+def last_token_pool(
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    padding_side: str,
+) -> torch.Tensor:
+    """Embedding = last non-padded position, the convention these decoder-based
+    embedding models are trained with.
+
+    hidden_states: (batch, seq, dim), attention_mask: (batch, seq).
+
+    `padding_side` comes from `model.padding_side` (config), not from `arch`: only
+    gemma-4 pads left, and branching on the architecture would hide that fact from
+    whoever reads this function. It has no default — the earlier version assumed
+    right padding while claiming to handle both, and returned position 1 instead of
+    3 for the mask [0,0,1,1]. A default would let that mistake back in silently.
+
+    The mask is checked against the declared side rather than trusted — unless
+    `padding_preverified()` is currently open, in which case `assert_padding_conforms`
+    is skipped and this call reads no device tensor into Python at all. Both
+    branches used to pool a PAD position, silently and without an exception, when
+    the tokeniser padded the other way: right pooled `sum-1`, which for [0,0,1,1]
+    is a PAD, and left read the last column, which for [1,1,0,0] is a PAD. Nothing
+    downstream can tell a PAD embedding from a real one, so the disagreement has
+    to stop the run.
+
+    Checked by default rather than only when a caller opts in, because most
+    callers have no upstream proof to lean on: `trainbench/probe/steps.py::encode`
+    is called directly against a hand-built probe batch, and neither `tevatron`
+    nor `sentence_transformers` reaches this function at all (they pool inside
+    their own forward). `scripts/bench.py::train()`'s loop is the one caller whose
+    batches are provably already checked — `trainbench/collate.py`'s
+    `Collate`/`PretokenizedCollate` ran `assert_padding_conforms` while building
+    each mask — and it is the only place that opens `padding_preverified()` (see
+    that function's docstring). Every other caller, present or future, gets the
+    check by default rather than having to remember to ask for it.
+    """
+    if padding_side not in PADDING_SIDES:
+        raise ValueError(f"padding_side must be 'left' or 'right', got {padding_side!r}")
+
+    mask = attention_mask.bool()
+    lengths = mask.sum(dim=1)
+    if not _PADDING_PREVERIFIED.get():
+        assert_padding_conforms(mask, lengths, padding_side=padding_side)
 
     if padding_side == "right":
         # Padding sits after the content, so the last attended index is length - 1.

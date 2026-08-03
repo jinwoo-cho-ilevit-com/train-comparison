@@ -32,6 +32,7 @@ from trainbench.metrics import (
     reset_peak_memory,
     stdev,
     summarise,
+    synchronize,
     training_verdict,
 )
 from trainbench.metrics.validity import _NORM_CHUNK_ELEMENTS
@@ -153,6 +154,45 @@ def test_the_timer_times_warmup_steps_too():
 
     assert summary["steps_timed"] == 5
     assert summary["steps_measured"] == 3
+
+
+def test_synchronize_is_a_no_op_on_cpu():
+    """CPU ops are synchronous already; there is nothing to wait for."""
+    synchronize(CPU)
+
+
+def test_synchronize_dispatches_to_the_matching_accelerator(monkeypatch):
+    """`device.type == 'cuda'` used to be the only branch here, which silently
+    no-opped on `mps` — this is the fix: any accelerator this process actually
+    has gets a real wait, through the one device-agnostic call."""
+    calls = []
+    fake_device = torch.device("mps")
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: fake_device)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda d: calls.append(d))
+
+    synchronize(fake_device)
+
+    assert calls == [fake_device]
+
+
+def test_synchronize_refuses_a_device_it_cannot_actually_wait_for(monkeypatch):
+    """A mismatch between `device` and the process's real accelerator would
+    otherwise either no-op or wait on the wrong device — both report a
+    wall-clock number under a device-measurement label, which `StepTimer` must
+    not do."""
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("mps"))
+
+    with pytest.raises(RuntimeError, match="cannot synchronize"):
+        synchronize(torch.device("cuda"))
+
+
+def test_synchronize_refuses_a_device_when_no_accelerator_is_available(monkeypatch):
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="cannot synchronize"):
+        synchronize(torch.device("cuda"))
 
 
 # ---------------------------------------------------------------------------
