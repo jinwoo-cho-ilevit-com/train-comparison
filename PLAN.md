@@ -488,6 +488,7 @@ train-comparison/
 │   ├── test_pods.py
 │   ├── test_probe.py
 │   ├── test_prompt.py
+│   ├── test_record.py
 │   ├── test_report.py
 │   └── test_smoke_cpu.py
 ├── docker/                    # Dockerfile.base + Dockerfile.framework + entrypoint
