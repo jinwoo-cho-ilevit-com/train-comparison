@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 from enum import Enum
 from types import SimpleNamespace
@@ -510,15 +509,6 @@ def test_an_axis_value_with_no_implementation_is_refused_not_substituted(config_
         axes.assemble(torch_model(), config, CPU, framework="native")
 
 
-def test_an_fp8_recipe_is_refused_rather_than_run_as_bf16(config_mapping):
-    """Precision is not only a construction-time choice — fp8 wraps the forward
-    pass — so an axis with nowhere to live would get applied somewhere unverified."""
-    assert isinstance(axes.step_context(bench(config_mapping)), contextlib.AbstractContextManager)
-
-    with pytest.raises(axes.UnappliedAxis):
-        axes.step_context(bench(config_mapping, **{"precision.name": "mxfp8"}))
-
-
 def test_assemble_hands_back_the_model(config_mapping):
     """peft, torch.compile and FSDP all replace the model rather than mutate it,
     and deepspeed.initialize returns the model, optimizer and dataloader from one
@@ -651,10 +641,11 @@ class _RecipeLinear(torch.nn.Linear):
 _RecipeLinear.__module__ = "transformer_engine.pytorch.module.linear"
 
 
-def test_an_fp8_recipe_is_not_read_off_bf16_weights(config_mapping):
-    """transformer-engine keeps bf16 parameters and casts inside the recipe that
-    wraps the step. Reading the weights of an mxfp8 run would report bf16, and a
-    bf16 request over that model would then be certified as a match."""
+def test_a_module_swapped_by_a_recipe_package_is_not_read_as_bf16(config_mapping):
+    """A low-precision recipe package keeps bf16 parameters and casts inside the
+    step it wraps. Reading the weights straight off such a model would report
+    bf16, and a bf16 request over it would then be certified as a match on
+    nothing but the swapped-in module's own dtype choice."""
     model = bf16_model()
     model.language_model = _RecipeLinear(2, 2).to(torch.bfloat16)
 
@@ -672,82 +663,6 @@ def test_a_model_with_no_floating_point_weights_is_undetermined(config_mapping):
 
     assert precision.applied is None
     assert precision.detail["base"] == {}
-
-
-def recipe_model(dtype=torch.bfloat16, vision_dtype=None):
-    """A model whose modules a recipe package defined, which is what an fp8 run
-    has and what this host cannot build for real."""
-    model = bf16_model(dtype, vision_dtype)
-    model.language_model = _RecipeLinear(2, 2).to(dtype)
-    model.visual = _RecipeLinear(2, 2).to(vision_dtype or dtype)
-    return model
-
-
-def mxfp8_recipe():
-    return type("MXFP8BlockScaling", (), {})()
-
-
-def test_an_fp8_run_whose_model_agrees_with_the_recipe_is_certified(config_mapping):
-    """The value has to stay reachable: the refusals below are worth nothing if the
-    axis simply cannot be certified any more."""
-    config = bench(config_mapping, **{"precision.name": "mxfp8"})
-
-    state = capture(Built(model=recipe_model(), precision_recipe=mxfp8_recipe()), config)
-    precision = axis(state, "precision.name")
-
-    assert precision.applied == "mxfp8"
-    assert precision.matches
-    assert precision.detail["recipe_modules"] == ["transformer_engine"]
-
-
-def test_a_recipe_does_not_certify_a_half_converted_model(config_mapping):
-    """Everything this probe reads off the weights used to be skipped whenever a
-    recipe was on `Built` — and `axes.assemble` puts one there from the same config
-    the state is checked against, so an fp8 request certified whatever model it was
-    handed. A tower left in fp32 is neither precision under a recipe either."""
-    config = bench(config_mapping, **{"precision.name": "mxfp8"})
-    model = recipe_model(vision_dtype=torch.float32)
-
-    state = capture(Built(model=model, precision_recipe=mxfp8_recipe()), config)
-    precision = axis(state, "precision.name")
-
-    assert precision.applied is None
-    assert precision.detail["base"] == {"bf16": 2, "fp32": 2}
-    with pytest.raises(AppliedMismatch, match="precision.name"):
-        assert_matches(state, config)
-
-
-def test_a_recipe_over_fp32_weights_is_the_wrong_machine_not_an_fp8_run(config_mapping):
-    """`dtype_for` returns fp32 off CUDA, so the ordinary way this goes wrong is a
-    model loaded on a host that cannot run the recipe at all — and the recipe object
-    is on `Built` regardless, because the request is what built it."""
-    config = bench(config_mapping, **{"precision.name": "mxfp8"})
-
-    state = capture(
-        Built(model=recipe_model(torch.float32), precision_recipe=mxfp8_recipe()), config
-    )
-    precision = axis(state, "precision.name")
-
-    assert precision.applied is None
-    assert "fp32" in precision.detail["reason"]
-    with pytest.raises(AppliedMismatch, match="precision.name"):
-        assert_matches(state, config)
-
-
-def test_a_recipe_that_replaced_no_module_is_not_read_as_an_fp8_run(config_mapping):
-    """`axes._apply_to_model` replaces no module, so the recipe arrives over a tree
-    of plain torch classes. Reading the recipe's class name there returns the
-    request — the module scan is the model's own word against it."""
-    config = bench(config_mapping, **{"precision.name": "mxfp8"})
-
-    state = capture(Built(model=bf16_model(), precision_recipe=mxfp8_recipe()), config)
-    precision = axis(state, "precision.name")
-
-    assert precision.applied is None
-    assert precision.detail["recipe_modules"] == []
-    assert "transformer_engine" in precision.detail["reason"]
-    with pytest.raises(AppliedMismatch, match="precision.name"):
-        assert_matches(state, config)
 
 
 # --- train.offload ------------------------------------------------------------
@@ -1088,7 +1003,7 @@ def test_a_real_engine_in_the_tree_decides_both_axes(config_mapping):
     assert axis(state, "train.offload").detail["offload_optimizer"] is True
 
 
-# --- the two class tables -----------------------------------------------------
+# --- the class table -----------------------------------------------------
 
 
 def literal_values(section: str, name: str) -> set[str]:
@@ -1096,28 +1011,11 @@ def literal_values(section: str, name: str) -> set[str]:
     return {str(option) for option in get_args(annotation)}
 
 
-def test_the_tables_map_from_what_ran_not_from_what_was_asked_for():
-    """The shortest way to make the contested axes match is a table keyed by the
-    request, and that certifies every run. Both tables are keyed by the class the
-    run built, so no key of either may be a value the config can ask for."""
+def test_the_table_maps_from_what_ran_not_from_what_was_asked_for():
+    """The shortest way to make the contested axis match is a table keyed by the
+    request, and that certifies every run. The table is keyed by the class the
+    run built, so no key of it may be a value the config can ask for."""
     assert not set(applied_module.OPTIM_CLASS_AXIS) & literal_values("optim", "name")
-    assert not set(applied_module.PRECISION_RECIPE_AXIS) & literal_values("precision", "name")
-
-
-def test_a_recipe_the_table_does_not_name_is_undetermined(config_mapping):
-    """An fp8 run wrapped with something this cannot name is a run whose matmul
-    precision nobody read. Falling back to the bf16 on the weights is exactly the
-    misreading the recipe path exists to remove."""
-    config = bench(config_mapping, **{"precision.name": "mxfp8"})
-    recipe = type("Float8CurrentScaling", (), {})()
-
-    state = capture(Built(model=bf16_model(), precision_recipe=recipe), config)
-    precision = axis(state, "precision.name")
-
-    assert precision.applied is None
-    assert precision.detail["recipe"] == "Float8CurrentScaling"
-    with pytest.raises(AppliedMismatch, match="precision.name"):
-        assert_matches(state, config)
 
 
 # --- the third state ----------------------------------------------------------

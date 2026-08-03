@@ -505,18 +505,15 @@ transformers가 예외도 경고도 아닌 **로그 한 줄만 남기고** 느�
 | `attn/fa2,fa3,fa4` | `flash-attn>=2.8` | native | 축 sweep이 native에서 돈다 |
 | `kernel/fla` | `flash-linear-attention`, `causal-conv1d>=1.6` | **6개 전부** | GDN 무음 fallback 제거 (위 예외) |
 | `kernel/liger` | `liger-kernel>=0.6` | native | axolotl에만 전이 의존으로 있었다 |
-| `precision/mxfp8,nvfp4` | `transformer-engine[core-cu13,pytorch]>=2.17` | native | extras 필수, 아래 참조 |
 | `optim/adamw_8bit`, `peft/qlora` | `bitsandbytes>=0.48` | native | 6개 중 2개에만 있었고 native는 아니었다 |
 | `optim/muon` | `pytorch-optimizer>=3.10` | native | |
 | `parallel/zero2,zero3` | `deepspeed>=0.19` | native | |
 | `dataloader/dali,dali_packed` | `nvidia-dali-cuda130>=2.2` | native | 이름 문제, 아래 참조 |
 | `loss/cached_mnrl` | `gradcache` (git) | native | 이름 문제, 아래 참조 |
 
-`transformer-engine`을 extras 없이 넣으면 안 된다. PyPI의 `transformer-engine`
-2.17.0은 **내용이 전부 extras 뒤에 있는 shim**이다(`requires_dist`가
-`transformer_engine_cu12/cu13/torch/jax`를 전부 extra 조건부로만 선언). 이름 검사는
-통과시키면서 커널은 하나도 주지 않으므로 `[core-cu13,pytorch]`를 명시했다. `cu13`은
-베이스 이미지의 CUDA 13 및 `cu130` torch 인덱스와 맞춘 것이다.
+`precision/mxfp8,nvfp4`는 `transformer-engine[core-cu13,pytorch]`를 native에
+넣어 열었으나, 이후 캠페인이 A100(CC 8.0)으로 통일되면서 제거됐다 — 두 recipe 모두
+CC 10.x 전용이라 이 스터디의 파드에서는 원리적으로 열릴 수 없었다.
 
 ### 패키지 이름이 존재하지 않는 축 2건 — 계약 변경 요청
 
@@ -793,10 +790,17 @@ env별 lock에서 휠이 없어 소스에서 빌드되는 패키지(2026-08-02, 
 
 | env | 소스 빌드 |
 |---|---|
-| native | `causal-conv1d`, `deepspeed`, `transformer-engine-torch` |
+| native | `causal-conv1d`, `deepspeed` |
 | sentence-transformers / tevatron / unsloth | `causal-conv1d` |
 | ms-swift | `causal-conv1d` 외 CUDA 아닌 것 4종 |
 | axolotl | `causal-conv1d` 외 CUDA 아닌 것 7종 |
+
+native의 소스 빌드 목록에는 2026-08-02 실측 당시 `transformer-engine-torch`도
+있었다. 2026-08-03 `precision/mxfp8,nvfp4` 제거로 native 빌드에서 빠졌다 —
+**빌드 시간 단축은 측정 안 함.** 아래 문단이 인용하는 `821f8f4` 빌드 로그는 완료
+시각만 주고 소요 시간을 주지 않으며, `transformer-engine-torch`는
+`causal-conv1d`와 동시에 빌드됐으므로 그 완료 시각 차이를 이 빌드에서 뺄 근거도
+없다.
 
 **`flash-attn`은 어느 env에도 더는 없다** — 원래 native에만 있었다. 같은 처리를
 받을 다음 후보는 `causal-conv1d`다: 여섯 env 전부에 있고, arch를 좁히는 변수를

@@ -43,7 +43,6 @@ _TRACKED_PACKAGES = (
     # recording only half of that pair records only half the evidence.
     "flash-attn",
     "causal-conv1d",
-    "transformer-engine",
     "bitsandbytes",
     "deepspeed",
     "torchvision",

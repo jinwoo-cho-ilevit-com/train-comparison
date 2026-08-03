@@ -19,14 +19,7 @@ COPY envs/${FRAMEWORK} ./envs/${FRAMEWORK}
 # flags (cpp_extension.py), and causal-conv1d does.
 #
 #   MAX_JOBS       concurrent compile jobs. Read by torch's ninja backend for
-#                  causal-conv1d and by transformer-engine as a fallback for the
-#                  next one.
-#   NVTE_BUILD_MAX_JOBS  transformer-engine's own, taking precedence over
-#                  MAX_JOBS, so bounding one build does not also slow the cmake
-#                  build that already succeeded at full width.
-#   NVTE_CUDA_ARCHS  which GPUs get SASS. 80/90/100 is A100, H200, B200 —
-#                  exactly the three PLAN.md names, including the H200 fallback.
-#                  Dropping the rest cuts transformer-engine from 6 gencodes to 3.
+#                  causal-conv1d.
 #
 # flash-attn no longer compiles here: envs/native installs a wheel we built, and
 # its own FLASH_ATTN_CUDA_ARCHS and NVCC_THREADS went with the build. What that
@@ -44,8 +37,6 @@ COPY envs/${FRAMEWORK} ./envs/${FRAMEWORK}
 # start-up check can compare it against the GPU before a run begins; nothing
 # reads it yet (see docs/support-matrix.md).
 ENV MAX_JOBS=2 \
-    NVTE_BUILD_MAX_JOBS=4 \
-    NVTE_CUDA_ARCHS="80;90;100" \
     TRAINBENCH_CUDA_ARCHS="80;90;100"
 
 # The sync runs in three passes.

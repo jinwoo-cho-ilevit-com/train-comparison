@@ -35,7 +35,7 @@ InfoNCE가 같은 행을 자기 자신과 대조하게 되므로 스키마가 �
 컨벤션 위반이다.
 
 ```bash
-uv run python scripts/env_report.py device=cpu model=gemma4_e2b attn=fa4 precision=mxfp8 freeze=ple data.limit=4 train.batch_size=4
+uv run python scripts/env_report.py device=cpu model=gemma4_e2b attn=fa4 freeze=ple data.limit=4 train.batch_size=4
 ```
 
 ## 측정 규율

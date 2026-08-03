@@ -18,7 +18,7 @@ run that measures one thing under another thing's name.
    failing to apply. `framework_owned` is that third state.
 
 2. **A capture may not become a mirror.** The module's principle is that it reads
-   back, not that it repeats the request. Four axes currently return values that can
+   back, not that it repeats the request. Three axes currently return values that can
    never equal their config value, and the shortest fix for each — return what was
    asked for — turns the whole mechanism into decoration. The mirror tests below are
    the ones that must die if that shortcut is taken anywhere.
@@ -33,10 +33,10 @@ The hydra/bench helpers below are deliberately a second copy of the ones in
 rewrite it; a contract must not depend on a file either lane owns.
 
 Not checked here, and not checkable on this host: what these capture paths read off
-a real bitsandbytes optimizer, a real deepspeed engine or a real Transformer Engine
-recipe. None of the three installs here — 확인 안 함. That is why the two foreign
-class-name tables below are pinned as *tables*: the spellings are a pod question,
-and a table keeps them in one reviewable place instead of inside a branch.
+a real bitsandbytes optimizer or a real deepspeed engine. Neither installs here —
+확인 안 함. That is why the foreign class-name table below is pinned as a *table*:
+the spellings are a pod question, and a table keeps them in one reviewable place
+instead of inside a branch.
 
 **Twenty-one of these tests are deferred, not passing.** `trainbench/applied.py`
 carries none of the third state yet, and nine lanes fan out from the commit that
@@ -97,7 +97,7 @@ OWNED_BY_TEVATRON = ("loss.name", "parallel.cross_device_negatives")
 
 # Axes whose applied value cannot today equal any value the config offers, which is
 # what makes implementing them impossible: `assert_matches` refuses the run.
-CONTESTED = ("optim.name", "parallel.strategy", "precision.name", "train.offload")
+CONTESTED = ("optim.name", "parallel.strategy", "train.offload")
 
 
 # --- fixtures ----------------------------------------------------------------
@@ -488,55 +488,6 @@ def test_an_optimizer_the_table_does_not_name_earns_no_config_value(config_mappi
     assert not entry.matches
 
 
-def test_the_precision_recipe_table_only_maps_to_values_the_config_offers():
-    """`_capture_precision` refuses to read an fp8 run's precision off bf16 weights,
-    which is correct and is why the axis is permanently undetermined. The recipe is
-    the thing that decides it, so the recipe has to travel on `Built`.
-
-    확인 안 함: the Transformer Engine class names. transformer-engine does not
-    install on this host.
-    """
-    table = applied_module.PRECISION_RECIPE_AXIS
-    offered = literal_values("precision.name")
-
-    assert set(table.values()) <= offered, sorted(set(table.values()) - offered)
-    assert {"mxfp8", "nvfp4"} <= set(table.values())
-
-
-@pytest.mark.parametrize("wanted", ["mxfp8", "nvfp4"])
-def test_precision_is_read_off_the_recipe_the_step_actually_wrapped_with(config_mapping, wanted):
-    config = bench(config_mapping, **{"precision.name": wanted})
-    class_name = next(
-        name for name, value in applied_module.PRECISION_RECIPE_AXIS.items() if value == wanted
-    )
-
-    entry = axis(
-        capture(
-            Built(model=model(params=weights()), precision_recipe=instance(class_name)),
-            config,
-        ),
-        "precision.name",
-    )
-
-    assert entry.applied == wanted
-    assert entry.matches
-
-
-def test_an_fp8_request_with_no_recipe_is_never_certified_from_the_weights(config_mapping):
-    """The refusal that must survive the change: bf16 parameters are what an fp8 run
-    has, so reading the dtype and calling it mxfp8 is exactly the failure this
-    module exists to prevent."""
-    config = bench(config_mapping, **{"precision.name": "mxfp8"})
-
-    entry = axis(
-        capture(Built(model=model(params=weights()), precision_recipe=None), config),
-        "precision.name",
-    )
-
-    assert entry.applied != "mxfp8"
-    assert not entry.matches
-
-
 def engine_model(engine_class: str = "DeepSpeedEngine", params=()):
     return model(modules=[("module", instance(engine_class))], params=params)
 
@@ -649,13 +600,11 @@ def test_every_contested_axis_can_reach_a_state_that_matches(config_mapping, nam
     evidence is the tests above."""
     reachable = {
         "optim.name": set(applied_module.OPTIM_CLASS_AXIS.values()),
-        "precision.name": set(applied_module.PRECISION_RECIPE_AXIS.values()),
         "parallel.strategy": {"zero2", "zero3"},
         "train.offload": {value for _, value in OFFLOAD_TARGETS},
     }[name]
     blocked = {
         "optim.name": {"adamw_8bit"},
-        "precision.name": {"mxfp8", "nvfp4"},
         "parallel.strategy": {"zero2", "zero3"},
         "train.offload": {"optimizer", "param", "both"},
     }[name]

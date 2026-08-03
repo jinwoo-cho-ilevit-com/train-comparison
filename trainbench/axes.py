@@ -31,9 +31,10 @@ the offload axis cannot be split across three independent hooks. It returns the
 model for the same reason `torch.compile`, `get_peft_model` and FSDP do: they
 replace the model rather than mutate it.
 
-`step_context` exists because precision is not only a construction-time choice —
-fp8 recipes wrap the forward pass — and an axis with nowhere to live is an axis
-that gets applied somewhere unverified.
+`step_context` exists because some adapters require a region around the step that
+this harness never opens itself — axolotl trains inside `torch.autocast` upstream
+(decision 1) — and an axis with nowhere to live is an axis that gets applied
+somewhere unverified.
 
 An axis value with no implementation raises `UnappliedAxis` rather than falling
 back to the default. A silent substitution is the failure this whole mechanism
@@ -682,10 +683,6 @@ def assemble(
     its own action cannot catch the case where the action did not take.
     """
     applied: list[str] = []
-    recipe = _recorded_precision_recipe(config)
-    if recipe is not None:
-        applied.append("precision.name")
-
     model, names = _apply_to_model(model, config)
     applied += names
     optimizer, names = _optimizer(model.parameters(), config, device)
@@ -711,40 +708,9 @@ def assemble(
         dataloader=loader,
         loss_fn=loss,
         framework=framework,
-        precision_recipe=recipe,
         owned_axes=tuple(owned_axes),
     )
     return built, [*applied, "framework.name"]
-
-
-# Transformer Engine, by module path rather than by import, because nothing in
-# this file may import it at module scope: it is absent from the orchestrator-side
-# environment and from five of the six framework images.
-#
-# `transformer-engine` on PyPI is a shim whose Python surface (recipes, autocast,
-# the support checks) is all that is read here; the compiled half arrives as
-# `transformer-engine-torch`, built from sdist on the pod
-# (`.plans/research/axis-libraries.md` §6.1).
-TE_TORCH_MODULE = "transformer_engine.pytorch"
-TE_RECIPE_MODULE = "transformer_engine.common.recipe"
-TE_QUANTIZATION_MODULE = "transformer_engine.pytorch.quantization"
-TE_AUTOCAST = "autocast"
-
-# The recipe class each precision is, and the support check that must pass before
-# it is entered. Class names from `common/recipe/__init__.py:337,479`; the checks
-# from `pytorch/quantization.py` (§6.2, §6.4). `applied.PRECISION_RECIPE_AXIS`
-# holds the same two class names on the reading side — that is the boundary this
-# axis crosses, and the recipe object travels on `Built.precision_recipe`.
-#
-# **The support check is not optional and not symmetric.** `check_recipe_support`
-# has an `elif` chain that covers MXFP8 and does not mention NVFP4, so an nvfp4
-# run on an unsupported device enters the region without complaint and produces a
-# number that is not fp4 (§6.4). Both are gated here instead, in one place, so
-# neither depends on TE noticing.
-TE_PRECISIONS = {
-    "mxfp8": ("MXFP8BlockScaling", "is_mxfp8_available"),
-    "nvfp4": ("NVFP4BlockScaling", "is_nvfp4_available"),
-}
 
 
 def _import_or_refuse(module_name: str, why: str) -> Any:
@@ -758,99 +724,6 @@ def _import_or_refuse(module_name: str, why: str) -> Any:
         return importlib.import_module(module_name)
     except ImportError as exc:
         raise UnappliedAxis(f"{why}, and {module_name} is not importable here ({exc}).") from exc
-
-
-def _precision_supported(precision: str, checker: str) -> None:
-    """Refuse a precision this device cannot execute, in the checker's own words.
-
-    Two shapes are accepted because which one the pinned release returns is
-    확인 안 함 — the private `_compute_*_support` pair returns `(bool, str)` and the
-    public wrappers are read here for the first time on a pod. A `(False, reason)`
-    tuple is truthy, so reading the result as a bare bool would turn "this GPU
-    cannot do fp4" into "supported" — which is the one failure mode this gate
-    exists for. Anything the checker raises is a refusal too: a check that did not
-    answer has not said yes.
-    """
-    module = _import_or_refuse(
-        TE_QUANTIZATION_MODULE,
-        f"precision={precision} runs the step inside a Transformer Engine recipe and has to be "
-        "gated on the device that executes it",
-    )
-    check = getattr(module, checker, None)
-    if not callable(check):
-        raise UnappliedAxis(
-            f"{TE_QUANTIZATION_MODULE} has no {checker}(), so nothing here can tell whether "
-            f"this device executes {precision}. Transformer Engine's own check_recipe_support "
-            "does not cover NVFP4 at all, so an ungated run would report a bf16 number under "
-            f"the {precision} label."
-        )
-    try:
-        answer = check()
-    except Exception as exc:  # noqa: BLE001 - a check that raises has not said yes
-        raise UnappliedAxis(
-            f"precision={precision}: {checker}() raised {type(exc).__name__}: {exc}. "
-            "A support check that does not answer is not a device that supports it."
-        ) from exc
-    supported, reason = answer if isinstance(answer, tuple) else (answer, "")
-    if not supported:
-        raise UnappliedAxis(
-            f"precision={precision} is not executable on this device: "
-            f"{reason or f'{checker}() returned {supported!r}'}. Both block-scaling recipes "
-            "need compute capability 10.x, and this study's pods are A100 (8.0), so the axis "
-            "may be a hardware fact here rather than a missing implementation."
-        )
-
-
-def _precision_recipe(config: BenchConfig) -> Any:
-    """The recipe the step is wrapped with, or None where the weights are the answer.
-
-    bf16 returns None: the model is loaded in that dtype and an autocast region
-    would be a second answer to the same question. Everything else is a
-    block-scaling recipe that keeps bf16 parameters and casts inside the step,
-    which is why `applied._capture_precision` cannot read it off the weights and
-    reads `Built.precision_recipe` instead.
-    """
-    precision = config.precision.name
-    if precision == NO_RECIPE_PRECISION:
-        return None
-    named = TE_PRECISIONS.get(precision)
-    if named is None:
-        raise UnappliedAxis(
-            f"precision={precision} has no recipe recorded here; known: {sorted(TE_PRECISIONS)}."
-        )
-    class_name, checker = named
-    _precision_supported(precision, checker)
-    module = _import_or_refuse(
-        TE_RECIPE_MODULE, f"precision={precision} is a Transformer Engine block-scaling recipe"
-    )
-    recipe = getattr(module, class_name, None)
-    if recipe is None:
-        raise UnappliedAxis(
-            f"{TE_RECIPE_MODULE} has no {class_name}; this pin does not carry the recipe "
-            f"precision={precision} names."
-        )
-    return recipe()
-
-
-def _recorded_precision_recipe(config: BenchConfig) -> Any:
-    """The recipe object `Built` carries, or None where this site cannot build one.
-
-    The refusal belongs to `step_context`. docs/CONTRACTS.md §2 assigns the fp8
-    autocast to that call site, and `scripts/bench.py` enters it once before the
-    timer, so a recipe this environment cannot build stops the run outside the
-    timed window and is recorded against the site that decides it. Raising here
-    would move that record without changing the outcome.
-
-    What `assemble` does owe is the object, because `Built` can only be made here
-    and `applied._capture_precision` has nothing else to read: these recipes keep
-    bf16 parameters and cast inside the step. `None` is not an escape either — a
-    run that asked for mxfp8 and carries no recipe reads back as the dtype on its
-    weights, and `assert_matches` blocks it.
-    """
-    try:
-        return _precision_recipe(config)
-    except UnappliedAxis:
-        return None
 
 
 def _autocast_step_context(required: Any, config: BenchConfig) -> contextlib.AbstractContextManager:
@@ -884,10 +757,6 @@ def _autocast_step_context(required: Any, config: BenchConfig) -> contextlib.Abs
     return torch.autocast(device_type=device.type, dtype=dtype)
 
 
-# The one precision whose answer is the weights rather than a recipe: the model is
-# already loaded in it, so the step needs no region of its own.
-NO_RECIPE_PRECISION = "bf16"
-
 # The kinds of context an adapter may ask this site to establish, and what builds
 # each. `tests/contract/test_loader_bench.py` fixes the set of names; this is the
 # other half — a name the contract admits and this table does not is a contract
@@ -900,73 +769,36 @@ STEP_CONTEXT_ESTABLISHERS = {
 def step_context(config: BenchConfig, required: Any = None) -> contextlib.AbstractContextManager:
     """Context wrapping one training step.
 
-    Two things ask for one, and this is the only site that establishes either
-    (docs/CONTRACTS.md §2). `config.precision` is the axis this study varies.
-    `required` is `AdapterOut.required_step_context`: a regime the framework
-    already trains in upstream, which the adapter states and never enters itself —
-    axolotl loads `embed_tokens`/`lm_head` in fp32 beside a bf16 body and needs
-    `torch.autocast` for the matmul between them (decision 1).
+    The only thing that asks for one is `required` — `AdapterOut.required_step_context`,
+    a regime the framework already trains in upstream, which the adapter states
+    and never enters itself. axolotl loads `embed_tokens`/`lm_head` in fp32 beside
+    a bf16 body and needs `torch.autocast` for the matmul between them (decision 1).
 
-    **The two cannot both be in effect.** An fp8 recipe and a bf16 autocast are
-    two answers to what precision a step runs in, and nesting them would report an
-    fp8 number for a step that also ran under bf16 autocast. A run that asks for
-    both is refused here rather than given the arbitrary winner.
-
-    bf16 needs none: the model is already loaded in that dtype, so an autocast
-    region would be a second, different answer to the same question. The fp8/fp4
-    recipes do need one, and it is Transformer Engine's `autocast` — the kind
-    `tests/contract/test_loader_bench.py` fixes as the only one this site can
-    establish.
-
-    `fp8_autocast` is deliberately not used. It is deprecated in the pinned release
-    and its parameters are named differently (`fp8_recipe`, `fp8_group` against
-    `recipe`, `amax_reduction_group`), so calling it would put a DeprecationWarning
-    inside every timed step and pin this module to the older spelling
-    (`transformer_engine/pytorch/quantization.py:931`,
-    `.plans/research/axis-libraries.md` §6.3).
-
-    A fresh recipe per step rather than one reused: entering the same `autocast`
-    instance twice is refused by TE (`quantization.py:1027`), and the recipe is a
-    settings object with no run state, so `assemble` and this site building one
-    each through `_precision_recipe` cannot disagree about which one is in effect.
+    `precision.name` is bf16 only, and the load dtype comes from
+    `probe/steps.py::dtype_for`, so a run with no `required` needs no region of its
+    own — a second, autocast-shaped answer to a question the weights already
+    answered would be the same misreading `applied._capture_precision` exists to
+    catch on the read side. The schema already refuses any other value; this reads
+    it anyway rather than assuming the premise, on the same no-silent-substitution
+    ground the rest of this module stands on.
     """
-    if required is not None:
-        # Decided on the *request*, before `_precision_recipe` is consulted. Asking
-        # the recipe first made this branch unreachable wherever Transformer Engine
-        # is absent — the import refusal fired instead, and the conflict would only
-        # ever have been detected on a pod that could build the recipe anyway.
-        if config.precision.name != NO_RECIPE_PRECISION:
+    if required is None:
+        if config.precision.name != "bf16":
             raise UnappliedAxis(
-                f"precision={config.precision.name} wraps the step in a Transformer Engine "
-                f"recipe and this framework also requires a {getattr(required, 'kind', '?')} "
-                f"region ({getattr(required, 'reason', 'no reason given')}). Both decide what "
-                "precision the step runs in, so the number would carry one label and two "
-                "regimes."
+                f"precision={config.precision.name} has no region recorded here; the only "
+                "value this axis can reach without `required` is bf16, read straight off "
+                "the weights `probe/steps.py::dtype_for` already loaded."
             )
-        kind = getattr(required, "kind", None)
-        establish = STEP_CONTEXT_ESTABLISHERS.get(str(kind))
-        if establish is None:
-            raise UnappliedAxis(
-                f"required_step_context.kind={kind!r} has no establisher in "
-                f"STEP_CONTEXT_ESTABLISHERS ({sorted(STEP_CONTEXT_ESTABLISHERS)}); nothing "
-                "here can enter the region this framework trains in."
-            )
-        return establish(required, config)
-    recipe = _precision_recipe(config)
-    if recipe is None:
         return contextlib.nullcontext()
-    module = _import_or_refuse(
-        TE_TORCH_MODULE,
-        f"precision={config.precision.name} wraps the forward pass in a Transformer Engine recipe",
-    )
-    autocast = getattr(module, TE_AUTOCAST, None)
-    if not callable(autocast):
+    kind = getattr(required, "kind", None)
+    establish = STEP_CONTEXT_ESTABLISHERS.get(str(kind))
+    if establish is None:
         raise UnappliedAxis(
-            f"{TE_TORCH_MODULE} has no {TE_AUTOCAST}(), which is the current spelling of the "
-            "region an fp8 recipe is entered through. Without it the step would run in bf16 "
-            f"and be reported as {config.precision.name}."
+            f"required_step_context.kind={kind!r} has no establisher in "
+            f"STEP_CONTEXT_ESTABLISHERS ({sorted(STEP_CONTEXT_ESTABLISHERS)}); nothing "
+            "here can enter the region this framework trains in."
         )
-    return autocast(enabled=True, recipe=recipe)
+    return establish(required, config)
 
 
 def _apply_to_model(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:

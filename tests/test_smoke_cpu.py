@@ -1288,8 +1288,10 @@ def timing_config(config_mapping, **overrides):  # noqa: F811
 def test_an_axis_this_environment_cannot_apply_is_written_before_the_timer(
     pod_setting,
     config_mapping,  # noqa: F811
+    monkeypatch,
 ):
-    """`precision=mxfp8` has no recipe, and `axes.step_context` is what says so.
+    """axolotl declares `required_step_context` as a cuda autocast region (decision
+    1), and `axes.step_context` is what refuses it off CUDA.
 
     That call site is inside the measured loop, after `timer.__enter__`. `build_run`
     calls it once up front so the refusal lands here rather than on step 0 inside
@@ -1303,7 +1305,16 @@ def test_an_axis_this_environment_cannot_apply_is_written_before_the_timer(
     Before it existed, such a process died with no `--out`, docker/entrypoint.sh
     filed a fallback record saying `exit 1`, and the reason stayed in the pod log.
     """
-    config = timing_config(config_mapping, **{"precision.name": "mxfp8"})
+    adapter_binding(
+        monkeypatch,
+        required_step_context=SimpleNamespace(
+            kind="autocast",
+            device_type="cuda",
+            dtype="bfloat16",
+            reason="axolotl trains under torch.autocast(bfloat16)",
+        ),
+    )
+    config = timing_config(config_mapping)
 
     code, record = pod_setting(config, rows(8))
 
@@ -1312,9 +1323,9 @@ def test_an_axis_this_environment_cannot_apply_is_written_before_the_timer(
     assert record["refusal"]["kind"] == "UnappliedAxis"
     # The body, not a category. This sentence is what the report has to be able to
     # say, and nothing here paraphrases it.
-    assert "Transformer Engine recipe" in record["refusal"]["reason"]
+    assert "needs a cuda autocast region" in record["refusal"]["reason"]
     # The setting, so the row is attributable without decoding the whole config.
-    assert record["refusal"]["requested_axes"]["precision.name"] == "mxfp8"
+    assert record["refusal"]["requested_axes"]["framework.name"] == "native"
     # Never. report.py renders a record carrying this as a measurement.
     assert "metrics" not in record
 
@@ -1427,6 +1438,7 @@ def test_report_renders_the_refusal_as_a_reason_and_not_as_a_measurement(
     tmp_path,
     pod_setting,
     config_mapping,  # noqa: F811
+    monkeypatch,
 ):
     """Passed through the real report.py, not asserted about in the abstract.
 
@@ -1434,7 +1446,16 @@ def test_report_renders_the_refusal_as_a_reason_and_not_as_a_measurement(
     that decides the lane, so without the control this test would also pass against
     a report that renders no measurement table at all.
     """
-    config = timing_config(config_mapping, **{"precision.name": "mxfp8"})
+    adapter_binding(
+        monkeypatch,
+        required_step_context=SimpleNamespace(
+            kind="autocast",
+            device_type="cuda",
+            dtype="bfloat16",
+            reason="axolotl trains under torch.autocast(bfloat16)",
+        ),
+    )
+    config = timing_config(config_mapping)
     _, refused = pod_setting(config, rows(8))
 
     pod = "results/native/qwen3_vl_emb_2b/pod-a"
@@ -1460,22 +1481,20 @@ def test_report_renders_the_refusal_as_a_reason_and_not_as_a_measurement(
     document = merged_document(
         tmp_path,
         {
-            f"{pod}/precision-mxfp8/result.json": refused,
-            f"{pod}/precision-bf16/result.json": measured,
+            f"{pod}/setting-refused/result.json": refused,
+            f"{pod}/setting-ok/result.json": measured,
         },
     )
 
-    rows_in_tables = [line for line in document.splitlines() if line.startswith("| precision-")]
+    rows_in_tables = [line for line in document.splitlines() if line.startswith("| setting-")]
     # The control landed in a table, so "not in a table" below is a distinction the
     # document can actually draw.
-    assert any(line.startswith("| precision-bf16 |") for line in rows_in_tables)
-    assert not any(line.startswith("| precision-mxfp8 |") for line in rows_in_tables)
+    assert any(line.startswith("| setting-ok |") for line in rows_in_tables)
+    assert not any(line.startswith("| setting-refused |") for line in rows_in_tables)
     # And the reason is in the document, in full — both halves of the sentence, so
-    # a renderer that printed a category would fail here. The second half used to be
-    # "which is not implemented"; the recipe is implemented now and what is missing
-    # is the package, which is what the refusal says on this host.
-    assert "Transformer Engine recipe" in document
-    assert "is not importable here" in document
+    # a renderer that printed a category would fail here.
+    assert "needs a cuda autocast region" in document
+    assert "torch.autocast would warn and disable itself" in document
     assert "지표 없음" in document
 
 
@@ -1514,12 +1533,11 @@ def test_a_plan_whose_settings_can_all_be_applied_passes(tmp_path, config_mappin
 
 
 def test_one_unapplicable_setting_refuses_the_whole_plan(tmp_path, config_mapping, pod_gpu):  # noqa: F811
-    """`precision=mxfp8` is refused on every host this study runs on: the recipe
-    needs Transformer Engine, which is absent here, and needs compute capability
-    10.x, which the A100 pods do not have. `preflight` reaches it through
-    `axes.step_context`."""
+    """`peft.mode=qlora` needs a CUDA device to quantise the base, and this
+    fixture's device is fixed to cpu, so it is refused on this host. `preflight`
+    reaches it through `axes.load_kwargs`."""
     good = bench(config_mapping).model_dump(mode="json")
-    bad = bench(config_mapping, **{"precision.name": "mxfp8"}).model_dump(mode="json")
+    bad = bench(config_mapping, **{"peft.mode": "qlora", "peft.r": 32}).model_dump(mode="json")
     path = plan_file(tmp_path, [plan_item("a", good), plan_item("b", bad)])
     assert bench_entry.preflight(path) == bench_entry.PREFLIGHT_EXIT
 
@@ -1532,7 +1550,7 @@ def test_a_probe_that_declines_an_axis_is_still_started(tmp_path, config_mapping
     is.
     """
     declined = bench(
-        config_mapping, **{"precision.name": "mxfp8", "run.purpose": "probe"}
+        config_mapping, **{"peft.mode": "qlora", "peft.r": 32, "run.purpose": "probe"}
     ).model_dump(mode="json")
     path = plan_file(tmp_path, [plan_item("a", declined)])
 
@@ -1660,13 +1678,13 @@ def test_a_pod_wrong_in_both_ways_is_told_both(tmp_path, config_mapping, monkeyp
     """One pod log naming the GPU and the setting is worth more than two relaunches."""
     monkeypatch.setenv(bench_entry.CUDA_ARCHS_ENV, "80;90;100")
     monkeypatch.setattr(bench_entry, "current_gpu_arch", lambda: "120")
-    bad = bench(config_mapping, **{"precision.name": "mxfp8"}).model_dump(mode="json")
+    bad = bench(config_mapping, **{"peft.mode": "qlora", "peft.r": 32}).model_dump(mode="json")
     path = plan_file(tmp_path, [plan_item("a", bad)])
     log = io.StringIO()
     assert bench_entry.preflight(path, stream=log) == bench_entry.PREFLIGHT_EXIT
     printed = log.getvalue()
     assert "this pod's GPU" in printed
-    assert "mxfp8" in printed
+    assert "qlora" in printed
 
 
 # --- what the adapter says, reaching the run ---------------------------------

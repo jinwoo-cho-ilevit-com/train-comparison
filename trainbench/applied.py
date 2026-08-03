@@ -170,11 +170,6 @@ class Built:
     # from the config: the config is the request, and telling the two apart is the
     # entire job of this module.
     framework: str | None = None
-    # The recipe the training step was wrapped with, for the precisions that cast
-    # inside the step rather than on the weights. Without it an fp8 run's precision
-    # can only be read off bf16 parameters, which is the misreading this module
-    # exists to prevent — so the axis stays undetermined forever instead.
-    precision_recipe: Any = None
     # Axes this adapter computes itself, named by the object the adapter built.
     # Taken from here rather than from the config so that `framework=tevatron` —
     # the request — cannot exempt a cell from the axes it was least likely to
@@ -1044,29 +1039,6 @@ DTYPE_NAMES = {
 # of reading bf16 off the weights of an fp8 run.
 PRECISION_MODULE_ROOTS = ("transformer_engine", "torchao")
 
-# The recipe class the step was wrapped with, in this axis's vocabulary. This is
-# the only thing that can decide an fp8 run: the weights stay bf16, and reading
-# them would certify an mxfp8 run as bf16 — which is why this axis was permanently
-# undetermined before the recipe travelled on `Built`.
-#
-# The spellings are Transformer Engine's `MXFP8BlockScaling` and `NVFP4BlockScaling`
-# (`transformer_engine/common/recipe/__init__.py:337,479`, read in
-# `.plans/research/axis-libraries.md` §6). 확인 안 함: which of them
-# `axes.step_context` ends up constructing, because transformer-engine does not
-# import on this host. A pod must print `type(recipe).__name__` for `mxfp8` and for
-# `nvfp4` and correct this table.
-PRECISION_RECIPE_AXIS = {
-    "MXFP8BlockScaling": "mxfp8",
-    "NVFP4BlockScaling": "nvfp4",
-}
-
-# The store a recipe run's base weights have to be in. Not a claim about
-# Transformer Engine: this study loads every model through
-# `probe/steps.py::dtype_for`, which is bf16 on CUDA and fp32 everywhere else, so
-# fp32 base weights under an fp8 recipe are a model loaded off CUDA — and the
-# recipe object is built from the config either way.
-RECIPE_BASE_DTYPES = ("bf16", "fp16")
-
 # peft holds its adapter weights in fp32 over a bf16 base. Measured on peft
 # 0.20.0: `get_peft_model` over a bfloat16 model returns `lora_A`/`lora_B` in
 # float32 while every base tensor stays bfloat16. A probe demanding one dtype
@@ -1093,16 +1065,9 @@ def _capture_precision(built: Built, config: BenchConfig) -> tuple[str | None, d
     keeps them in fp32 over a bf16 base, so one dtype across the whole model is
     not what a correct LoRA run looks like.
 
-    Which fp8 recipe is in effect is not on the weights at all — those cast inside
-    the step — so the recipe the step was wrapped with (`Built.precision_recipe`)
-    is what names the value. Naming is not certifying: `axes.assemble` builds that
-    object out of the same config this state is checked against, so a branch that
-    read only its class name would hand the request back and every dtype reading
-    below would be skipped. The model has to agree — base weights in a store a
-    recipe casts from (`RECIPE_BASE_DTYPES`), and, once the model lists modules at
-    all, modules from a recipe package among them. Without a recipe, a model whose
-    modules come from a recipe package is undetermined; the alternative is to read
-    bf16 off an mxfp8 run's parameters and certify it as bf16.
+    A model whose modules come from `PRECISION_MODULE_ROOTS` is undetermined
+    rather than read off the weights: those packages cast inside the step, so a
+    dtype read straight off the parameters would be the request answering itself.
     """
     if built.model is None:
         return None, {"reason": "no model was built"}
@@ -1118,15 +1083,6 @@ def _capture_precision(built: Built, config: BenchConfig) -> tuple[str | None, d
         bucket = adapter if ADAPTER_PARAM_MARKER in name else base
         bucket[spelling] = bucket.get(spelling, 0) + 1
     detail: dict[str, Any] = {"base": base, "adapter": adapter, "recipe_modules": swapped}
-    recipe = None if built.precision_recipe is None else type(built.precision_recipe).__name__
-    if recipe is not None:
-        detail = {**detail, "recipe": recipe}
-        if recipe not in PRECISION_RECIPE_AXIS:
-            return None, {
-                **detail,
-                "reason": f"the step is wrapped with a {recipe} recipe, which this does not "
-                "name, so which precision the matmuls ran in is unknown",
-            }
     if not base:
         return None, {
             **detail,
@@ -1140,28 +1096,6 @@ def _capture_precision(built: Built, config: BenchConfig) -> tuple[str | None, d
             f"{ADAPTER_PARAM_MARKER!r}, so adapter weights cannot be told apart from base "
             "weights and either could be the dtype reported here",
         }
-    if recipe is not None:
-        named = PRECISION_RECIPE_AXIS[recipe]
-        # The module scan is evidence against the recipe, not for it: a model listing
-        # modules of its own, none of them from a recipe package, is one the recipe
-        # wraps with nothing of the package in it. 확인 안 함 — transformer-engine
-        # does not import here, so a pod must print `_module_roots(model)`.
-        if roots and not swapped:
-            return None, {
-                **detail,
-                "reason": f"the step is wrapped with a {recipe} recipe, but none of this "
-                f"model's {sum(roots.values())} modules come from "
-                f"{' or '.join(PRECISION_MODULE_ROOTS)}, so nothing in the model says the "
-                f"matmuls ran in {named}",
-            }
-        if len(base) != 1 or next(iter(base)) not in RECIPE_BASE_DTYPES:
-            return None, {
-                **detail,
-                "reason": f"the base weights are {'+'.join(sorted(base))} where a {named} run "
-                f"is loaded in one of {', '.join(RECIPE_BASE_DTYPES)}, so the {recipe} recipe "
-                "is over parameters this study does not load an fp8 run in",
-            }
-        return named, detail
     if swapped:
         return None, {
             **detail,

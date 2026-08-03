@@ -2819,7 +2819,8 @@ def test_one_unrunnable_setting_stops_the_settings_that_would_have_run(tmp_path)
     """The pod is refused whole. A sweep publishing only the settings that happened
     to survive would report an axis measured against a baseline that never ran."""
     plan = sweep_plan()
-    plan[-1]["config"]["precision"]["name"] = "mxfp8"
+    plan[-1]["config"]["peft"]["mode"] = "qlora"
+    plan[-1]["config"]["peft"]["r"] = 32
     sweep = sweep_pod(tmp_path, plan)
     assert sweep.bench == []
     assert f"preflight REFUSED {plan[-1]['name']}" in sweep.proc.stdout
