@@ -21,6 +21,8 @@ run: timing
 gpu_type_id: NVIDIA A100-SXM4-80GB
 baseline: canonical
 # Explicit rather than inherited. `peft=full` is what this pod exists to test, and
-# a default that moves would silently change the question.
+# a default that moves would silently change the question. The batch matches the
+# baseline's for the same reason: 16 OOMed on the first attempt (2026-08-03).
 overrides:
   - peft=full
+  - train.batch_size=4

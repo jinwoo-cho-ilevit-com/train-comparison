@@ -41,3 +41,8 @@ canonical:
     - dataloader=torch
     - parallel=single
     - train=default
+    # Pinned rather than inherited, and not cosmetic: `train=default` carries 16,
+    # which OOMs on an A100 80GB (measured 2026-08-03, peak 80.7GB with 75.10GiB
+    # held by PyTorch — 18 of Qwen3.5's 24 layers are Gated DeltaNet, conv_dim 6x
+    # hidden with fp32 chunk states, and the vision tower runs uncheckpointed).
+    - train.batch_size=4
