@@ -18,7 +18,9 @@ from typing import Any
 
 import torch
 
+from trainbench import axes
 from trainbench.config_schema import BenchConfig
+from trainbench.loader import ADAPTERS
 from trainbench.probe import steps
 from trainbench.probe.types import ProbeReport
 
@@ -105,12 +107,17 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
         ),
     )
 
+    def _infonce_backward() -> dict[str, Any]:
+        # ADAPTERS["axolotl"].required_step_context is the one declaration of this
+        # regime; a timing run enters it the same way at scripts/bench.py:278. On a
+        # non-CUDA host this raises UnappliedAxis, recorded as an ordinary failed check.
+        required = ADAPTERS["axolotl"].required_step_context
+        with axes.step_context(config, required):
+            return steps.infonce_backward(model, tokenized, config.loss.temperature, side)
+
     if report.run("text_tokenize", lambda: steps.tokenize_text(tokenizer, device, tokenized, side))[
         0
     ]:
-        report.run(
-            "infonce_backward",
-            lambda: steps.infonce_backward(model, tokenized, config.loss.temperature, side),
-        )
+        report.run("infonce_backward", _infonce_backward)
     else:
         report.skip("infonce_backward", "tokenization failed")

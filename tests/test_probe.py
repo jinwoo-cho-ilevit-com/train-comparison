@@ -7,6 +7,7 @@ here is the probe machinery around them.
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import math
 import pathlib
@@ -842,6 +843,95 @@ def test_the_axolotl_probe_hands_it_a_config_it_accepts(config_mapping, monkeypa
     assert [d["path"] for d in cfg["datasets"]] == [config.data.repo_id]
 
 
+class _AxolotlTokenizer:
+    """A bare tokenizer, the shape `load_tokenizer` hands back — no `.tokenizer`
+    wrapper, so `align_padding_side` keeps `padding_side` on the object itself."""
+
+    def __init__(self, padding_side="right"):
+        self.padding_side = padding_side
+
+    def __call__(self, text=None, return_tensors=None, padding=None):
+        ids = torch.arange(len(text) * 3).reshape(len(text), 3) % 8
+        return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+
+def _stub_axolotl_run(monkeypatch, model, tokenizer):
+    """Stand in for the axolotl package plus this probe's own `load()`.
+
+    The validate/normalize/load order inside `load()` is already pinned by
+    `test_the_axolotl_probe_hands_it_a_config_it_accepts`; here that call is
+    replaced wholesale so what is under test is only what `run()` does with the
+    (model, tokenizer) it gets back.
+    """
+    import trainbench.probe.axolotl as axolotl_probe
+
+    root = types.ModuleType("axolotl")
+    root.__version__ = "0.0-stub"
+    monkeypatch.setitem(sys.modules, "axolotl", root)
+    monkeypatch.setattr(
+        axolotl_probe, "load", lambda config, device, load_kwargs: (model, tokenizer)
+    )
+
+
+def test_the_axolotl_probe_enters_step_context_before_the_backward(config_mapping, monkeypatch):
+    """The probe used to call `steps.infonce_backward` directly, so axolotl's own
+    `required_step_context` (`trainbench/loader.py` `ADAPTERS["axolotl"]`) was
+    declared but never entered. On a real pod this is the fp32/bf16 matmul
+    (`RuntimeError: expected mat1 and mat2 to have the same dtype`, measured
+    2026-08-03). This pins that `axes.step_context` is now entered, with that
+    exact requirement, and that the step runs inside it rather than around it.
+    """
+    from trainbench import axes
+    from trainbench.loader import ADAPTERS
+
+    _stub_axolotl_run(monkeypatch, _Encoder(), _AxolotlTokenizer())
+    calls = []
+    entered = []
+
+    @contextlib.contextmanager
+    def _fake_ctx():
+        entered.append("enter")
+        yield
+        entered.append("exit")
+
+    def _spy(config, required=None):
+        calls.append(required)
+        return _fake_ctx()
+
+    monkeypatch.setattr(axes, "step_context", _spy)
+    mapping = json.loads(json.dumps(config_mapping))
+    mapping["framework"]["name"] = "axolotl"
+
+    report = run_probe(to_bench_config(mapping), get_device("cpu"))
+    check = next(c for c in report.checks if c.name == "infonce_backward")
+
+    assert calls == [ADAPTERS["axolotl"].required_step_context]
+    assert check.ok, check.error
+    # entered before the step and exited after it, not skipped and not wrapped
+    # around a step that ran outside it
+    assert entered == ["enter", "exit"]
+
+
+def test_on_a_non_cuda_host_the_backward_is_refused_not_silently_measured(
+    config_mapping, monkeypatch
+):
+    """`axes._autocast_step_context` raises `UnappliedAxis` when the required
+    `device_type` ("cuda") does not match the resolved device. This host has no
+    CUDA, so this exercises the real, unpatched `axes.step_context`: the check
+    must fail loudly with that reason rather than being skipped or measured in a
+    regime axolotl does not train in.
+    """
+    _stub_axolotl_run(monkeypatch, _Encoder(), _AxolotlTokenizer())
+    mapping = json.loads(json.dumps(config_mapping))
+    mapping["framework"]["name"] = "axolotl"
+
+    report = run_probe(to_bench_config(mapping), get_device("cpu"))
+    check = next(c for c in report.checks if c.name == "infonce_backward")
+
+    assert check.error_type == "UnappliedAxis"
+    assert "cuda autocast" in check.error
+
+
 def _fake_unsloth(monkeypatch, seen):
     """unsloth installs only inside its own image, so what is stood in for is the
     one behaviour under test: `from_pretrained` recording what it was asked for."""
@@ -1199,7 +1289,7 @@ def test_a_mismatch_this_cannot_classify_is_not_called_environment_bound(
 
 
 def _fake_tevatron(monkeypatch, seen):
-    """A miniature of tevatron dd063104 keeping the two lines the shim is for.
+    """A miniature of tevatron dd063104 keeping the lines the shims are for.
 
     `DenseModel.load` reads `base_model.config.pad_token_id` directly rather than
     through `getattr` and then fills a `None` with 0
@@ -1208,7 +1298,9 @@ def _fake_tevatron(monkeypatch, seen):
     thing under test. The `config` kwarg is honoured the way
     `AutoModel.from_pretrained` honours it — a `PreTrainedConfig` instance is used
     as given and `AutoConfig` is not consulted (transformers 5.14.1
-    models/auto/auto_factory.py:262, :324).
+    models/auto/auto_factory.py:262, :324). `self.temperature = 1.0` reproduces
+    `EncoderModel.__init__`'s default (encoder.py:38), which `apply_temperature`
+    overrides.
     """
 
     class _Loaded(torch.nn.Module):
@@ -1216,6 +1308,7 @@ def _fake_tevatron(monkeypatch, seen):
             super().__init__()
             self.linear = torch.nn.Linear(2, 2)
             self.config = config
+            self.temperature = 1.0
 
     class DenseModel:
         @staticmethod
@@ -1303,6 +1396,138 @@ def test_the_tevatron_shim_leaves_a_config_that_already_declares_it_alone():
 
     assert plant_pad_token_id(hf_config)["pad_token_id_planted"] is False
     assert hf_config.pad_token_id == 7
+
+
+class _FakeEncoderModel(torch.nn.Module):
+    """Stand-in for tevatron's `EncoderModel`: the same `forward(query=, passage=)`
+    signature and the same eval-branch truthiness trap on an empty dict (dd06310
+    encoder.py:52-61), with a real `nn.Embedding` so there is a parameter for
+    `training_step_evidence` to count.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.embed = torch.nn.Embedding(8, 4)
+        self.temperature = 1.0
+
+    def _encode(self, side):
+        return self.embed(side["input_ids"])[:, -1]
+
+    def forward(self, query=None, passage=None):
+        q_reps = self._encode(query) if query else None
+        p_reps = self._encode(passage) if passage else None
+        if q_reps is None or p_reps is None:
+            return types.SimpleNamespace(loss=None, q_reps=q_reps, p_reps=p_reps)
+        scores = q_reps @ p_reps.transpose(0, 1) / self.temperature
+        target = torch.arange(scores.size(0))
+        loss = torch.nn.functional.cross_entropy(scores, target)
+        return types.SimpleNamespace(loss=loss, q_reps=q_reps, p_reps=p_reps)
+
+
+class _FakeTevatronProcessor:
+    """`processor(text=..., return_tensors=..., padding=...)` -> a fixed batch,
+    the same shape the sentence-transformers stub's `.tokenize` uses."""
+
+    padding_side = "right"
+
+    def __call__(self, text=None, return_tensors=None, padding=None):
+        ids = torch.arange(len(text) * 3).reshape(len(text), 3) % 8
+        return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+
+def _fake_tevatron_encoder_model(monkeypatch, seen, frozen=False):
+    """Like `_fake_tevatron`, but `DenseModel.load` hands back something that can
+    run a real `forward`/`backward`, for the checks past `dense_model_load`."""
+    hf_config = types.SimpleNamespace(pad_token_id=0)
+
+    class DenseModel:
+        @staticmethod
+        def load(
+            model_name_or_path, pooling="cls", normalize=False, lora_name_or_path=None, **hf_kwargs
+        ):
+            seen["hf_kwargs"] = hf_kwargs
+            model = _FakeEncoderModel(hf_kwargs.get("config", hf_config))
+            if frozen:
+                model.requires_grad_(False)
+                # The same trick real unsloth's enable_input_require_grads plays:
+                # requires_grad on the embedding *output*, not on any parameter.
+                model.embed.register_forward_hook(
+                    lambda module, args, output: output.requires_grad_(True)
+                )
+            seen["model"] = model
+            return model
+
+    root = types.ModuleType("tevatron")
+    root.__path__ = []
+    root.__version__ = "0.0-stub"
+    modeling = types.ModuleType("tevatron.retriever.modeling")
+    modeling.DenseModel = DenseModel
+    for name, module in {
+        "tevatron": root,
+        "tevatron.retriever": types.ModuleType("tevatron.retriever"),
+        "tevatron.retriever.modeling": modeling,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    from transformers import AutoConfig, AutoProcessor
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *a, **k: hf_config)
+    monkeypatch.setattr(AutoProcessor, "from_pretrained", lambda *a, **k: _FakeTevatronProcessor())
+
+
+def _tevatron_checks(config_mapping, monkeypatch, frozen=False):
+    seen: dict[str, object] = {}
+    _fake_tevatron_encoder_model(monkeypatch, seen, frozen=frozen)
+    mapping = json.loads(json.dumps(config_mapping))
+    mapping["framework"]["name"] = "tevatron"
+    report = run_probe(to_bench_config(mapping), get_device("cpu"))
+    return {c.name: c for c in report.checks}, seen
+
+
+def test_the_tevatron_backward_builds_query_and_passage_dicts_and_reads_the_loss_off_the_encoder(
+    config_mapping, monkeypatch
+):
+    """`EncoderModel.forward` takes `query=`/`passage=` dicts and computes the loss
+    itself (dd06310 encoder.py:52-87); the probe used to call
+    `model(**batch, output_hidden_states=False)`, a call this signature has no
+    `input_ids` keyword for, and which failed on all three models on real pods
+    (2026-08-03) with `unexpected keyword argument 'input_ids'`."""
+    checks, _ = _tevatron_checks(config_mapping, monkeypatch)
+    check = checks["infonce_backward"]
+
+    assert check.ok, check.error
+    assert check.detail["trainable_params"] == check.detail["total_params"] == 1
+    assert check.detail["params_with_grad"] == 1
+
+
+def test_the_tevatron_backward_records_the_temperature_it_actually_ran_at(
+    config_mapping, monkeypatch
+):
+    """`DenseModel.load` takes no `temperature` kwarg, so `EncoderModel.__init__`'s
+    default of 1.0 (encoder.py:38) would otherwise silently outlive
+    `config.loss.temperature`, scoring one tevatron cell at a temperature no other
+    framework's cell used and leaving nothing in the record to say so."""
+    checks, seen = _tevatron_checks(config_mapping, monkeypatch)
+    config = to_bench_config(config_mapping)
+
+    assert seen["model"].temperature == config.loss.temperature
+    assert checks["dense_model_load"].detail["temperature"] == config.loss.temperature
+    assert checks["infonce_backward"].detail["temperature"] == config.loss.temperature
+
+
+def test_the_tevatron_backward_refuses_a_frozen_encoder_like_every_other_framework(
+    config_mapping, monkeypatch
+):
+    """Reuses `steps.training_step_evidence`, so the guard that caught three frozen
+    unsloth cells (2026-08-02, `params_with_grad=0, trainable_params=0`) is on this
+    adapter too, even though tevatron computes its own loss and never calls
+    `steps.infonce_backward`."""
+    checks, _ = _tevatron_checks(config_mapping, monkeypatch, frozen=True)
+    check = checks["infonce_backward"]
+
+    assert (check.ok, check.error_type) == (False, "ValueError"), check.error
+    assert "trained nothing" in check.error
 
 
 def test_proportional_quota_preserves_composition_and_total():

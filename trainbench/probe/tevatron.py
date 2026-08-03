@@ -65,6 +65,21 @@ def plant_pad_token_id(hf_config: Any) -> dict[str, Any]:
     }
 
 
+def apply_temperature(model: Any, config: BenchConfig) -> dict[str, Any]:
+    """Fill the temperature `DenseModel.load` has no keyword for.
+
+    `EncoderModel.__init__`'s default is 1.0 (dd06310 encoder.py:38) and `load`
+    (encoder.py:159-165) forwards no `temperature`, so a loaded model scores at
+    1.0 regardless of `config.loss.temperature` until something sets it. The
+    override is recorded rather than silent: a tevatron cell measured at a
+    temperature no other framework's cell used would corrupt the comparison if
+    nothing said so.
+    """
+    before = model.temperature
+    model.temperature = config.loss.temperature
+    return {"temperature": model.temperature, "temperature_before_override": before}
+
+
 def load_dense_model(config: BenchConfig) -> tuple[Any, dict[str, Any]]:
     """`DenseModel.load` with the shim planted first, and what the shim did."""
     from transformers import AutoConfig
@@ -79,6 +94,7 @@ def load_dense_model(config: BenchConfig) -> tuple[Any, dict[str, Any]]:
         config=hf_config,
         revision=config.model.revision,
     )
+    shim.update(apply_temperature(model, config))
     return model, shim
 
 
@@ -149,12 +165,38 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
         ),
     )
 
+    def _backward() -> dict[str, Any]:
+        """tevatron's own training step, not the harness's.
+
+        `EncoderModel.forward(query=, passage=)` encodes, pools, normalises,
+        scores and computes InfoNCE itself (dd06310 encoder.py:52-87,
+        dense.py:18-46), so `steps.encode`/`embedding.info_nce` never run here —
+        `EncoderOutput.loss` is the whole step. The split mirrors
+        `steps.infonce_backward`'s: the collate lays every query before every
+        positive, so the first half of the tokenised batch is the query side.
+
+        An empty `query` or `passage` dict is falsy and silently takes the eval
+        branch (encoder.py:53-61), which leaves `loss=None`; refused here rather
+        than left to surface as an `AttributeError` on `.backward()`.
+        """
+        model.train()
+        half = tokenized["input_ids"].shape[0] // 2
+        query = {k: v[:half] for k, v in tokenized.items()}
+        passage = {k: v[half:] for k, v in tokenized.items()}
+        output = model(query=query, passage=passage)
+        if output.loss is None:
+            raise ValueError(
+                "EncoderModel.forward returned loss=None; query or passage was empty "
+                "and the call took its inference branch instead of training"
+            )
+        output.loss.backward()
+        detail = steps.training_step_evidence(model, output.loss)
+        detail["temperature"] = model.temperature
+        return detail
+
     if report.run(
         "text_tokenize", lambda: steps.tokenize_text(loaded["processor"], device, tokenized, side)
     )[0]:
-        report.run(
-            "infonce_backward",
-            lambda: steps.infonce_backward(model, tokenized, config.loss.temperature, side),
-        )
+        report.run("infonce_backward", _backward)
     else:
         report.skip("infonce_backward", "tokenization failed")
