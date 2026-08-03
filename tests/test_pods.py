@@ -1227,6 +1227,39 @@ def test_an_override_that_moves_no_axis_does_not_collide():
     )
 
 
+def test_one_value_pinned_by_every_pod_is_a_constant_rather_than_a_split():
+    """`kernel=fla` is not a comparison — it is what a Qwen3.5 run on these images
+    is. transformers binds fla at import whenever the package, the version floor
+    and CUDA are present, so `kernel=none` cannot be built and every pod touching
+    that model pins the same one value. A guard keyed on the axis being mentioned
+    rather than moved refused the shipped fix: measured 2026-08-03, adding the
+    line to the six Phase 0 manifests made `--dry-run` exit 2."""
+    same = [measuring(name, overrides=["kernel=fla"]) for name in ("a", "b", "c")]
+    orchestrate.check_axis_not_split(same)
+    assert orchestrate.held_constant({e.name: ["kernel=fla"] for e in same})
+
+
+def test_a_second_value_beside_the_constant_is_still_a_split():
+    """The relaxation is one value wide. One pod drifting off the pinned value is
+    the original defect, and it must not ride in behind the constant."""
+    with pytest.raises(orchestrate.ManifestError, match="kernel"):
+        orchestrate.check_axis_not_split(
+            [
+                measuring("a", overrides=["kernel=fla"]),
+                measuring("b", overrides=["kernel=fla"]),
+                measuring("c", overrides=["kernel=liger"]),
+            ]
+        )
+
+
+def test_a_declared_comparison_axis_is_never_a_constant():
+    """Two pods declaring the same comparison axis carry no override to compare,
+    so a value-only rule would read them as identical and let half a comparison
+    run on each host — which is what `axis` alone used to mean."""
+    assert not orchestrate.held_constant({"a": ["declared"], "b": ["declared"]})
+    assert not orchestrate.held_constant({"a": ["declared"], "b": ["attn=sdpa"]})
+
+
 def test_two_models_may_run_the_same_axis_on_their_own_pods():
     """The rule is one axis per model per pod, not one axis per campaign — the
     shipped `loss` sweep is three pods, one per model."""

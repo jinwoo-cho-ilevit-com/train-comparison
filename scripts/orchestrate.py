@@ -134,6 +134,11 @@ ROLE_EXPERIMENT = "experiment"
 # and nothing said a word.
 CROSS_POD_GROUP = "framework"
 
+# Evidence that a pod owns an axis as its comparison rather than pinning a value on
+# it. Not a value, so two pods carrying it are always half a comparison each — even
+# when neither has written an override yet.
+AXIS_DECLARED = "declared"
+
 
 class ManifestError(ValueError):
     """An experiment definition that cannot be trusted to describe a pod."""
@@ -334,10 +339,26 @@ def split_axes(experiments: list[Experiment]) -> dict[tuple[str, str], dict[str,
     for exp in experiments:
         touched = axes_touched(exp)
         if exp.axis:
-            touched.setdefault(exp.axis, ["declared"])
+            touched.setdefault(exp.axis, [AXIS_DECLARED])
         for axis, evidence in touched.items():
             seen.setdefault((exp.model, axis), {})[exp.name] = evidence
     return {key: owners for key, owners in seen.items() if len(owners) > 1}
+
+
+def held_constant(owners: dict[str, list[str]]) -> bool:
+    """Whether every pod touching this axis pins the same single value.
+
+    Then nothing about the axis is compared across hosts, which is the only thing
+    the split guard exists to prevent. `kernel=fla` is the case that forced the
+    distinction: on `arch=qwen3_5` transformers binds fla at import whatever the
+    config asks (`_baselines.yaml` carries the source), so every pod touching that
+    model has to pin the same one value — and a guard keyed on the axis being
+    mentioned rather than moved read the fix as the defect.
+
+    `AXIS_DECLARED` is not a value, so its presence is always a split.
+    """
+    evidence = {why for whys in owners.values() for why in whys}
+    return len(evidence) == 1 and AXIS_DECLARED not in evidence
 
 
 def _split_detail(split: dict[tuple[str, str], dict[str, list[str]]]) -> str:
@@ -383,11 +404,13 @@ def check_axis_not_split(experiments: list[Experiment]) -> None:
     images and an image cannot be shared. It is allowed through here and reported
     by `cross_pod_notes`, which is the half that was missing — the guard used to
     be blind to it because `framework` reaches a run through `pod_overrides`.
+
+    An axis every pod pins to the *same* value is not split; see `held_constant`.
     """
     refused = {
         key: owners
         for key, owners in split_axes(experiments).items()
-        if not is_cross_pod_group(key[1])
+        if not is_cross_pod_group(key[1]) and not held_constant(owners)
     }
     if refused:
         raise ManifestError(
