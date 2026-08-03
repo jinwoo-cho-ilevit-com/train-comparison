@@ -2278,10 +2278,39 @@ def stub_bin(bin_dir, calls, forward):
 
     `uv run --frozen python` and `timeout --signal=… --kill-after=… <seconds>`
     each take three arguments of their own before the command they wrap.
+
+    The `infisical` stub does not `exec`, and that is the whole point of it:
+    `infisical run` flattens every non-zero child exit to its own `1` (measured
+    against infisical 0.43.116 — `sys.exit(42)` and a SIGSEGV death both come
+    back as 1) and leaves the real code only as text on stderr. An `exec`ing
+    stub leaked the real code straight through, so every test in this section
+    was reading an exit code the pod could never see, and the laundering went
+    twenty-odd tests without being noticed. `INFISICAL_EXIT_BEFORE_RUN` is how
+    a test asks for the other measured refusal — the CLI declining before it
+    launches anything, which writes no capture file at all.
     """
     forwarding = {
         "uv": f'shift 3\nexec "{sys.executable}" "$@"',
-        "infisical": 'while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done\nshift\nexec "$@"',
+        "infisical": (
+            'if [[ -n "${INFISICAL_EXIT_BEFORE_RUN:-}" ]]; then\n'
+            '    echo "Project ID is required when using machine identity" >&2\n'
+            "    exit 1\n"
+            "fi\n"
+            'while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done\n'
+            "shift\n"
+            '"$@"\n'
+            "ec=$?\n"
+            "[[ ${ec} -eq 0 ]] && exit 0\n"
+            # A signalled child is named rather than numbered, so a test cannot
+            # read the code back out of the message either.
+            "if (( ec > 128 )); then\n"
+            '    echo "failed to wait for command termination: signal:'
+            ' $(kill -l $((ec - 128)))" >&2\n'
+            "else\n"
+            '    echo "failed to wait for command termination: exit status ${ec}" >&2\n'
+            "fi\n"
+            "exit 1"
+        ),
         "timeout": 'shift 3\nexec "$@"',
         "python3": f'exec "{sys.executable}" "$@"',
     }
@@ -2296,7 +2325,14 @@ def stub_bin(bin_dir, calls, forward):
 
 
 def run_entrypoint(tmp_path, env, forward=False):
-    """Run the real entrypoint against `stub_bin`'s PATH."""
+    """Run the real entrypoint against `stub_bin`'s PATH.
+
+    `INFISICAL_TOKEN` is set because every real pod has one — `orchestrate.pod_env`
+    builds `{PATH, HOME, INFISICAL_TOKEN}` and nothing else. Without it here every
+    test in this section took `run_with_secrets`'s no-secrets branch, which is the
+    one branch no pod ever runs, and the exit-code laundering `infisical run` does
+    on the branch pods do run could not be seen from this file at all.
+    """
     bin_dir = tmp_path / "bin"
     calls = tmp_path / "calls.log"
     stub_bin(bin_dir, calls, forward)
@@ -2309,11 +2345,59 @@ def run_entrypoint(tmp_path, env, forward=False):
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "TRAINBENCH_RESULT_DIR": str(result_dir),
             "TRAINBENCH_RESULT_REPO": "acct/results",
+            "INFISICAL_TOKEN": "the pod token the orchestrator minted",
+            "INFISICAL_ENV": orchestrate.POD_INFISICAL_ENV,
             **env,
         },
     )
     logged = calls.read_text().splitlines() if calls.exists() else []
     return proc, logged
+
+
+def entrypoint_line(prefix):
+    """One live line of the entrypoint, found by its own leading text.
+
+    Read out of the shipped file rather than retyped: a copy in here would keep
+    passing after the line it copied had changed, which is the failure mode a
+    shell test is most prone to.
+    """
+    return next(line for line in ENTRYPOINT.read_text().splitlines() if line.startswith(prefix))
+
+
+def entrypoint_function(prefix):
+    """From a live line to the `}` that closes the function under it."""
+    lines = ENTRYPOINT.read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(prefix))
+    end = next(i for i in range(start, len(lines)) if lines[i] == "}")
+    return "\n".join(lines[start : end + 1])
+
+
+def call_run_with_secrets(tmp_path, *script, pod_token=True):
+    """`run_with_secrets` alone, lifted live out of the entrypoint.
+
+    `RESULT_DIR` comes from the entrypoint's own derivation rather than being
+    injected, so the capture file lands where the pod puts it — a test that set
+    `RESULT_DIR` itself would keep passing after that derivation broke.
+    """
+    bin_dir = tmp_path / "bin"
+    stub_bin(bin_dir, tmp_path / "calls.log", forward=True)
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "TRAINBENCH_RESULT_DIR": str(tmp_path / "result"),
+    }
+    if pod_token:
+        env["INFISICAL_TOKEN"] = "the pod token the orchestrator minted"
+        env["INFISICAL_ENV"] = orchestrate.POD_INFISICAL_ENV
+    body = "\n".join(
+        [
+            entrypoint_line("set -"),
+            entrypoint_line("RESULT_DIR="),
+            entrypoint_line('mkdir -p "${RESULT_DIR}"'),
+            entrypoint_function("EXIT_CAPTURE_FILE="),
+            *script,
+        ]
+    )
+    return subprocess.run(["bash", "-c", body], env=env, capture_output=True, text=True)
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
@@ -2404,6 +2488,103 @@ def test_a_pod_that_refused_its_own_config_is_also_not_run_again(tmp_path):
     assert "this container is a restart" in second.stderr
 
 
+# --- what a failed setting's exit code says -------------------------------------
+#
+# `infisical run` reports its own `1` for every way the command under it can fail,
+# so `run_status=$?` recorded a SIGSEGV, a `timeout` kill and a `sys.exit(1)` as
+# the same number. Pods zql0z8hc4k8dlx and x2i12l0tyqzf2a were both filed as "no
+# result file after the run (exit 1)" while dying to SIGSEGV, and pod
+# 5kdvxzvfwc08ne's canonical baseline read as a mystery for hours on that text.
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_the_infisical_stub_launders_exit_codes_the_way_the_real_binary_does(tmp_path):
+    """What every test below rests on, so it is asserted rather than assumed.
+
+    Measured against infisical 0.43.116: a child that exits 42 and a child killed
+    by SIGSEGV both come back as the CLI's own 1; the number survives as stderr
+    text for the first and not at all for the second; a successful child passes 0
+    through. The stub used to `exec` instead, which leaked the real code and is why
+    this file could not see the laundering at all.
+    """
+    bin_dir = tmp_path / "bin"
+    stub_bin(bin_dir, tmp_path / "calls.log", forward=True)
+
+    def through(*command):
+        return subprocess.run(
+            [str(bin_dir / "infisical"), "run", "--env=pod", "--", *command],
+            capture_output=True,
+            text=True,
+        )
+
+    assert through("true").returncode == 0
+    plain = through(sys.executable, "-c", "import sys; sys.exit(42)")
+    assert plain.returncode == 1
+    assert "exit status 42" in plain.stderr
+    killed = through(
+        sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGSEGV)"
+    )
+    assert killed.returncode == 1
+    assert "signal:" in killed.stderr
+    assert "139" not in killed.stderr
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_signalled_command_reports_its_own_code_and_not_infisicals(tmp_path):
+    proc = call_run_with_secrets(
+        tmp_path,
+        'run_with_secrets python3 -c "import os, signal; os.kill(os.getpid(), signal.SIGSEGV)"',
+    )
+    assert proc.returncode == 139, proc.stderr
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_plain_non_zero_exit_is_not_flattened_either(tmp_path):
+    """Not only signal deaths: `timeout`'s 124, `bench.py`'s REFUSED_EXIT and
+    OOM_EXIT and the entrypoint's own 125 all come back through the same call, and
+    every one of them was arriving as 1."""
+    proc = call_run_with_secrets(tmp_path, 'run_with_secrets python3 -c "import sys; sys.exit(42)"')
+    assert proc.returncode == 42, proc.stderr
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_command_that_succeeded_still_reports_zero(tmp_path):
+    proc = call_run_with_secrets(tmp_path, "run_with_secrets true")
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_prior_settings_exit_code_is_never_read_as_the_next_ones(tmp_path):
+    """One capture file serves every setting of a sweep, so the clear at the top of
+    the function is what stops a setting that wrote no file of its own from
+    inheriting the last one's code. Here the second call's `infisical` declines
+    before it launches anything — the measured refusal, which writes nothing — and
+    the honest answer is the CLI's own 1, not the 7 before it.
+    """
+    proc = call_run_with_secrets(
+        tmp_path,
+        'run_with_secrets python3 -c "import sys; sys.exit(7)"',
+        "first=$?",
+        "( export INFISICAL_EXIT_BEFORE_RUN=1; run_with_secrets true )",
+        "second=$?",
+        'echo "first=${first} second=${second}"',
+    )
+    assert "first=7 second=1" in proc.stdout, proc.stdout + proc.stderr
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_without_a_pod_token_the_shell_already_reported_the_real_code(tmp_path):
+    """The no-secrets branch runs the command directly and bash does not launder a
+    child's exit, so it was never broken. It is also the only branch that writes no
+    capture file, which makes it the one exercising the fallback."""
+    proc = call_run_with_secrets(
+        tmp_path,
+        'run_with_secrets python3 -c "import os, signal; os.kill(os.getpid(), signal.SIGSEGV)"',
+        pod_token=False,
+    )
+    assert proc.returncode == 139, proc.stderr
+
+
 def test_a_started_file_alone_means_the_pod_ran_and_said_nothing(tmp_path):
     payload = publish_result.started_record(resolved_config())
     path = write_artifact(tmp_path, "native", "gemma4_e2b", "a", "started.json", payload)
@@ -2436,6 +2617,7 @@ from pathlib import Path
 sys.path.insert(0, "__REPO__")
 
 from trainbench.config_schema import BenchConfig
+from trainbench.kernels import RUNTIME_FETCH_ENV
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", type=Path)
@@ -2492,6 +2674,12 @@ except Exception as exc:
 with open(os.environ["FAKE_BENCH_LOG"], "a") as handle:
     handle.write(json.dumps(entry) + "\\n")
 
+if args.out.stem in os.environ.get("FAKE_BENCH_CRASH", "").split(","):
+    # A signal death, not an exit: what the axolotl cells did on the pod, and the
+    # one shape `infisical run` cannot report a code for at all.
+    import signal
+
+    os.kill(os.getpid(), signal.SIGSEGV)
 if entry["error"] or args.out.stem in os.environ.get("FAKE_BENCH_FAIL", "").split(","):
     raise SystemExit(1)
 args.out.write_text(json.dumps({"status": "ok", "config": payload}))
@@ -2614,6 +2802,7 @@ def sweep_pod(
     plan,
     purpose="timing",
     fail="",
+    crash="",
     config=None,
     budget=None,
     floor=None,
@@ -2654,6 +2843,7 @@ def sweep_pod(
         "FAKE_BENCH_LOG": str(bench_log),
         "FAKE_HUB_LOG": str(hub_log),
         "FAKE_BENCH_FAIL": fail,
+        "FAKE_BENCH_CRASH": crash,
     }
     if pod_image:
         env["FAKE_POD_IMAGE"] = "1"
@@ -2721,6 +2911,26 @@ def test_one_setting_failing_does_not_take_the_rest_of_the_axis_with_it(tmp_path
     assert plan[1]["name"] in by_setting[failed]["probe"]["checks"][0]["error"]
     assert sorted(b["status"] for s, b in by_setting.items() if s != failed) == ["ok", "ok"]
     assert "run exited 1" in sweep.proc.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
+def test_a_setting_killed_by_a_signal_publishes_that_code_and_not_infisicals(tmp_path):
+    """The whole chain, because the unit tests above stop at the shell function.
+
+    The reason string a setting's fallback record carries is built from
+    `run_with_secrets`'s return value, so a setting killed by SIGSEGV published
+    "exit 1" — the same text `sys.exit(1)` produces, and the only trace left of a
+    pod-hour. The other two settings still measure, so the axis is not lost either.
+    """
+    plan = sweep_plan()
+    sweep = sweep_pod(tmp_path, plan, crash="result-0")
+    results = published_results(sweep)
+    by_setting = {path.split("/")[-2]: body for path, body in results.items()}
+    killed = publish_result.setting_dir(plan[0]["name"])
+    assert by_setting[killed]["status"] == "no_result"
+    assert "exit 139" in by_setting[killed]["probe"]["checks"][0]["error"]
+    assert sorted(b["status"] for s, b in by_setting.items() if s != killed) == ["ok", "ok"]
+    assert "run exited 139" in sweep.proc.stdout
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")

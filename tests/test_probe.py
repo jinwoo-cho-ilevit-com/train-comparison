@@ -24,6 +24,10 @@ from trainbench.probe.steps import image_token_id, visual_token_count
 from trainbench.probe.types import ProbeReport
 from trainbench.record import write_json
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
+
+import verify_env  # noqa: E402
+
 import torch  # isort: skip
 
 FRAMEWORKS = ["unsloth", "ms_swift", "sentence_transformers", "tevatron", "axolotl"]
@@ -105,6 +109,44 @@ def test_a_crashing_adapter_keeps_the_checks_it_already_recorded(config_mapping,
     assert report.checks[0].ok
     assert report.checks[1].error_type == "RuntimeError"
     assert not report.all_ok
+
+
+def test_what_escapes_run_probe_is_still_filed_as_a_result(config_mapping, tmp_path, monkeypatch):
+    """One level above the net `report.run` casts: a pod whose probe died between
+    the adapters left no artifact at all, so the combination read as never
+    attempted and the traceback stayed in a log that dies with the pod."""
+    config_path = write_json(tmp_path / "resolved.json", config_mapping)
+    out = tmp_path / "result.json"
+
+    def boom(config, device):
+        raise MemoryError("died between the adapters")
+
+    monkeypatch.setattr(verify_env, "run_probe", boom)
+    assert verify_env.main(["--config", str(config_path), "--out", str(out)]) == 1
+
+    record = json.loads(out.read_text())
+    check = record["probe"]["checks"][0]
+    assert check["name"] == "probe_process"
+    assert check["error_type"] == "MemoryError"
+    assert "died between the adapters" in check["error"]
+    assert "MemoryError" in check["traceback"]
+
+
+def test_a_deliberate_exit_code_is_not_refiled_as_a_framework_failure(
+    config_mapping, tmp_path, monkeypatch
+):
+    """The net catches `Exception`, not `BaseException`. Swallowing `SystemExit`
+    rewrote a chosen exit code as this entry point's own 1 — the same laundering
+    `docker/entrypoint.sh::run_with_secrets` exists to undo — and filed the exit as
+    though the framework had refused the model."""
+    config_path = write_json(tmp_path / "resolved.json", config_mapping)
+    out = tmp_path / "result.json"
+    monkeypatch.setattr(verify_env, "run_probe", lambda config, device: sys.exit(3))
+
+    with pytest.raises(SystemExit) as raised:
+        verify_env.main(["--config", str(config_path), "--out", str(out)])
+    assert raised.value.code == 3
+    assert not out.exists()
 
 
 class _Config:

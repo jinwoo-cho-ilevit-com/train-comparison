@@ -75,17 +75,46 @@ printf '%s' "${TRAINBENCH_PLAN_JSON:-[]}" > "${PLAN_PATH}"
 # injects a short-lived token as an env var; the client secret never reaches here.
 # A machine-identity token carries no project of its own, so --projectId is
 # required whenever it is known — and passing it empty makes the CLI reject the call.
+#
+# `infisical run` flattens ANY non-zero exit from the command it wraps to a flat
+# `1` — measured against infisical 0.43.116: a child that exits normally with 42
+# and a child killed by SIGSEGV both come back as infisical's own exit 1. What
+# reaches stderr is text, and not always a number: a normal exit leaves "failed to
+# wait for command termination: exit status 42", while a directly signalled child
+# leaves "...: signal: segmentation fault" with no code in it at all.
+# `run_status=$?` after this function has therefore recorded every one of this
+# repository's signal deaths as "exit 1" — indistinguishable from an ordinary
+# Python `sys.exit(1)`. A plain POSIX shell does not have this
+# problem: its own `exit "$ec"` after a signalled child reports 128+signal
+# untouched, so the real command runs one shell layer further in, and that
+# shell's own `$?` is persisted to a file infisical cannot launder because it
+# never passes through infisical's own exit path at all.
+EXIT_CAPTURE_FILE="${RESULT_DIR}/.last-exit"
+
 run_with_secrets() {
+    # Cleared before every call — this function runs once per sweep setting, and
+    # a stale file from a prior setting must never be read as this one's code.
+    rm -f "${EXIT_CAPTURE_FILE}"
     if [[ -n "${INFISICAL_TOKEN:-}" ]]; then
         local args=(run "--env=${INFISICAL_ENV:-dev}")
         if [[ -n "${INFISICAL_PROJECT_ID:-}" ]]; then
             args+=("--projectId=${INFISICAL_PROJECT_ID}")
         fi
-        infisical "${args[@]}" -- "$@"
+        # `_` fills the inner shell's own `$0` so a crash message (which bash and
+        # sh both prefix with `$0`) names a placeholder instead of the capture
+        # file path, which would otherwise read like the file itself crashed.
+        infisical "${args[@]}" -- \
+            sh -c 'file="$1"; shift; "$@"; ec=$?; printf %s "$ec" > "$file"; exit $ec' \
+            _ "${EXIT_CAPTURE_FILE}" "$@"
     else
         echo "INFISICAL_TOKEN not set; running without secret injection" >&2
         "$@"
     fi
+    local reported=$?
+    if [[ -s "${EXIT_CAPTURE_FILE}" ]]; then
+        return "$(cat "${EXIT_CAPTURE_FILE}")"
+    fi
+    return "${reported}"
 }
 
 publish_failures=0
