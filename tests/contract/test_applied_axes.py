@@ -307,13 +307,24 @@ def lora_model(dtype=torch.bfloat16):
     )
 
 
+def unnamed_adapter_model():
+    """An adapter type `peft.mode` offers no value for. `_capture_peft` names only
+    `full` and `lora`, so a build carrying any other `peft_type` must survive as
+    `peft(...)` rather than being rounded to the nearest configured value."""
+    entry = SimpleNamespace(peft_type="IA3")
+    return model(
+        params=weights(),
+        peft_config=SimpleNamespace(values=lambda: [entry]),
+    )
+
+
 MIRRORS = (
     # (axis, config overrides, Built, what capture must say instead of the request)
     ("attn.name", {"attn.name": "fa3"}, lambda: Built(model=model("sdpa")), "sdpa"),
     ("kernel.name", {"kernel.name": "liger"}, lambda: Built(model=model()), "none"),
     (
         "peft.mode",
-        {"peft.mode": "qlora", "peft.r": 8},
+        {"peft.mode": "lora", "peft.r": 8},
         lambda: Built(model=model(params=weights())),
         "full",
     ),
@@ -402,13 +413,8 @@ UNNAMEABLE = (
     ),
     (
         "peft.mode",
-        lambda: Built(
-            model=SimpleNamespace(
-                **vars(lora_model()),
-                is_loaded_in_4bit=True,
-            )
-        ),
-        None,  # any qlora(...) qualification; asserted by prefix below
+        lambda: Built(model=unnamed_adapter_model()),
+        None,  # any peft(...) qualification; asserted by prefix below
     ),
 )
 
@@ -423,7 +429,7 @@ def test_deliberately_unnameable_values_survive(config_mapping, name, build, exp
     if expected is not None:
         assert entry.applied == expected
     else:
-        assert entry.applied.startswith("qlora(")
+        assert entry.applied.startswith("peft(")
     assert entry.applied not in literal_values(name), (
         f"{entry.applied!r} became a value the config can ask for, so a run that "
         "belongs to no setting now matches one"

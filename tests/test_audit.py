@@ -823,10 +823,10 @@ def test_model_spec_notices_a_missing_field():
 
 def test_every_model_states_the_same_facts_in_the_spec():
     """`model_spec_problems` walks the spec's fields, so a field the spec omits for
-    one model is not compared against anything — measured: deleting gemma-4's
-    `prompt_format` from docs/model-spec.yaml leaves the audit at 12/15 passing,
-    while flipping its value is caught. The omission is what this closes: every
-    model declares the same facts, so a per-model decision cannot go unstated.
+    one model is not compared against anything — measured: deleting a model's
+    `prompt_format` from docs/model-spec.yaml leaves the audit passing, while
+    flipping its value is caught. The omission is what this closes: every model
+    declares the same facts, so a per-model decision cannot go unstated.
     """
     loaded = audit_plan.yaml.safe_load((REPO / "docs" / "model-spec.yaml").read_text()) or {}
     spec = loaded["models"]

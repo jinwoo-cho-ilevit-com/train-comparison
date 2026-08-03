@@ -59,7 +59,7 @@ ATTENTION_AXIS = "attn.name"
 
 # peft modes that make parameters trainable *after* this module is done: the
 # adapter is attached by `axes._peft`, inside `axes.assemble`.
-ADAPTER_ATTACHING_PEFT_MODES = ("lora", "qlora")
+ADAPTER_ATTACHING_PEFT_MODES = ("lora",)
 
 
 class AdapterRefusal(AppliedMismatch):
@@ -311,8 +311,8 @@ def attaches_an_adapter_later(config: BenchConfig) -> bool:
     unsloth freezes every parameter without a LoRA marker inside
     `from_pretrained`, and the LoRA that unfreezes it is attached by `axes._peft`
     inside `axes.assemble` — later than any load here. So a frozen build under
-    `peft.mode=lora`/`qlora` is the expected intermediate state, and the
-    frozen-graph refusal belongs to whoever holds the assembled model.
+    `peft.mode=lora` is the expected intermediate state, and the frozen-graph
+    refusal belongs to whoever holds the assembled model.
     """
     return config.peft.mode in ADAPTER_ATTACHING_PEFT_MODES
 

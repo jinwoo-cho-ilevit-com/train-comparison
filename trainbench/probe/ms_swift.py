@@ -96,7 +96,6 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
             model,
             device,
             side,
-            config.model.max_tokens_per_image,
             config.model.prompt_format,
         ),
     )

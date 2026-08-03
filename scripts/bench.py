@@ -989,8 +989,8 @@ def build_run(
     with refusing("load_kwargs"):
         # `native_binding` tags its own `axes.load_kwargs` call, but an adapter's
         # does not go through it — `trainbench.loader` calls `axes.load_kwargs`
-        # itself, outside that block. Without this the `UnappliedAxis` a refused
-        # `peft.mode=qlora` raises would leave `main`'s broad `except` instead of
+        # itself, outside that block. Without this an `UnappliedAxis` a refused
+        # load-time axis raises would leave `main`'s broad `except` instead of
         # `refusal_record`, and the setting would produce no result file at all.
         binding = load_framework(config, device)
     with refusing("binding", fingerprint=binding.fingerprint):

@@ -3,7 +3,7 @@
 The pod side never composes: it receives this file. That keeps Hydra out of the
 framework images and guarantees the config that ran is the config recorded.
 
-    python scripts/compose_config.py model=gemma4_e2b framework=unsloth run=probe
+    python scripts/compose_config.py model=qwen3_5_0_8b framework=unsloth run=probe
 """
 
 from __future__ import annotations

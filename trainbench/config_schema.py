@@ -30,11 +30,10 @@ BASELINE_DEVIATION_LIMIT = 0.03
 # One visual token under `Qwen2VLImageProcessor` covers patch_size**2 * merge_size**2
 # pixels (transformers 5.14.1 image_processing_qwen2_vl.py: `_preprocess` divides the
 # resized grid by `patch_size` then folds `merge_size**2` patches into one feature).
-# Both currently-active models declare patch_size=16, merge_size=2 in their own
+# Both models declare patch_size=16, merge_size=2 in their own
 # `preprocessor_config.json` (qwen3_vl, qwen3_5) -> 16**2 * 2**2 = 1024. Scoped to
-# those two archs by `_the_pixel_cap_fits_the_sequence_budget` below: gemma4 uses a
-# different image processor and a different budget declaration
-# (`model.max_tokens_per_image`), not this pixel arithmetic.
+# those two archs by `_the_pixel_cap_fits_the_sequence_budget` below, which is
+# every arch this schema offers.
 QWEN_PIXELS_PER_VISUAL_TOKEN = 16**2 * 2**2
 
 # Subset revisions that must never be trained on again, with the reason a run
@@ -90,7 +89,7 @@ def _reader(section: str, name: str) -> Callable[[BenchConfig], Any]:
 class ModelConfig(Strict):
     name: str
     hf_id: str
-    arch: Literal["qwen3_vl", "qwen3_5", "gemma4"]
+    arch: Literal["qwen3_vl", "qwen3_5"]
     revision: str | None = None
     # How this model is meant to be used, per docs/model-spec.md. These live in
     # config rather than code because they differ per model and a wrong value is
@@ -101,10 +100,10 @@ class ModelConfig(Strict):
     # generative models, which have no embedding spec — inventing one would add
     # an unvalidated confound.
     instruction_prompt: str | None = None
-    # From tokenizer_config.json. gemma4 pads left and the other two right, which
-    # decides which index last-token pooling must read. Declared here rather than
-    # branched on `arch` in code so that a lane reading the pooling code sees the
-    # value it has to handle instead of assuming one.
+    # From tokenizer_config.json. Decides which index last-token pooling must
+    # read. Declared here rather than branched on `arch` in code so that a lane
+    # reading the pooling code sees the value it has to handle instead of
+    # assuming one.
     padding_side: Literal["left", "right"]
     # How the embedding is formed. Only qwen3_vl has an official answer
     # (1_Pooling/config.json); for the generative models this is our choice, and
@@ -115,13 +114,6 @@ class ModelConfig(Strict):
     # difference in what is measured, not an implementation detail, which is why
     # it is declared here and read only by trainbench/prompt.py.
     prompt_format: Literal["chat_template", "raw"]
-    # The most visual tokens one image can become, where the model declares a cap.
-    # No model here has a fixed per-image count: gemma4's processor computes the
-    # count from the aspect ratio and stops at max_soft_tokens=280, and the Qwen
-    # models are pixel-proportional with no declared token cap at all (None). The
-    # count itself is always measured, never assumed — fixing a single budget
-    # across models was abandoned (docs/model-spec.md decision 3).
-    max_tokens_per_image: int | None = Field(default=None, gt=0)
 
 
 class DataConfig(Strict):
@@ -241,7 +233,7 @@ class LossConfig(Strict):
 
 
 class PeftConfig(Strict):
-    mode: Literal["full", "lora", "qlora"] = Axis()
+    mode: Literal["full", "lora"] = Axis()
     r: int = Field(default=0, ge=0)
     alpha: int = Field(default=0, ge=0)
     dropout: float = Field(default=0.0, ge=0, le=1)
@@ -249,8 +241,6 @@ class PeftConfig(Strict):
 
 class FreezeConfig(Strict):
     vision_tower: bool = Axis(False)
-    # Per-layer embeddings, gemma4 only.
-    ple: bool = Axis(False)
 
 
 class DataloaderConfig(Strict):
@@ -486,15 +476,6 @@ class BenchConfig(Strict):
         return self
 
     @model_validator(mode="after")
-    def _ple_is_gemma4_only(self) -> BenchConfig:
-        if self.freeze.ple and self.model.arch != "gemma4":
-            raise ValueError(
-                f"freeze.ple applies to per-layer embeddings, which only exist in gemma4; "
-                f"model arch is {self.model.arch}."
-            )
-        return self
-
-    @model_validator(mode="after")
     def _warmup_leaves_a_measured_window(self) -> BenchConfig:
         """Discarding more steps than exist measures nothing at all. The
         max-autotune rule below sets a floor on warmup; this sets the ceiling."""
@@ -623,20 +604,19 @@ class BenchConfig(Strict):
 
         Measured (peft 0.20.0): `get_peft_model` sets `requires_grad=False` on every
         base parameter, and the result is identical whether or not a freeze axis ran
-        first. `freeze.ple=true` and `freeze.ple=false` therefore build the same
-        model under LoRA — the axis has no state to be in.
+        first. `freeze.vision_tower=true` and `freeze.vision_tower=false` therefore
+        build the same model under LoRA — the axis has no state to be in.
 
         Refused here rather than at the axis, because the two settings are not a
         mismatch to be caught at capture time; they are a request for a comparison
         that does not exist. Leaving it legal would put two rows in the ablation
         table whose only difference is their labels.
         """
-        frozen = [name for name in ("vision_tower", "ple") if getattr(self.freeze, name)]
-        if self.peft.mode != "full" and frozen:
+        if self.peft.mode != "full" and self.freeze.vision_tower:
             raise ValueError(
                 f"peft.mode={self.peft.mode} freezes every base parameter, so "
-                f"freeze.{'/freeze.'.join(frozen)}=true selects nothing; use freeze=none "
-                "with an adapter, or peft=full to measure the freeze axes."
+                "freeze.vision_tower=true selects nothing; use freeze=none with an "
+                "adapter, or peft=full to measure the freeze axis."
             )
         return self
 
@@ -660,27 +640,6 @@ class BenchConfig(Strict):
         return self
 
     @model_validator(mode="after")
-    def _an_image_token_cap_is_gemma4_only(self) -> BenchConfig:
-        """gemma4's processor declares max_soft_tokens=280 and computes each image's
-        count from its aspect ratio, so 280 bounds the count without being it. The
-        Qwen models declare a pixel range and no token cap, so a number there would
-        be our arithmetic presented as the model's spec, and it would reintroduce the
-        cross-model token budget that decision 3 abandoned (docs/model-spec.md)."""
-        capped = self.model.max_tokens_per_image is not None
-        if capped and self.model.arch != "gemma4":
-            raise ValueError(
-                f"model.max_tokens_per_image is set for arch={self.model.arch}, which "
-                "declares a pixel range and no token cap; the count must be measured."
-            )
-        if not capped and self.model.arch == "gemma4":
-            raise ValueError(
-                "arch=gemma4's processor declares max_soft_tokens; "
-                "model.max_tokens_per_image must carry it so a measured count above the "
-                "cap is caught instead of published."
-            )
-        return self
-
-    @model_validator(mode="after")
     def _the_pixel_cap_fits_the_sequence_budget(self) -> BenchConfig:
         """A batch of 1 can already overflow `data.max_seq_len` — measured: a single
         image-bearing row reached 16281 tokens under Qwen3.5-0.8B's shipped
@@ -692,10 +651,9 @@ class BenchConfig(Strict):
         a row carries — query and positive are separate rows) must not exceed
         `data.max_seq_len`.
 
-        Scoped to qwen3_vl/qwen3_5: gemma4 uses a different image processor and a
-        different budget declaration (`model.max_tokens_per_image`), not this pixel
-        arithmetic, and it is being dropped from the campaign regardless
-        (`_an_image_token_cap_is_gemma4_only` above is its still-standing check).
+        Scoped to qwen3_vl/qwen3_5, which is every arch this schema offers: gemma4
+        used a different image processor and a different budget declaration, and it
+        has left the campaign.
 
         Scoped to `timing`/`quality` the same way `_measured_runs_pin_their_data`
         is: a probe answers "does it run" over whatever `data.max_seq_len` a test
@@ -732,6 +690,6 @@ class BenchConfig(Strict):
 
     @model_validator(mode="after")
     def _lora_needs_rank(self) -> BenchConfig:
-        if self.peft.mode in ("lora", "qlora") and self.peft.r <= 0:
+        if self.peft.mode == "lora" and self.peft.r <= 0:
             raise ValueError(f"peft.mode={self.peft.mode} requires peft.r > 0")
         return self

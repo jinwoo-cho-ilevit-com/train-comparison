@@ -53,7 +53,7 @@ def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any])
             "revision_of_model": config.model.revision,
             "sequence_len": config.data.max_seq_len,
             "bf16": True,
-            "load_in_4bit": config.peft.mode == "qlora",
+            "load_in_4bit": False,
             "adapter": None if config.peft.mode == "full" else config.peft.mode,
             "lora_r": config.peft.r or None,
             "lora_alpha": config.peft.alpha or None,

@@ -10,7 +10,6 @@ from typing import Any
 
 import torch
 
-from trainbench import axes
 from trainbench.config_schema import BenchConfig
 from trainbench.probe import steps
 from trainbench.probe.types import ProbeReport
@@ -28,7 +27,7 @@ def load_processor(config: BenchConfig) -> Any:
 
 def load_model(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any]) -> Any:
     """AutoModel rather than the generative head: an embedding model never
-    materialises the LM head, which for gemma4 is 262144 x 1536."""
+    materialises the LM head, which is a large tensor no run here needs."""
     from transformers import AutoModel
 
     return AutoModel.from_pretrained(
@@ -98,7 +97,6 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
             model,
             device,
             side,
-            config.model.max_tokens_per_image,
             config.model.prompt_format,
         ),
     )
@@ -118,10 +116,7 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
         lambda: _multimodal_embed(model, processor, device, side, config.model.prompt_format),
     )
 
-    if config.model.arch == "gemma4":
-        report.run("ple_parameters", lambda: _ple_report(model))
-
-    if config.peft.mode in ("lora", "qlora"):
+    if config.peft.mode == "lora":
         report.run("lora_attach", lambda: _lora_attach(model, config))
 
 
@@ -142,50 +137,6 @@ def _multimodal_embed(
     return {"embedding_shape": list(pooled.shape), "seq_len": int(batch["input_ids"].shape[1])}
 
 
-def _ple_report(model: Any) -> dict[str, Any]:
-    """Locate gemma4 per-layer embeddings and confirm they can be frozen.
-
-    Roughly half of gemma-4-E2B's 5.1B parameters live in these tables, so whether
-    they are trainable dominates the optimizer-memory picture for this model.
-    """
-    # Which parameters are PLE is defined once, in axes.py. A second definition
-    # here drifted already: it also matched "altup", which the measured weight map
-    # shows matches nothing (docs/model-spec.md), and it would have gone on
-    # disagreeing with the freeze axis that this check is about.
-    matches = [(name, param.numel()) for name, param in axes.ple_parameters(model)]
-    # Zero matches is a failure, not a finding. Roughly half of gemma-4-E2B lives in
-    # these tables, so an empty match means the name marker no longer fits this
-    # checkpoint — and `freeze.ple` would then freeze nothing while reporting that
-    # it froze what it was asked to. Reporting ok on a zero match is how the second,
-    # already-drifted PLE definition went unnoticed.
-    if not matches:
-        raise ValueError(
-            f"no parameter name contains {axes.PLE_PARAM_MARKER!r} in this gemma4 "
-            f"checkpoint ({len(list(model.named_parameters()))} parameters); "
-            "freeze.ple would silently freeze nothing."
-        )
-    total = sum(p.numel() for p in model.parameters())
-    ple_total = sum(n for _, n in matches)
-
-    before = {name: param.requires_grad for name, param in model.named_parameters()}
-    for _, param in axes.ple_parameters(model):
-        param.requires_grad_(False)
-    frozen = sum(1 for _, p in model.named_parameters() if not p.requires_grad)
-    # Restore what was there, not everything to True: forcing True would undo the
-    # freeze axis that axes.apply() just set, and the run would measure a model
-    # training 2.39B parameters it was told to freeze.
-    for name, param in model.named_parameters():
-        param.requires_grad_(before[name])
-    return {
-        "matched_parameter_names": [name for name, _ in matches][:20],
-        "matched_count": len(matches),
-        "ple_parameters": ple_total,
-        "total_parameters": total,
-        "ple_fraction": round(ple_total / total, 4) if total else None,
-        "froze_successfully": frozen,
-    }
-
-
 def _lora_attach(model: Any, config: BenchConfig) -> dict[str, Any]:
     """Whether peft accepts this architecture. Terminal: no check may follow it.
 
@@ -193,11 +144,11 @@ def _lora_attach(model: Any, config: BenchConfig) -> dict[str, Any]:
     a model that is no longer the one the axes were captured from. It runs last
     and its result is discarded for that reason.
 
-    It is not an axis application site — `peft.mode` has no implementation in
-    axes.py yet, because freezing under LoRA collides with `freeze.ple`: peft
-    freezes every base parameter, so a `freeze.ple=false` run would read back as
-    frozen. Deciding whether freeze axes mean "frozen" or "frozen in addition to
-    what peft does" belongs to the lane that implements the axis, not here.
+    It is not an axis application site: freezing under LoRA collides with
+    `freeze.vision_tower`, because peft freezes every base parameter, so a
+    `freeze.vision_tower=false` run would read back as frozen regardless
+    (`config_schema.py`'s `_freeze_axes_mean_nothing_under_an_adapter` refuses
+    the combination outright).
     """
     from peft import LoraConfig, get_peft_model
 

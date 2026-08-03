@@ -6,12 +6,11 @@ except `peak_memory_bytes` and `synchronize`, which are the two places the devic
 has to be asked.
 
 Deliberately absent: MFU. The standard FLOP formula assumes dense attention over
-a fixed hidden size, and all three models under test break it in different ways —
-Qwen3.5 is 75% Gated DeltaNet (linear attention), gemma-4 does a per-layer
-embedding lookup that is memory traffic rather than matmul, and both VLMs use
-sliding-window layers. A single formula would be wrong by an unknown amount per
-model, which is worse than no number. tokens/s is the primary figure until a
-per-model formula exists with a unit test behind it (PLAN.md Phase 1).
+a fixed hidden size, and both models under test break it in different ways —
+Qwen3.5 is 75% Gated DeltaNet (linear attention), and both use sliding-window
+layers. A single formula would be wrong by an unknown amount per model, which is
+worse than no number. tokens/s is the primary figure until a per-model formula
+exists with a unit test behind it (PLAN.md Phase 1).
 """
 
 from __future__ import annotations
@@ -288,9 +287,9 @@ def summarise(
 
     `tokens_per_step` is optional and separate from `rows_per_step` because the
     token count is what makes two models comparable and the row count is not:
-    tokenisers differ, and image tokens differ again (Qwen scales with pixels,
-    gemma-4 is fixed at 280). A run that could not count tokens reports None
-    rather than a row-derived stand-in.
+    tokenisers differ, and image tokens scale with pixels rather than with rows.
+    A run that could not count tokens reports None rather than a row-derived
+    stand-in.
 
     The per-step counts are averages over the measured steps and are floats on
     purpose. Flooring them to int understated every rate by up to one row per

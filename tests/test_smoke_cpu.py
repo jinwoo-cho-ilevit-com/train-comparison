@@ -1710,25 +1710,67 @@ def test_a_plan_whose_settings_can_all_be_applied_passes(tmp_path, config_mappin
     assert bench_entry.preflight(path) == 0
 
 
-def test_one_unapplicable_setting_refuses_the_whole_plan(tmp_path, config_mapping, pod_gpu):  # noqa: F811
-    """`peft.mode=qlora` needs a CUDA device to quantise the base, and this
-    fixture's device is fixed to cpu, so it is refused on this host. `preflight`
-    reaches it through `axes.load_kwargs`."""
+# A marker `train.seed` value nothing else uses, so `_refuse_a_marked_config`
+# can pick the one config to refuse out of a plan without needing a real axis
+# this environment cannot apply. qlora was that axis until 2026-08-03, when it
+# left the campaign along with `axes.load_kwargs`'s only refusal; borrowing
+# whichever real axis is unapplicable this week is how the exemplar was lost
+# once already (`precision=mxfp8` was removed the same day it was needed here).
+UNAPPLICABLE_MARKER_SEED = 913_204_711
+
+
+def _refuse_a_marked_config(monkeypatch):
+    """Make `axes.load_kwargs` raise `UnappliedAxis` for the one config carrying
+    `UNAPPLICABLE_MARKER_SEED`, and behave exactly as before for every other.
+
+    This is the synthetic stand-in for a real load-time refusal: the invariant
+    under test is that `preflight` stops a pod on an axis it cannot apply before
+    the timer starts, and that invariant must not depend on which real axis
+    happens to be unapplicable this week.
+    """
+    real_load_kwargs = axes.load_kwargs
+
+    def fake(config):
+        if config.train.seed == UNAPPLICABLE_MARKER_SEED:
+            raise axes.UnappliedAxis(
+                "synthetic refusal injected by test_smoke_cpu.py for a config marked "
+                f"train.seed={UNAPPLICABLE_MARKER_SEED}"
+            )
+        return real_load_kwargs(config)
+
+    monkeypatch.setattr(axes, "load_kwargs", fake)
+
+
+def test_one_unapplicable_setting_refuses_the_whole_plan(
+    tmp_path,
+    config_mapping,  # noqa: F811
+    pod_gpu,
+    monkeypatch,
+):
+    """An axis this environment cannot apply is refused through `axes.load_kwargs`,
+    and `preflight` reaches it there."""
+    _refuse_a_marked_config(monkeypatch)
     good = bench(config_mapping).model_dump(mode="json")
-    bad = bench(config_mapping, **{"peft.mode": "qlora", "peft.r": 32}).model_dump(mode="json")
+    bad = bench(config_mapping, **{"train.seed": UNAPPLICABLE_MARKER_SEED}).model_dump(mode="json")
     path = plan_file(tmp_path, [plan_item("a", good), plan_item("b", bad)])
     assert bench_entry.preflight(path) == bench_entry.PREFLIGHT_EXIT
 
 
-def test_a_probe_that_declines_an_axis_is_still_started(tmp_path, config_mapping, pod_gpu):  # noqa: F811
+def test_a_probe_that_declines_an_axis_is_still_started(
+    tmp_path,
+    config_mapping,  # noqa: F811
+    pod_gpu,
+    monkeypatch,
+):
     """A probe pod is launched to answer whether this framework takes this axis,
     and `applied.ENFORCED_PURPOSES` never held `probe` for that reason.
     Standing the pod down here published the answer as `결과 없음(기동됨)` — the
     same cell a pod that booted and died produces — instead of as the refusal it
     is.
     """
+    _refuse_a_marked_config(monkeypatch)
     declined = bench(
-        config_mapping, **{"peft.mode": "qlora", "peft.r": 32, "run.purpose": "probe"}
+        config_mapping, **{"train.seed": UNAPPLICABLE_MARKER_SEED, "run.purpose": "probe"}
     ).model_dump(mode="json")
     path = plan_file(tmp_path, [plan_item("a", declined)])
 
@@ -1854,15 +1896,16 @@ def test_a_runnable_plan_on_the_wrong_gpu_measures_nothing(tmp_path, config_mapp
 
 def test_a_pod_wrong_in_both_ways_is_told_both(tmp_path, config_mapping, monkeypatch):  # noqa: F811
     """One pod log naming the GPU and the setting is worth more than two relaunches."""
+    _refuse_a_marked_config(monkeypatch)
     monkeypatch.setenv(bench_entry.CUDA_ARCHS_ENV, "80;90;100")
     monkeypatch.setattr(bench_entry, "current_gpu_arch", lambda: "120")
-    bad = bench(config_mapping, **{"peft.mode": "qlora", "peft.r": 32}).model_dump(mode="json")
+    bad = bench(config_mapping, **{"train.seed": UNAPPLICABLE_MARKER_SEED}).model_dump(mode="json")
     path = plan_file(tmp_path, [plan_item("a", bad)])
     log = io.StringIO()
     assert bench_entry.preflight(path, stream=log) == bench_entry.PREFLIGHT_EXIT
     printed = log.getvalue()
     assert "this pod's GPU" in printed
-    assert "qlora" in printed
+    assert str(UNAPPLICABLE_MARKER_SEED) in printed
 
 
 # --- what the adapter says, reaching the run ---------------------------------
