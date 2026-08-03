@@ -1196,11 +1196,11 @@ axolotl 칸에는 하나가 더 붙는다. `required_step_context`(autocast, cud
 
 | | qwen3_vl_emb_2b | qwen3_5_0_8b | gemma4_e2b |
 |---|---|---|---|
-| native | OK (12 checks) | FAIL axes_verified (AppliedMismatch) | OK (13 checks) |
+| native | OK (12 checks) | OK (12 checks) | OK (13 checks) |
 | unsloth | FAIL axes_verified (AppliedMismatch) | FAIL axes_verified (AppliedMismatch) | FAIL axes_verified (AppliedMismatch) |
-| ms_swift | OK (10 checks) | FAIL axes_verified (AppliedMismatch) | OK (10 checks) |
-| sentence_transformers | OK (9 checks) | FAIL axes_verified (AppliedMismatch) | OK (9 checks) |
-| tevatron | FAIL infonce_backward (TypeError) | FAIL axes_verified (AppliedMismatch) | FAIL infonce_backward (TypeError) |
+| ms_swift | OK (10 checks) | OK (10 checks) | OK (10 checks) |
+| sentence_transformers | OK (9 checks) | OK (9 checks) | OK (9 checks) |
+| tevatron | OK (10 checks) | OK (10 checks) | OK (10 checks) |
 | axolotl | FAIL axes_verified (AppliedMismatch) | FAIL axes_verified (AppliedMismatch) | FAIL axes_verified (AppliedMismatch) |
 
 ### 지원 매트릭스가 틀렸다 — 실패할 것으로 표시한 체크가 통과했다
@@ -1238,71 +1238,83 @@ axolotl 칸에는 하나가 더 붙는다. `required_step_context`(autocast, cud
 
 - **axolotl x gemma4_e2b / axes_verified** — AppliedMismatch
   - `the model that was built is not the one this run asked for: precision.name: requested 'bf16', applied 'mixed(bf16,fp32)'`
-- **axolotl x gemma4_e2b / infonce_backward** — RuntimeError
-  - `expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`
 - **axolotl x qwen3_5_0_8b / axes_verified** — AppliedMismatch
-  - `the model that was built is not the one this run asked for: kernel.name: requested 'none', applied 'fla' (environment-bound: this image binds kernel=fla on arch=qwen3_5 while trans`
+  - `the model that was built is not the one this run asked for: precision.name: requested 'bf16', applied 'mixed(bf16,fp32)'`
 - **axolotl x qwen3_5_0_8b / infonce_backward** — RuntimeError
   - `expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`
 - **axolotl x qwen3_vl_emb_2b / axes_verified** — AppliedMismatch
   - `the model that was built is not the one this run asked for: precision.name: requested 'bf16', applied 'mixed(bf16,fp32)'`
-- **axolotl x qwen3_vl_emb_2b / infonce_backward** — RuntimeError
-  - `expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`
-- **ms_swift x qwen3_5_0_8b / axes_verified** — AppliedMismatch
-  - `the model that was built is not the one this run asked for: kernel.name: requested 'none', applied 'fla' (environment-bound: this image binds kernel=fla on arch=qwen3_5 while trans`
-- **native x qwen3_5_0_8b / axes_verified** — AppliedMismatch
-  - `the model that was built is not the one this run asked for: kernel.name: requested 'none', applied 'fla' (environment-bound: this image binds kernel=fla on arch=qwen3_5 while trans`
-- **sentence_transformers x qwen3_5_0_8b / axes_verified** — AppliedMismatch
-  - `the model that was built is not the one this run asked for: kernel.name: requested 'none', applied 'fla' (environment-bound: this image binds kernel=fla on arch=qwen3_5 while trans`
-- **tevatron x gemma4_e2b / infonce_backward** — TypeError
-  - `EncoderModel.forward() got an unexpected keyword argument 'input_ids'`
-- **tevatron x qwen3_5_0_8b / axes_verified** — AppliedMismatch
-  - `the model that was built is not the one this run asked for: kernel.name: requested 'none', applied 'fla' (environment-bound: this image binds kernel=fla on arch=qwen3_5 while trans`
-- **tevatron x qwen3_5_0_8b / infonce_backward** — TypeError
-  - `EncoderModel.forward() got an unexpected keyword argument 'input_ids'`
-- **tevatron x qwen3_vl_emb_2b / infonce_backward** — TypeError
-  - `EncoderModel.forward() got an unexpected keyword argument 'input_ids'`
 - **unsloth x gemma4_e2b / axes_verified** — AppliedMismatch
   - `the model that was built is not the one this run asked for: precision.name: requested 'bf16', applied 'mixed(bf16,fp32)'`
 - **unsloth x qwen3_5_0_8b / axes_verified** — AppliedMismatch
-  - `the model that was built is not the one this run asked for: kernel.name: requested 'none', applied 'fla' (environment-bound: this image binds kernel=fla on arch=qwen3_5 while trans`
+  - `the model that was built is not the one this run asked for: precision.name: requested 'bf16', applied 'mixed(bf16,fp32)'`
 - **unsloth x qwen3_vl_emb_2b / axes_verified** — AppliedMismatch
   - `the model that was built is not the one this run asked for: precision.name: requested 'bf16', applied 'mixed(bf16,fp32)'`
 
 ### 병합에서 제외한 파일
 
+- 중복: axolotl x gemma4_e2b: ignored results/axolotl/gemma4_e2b/jmfxvky2jntn0v/result.json
+- 중복: axolotl x gemma4_e2b: ignored results/axolotl/gemma4_e2b/x0yrie57seu0mm/started.json
 - 중복: axolotl x gemma4_e2b: ignored results/axolotl/gemma4_e2b/jmfxvky2jntn0v/started.json
 - 중복: axolotl x gemma4_e2b: ignored results/axolotl/gemma4_e2b/96ykbqpg8zhv4k/started.json
 - 중복: axolotl x gemma4_e2b: ignored results/axolotl/gemma4_e2b/re17q5hfpr2qdd/started.json
+- 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/3yojefsdd6hk0u/result.json
+- 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/zql0z8hc4k8dlx/result.json
+- 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/zql0z8hc4k8dlx/started.json
+- 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/xzrx2gnudntf09/started.json
 - 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/3yojefsdd6hk0u/started.json
 - 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/5zjp3w6lt56d4j/started.json
 - 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/pjn3jrv0dy59ql/started.json
+- 중복: axolotl x qwen3_vl_emb_2b: ignored results/axolotl/qwen3_vl_emb_2b/2ounbt5px9bmh9/result.json
+- 중복: axolotl x qwen3_vl_emb_2b: ignored results/axolotl/qwen3_vl_emb_2b/53lb8wroqbw4mz/started.json
 - 중복: axolotl x qwen3_vl_emb_2b: ignored results/axolotl/qwen3_vl_emb_2b/2ounbt5px9bmh9/started.json
 - 중복: axolotl x qwen3_vl_emb_2b: ignored results/axolotl/qwen3_vl_emb_2b/twkpqbpknu9v9w/started.json
 - 중복: axolotl x qwen3_vl_emb_2b: ignored results/axolotl/qwen3_vl_emb_2b/117ldk6qywwda3/started.json
+- 중복: ms_swift x gemma4_e2b: ignored results/ms_swift/gemma4_e2b/6cp180d0yom9t5/result.json
+- 중복: ms_swift x gemma4_e2b: ignored results/ms_swift/gemma4_e2b/ob790ntraktfvt/started.json
 - 중복: ms_swift x gemma4_e2b: ignored results/ms_swift/gemma4_e2b/6cp180d0yom9t5/started.json
 - 중복: ms_swift x gemma4_e2b: ignored results/ms_swift/gemma4_e2b/lfwess4lnnkdba/started.json
 - 중복: ms_swift x gemma4_e2b: ignored results/ms_swift/gemma4_e2b/106pq7lep4ndot/started.json
+- 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/kwjo8058tcawrj/result.json
+- 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/d8b8vedzxv0ced/result.json
+- 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/mcq25mjvnxgcb0/started.json
+- 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/kwjo8058tcawrj/started.json
 - 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/d8b8vedzxv0ced/started.json
 - 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/bjdyt8s8l7eb0r/started.json
 - 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/rz2t3hjjctb9ir/started.json
+- 중복: ms_swift x qwen3_vl_emb_2b: ignored results/ms_swift/qwen3_vl_emb_2b/3lse8mupfa1rep/result.json
+- 중복: ms_swift x qwen3_vl_emb_2b: ignored results/ms_swift/qwen3_vl_emb_2b/h5ox9ep7lu2o3e/started.json
 - 중복: ms_swift x qwen3_vl_emb_2b: ignored results/ms_swift/qwen3_vl_emb_2b/3lse8mupfa1rep/started.json
 - 중복: ms_swift x qwen3_vl_emb_2b: ignored results/ms_swift/qwen3_vl_emb_2b/92grvnmui311st/started.json
 - 중복: ms_swift x qwen3_vl_emb_2b: ignored results/ms_swift/qwen3_vl_emb_2b/ngvpq0n6jwehzk/started.json
+- 중복: native x gemma4_e2b: ignored results/native/gemma4_e2b/0vr6kgfeiqptb2/result.json
+- 중복: native x gemma4_e2b: ignored results/native/gemma4_e2b/ls6huw5arfzj1j/started.json
 - 중복: native x gemma4_e2b: ignored results/native/gemma4_e2b/0vr6kgfeiqptb2/started.json
 - 중복: native x gemma4_e2b: ignored results/native/gemma4_e2b/n2lsusgmhk45xw/started.json
 - 중복: native x gemma4_e2b: ignored results/native/gemma4_e2b/oegus80eth8r75/started.json
+- 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/9rmt1v6qtm4f5x/result.json
+- 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/pawcygtc073uzi/result.json
 - 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/9t0p0tl7o2e0n5/result.json
+- 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/ooqmou59fib4du/started.json
+- 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/9rmt1v6qtm4f5x/started.json
 - 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/pawcygtc073uzi/started.json
 - 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/9t0p0tl7o2e0n5/started.json
 - 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/k9wkyvgstvnq2x/started.json
 - 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/o7lrjq7e02enqv/started.json
+- 중복: native x qwen3_vl_emb_2b: ignored results/native/qwen3_vl_emb_2b/37qsvrojng72yw/result.json
+- 중복: native x qwen3_vl_emb_2b: ignored results/native/qwen3_vl_emb_2b/udt814eokzll0r/started.json
 - 중복: native x qwen3_vl_emb_2b: ignored results/native/qwen3_vl_emb_2b/37qsvrojng72yw/started.json
 - 중복: native x qwen3_vl_emb_2b: ignored results/native/qwen3_vl_emb_2b/cjv20cvy38c84m/started.json
 - 중복: native x qwen3_vl_emb_2b: ignored results/native/qwen3_vl_emb_2b/cs5m0fd2lmcmn8/started.json
+- 중복: sentence_transformers x gemma4_e2b: ignored results/sentence_transformers/gemma4_e2b/00qrf8y4rl17xa/result.json
+- 중복: sentence_transformers x gemma4_e2b: ignored results/sentence_transformers/gemma4_e2b/kn2h1o4snzgr0n/started.json
 - 중복: sentence_transformers x gemma4_e2b: ignored results/sentence_transformers/gemma4_e2b/00qrf8y4rl17xa/started.json
 - 중복: sentence_transformers x gemma4_e2b: ignored results/sentence_transformers/gemma4_e2b/dkjq8um6a26b29/started.json
 - 중복: sentence_transformers x gemma4_e2b: ignored results/sentence_transformers/gemma4_e2b/p3ffx6xcg05ksv/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/ave6fhei1uedbk/result.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/ppybhr9spj53cn/result.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/4ls03h0lctaxj9/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/ave6fhei1uedbk/started.json
 - 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/ppybhr9spj53cn/started.json
 - 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/98as4en2an38rs/started.json
 - 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/ctsn3ky63mvul0/started.json
@@ -1310,24 +1322,42 @@ axolotl 칸에는 하나가 더 붙는다. `required_step_context`(autocast, cud
 - 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/1jscf6cxmjz72y/started.json
 - 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/xchraazlhvqt6y/started.json
 - 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/3tmi4ht24hs5uz/started.json
+- 중복: sentence_transformers x qwen3_vl_emb_2b: ignored results/sentence_transformers/qwen3_vl_emb_2b/os2q6ynmjsgk9g/result.json
+- 중복: sentence_transformers x qwen3_vl_emb_2b: ignored results/sentence_transformers/qwen3_vl_emb_2b/1jwamawidc0yql/started.json
 - 중복: sentence_transformers x qwen3_vl_emb_2b: ignored results/sentence_transformers/qwen3_vl_emb_2b/os2q6ynmjsgk9g/started.json
 - 중복: sentence_transformers x qwen3_vl_emb_2b: ignored results/sentence_transformers/qwen3_vl_emb_2b/adsvsynn0j2pct/started.json
 - 중복: sentence_transformers x qwen3_vl_emb_2b: ignored results/sentence_transformers/qwen3_vl_emb_2b/zz21apdq19z46i/started.json
+- 중복: tevatron x gemma4_e2b: ignored results/tevatron/gemma4_e2b/8uxfqkoz32isx2/result.json
+- 중복: tevatron x gemma4_e2b: ignored results/tevatron/gemma4_e2b/ft9co3xj9xwysm/started.json
 - 중복: tevatron x gemma4_e2b: ignored results/tevatron/gemma4_e2b/8uxfqkoz32isx2/started.json
 - 중복: tevatron x gemma4_e2b: ignored results/tevatron/gemma4_e2b/j0i8cqmakhz6bk/started.json
 - 중복: tevatron x gemma4_e2b: ignored results/tevatron/gemma4_e2b/dh4m30ex41frn1/started.json
+- 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/p2hlma9znui9l2/result.json
+- 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/afzgznxkvwhz42/result.json
+- 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/4nvrf3sytmassu/started.json
+- 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/p2hlma9znui9l2/started.json
 - 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/afzgznxkvwhz42/started.json
 - 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/wwo36vlg1onptz/started.json
 - 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/n3r8t21c0clle3/started.json
+- 중복: tevatron x qwen3_vl_emb_2b: ignored results/tevatron/qwen3_vl_emb_2b/55738u0yw7s2v8/result.json
+- 중복: tevatron x qwen3_vl_emb_2b: ignored results/tevatron/qwen3_vl_emb_2b/2ffarhkv2n55zi/started.json
 - 중복: tevatron x qwen3_vl_emb_2b: ignored results/tevatron/qwen3_vl_emb_2b/55738u0yw7s2v8/started.json
 - 중복: tevatron x qwen3_vl_emb_2b: ignored results/tevatron/qwen3_vl_emb_2b/poo9rswlunjkj5/started.json
 - 중복: tevatron x qwen3_vl_emb_2b: ignored results/tevatron/qwen3_vl_emb_2b/6kg59vfo5dbfpe/started.json
+- 중복: unsloth x gemma4_e2b: ignored results/unsloth/gemma4_e2b/gnsyr8b60cui3b/result.json
+- 중복: unsloth x gemma4_e2b: ignored results/unsloth/gemma4_e2b/11o56rwd03txyi/started.json
 - 중복: unsloth x gemma4_e2b: ignored results/unsloth/gemma4_e2b/gnsyr8b60cui3b/started.json
 - 중복: unsloth x gemma4_e2b: ignored results/unsloth/gemma4_e2b/xlz4cbame1awm4/started.json
 - 중복: unsloth x gemma4_e2b: ignored results/unsloth/gemma4_e2b/32plsncjtkxzvv/started.json
+- 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/uy5q5fuhu514wp/result.json
+- 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/tdvi81oek019ll/result.json
+- 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/2v0hypp3wshksa/started.json
+- 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/uy5q5fuhu514wp/started.json
 - 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/tdvi81oek019ll/started.json
 - 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/hjqfwu95965l8p/started.json
 - 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/yh32nxs19wlqv2/started.json
+- 중복: unsloth x qwen3_vl_emb_2b: ignored results/unsloth/qwen3_vl_emb_2b/lexjdx5etl0hrb/result.json
+- 중복: unsloth x qwen3_vl_emb_2b: ignored results/unsloth/qwen3_vl_emb_2b/a8yzn3uq22tdb7/started.json
 - 중복: unsloth x qwen3_vl_emb_2b: ignored results/unsloth/qwen3_vl_emb_2b/lexjdx5etl0hrb/started.json
 - 중복: unsloth x qwen3_vl_emb_2b: ignored results/unsloth/qwen3_vl_emb_2b/vfamxhetm6flkp/started.json
 - 중복: unsloth x qwen3_vl_emb_2b: ignored results/unsloth/qwen3_vl_emb_2b/n75371z1ll7tz0/started.json
