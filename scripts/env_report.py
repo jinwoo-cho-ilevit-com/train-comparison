@@ -36,6 +36,7 @@ def main(cfg: DictConfig) -> None:
     table.add_row("device", str(device))
     table.add_row("deterministic", str(config.train.deterministic))
     table.add_row("data.limit", str(config.data.limit))
+    table.add_row("data.text_token_ceiling", str(config.data.text_token_ceiling))
     table.add_row("git", record["git_commit"][:12])
     for name, version in record["packages"].items():
         table.add_row(name, version)

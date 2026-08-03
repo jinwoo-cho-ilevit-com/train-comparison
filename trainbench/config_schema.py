@@ -27,6 +27,16 @@ COMMIT_SHA = re.compile(r"[0-9a-f]{7,40}")
 # until it reads this one, the schema refuses any other value.
 BASELINE_DEVIATION_LIMIT = 0.03
 
+# One visual token under `Qwen2VLImageProcessor` covers patch_size**2 * merge_size**2
+# pixels (transformers 5.14.1 image_processing_qwen2_vl.py: `_preprocess` divides the
+# resized grid by `patch_size` then folds `merge_size**2` patches into one feature).
+# Both currently-active models declare patch_size=16, merge_size=2 in their own
+# `preprocessor_config.json` (qwen3_vl, qwen3_5) -> 16**2 * 2**2 = 1024. Scoped to
+# those two archs by `_the_pixel_cap_fits_the_sequence_budget` below: gemma4 uses a
+# different image processor and a different budget declaration
+# (`model.max_tokens_per_image`), not this pixel arithmetic.
+QWEN_PIXELS_PER_VISUAL_TOKEN = 16**2 * 2**2
+
 # Subset revisions that must never be trained on again, with the reason a run
 # that recorded one has to be discarded. Named rather than deleted from the Hub:
 # results already exist that record this revision, and which corpus they were
@@ -136,11 +146,39 @@ class DataConfig(Strict):
     limit: int | None = Field(default=None, gt=0)
     max_seq_len: int = Field(gt=0)
     num_workers: int = Field(ge=0)
+    # The processor's pixel budget, applied identically to every model in the
+    # campaign so the workload stops being a function of which images got sampled.
+    # Lives here rather than in `configs/model/` because the sameness across models
+    # is the point: two copies in two model files would drift. 1310720 is
+    # `Qwen/Qwen3-VL-Embedding-2B`'s own shipped `max_pixels`
+    # (`preprocessor_config.json`), not our arithmetic — the validator at
+    # `config_schema.py:624-643` already refuses a Qwen model presenting derived
+    # arithmetic as its own spec, and giving qwen3_5 a bigger number here would be
+    # exactly that in reverse.
+    max_pixels: int = Field(gt=0)
+    min_pixels: int = Field(gt=0)
+    # The whole corpus's text side (query + positive, no image, no truncation),
+    # tokenised with each active model's own prompt format, worst case across both:
+    # measured 2026-08-03 against this revision (see the field's value in each
+    # `configs/data/*.yaml` for the numbers). A corpus regenerated under a new
+    # revision invalidates this number; re-measure it, do not carry it forward.
+    text_token_ceiling: int = Field(gt=0)
 
     @property
     def effective_rows(self) -> int:
         """Rows a run actually draws from: the small-sample limit, else the subset."""
         return self.limit if self.limit is not None else self.subset_rows
+
+    @model_validator(mode="after")
+    def _pixel_budget_is_ordered(self) -> DataConfig:
+        if self.min_pixels > self.max_pixels:
+            raise ValueError(
+                f"data.min_pixels ({self.min_pixels}) exceeds data.max_pixels "
+                f"({self.max_pixels}); the processor's own backward-compat merge "
+                "(transformers 5.14.1 image_processing_qwen2_vl.py __init__) would "
+                "build a size dict with shortest_edge > longest_edge."
+            )
+        return self
 
     @model_validator(mode="after")
     def _upstream_is_pinned_to_a_commit(self) -> DataConfig:
@@ -639,6 +677,43 @@ class BenchConfig(Strict):
                 "arch=gemma4's processor declares max_soft_tokens; "
                 "model.max_tokens_per_image must carry it so a measured count above the "
                 "cap is caught instead of published."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _the_pixel_cap_fits_the_sequence_budget(self) -> BenchConfig:
+        """A batch of 1 can already overflow `data.max_seq_len` — measured: a single
+        image-bearing row reached 16281 tokens under Qwen3.5-0.8B's shipped
+        `max_pixels` before `data.max_pixels` capped it. Refused here rather than
+        four minutes into a pod, which is what it cost twice on 2026-08-03.
+
+        The inequality: `data.text_token_ceiling` (one side of a pair, no image) +
+        `ceil(data.max_pixels / QWEN_PIXELS_PER_VISUAL_TOKEN)` (one image, the most
+        a row carries — query and positive are separate rows) must not exceed
+        `data.max_seq_len`.
+
+        Scoped to qwen3_vl/qwen3_5: gemma4 uses a different image processor and a
+        different budget declaration (`model.max_tokens_per_image`), not this pixel
+        arithmetic, and it is being dropped from the campaign regardless
+        (`_an_image_token_cap_is_gemma4_only` above is its still-standing check).
+
+        Scoped to `timing`/`quality` the same way `_measured_runs_pin_their_data`
+        is: a probe answers "does it run" over whatever `data.max_seq_len` a test
+        constructs to reach a different check, and is not a claim about a pod's
+        real throughput capacity.
+        """
+        if self.run.purpose not in ("timing", "quality"):
+            return self
+        if self.model.arch not in ("qwen3_vl", "qwen3_5"):
+            return self
+        image_tokens = -(-self.data.max_pixels // QWEN_PIXELS_PER_VISUAL_TOKEN)
+        worst_case = self.data.text_token_ceiling + image_tokens
+        if worst_case > self.data.max_seq_len:
+            raise ValueError(
+                f"data.text_token_ceiling ({self.data.text_token_ceiling}) + "
+                f"ceil(data.max_pixels / {QWEN_PIXELS_PER_VISUAL_TOKEN}) ({image_tokens}) "
+                f"= {worst_case} exceeds data.max_seq_len ({self.data.max_seq_len}); "
+                "lower data.max_pixels or raise data.max_seq_len before this reaches a pod."
             )
         return self
 

@@ -241,7 +241,9 @@
     },
     "data": {
       "limit": 512,
+      "max_pixels": 1310720,
       "max_seq_len": 2048,
+      "min_pixels": 4096,
       "num_workers": 8,
       "push_subset": false,
       "repo_id": "jinwoo-cho/mmeb-subset",
@@ -249,7 +251,8 @@
       "sample_seed": 1234,
       "source_repo": "MrZilinXiao/MMEB_train_with_image",
       "source_revision": "9d0fd31789c12a007442de52fe22509e46e49e7d",
-      "subset_rows": 2048
+      "subset_rows": 2048,
+      "text_token_ceiling": 285
     },
     "dataloader": {
       "backend": "torch",

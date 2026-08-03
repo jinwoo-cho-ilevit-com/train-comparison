@@ -1,7 +1,14 @@
 name: qwen3_5_0_8b
 hf_id: Qwen/Qwen3.5-0.8B
 arch: qwen3_5
-revision: null
+# Pinned rather than null: see the identical note in configs/model/qwen3_vl_emb_2b.yaml.
+# `2fc06364715b967f1860aea9cf38778875588b17` is what a real 2026-08-03 pod run
+# already recorded in its logs as `checkpoint=Qwen/Qwen3.5-0.8B@...`, and it is the
+# Hub's current `sha` for this repo's default branch tip (read via
+# `GET https://huggingface.co/api/models/Qwen/Qwen3.5-0.8B`, lastModified
+# 2026-03-02, months before the campaign) — the two agree, so the fetch had not
+# moved between the pod's run and this read.
+revision: 2fc06364715b967f1860aea9cf38778875588b17
 # Generative VLM, no embedding spec. add_generation_prompt=true would append
 # an assistant <think> scaffold whose last token would become the embedding.
 add_generation_prompt: false

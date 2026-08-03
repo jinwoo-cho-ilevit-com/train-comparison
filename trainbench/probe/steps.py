@@ -27,6 +27,32 @@ def dtype_for(device: torch.device) -> torch.dtype:
     return torch.bfloat16 if device.type == "cuda" else torch.float32
 
 
+# Both currently-active archs share `Qwen2VLImageProcessor`. gemma4 uses a
+# different image processor entirely and is being dropped from the campaign, so
+# `pixel_budget_kwargs` never applies to it.
+PIXEL_BUDGET_ARCHS = ("qwen3_vl", "qwen3_5")
+
+
+def pixel_budget_kwargs(config: BenchConfig) -> dict[str, int]:
+    """`max_pixels`/`min_pixels` for `AutoProcessor.from_pretrained`.
+
+    Passing them overrides whatever `preprocessor_config.json` ships: transformers
+    5.14.1 `image_processing_base.py`'s `from_dict` updates the loaded config dict
+    with any kwarg matching `valid_kwargs.__annotations__` before constructing the
+    image processor, and `Qwen2VLImageProcessor.__init__` (`image_processing_qwen2_vl.py`)
+    then writes `min_pixels`/`max_pixels` into `size["shortest_edge"]`/`["longest_edge"]`
+    ahead of whatever `size` the checkpoint declared. That override is the point —
+    `data.max_pixels`/`data.min_pixels` are the budget, not the checkpoint's own range.
+
+    Empty for any other arch: gemma4 does not use `Qwen2VLImageProcessor`, and these
+    two keys reaching it would be inert at best (silently dropped as unused kwargs)
+    and misleading at worst (looking like a cap that this arch never gets).
+    """
+    if config.model.arch not in PIXEL_BUDGET_ARCHS:
+        return {}
+    return {"max_pixels": config.data.max_pixels, "min_pixels": config.data.min_pixels}
+
+
 def patch_axes(config: BenchConfig, report: ProbeReport) -> None:
     """Axes that have to be applied before any model exists.
 
@@ -249,8 +275,14 @@ def encode(model: Any, batch: dict[str, torch.Tensor], padding_side: str) -> tor
     docs/model-spec.yaml. It is not merely a claim any more — every batch built
     here goes through `align_padding_side` first, and `last_token_pool` rejects a
     mask that disagrees with the declared side.
+
+    `use_cache=False`: every model here ships `config.use_cache=True`, so the
+    default forward allocates a KV cache none of this file's callers read back —
+    an embedding forward pools one hidden state and stops, it never generates a
+    second token. `scripts/bench.py`'s packed path already turns this off for the
+    same reason (`pooled_embeddings`); this padded path is the one it left on.
     """
-    output = model(**batch, output_hidden_states=False)
+    output = model(**batch, output_hidden_states=False, use_cache=False)
     hidden = getattr(output, "last_hidden_state", None)
     if hidden is None:
         hidden = getattr(output, "hidden_states", None)
