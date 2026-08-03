@@ -1196,12 +1196,12 @@ axolotl 칸에는 하나가 더 붙는다. `required_step_context`(autocast, cud
 
 | | qwen3_vl_emb_2b | qwen3_5_0_8b | gemma4_e2b |
 |---|---|---|---|
-| native | OK (12 checks) | OK (12 checks) | OK (13 checks) |
-| unsloth | OK (9 checks, 문서화된 한계 1건) | OK (9 checks, 문서화된 한계 1건) | OK (9 checks, 문서화된 한계 1건) |
-| ms_swift | OK (10 checks) | OK (10 checks) | OK (10 checks) |
-| sentence_transformers | OK (9 checks) | OK (9 checks) | OK (9 checks) |
-| tevatron | FAIL dense_model_load (AttributeError) | FAIL dense_model_load (AttributeError) | FAIL dense_model_load (AttributeError) |
-| axolotl | FAIL infonce_backward (RuntimeError) | FAIL infonce_backward (RuntimeError) | FAIL infonce_backward (RuntimeError) |
+| native | OK (12 checks) | FAIL axes_verified (AppliedMismatch) | OK (13 checks) |
+| unsloth | FAIL axes_verified (AppliedMismatch) | FAIL axes_verified (AppliedMismatch) | FAIL axes_verified (AppliedMismatch) |
+| ms_swift | OK (10 checks) | FAIL axes_verified (AppliedMismatch) | OK (10 checks) |
+| sentence_transformers | OK (9 checks) | FAIL axes_verified (AppliedMismatch) | OK (9 checks) |
+| tevatron | FAIL infonce_backward (TypeError) | FAIL axes_verified (AppliedMismatch) | FAIL infonce_backward (TypeError) |
+| axolotl | FAIL axes_verified (AppliedMismatch) | FAIL axes_verified (AppliedMismatch) | FAIL axes_verified (AppliedMismatch) |
 
 ### 지원 매트릭스가 틀렸다 — 실패할 것으로 표시한 체크가 통과했다
 
@@ -1236,42 +1236,138 @@ axolotl 칸에는 하나가 더 붙는다. `required_step_context`(autocast, cud
 
 ### 실패 상세
 
+- **axolotl x gemma4_e2b / axes_verified** — AppliedMismatch
+  - `the model that was built is not the one this run asked for: precision.name: requested 'bf16', applied 'mixed(bf16,fp32)'`
 - **axolotl x gemma4_e2b / infonce_backward** — RuntimeError
   - `expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`
+- **axolotl x qwen3_5_0_8b / axes_verified** — AppliedMismatch
+  - `the model that was built is not the one this run asked for: kernel.name: requested 'none', applied 'fla' (environment-bound: this image binds kernel=fla on arch=qwen3_5 while trans`
 - **axolotl x qwen3_5_0_8b / infonce_backward** — RuntimeError
   - `expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`
+- **axolotl x qwen3_vl_emb_2b / axes_verified** — AppliedMismatch
+  - `the model that was built is not the one this run asked for: precision.name: requested 'bf16', applied 'mixed(bf16,fp32)'`
 - **axolotl x qwen3_vl_emb_2b / infonce_backward** — RuntimeError
   - `expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`
-- **tevatron x gemma4_e2b / dense_model_load** — AttributeError
-  - `'Gemma4Config' object has no attribute 'pad_token_id'`
-- **tevatron x gemma4_e2b / infonce_backward** — Skipped
-  - `skipped: model did not load`
-- **tevatron x qwen3_5_0_8b / dense_model_load** — AttributeError
-  - `'Qwen3_5Config' object has no attribute 'pad_token_id'`
-- **tevatron x qwen3_5_0_8b / infonce_backward** — Skipped
-  - `skipped: model did not load`
-- **tevatron x qwen3_vl_emb_2b / dense_model_load** — AttributeError
-  - `'Qwen3VLConfig' object has no attribute 'pad_token_id'`
-- **tevatron x qwen3_vl_emb_2b / infonce_backward** — Skipped
-  - `skipped: model did not load`
+- **ms_swift x qwen3_5_0_8b / axes_verified** — AppliedMismatch
+  - `the model that was built is not the one this run asked for: kernel.name: requested 'none', applied 'fla' (environment-bound: this image binds kernel=fla on arch=qwen3_5 while trans`
+- **native x qwen3_5_0_8b / axes_verified** — AppliedMismatch
+  - `the model that was built is not the one this run asked for: kernel.name: requested 'none', applied 'fla' (environment-bound: this image binds kernel=fla on arch=qwen3_5 while trans`
+- **sentence_transformers x qwen3_5_0_8b / axes_verified** — AppliedMismatch
+  - `the model that was built is not the one this run asked for: kernel.name: requested 'none', applied 'fla' (environment-bound: this image binds kernel=fla on arch=qwen3_5 while trans`
+- **tevatron x gemma4_e2b / infonce_backward** — TypeError
+  - `EncoderModel.forward() got an unexpected keyword argument 'input_ids'`
+- **tevatron x qwen3_5_0_8b / axes_verified** — AppliedMismatch
+  - `the model that was built is not the one this run asked for: kernel.name: requested 'none', applied 'fla' (environment-bound: this image binds kernel=fla on arch=qwen3_5 while trans`
+- **tevatron x qwen3_5_0_8b / infonce_backward** — TypeError
+  - `EncoderModel.forward() got an unexpected keyword argument 'input_ids'`
+- **tevatron x qwen3_vl_emb_2b / infonce_backward** — TypeError
+  - `EncoderModel.forward() got an unexpected keyword argument 'input_ids'`
+- **unsloth x gemma4_e2b / axes_verified** — AppliedMismatch
+  - `the model that was built is not the one this run asked for: precision.name: requested 'bf16', applied 'mixed(bf16,fp32)'`
+- **unsloth x qwen3_5_0_8b / axes_verified** — AppliedMismatch
+  - `the model that was built is not the one this run asked for: kernel.name: requested 'none', applied 'fla' (environment-bound: this image binds kernel=fla on arch=qwen3_5 while trans`
+- **unsloth x qwen3_vl_emb_2b / axes_verified** — AppliedMismatch
+  - `the model that was built is not the one this run asked for: precision.name: requested 'bf16', applied 'mixed(bf16,fp32)'`
 
 ### 병합에서 제외한 파일
 
+- 중복: axolotl x gemma4_e2b: ignored results/axolotl/gemma4_e2b/jmfxvky2jntn0v/started.json
 - 중복: axolotl x gemma4_e2b: ignored results/axolotl/gemma4_e2b/96ykbqpg8zhv4k/started.json
+- 중복: axolotl x gemma4_e2b: ignored results/axolotl/gemma4_e2b/re17q5hfpr2qdd/started.json
+- 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/3yojefsdd6hk0u/started.json
 - 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/5zjp3w6lt56d4j/started.json
+- 중복: axolotl x qwen3_5_0_8b: ignored results/axolotl/qwen3_5_0_8b/pjn3jrv0dy59ql/started.json
+- 중복: axolotl x qwen3_vl_emb_2b: ignored results/axolotl/qwen3_vl_emb_2b/2ounbt5px9bmh9/started.json
 - 중복: axolotl x qwen3_vl_emb_2b: ignored results/axolotl/qwen3_vl_emb_2b/twkpqbpknu9v9w/started.json
+- 중복: axolotl x qwen3_vl_emb_2b: ignored results/axolotl/qwen3_vl_emb_2b/117ldk6qywwda3/started.json
+- 중복: ms_swift x gemma4_e2b: ignored results/ms_swift/gemma4_e2b/6cp180d0yom9t5/started.json
 - 중복: ms_swift x gemma4_e2b: ignored results/ms_swift/gemma4_e2b/lfwess4lnnkdba/started.json
+- 중복: ms_swift x gemma4_e2b: ignored results/ms_swift/gemma4_e2b/106pq7lep4ndot/started.json
+- 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/d8b8vedzxv0ced/started.json
 - 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/bjdyt8s8l7eb0r/started.json
+- 중복: ms_swift x qwen3_5_0_8b: ignored results/ms_swift/qwen3_5_0_8b/rz2t3hjjctb9ir/started.json
+- 중복: ms_swift x qwen3_vl_emb_2b: ignored results/ms_swift/qwen3_vl_emb_2b/3lse8mupfa1rep/started.json
 - 중복: ms_swift x qwen3_vl_emb_2b: ignored results/ms_swift/qwen3_vl_emb_2b/92grvnmui311st/started.json
+- 중복: ms_swift x qwen3_vl_emb_2b: ignored results/ms_swift/qwen3_vl_emb_2b/ngvpq0n6jwehzk/started.json
+- 중복: native x gemma4_e2b: ignored results/native/gemma4_e2b/0vr6kgfeiqptb2/started.json
 - 중복: native x gemma4_e2b: ignored results/native/gemma4_e2b/n2lsusgmhk45xw/started.json
+- 중복: native x gemma4_e2b: ignored results/native/gemma4_e2b/oegus80eth8r75/started.json
+- 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/9t0p0tl7o2e0n5/result.json
+- 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/pawcygtc073uzi/started.json
+- 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/9t0p0tl7o2e0n5/started.json
 - 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/k9wkyvgstvnq2x/started.json
+- 중복: native x qwen3_5_0_8b: ignored results/native/qwen3_5_0_8b/o7lrjq7e02enqv/started.json
+- 중복: native x qwen3_vl_emb_2b: ignored results/native/qwen3_vl_emb_2b/37qsvrojng72yw/started.json
 - 중복: native x qwen3_vl_emb_2b: ignored results/native/qwen3_vl_emb_2b/cjv20cvy38c84m/started.json
+- 중복: native x qwen3_vl_emb_2b: ignored results/native/qwen3_vl_emb_2b/cs5m0fd2lmcmn8/started.json
+- 중복: sentence_transformers x gemma4_e2b: ignored results/sentence_transformers/gemma4_e2b/00qrf8y4rl17xa/started.json
 - 중복: sentence_transformers x gemma4_e2b: ignored results/sentence_transformers/gemma4_e2b/dkjq8um6a26b29/started.json
+- 중복: sentence_transformers x gemma4_e2b: ignored results/sentence_transformers/gemma4_e2b/p3ffx6xcg05ksv/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/ppybhr9spj53cn/started.json
 - 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/98as4en2an38rs/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/ctsn3ky63mvul0/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/2i0ptlkcc5621p/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/1jscf6cxmjz72y/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/xchraazlhvqt6y/started.json
+- 중복: sentence_transformers x qwen3_5_0_8b: ignored results/sentence_transformers/qwen3_5_0_8b/3tmi4ht24hs5uz/started.json
+- 중복: sentence_transformers x qwen3_vl_emb_2b: ignored results/sentence_transformers/qwen3_vl_emb_2b/os2q6ynmjsgk9g/started.json
 - 중복: sentence_transformers x qwen3_vl_emb_2b: ignored results/sentence_transformers/qwen3_vl_emb_2b/adsvsynn0j2pct/started.json
+- 중복: sentence_transformers x qwen3_vl_emb_2b: ignored results/sentence_transformers/qwen3_vl_emb_2b/zz21apdq19z46i/started.json
+- 중복: tevatron x gemma4_e2b: ignored results/tevatron/gemma4_e2b/8uxfqkoz32isx2/started.json
 - 중복: tevatron x gemma4_e2b: ignored results/tevatron/gemma4_e2b/j0i8cqmakhz6bk/started.json
+- 중복: tevatron x gemma4_e2b: ignored results/tevatron/gemma4_e2b/dh4m30ex41frn1/started.json
+- 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/afzgznxkvwhz42/started.json
 - 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/wwo36vlg1onptz/started.json
+- 중복: tevatron x qwen3_5_0_8b: ignored results/tevatron/qwen3_5_0_8b/n3r8t21c0clle3/started.json
+- 중복: tevatron x qwen3_vl_emb_2b: ignored results/tevatron/qwen3_vl_emb_2b/55738u0yw7s2v8/started.json
 - 중복: tevatron x qwen3_vl_emb_2b: ignored results/tevatron/qwen3_vl_emb_2b/poo9rswlunjkj5/started.json
+- 중복: tevatron x qwen3_vl_emb_2b: ignored results/tevatron/qwen3_vl_emb_2b/6kg59vfo5dbfpe/started.json
+- 중복: unsloth x gemma4_e2b: ignored results/unsloth/gemma4_e2b/gnsyr8b60cui3b/started.json
 - 중복: unsloth x gemma4_e2b: ignored results/unsloth/gemma4_e2b/xlz4cbame1awm4/started.json
+- 중복: unsloth x gemma4_e2b: ignored results/unsloth/gemma4_e2b/32plsncjtkxzvv/started.json
+- 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/tdvi81oek019ll/started.json
 - 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/hjqfwu95965l8p/started.json
+- 중복: unsloth x qwen3_5_0_8b: ignored results/unsloth/qwen3_5_0_8b/yh32nxs19wlqv2/started.json
+- 중복: unsloth x qwen3_vl_emb_2b: ignored results/unsloth/qwen3_vl_emb_2b/lexjdx5etl0hrb/started.json
 - 중복: unsloth x qwen3_vl_emb_2b: ignored results/unsloth/qwen3_vl_emb_2b/vfamxhetm6flkp/started.json
+- 중복: unsloth x qwen3_vl_emb_2b: ignored results/unsloth/qwen3_vl_emb_2b/n75371z1ll7tz0/started.json
+- 판독 불가: results/axolotl/gemma4_e2b/96ykbqpg8zhv4k/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/axolotl/gemma4_e2b/re17q5hfpr2qdd/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/axolotl/qwen3_5_0_8b/5zjp3w6lt56d4j/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/axolotl/qwen3_5_0_8b/pjn3jrv0dy59ql/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/axolotl/qwen3_vl_emb_2b/117ldk6qywwda3/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/axolotl/qwen3_vl_emb_2b/twkpqbpknu9v9w/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/ms_swift/gemma4_e2b/106pq7lep4ndot/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/ms_swift/gemma4_e2b/lfwess4lnnkdba/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/ms_swift/qwen3_5_0_8b/bjdyt8s8l7eb0r/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/ms_swift/qwen3_5_0_8b/rz2t3hjjctb9ir/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/ms_swift/qwen3_vl_emb_2b/92grvnmui311st/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/ms_swift/qwen3_vl_emb_2b/ngvpq0n6jwehzk/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/native/gemma4_e2b/n2lsusgmhk45xw/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/native/gemma4_e2b/oegus80eth8r75/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/native/qwen3_5_0_8b/k9wkyvgstvnq2x/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/native/qwen3_5_0_8b/o7lrjq7e02enqv/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/native/qwen3_vl_emb_2b/cjv20cvy38c84m/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/native/qwen3_vl_emb_2b/cs5m0fd2lmcmn8/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/sentence_transformers/gemma4_e2b/dkjq8um6a26b29/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/sentence_transformers/gemma4_e2b/p3ffx6xcg05ksv/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/sentence_transformers/qwen3_5_0_8b/1jscf6cxmjz72y/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/sentence_transformers/qwen3_5_0_8b/2i0ptlkcc5621p/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/sentence_transformers/qwen3_5_0_8b/3tmi4ht24hs5uz/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/sentence_transformers/qwen3_5_0_8b/98as4en2an38rs/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/sentence_transformers/qwen3_5_0_8b/ctsn3ky63mvul0/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/sentence_transformers/qwen3_5_0_8b/xchraazlhvqt6y/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/sentence_transformers/qwen3_vl_emb_2b/adsvsynn0j2pct/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/sentence_transformers/qwen3_vl_emb_2b/zz21apdq19z46i/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/tevatron/gemma4_e2b/dh4m30ex41frn1/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/tevatron/gemma4_e2b/j0i8cqmakhz6bk/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/tevatron/qwen3_5_0_8b/n3r8t21c0clle3/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/tevatron/qwen3_5_0_8b/wwo36vlg1onptz/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/tevatron/qwen3_vl_emb_2b/6kg59vfo5dbfpe/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/tevatron/qwen3_vl_emb_2b/poo9rswlunjkj5/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/unsloth/gemma4_e2b/32plsncjtkxzvv/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/unsloth/gemma4_e2b/xlz4cbame1awm4/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/unsloth/qwen3_5_0_8b/hjqfwu95965l8p/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/unsloth/qwen3_5_0_8b/yh32nxs19wlqv2/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/unsloth/qwen3_vl_emb_2b/n75371z1ll7tz0/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
+- 판독 불가: results/unsloth/qwen3_vl_emb_2b/vfamxhetm6flkp/result.json: no `recorded_at`; the file's own clock is the download time in a clean clone, not the campaign this artifact belongs to
