@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from huggingface_hub import HfApi
 from hydra import compose, initialize_config_dir
 from rich.console import Console
 
@@ -138,6 +139,17 @@ CROSS_POD_GROUP = "framework"
 # it. Not a value, so two pods carrying it are always half a comparison each — even
 # when neither has written an override yet.
 AXIS_DECLARED = "declared"
+
+# Where a pod's container log is filed in the results repo: a sibling of its
+# result(s), named by the pod id, mirroring `publish_result.result_dir_in_repo`.
+# One pod may publish several settings under their own subdirectories, but it
+# has exactly one log, so it is filed at the shared parent rather than inside
+# any one of them. Kept in the results repo rather than on the orchestrator's
+# own disk because `scripts/report.py` reads results only from there
+# (`--result-repo`) — a log next to the orchestrator's `--out` ledger would be
+# invisible to the same report a missing log already cost this campaign a day
+# over.
+POD_LOG_NAME = "pod.log.jsonl"
 
 
 class ManifestError(ValueError):
@@ -522,6 +534,95 @@ def own_runs(runs: list[Run]) -> list[Run]:
     return [r for r in runs if r.role == ROLE_EXPERIMENT]
 
 
+def pod_log_destination(exp: Experiment, plans: dict[str, list[Run]], pod_id: str) -> str:
+    """Where this pod's log lands in the results repo.
+
+    Mirrors `publish_result.result_dir_in_repo`'s `results/<framework>/<model>/
+    <pod>` layout — read off the same resolved config `result.json` itself is
+    filed under, so a log always lands beside the result it explains even if a
+    manifest's raw `framework`/`model` strings and the schema's canonical names
+    ever diverge. Keyed on `pod_id` directly rather than reading `RUNPOD_POD_ID`
+    from the environment: that variable only exists on the pod itself, and the
+    orchestrator already holds the id it is asking about.
+    """
+    config = own_runs(plans[exp.name])[0].config
+    framework = config.get("framework", {}).get("name", "unknown")
+    model = config.get("model", {}).get("name", "unknown")
+    return f"results/{framework}/{model}/{pod_id}/{POD_LOG_NAME}"
+
+
+def capture_pod_log(
+    exp: Experiment, plans: dict[str, list[Run]], pod_id: str, result_repo: str
+) -> dict[str, Any]:
+    """Fetch a pod's container+system log and publish it beside its result.
+
+    Never raises. A pod is terminated whether or not this succeeds — see
+    `handle_pod_outcome` — so both the fetch and the upload are caught here
+    rather than left to propagate; either failing is recorded under
+    `unreadable`, reusing the name this module already gives a watch that
+    learned nothing (`PodOutcome.unreadable`) rather than inventing a second
+    word for the same kind of gap. `path_in_repo` stays `None` in that case, so
+    a log that was never captured is never confused with one that was captured
+    empty (`path_in_repo` set, `container_lines`/`system_lines` both 0) — a pod
+    can genuinely print nothing, and that is a different fact from this
+    function never having asked.
+
+    Not scrubbed for secrets. The only secret an experiment pod's own token can
+    reach is `HF_TOKEN` (`ALLOWED_ON_POD`, enforced before launch by
+    `assert_pod_scope_is_safe`), and it reaches the container only through
+    `infisical run`'s environment injection in `docker/entrypoint.sh` — that
+    file prints status lines of its own (`== announce ==`, purpose, deadline)
+    but never `os.environ` or any secret value, and the training code it
+    launches is under the same trust every pod's console already relies on.
+    A scrubbing regex nobody has tested against a shape RunPod has not
+    published would be a worse guarantee than this documented boundary.
+    """
+    try:
+        fetch = pods.fetch_log(pod_id)
+    except Exception as exc:  # noqa: BLE001 - any transport failure just means no log
+        return {
+            "path_in_repo": None,
+            "container_lines": None,
+            "system_lines": None,
+            "truncated": False,
+            "unreadable": f"{type(exc).__name__}: {exc}"[: pods.ERROR_BODY_CHARS],
+        }
+    body = "\n".join(json.dumps(event, ensure_ascii=False) for event in fetch.events).encode()
+    if body:
+        body += b"\n"
+    destination = pod_log_destination(exp, plans, pod_id)
+    try:
+        api = HfApi(token=os.environ.get("HF_TOKEN"))
+        # Asserted rather than assumed to exist, same reasoning as
+        # `publish_result.publish`: the repo may not exist yet on the first pod
+        # of a campaign, and every pod asserting it is cheaper than a race over
+        # who creates it.
+        api.create_repo(repo_id=result_repo, repo_type="dataset", private=True, exist_ok=True)
+        api.upload_file(
+            path_or_fileobj=body,
+            path_in_repo=destination,
+            repo_id=result_repo,
+            repo_type="dataset",
+        )
+    except Exception as exc:  # noqa: BLE001 - an upload failure is also just no log
+        return {
+            "path_in_repo": None,
+            "container_lines": None,
+            "system_lines": None,
+            "truncated": False,
+            "unreadable": f"upload of {destination} failed: {type(exc).__name__}: {exc}"[
+                : pods.ERROR_BODY_CHARS
+            ],
+        }
+    return {
+        "path_in_repo": destination,
+        "container_lines": fetch.container_lines,
+        "system_lines": fetch.system_lines,
+        "truncated": fetch.truncated,
+        "unreadable": None,
+    }
+
+
 def image_for(exp: Experiment, registry: str, tag: str) -> str:
     if exp.framework not in IMAGE_SUFFIX:
         raise ManifestError(f"{exp.name}: no image is built for framework '{exp.framework}'")
@@ -815,6 +916,43 @@ def default_project_id() -> str:
     return json.loads(path.read_text()).get("workspaceId", "")
 
 
+def handle_pod_outcome(
+    outcome: pods.PodOutcome,
+    exp: Experiment | None,
+    plans: dict[str, list[Run]],
+    entries: dict[str, dict[str, Any]],
+    args: argparse.Namespace,
+) -> None:
+    """Everything one finished pod triggers: record it, save its log, terminate it.
+
+    In that order and no other. The log has to be fetched while the pod can
+    still answer for it — a terminated pod's log endpoint answers `404 pod not
+    found`, confirmed directly against a live pod (see AGENTS.md) — and
+    termination must never wait on anything above it succeeding, which is why
+    `capture_pod_log` never raises and this function's own `try` covers only
+    `pods.terminate`.
+    """
+    if exp is not None:
+        entries[exp.name]["outcome"] = outcome.to_dict()
+        # The live note is superseded by the outcome, which carries the whole
+        # spell rather than its latest moment.
+        entries[exp.name]["unreadable"] = None
+        colour = "red" if outcome.reason == pods.REASON_UNREADABLE else "default"
+        console.print(f"[{colour}]{outcome.reason}[/{colour}] {exp.name} ({outcome.pod_id})")
+        if outcome.unreadable:
+            console.print(f"  [yellow]{outcome.unreadable}[/yellow]")
+        log = capture_pod_log(exp, plans, outcome.pod_id, args.result_repo)
+        entries[exp.name]["log"] = log
+        if log["unreadable"]:
+            console.print(f"  [yellow]log not captured[/yellow]: {log['unreadable']}")
+    # Terminate unconditionally: a pod left running keeps billing, and the
+    # result has already been uploaded by the entrypoint.
+    try:
+        pods.terminate(outcome.pod_id)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]terminate failed[/red] {outcome.pod_id}: {exc}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -913,6 +1051,9 @@ def main(argv: list[str] | None = None) -> int:
                 # ended — otherwise leaves a ledger that says nothing about ten
                 # minutes of failed reads.
                 "unreadable": None,
+                # Set once the pod's outcome is known and its log has been
+                # attempted, whatever the result — see `capture_pod_log`.
+                "log": None,
             }
         )
 
@@ -1007,23 +1148,7 @@ def main(argv: list[str] | None = None) -> int:
 
         for outcome in watch.wait_for_any():
             exp = running.pop(outcome.pod_id, None)
-            if exp is not None:
-                entries[exp.name]["outcome"] = outcome.to_dict()
-                # The live note is superseded by the outcome, which carries the
-                # whole spell rather than its latest moment.
-                entries[exp.name]["unreadable"] = None
-                colour = "red" if outcome.reason == pods.REASON_UNREADABLE else "default"
-                console.print(
-                    f"[{colour}]{outcome.reason}[/{colour}] {exp.name} ({outcome.pod_id})"
-                )
-                if outcome.unreadable:
-                    console.print(f"  [yellow]{outcome.unreadable}[/yellow]")
-            # Terminate unconditionally: a pod left running keeps billing, and the
-            # result has already been uploaded by the entrypoint.
-            try:
-                pods.terminate(outcome.pod_id)
-            except Exception as exc:  # noqa: BLE001
-                console.print(f"[red]terminate failed[/red] {outcome.pod_id}: {exc}")
+            handle_pod_outcome(outcome, exp, plans, entries, args)
             write_json(args.out, ledger)
 
     ledger["finished_at"] = time.time()

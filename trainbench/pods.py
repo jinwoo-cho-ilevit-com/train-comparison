@@ -88,8 +88,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -197,6 +199,51 @@ TERMINAL_DESIRED_STATUS = frozenset({"TERMINATED", "EXITED"})
 # of two stops rather than the only one.
 UNREADABLE_CEILING_SECONDS = 5 * 60
 
+# A pod's container log, over a fourth transport and a fourth host.
+#
+# v1 REST has no log endpoint at all — confirmed against
+# rest.runpod.io/v1/openapi.json (2026-08-03): its `paths` carry
+# `/pods`, `/pods/{podId}` and four action subpaths, and nothing named `logs`.
+# v2 REST does, but on ITS OWN host rather than a version segment of v1's —
+# `GET /v2/pods/{id}/logs`, confirmed the same day against
+# v2-rest.runpod.io/v2/openapi.json's own `getPodLogs` operation, which also
+# pins the exact wire shape used below: an SSE stream of
+# `data: {"source": "container"|"system", "line": "...", "ts": "..."}` frames,
+# `tail` backfills historical lines before the live tail (server default 100,
+# max 5000, ignored once `since` is set), and `source` omitted returns both
+# streams multiplexed — each frame already carries which one it came from, so
+# one connection reads both instead of two guesses at a "both" parameter that
+# does not exist.
+LOGS_V2_BASE_URL = "https://v2-rest.runpod.io/v2"
+
+# The server's own ceiling. Asked for outright: by the time a watch notices a
+# pod is finished, the line that explains why already happened, and there is no
+# reason to request less backfill than RunPod will give in one connection.
+LOG_TAIL_LINES = 5000
+
+# Two independent bounds on reading the stream, because holding a pod's
+# termination hostage to its log is the one failure this module must not add.
+# `LOG_IDLE_SECONDS` is `urlopen`'s own read timeout — how long a single read
+# may wait for the next byte before an idle connection counts as finished, which
+# is the ordinary case: a container that already exited is not producing more
+# lines, so its stream goes idle once the backfill has been sent.
+# `LOG_TOTAL_SECONDS` is the wall-clock ceiling checked between reads, for a
+# stream that keeps sending short chunks steadily rather than going idle. The
+# two are not simply additive-then-done: the deadline is only checked *between*
+# reads, so one read already in flight when the deadline passes can still run up
+# to `LOG_IDLE_SECONDS` before the timeout fires — the true worst case is
+# `LOG_TOTAL_SECONDS + LOG_IDLE_SECONDS`, not either alone.
+LOG_IDLE_SECONDS = 10.0
+LOG_TOTAL_SECONDS = 15.0
+
+# A byte ceiling for the same reason as the two time ceilings: a container that
+# never stops talking must not grow an orchestrator's memory or its ledger
+# without bound. Comfortably above what 5000 lines of a training script's
+# stdout runs to, so it is the two timeouts that end an ordinary fetch, not this.
+LOG_MAX_BYTES = 1_000_000
+LOG_CHUNK_BYTES = 8192
+
+
 # Why a pod stopped being watched. Recorded per pod, because "the work finished"
 # and "we gave up waiting" are different results and only one of them is a datum.
 REASON_EXITED = "exited"
@@ -303,35 +350,49 @@ def create_request(spec: PodSpec) -> Request:
     )
 
 
-def send(request: Request, urlopen: Callable[..., Any] = urllib.request.urlopen) -> dict[str, Any]:
-    """Send one request and return its decoded payload.
+def _build_http_request(request: Request) -> urllib.request.Request:
+    """Turn a `Request` into the real thing to send, key inserted last.
 
-    The key is read here, per call, and inlined into the header dict so that no
-    named local holds it.
+    Shared by every caller that goes out over `urllib` — `send` and, further
+    below, `stream_log` — so there is exactly one place that orders the
+    headers: User-Agent first (a Request may state its own), the credential
+    last (nothing in `request.headers` can silently un-set it). The key is read
+    here, per call, and inlined so that no named local holds it.
     """
-    http = urllib.request.Request(
+    return urllib.request.Request(
         request.url,
         data=request.body,
         headers={
-            # First, so a Request may state its own; last would silently un-set the
-            # one thing between these reads and a 403.
             "User-Agent": USER_AGENT,
             **request.headers,
             "Authorization": f"Bearer {_api_key()}",
         },
         method=request.method,
     )
+
+
+def _http_error_message(request: Request, exc: urllib.error.HTTPError) -> str:
+    """One line naming a real refusal, bounded so it is never a dump.
+
+    Shared by `send` and `stream_log`: both raise the same shape of message for
+    the same reason — a non-2xx response is the same kind of non-answer whether
+    it arrived as a JSON body or before an SSE stream ever opened.
+    """
+    detail = exc.read()[:ERROR_BODY_CHARS].decode("utf-8", "replace")
+    return f"RunPod REST {request.method} {request.url} -> {exc.code}: {detail}"
+
+
+def send(request: Request, urlopen: Callable[..., Any] = urllib.request.urlopen) -> dict[str, Any]:
+    """Send one request and return its decoded payload."""
+    http = _build_http_request(request)
     try:
         with urlopen(http, timeout=REST_TIMEOUT_SECONDS) as response:
             status = response.status
             payload = response.read()
     except urllib.error.HTTPError as exc:
-        detail = exc.read()[:ERROR_BODY_CHARS].decode("utf-8", "replace")
         # `from None`: the chained HTTPError adds nothing the message lacks, and a
         # traceback renderer that prints frame locals would print the header dict.
-        raise RuntimeError(
-            f"RunPod REST {request.method} {request.url} -> {exc.code}: {detail}"
-        ) from None
+        raise RuntimeError(_http_error_message(request, exc)) from None
     if not payload:
         # A pod may exist and be billing with nobody holding its id. Say so.
         raise RuntimeError(
@@ -353,6 +414,134 @@ def create(spec: PodSpec, transport: Transport = send) -> dict[str, Any]:
             f"(payload keys: {sorted(pod) if isinstance(pod, dict) else type(pod).__name__})"
         )
     return pod
+
+
+def logs_request(pod_id: str, tail: int = LOG_TAIL_LINES, source: str | None = None) -> Request:
+    """The wire request for one bounded snapshot of a pod's log.
+
+    `source` left at its default asks for both streams in one connection — see
+    LOGS_V2_BASE_URL for why that is safe rather than lossy. `Accept` is set
+    because this is the one request in the module whose response is not JSON.
+    """
+    query: dict[str, str] = {"tail": str(tail)}
+    if source is not None:
+        query["source"] = source
+    url = f"{LOGS_V2_BASE_URL}/pods/{urllib.parse.quote(pod_id, safe='')}/logs"
+    return Request(
+        method="GET",
+        url=f"{url}?{urllib.parse.urlencode(query)}",
+        headers={"Accept": "text/event-stream"},
+        body=None,
+    )
+
+
+def stream_log(
+    request: Request,
+    urlopen: Callable[..., Any] = urllib.request.urlopen,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[bytes, bool]:
+    """Read an SSE response for a bounded time, never past it, and return the
+    bytes collected plus whether the byte cap cut them off.
+
+    The endpoint holds the connection open (`Connection: keep-alive`, per its own
+    spec) whether or not it still has anything to say, so a plain `.read()` — what
+    `send` uses for a JSON reply — would hang on every pod whose container has
+    already exited and gone idle. Three independent things end this read instead,
+    whichever comes first: `LOG_TOTAL_SECONDS` of wall clock checked between
+    reads, `urlopen`'s own `timeout` firing when no byte arrives for
+    `LOG_IDLE_SECONDS` (a clean end, not a failure — an idle stream is a finished
+    one), and `LOG_MAX_BYTES`. Only a real HTTP refusal raises; running out of
+    time to read never does, because a pod's termination must never wait on it.
+    """
+    http = _build_http_request(request)
+    chunks: list[bytes] = []
+    total = 0
+    truncated = False
+    deadline = clock() + LOG_TOTAL_SECONDS
+    try:
+        with urlopen(http, timeout=LOG_IDLE_SECONDS) as response:
+            while clock() < deadline:
+                chunk = response.read(LOG_CHUNK_BYTES)
+                if not chunk:
+                    break  # the server closed the connection: a clean end
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= LOG_MAX_BYTES:
+                    truncated = True
+                    break
+    except TimeoutError:
+        # No byte arrived for LOG_IDLE_SECONDS: the same clean end as the server
+        # closing the connection, just observed from this side of it.
+        pass
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(_http_error_message(request, exc)) from None
+    return b"".join(chunks), truncated
+
+
+def parse_log_sse(raw: bytes) -> list[dict[str, Any]]:
+    """Parse one SSE snapshot into log frames, oldest first.
+
+    RunPod's own spec documents the shape: blocks separated by a blank line, an
+    `id:` line (the resume cursor — nothing this module keeps) and a `data:`
+    line carrying `{"source": "container"|"system", "line": "...", "ts": "..."}`.
+    Only `data:` lines are read; a `data:` field spanning several lines is
+    joined, matching the spec's own multi-line framing. A block whose payload is
+    not a JSON object is kept verbatim under `raw` rather than dropped, so a
+    shape this module was not written against still reaches the ledger as
+    *something* instead of silently vanishing — the same choice `container_uptime`
+    makes for a runtime whose fields moved.
+    """
+    text = raw.decode("utf-8", "replace")
+    events: list[dict[str, Any]] = []
+    for block in re.split(r"\r?\n\r?\n", text):
+        lines = block.splitlines()
+        data_lines = [line[5:].removeprefix(" ") for line in lines if line.startswith("data:")]
+        if not data_lines:
+            continue
+        payload = "\n".join(data_lines)
+        if not payload.strip():
+            continue
+        try:
+            parsed = json.loads(payload)
+        except ValueError:
+            events.append({"raw": payload})
+            continue
+        events.append(parsed if isinstance(parsed, dict) else {"raw": payload})
+    return events
+
+
+@dataclass(frozen=True)
+class LogFetch:
+    """One bounded snapshot of a pod's log, container and system lines together."""
+
+    events: tuple[dict[str, Any], ...]
+    truncated: bool
+
+    @property
+    def container_lines(self) -> int:
+        return sum(1 for event in self.events if event.get("source") == "container")
+
+    @property
+    def system_lines(self) -> int:
+        return sum(1 for event in self.events if event.get("source") == "system")
+
+
+def fetch_log(
+    pod_id: str,
+    tail: int = LOG_TAIL_LINES,
+    urlopen: Callable[..., Any] = urllib.request.urlopen,
+    clock: Callable[[], float] = time.monotonic,
+) -> LogFetch:
+    """One pod's log, container and system lines labelled and counted.
+
+    Raises on a real HTTP refusal (the pod may already be gone by the time this
+    is called, or the account's v2 access may answer differently); running out of
+    time to read never raises — see `stream_log`. What an exception here means
+    for the ledger and for the pod's termination is the caller's decision, not
+    this function's — see `scripts/orchestrate.capture_pod_log`.
+    """
+    raw, truncated = stream_log(logs_request(pod_id, tail=tail), urlopen=urlopen, clock=clock)
+    return LogFetch(events=tuple(parse_log_sse(raw)), truncated=truncated)
 
 
 # The read, written out here rather than taken from the SDK, and the selection set
