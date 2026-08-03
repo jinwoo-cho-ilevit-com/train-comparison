@@ -163,10 +163,56 @@ Wave 1b   멀티모달 packing 구현
 Wave 2b   축 스윕 15 (dataloader 2 포함)
 ```
 
-재료의 절반은 있다 — `axes._split_rows` 가 GradCache 용으로 만든, 행별 이미지 개수
-벡터로 `pixel_values` 를 자르는 프리미티브가 packing 이 필요로 하는 것과 같다.
-어려운 부분은 `cu_seqlens` 가 두 겹이라는 것이다: LM 의 문서 경계와, 비전 타워가
-이미 쓰고 있는 이미지별 윈도우.
+### packing 사전 조사 — 확정된 사실 (2026-08-03, 소스 읽기, 실행 검증 없음)
+
+transformers 5.14.1(실행 확인), fla-core 0.5.2(`envs/native/uv.lock` 핀과 일치).
+
+**가장 큰 것: packing 은 `batch_size == 1` 을 강제한다.** flash-attn 의
+`_is_packed_sequence`(`modeling_flash_attention_utils.py:534-547`)와 fla 의
+`chunk_gated_delta_rule`(`fla/ops/gated_delta_rule/chunk.py:397-`) 이 **각각 독립적으로**
+같은 제약을 건다 — 후자는 `"The batch size is expected to be 1 rather than {...} when
+using cu_seqlens."` 로 assert 한다. 공식 지원되는 형태는 배치 차원 1, 시퀀스 차원에
+전부 이어붙이고 `cu_seqlens` 로 경계를 표시하는 것 하나뿐이다.
+
+**비전 쪽은 할 일이 거의 없다.** `get_vision_cu_seqlens`(`vision_utils.py:35-50`)는
+`grid_thw` 만으로 계산하고 **어느 배치 행의 이미지인지 참조하지 않는다** — 이미
+flat 이다. `_image_bounds`(`axes.py:1784-1823`)도 같은 전제로 짜여 있다. 일이 몰리는
+곳은 순전히 LM 쪽 문서 경계다.
+
+**`_split_rows` 는 방향이 반대라 재사용 불가.** 그것은 배치 차원을 **자르고**, packing 은
+시퀀스 차원에 **잇는다**. 누적합으로 경계 벡터를 만들어 슬라이스하는 패턴만 전례로
+참고할 수 있다.
+
+**조용히 틀리는 함정 넷** — 전부 에러 없이 돌아간다:
+
+1. **`get_rope_index`(`modeling_qwen3_vl.py:927-1018`)는 packing 을 모른다.** 배치 행
+   단위로만 돌고 한 행 안에서 위치가 끝까지 단조 증가한다(`:993-1010`, 리셋 없음).
+   패킹된 행에 그대로 돌리면 문서 경계에 불연속이 안 생기고, **패킹 감지 자체가
+   실패한다.** 문서별로 따로 부른 뒤 4축 `position_ids` 를 잇는 조립 코드가 별도로
+   필요하고, 이 저장소에 없다.
+2. **경계 감지 규칙이 두 벌이고 서로 다르다.** flash-attn 은 `position_ids == 0`
+   (`modeling_flash_attention_utils.py:477`), `masking_utils.py:735-764` 는
+   `diff != 1`. **0 이 아닌 값으로 리셋하면 sdpa/eager 에서는 맞고 flash-attn 에서만
+   조용히 틀린다.**
+3. **GDN 은 `cu_seqlens` 로만 경계를 안다.** `attention_mask` 는 순수 패딩용이다.
+   `position_ids` 만 리셋하고 `cu_seq_lens_q` 를 명시적으로 넘기지 않으면 — flash-attn
+   백엔드는 어텐션 레이어 **내부에서** 계산하고 공유 `kwargs` 에 되쓰지 않으므로 —
+   **어텐션은 문서를 격리하는데 GDN 은 recurrent state 를 경계 너머로 이어간다.**
+   명시적으로 넘기면 `Qwen3_5DecoderLayer.forward`(`:773-813`)가 `self_attn` 과
+   `linear_attn` 양쪽에 같은 텐서를 준다.
+4. **fla 가 로드되지 않으면 `cu_seqlens` 가 통째로 무시된다.** 폴백
+   `torch_chunk_gated_delta_rule`(`modeling_qwen3_5.py:248`)이 `**kwargs` 로 받고 본문
+   어디서도 참조하지 않는다(249-322 전문 확인). `is_fast_path_available`(`:423-424`)이
+   False 면 이 경로다. **이것이 A2 를 라벨 문제에서 정확성 문제로 바꾼다** — 인증이
+   바인딩만 보면, packing 이 켜진 순간 다른 것을 계산하면서 `fla` 라고 부르게 된다.
+
+**두 `cu_seqlens` 는 이름만 비슷하고 완전히 독립이다.** 비전 쪽은 이미지 패치를,
+LM 쪽은 패킹된 토큰을 센다. 만드는 함수도 소비하는 모듈도 겹치지 않는다. 하나를
+만들면 나머지가 따라오지 않으므로 둘 다 따로 만들어야 한다.
+
+**파드에서만 답 가능:** 실제 GPU 에서 fla 커널이 `cu_seqlens` 를 어떻게 처리하는지,
+flash-attn varlen 커널의 수치적 동작. `vision_utils.py:102-` 의 window index 함수가
+`cu_seqlens` 와 상호작용하는지는 **확인 안 함**.
 
 ### 미룬 것
 
