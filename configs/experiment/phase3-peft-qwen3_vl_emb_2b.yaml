@@ -1,0 +1,18 @@
+# Phase 3 pod: the peft axis on Qwen3-VL-Embedding-2B.
+#
+# Both settings run here, on one host, so adapter overhead is not folded into
+# host-to-host variance. qlora is dropped from the campaign, so this is full
+# finetuning against LoRA only.
+phase: phase3
+description: full finetuning against LoRA on Qwen3-VL-Embedding-2B
+model: qwen3_vl_emb_2b
+framework: native
+run: timing
+gpu_type_id: NVIDIA A100-SXM4-80GB
+baseline: canonical
+axis: peft
+settings:
+  full:
+    - peft=full
+  lora:
+    - peft=lora

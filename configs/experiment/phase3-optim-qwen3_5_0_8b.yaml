@@ -1,0 +1,25 @@
+# Phase 3 pod: the optimizer axis on Qwen3.5-0.8B.
+#
+# All three settings run here, on one host, so optimizer overhead is not folded
+# into host-to-host variance.
+phase: phase3
+description: fused AdamW against 8-bit AdamW against Muon on Qwen3.5-0.8B
+model: qwen3_5_0_8b
+framework: native
+run: timing
+gpu_type_id: NVIDIA A100-SXM4-80GB
+baseline: canonical
+axis: optim
+# Required on every qwen3_5_0_8b pod: transformers binds fla while importing the
+# Qwen3.5 modelling module whenever the package, version floor and CUDA are all
+# present, so kernel=none (the default every run inherits) is unsatisfiable here.
+# Full reasoning: configs/experiment/_baselines.yaml, phase2-loss-qwen3_5_0_8b.yaml.
+overrides:
+  - kernel=fla
+settings:
+  adamw_fused:
+    - optim=adamw_fused
+  adamw_8bit:
+    - optim=adamw_8bit
+  muon:
+    - optim=muon

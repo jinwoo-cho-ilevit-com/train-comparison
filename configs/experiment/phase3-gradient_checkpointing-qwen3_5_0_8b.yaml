@@ -1,0 +1,26 @@
+# Phase 3 pod: the gradient-checkpointing axis on Qwen3.5-0.8B.
+#
+# Declared as the full dotted knob (`train.gradient_checkpointing`), not `train`:
+# the `train` group also carries the independent `offload` knob
+# (configs/train/default.yaml), and `train` alone would not say which one moved.
+phase: phase3
+description: no checkpointing against full against selective checkpointing on Qwen3.5-0.8B
+model: qwen3_5_0_8b
+framework: native
+run: timing
+gpu_type_id: NVIDIA A100-SXM4-80GB
+baseline: canonical
+axis: train.gradient_checkpointing
+# Required on every qwen3_5_0_8b pod: transformers binds fla while importing the
+# Qwen3.5 modelling module whenever the package, version floor and CUDA are all
+# present, so kernel=none (the default every run inherits) is unsatisfiable here.
+# Full reasoning: configs/experiment/_baselines.yaml, phase2-loss-qwen3_5_0_8b.yaml.
+overrides:
+  - kernel=fla
+settings:
+  none:
+    - train.gradient_checkpointing=none
+  full:
+    - train.gradient_checkpointing=full
+  selective:
+    - train.gradient_checkpointing=selective

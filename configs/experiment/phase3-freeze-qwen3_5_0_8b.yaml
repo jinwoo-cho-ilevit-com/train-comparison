@@ -1,0 +1,26 @@
+# Phase 3 pod: the freeze axis on Qwen3.5-0.8B.
+#
+# Both settings run here, on one host, so freeze overhead is not folded into
+# host-to-host variance. Not combined with the peft axis in this manifest: the
+# schema refuses an adapter crossed with a freeze axis
+# (config_schema._freeze_axes_mean_nothing_under_an_adapter), so this pod leaves
+# peft at its inherited default (`full`).
+phase: phase3
+description: no freeze against vision-tower freeze on Qwen3.5-0.8B
+model: qwen3_5_0_8b
+framework: native
+run: timing
+gpu_type_id: NVIDIA A100-SXM4-80GB
+baseline: canonical
+axis: freeze
+# Required on every qwen3_5_0_8b pod: transformers binds fla while importing the
+# Qwen3.5 modelling module whenever the package, version floor and CUDA are all
+# present, so kernel=none (the default every run inherits) is unsatisfiable here.
+# Full reasoning: configs/experiment/_baselines.yaml, phase2-loss-qwen3_5_0_8b.yaml.
+overrides:
+  - kernel=fla
+settings:
+  none:
+    - freeze=none
+  vision_tower:
+    - freeze=vision_tower

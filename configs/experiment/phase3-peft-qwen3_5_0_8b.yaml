@@ -1,0 +1,24 @@
+# Phase 3 pod: the peft axis on Qwen3.5-0.8B.
+#
+# Both settings run here, on one host, so adapter overhead is not folded into
+# host-to-host variance. qlora is dropped from the campaign, so this is full
+# finetuning against LoRA only.
+phase: phase3
+description: full finetuning against LoRA on Qwen3.5-0.8B
+model: qwen3_5_0_8b
+framework: native
+run: timing
+gpu_type_id: NVIDIA A100-SXM4-80GB
+baseline: canonical
+axis: peft
+# Required on every qwen3_5_0_8b pod: transformers binds fla while importing the
+# Qwen3.5 modelling module whenever the package, version floor and CUDA are all
+# present, so kernel=none (the default every run inherits) is unsatisfiable here.
+# Full reasoning: configs/experiment/_baselines.yaml, phase2-loss-qwen3_5_0_8b.yaml.
+overrides:
+  - kernel=fla
+settings:
+  full:
+    - peft=full
+  lora:
+    - peft=lora
