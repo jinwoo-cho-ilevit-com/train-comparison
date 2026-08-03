@@ -762,6 +762,29 @@ def test_probe_only_input_renders_byte_for_byte_as_before(tmp_path):
     assert rendered == PROBE_ONLY
 
 
+# --- the stored record has to be one a run can produce -----------------------
+
+
+def test_the_stored_record_sample_passes_the_schema_that_produced_it():
+    """The `record-report` sample's `config` block is what `build_record` writes.
+
+    Nothing checked that, and the sample drifted into a config no run can compose:
+    it carried `run.trackio_project`/`run.trackio_space_id` after decision 3 removed
+    them from `RunConfig`, and `BenchConfig` forbids extras. A boundary whose frozen
+    payload cannot be produced fixes nothing — both lanes validate against a record
+    neither of them will ever see.
+    """
+    from trainbench.config_schema import BenchConfig
+
+    payload = json.loads(RECORD_SAMPLE.read_text())
+    config = BenchConfig.model_validate(payload["config"])
+
+    # And every field the sample states survives the round trip, so a group the
+    # schema quietly drops is a failure here rather than a value nobody reads.
+    dumped = config.model_dump(mode="json")
+    assert {group: dumped.get(group) for group in payload["config"]} == payload["config"]
+
+
 # --- the training verdict has three definitions -----------------------------
 
 

@@ -561,6 +561,78 @@ def test_an_inline_revision_on_the_implementation_string_identifies_the_kernel()
         kernels.assert_packing_is_isolated(fingerprint)
 
 
+def _built_like(name: str) -> Any:
+    """A Qwen3-VL config in the state the frozen sample `name` describes."""
+    from transformers import Qwen3VLConfig
+
+    sample = SAMPLES[name]
+    config = Qwen3VLConfig()
+    config._attn_implementation = "sdpa"
+    for backbone, entry in sample["backbones"].items():
+        getattr(config, backbone)._attn_implementation_internal = entry["attn_implementation"]
+    return config
+
+
+@pytest.mark.parametrize("name", [HUB, UNREGISTERED])
+def test_the_runtime_can_produce_the_frozen_samples_from_a_string_request(name):
+    """Both Hub samples are string requests whose towers ran different kernels.
+
+    `config.attn.impl` is a plain string in every row of `ATTN_IMPL` — the schema
+    has no path that hands `read_fingerprint` a dict — and transformers resolves
+    each submodule on its own (`modeling_utils.py:2238-2239`), so the vision tower
+    stays on SDPA while the text tower takes the Hub kernel. Reading every reached
+    backbone as bound refused that state, which made two of the three frozen
+    samples unproducible: the whole `attn=fa2/fa3/fa4` x Qwen3-VL column came back
+    as `UnidentifiedKernel` and was published as a refusal record with no figures.
+
+    `mask_registered` is compared per backbone rather than against the stored
+    value: it is a read-back off the live registry, and this host has neither
+    `kernels` nor `flash-attn`, so the fa2 kernel is not bound here. The contract
+    says the same in `test_mask_registration_is_a_read_back_not_a_property_of_the_
+    requested_name`.
+    """
+    from trainbench.config_schema import ATTN_IMPL
+
+    sample = SAMPLES[name]
+    identity = sample["resolved"]["identity"]
+
+    fingerprint = kernels.read_fingerprint(
+        _Model(_built_like(name)),
+        axis=sample["requested"]["axis"],
+        value=sample["requested"]["value"],
+        requested=ATTN_IMPL[sample["requested"]["value"]],
+        requested_ref=identity["requested_ref"],
+        revision_resolver=lambda repo_id: identity["revision"],
+    )
+
+    contract.validate_kernel_fingerprint(fingerprint)
+    assert isinstance(ATTN_IMPL[sample["requested"]["value"]], str)
+    assert fingerprint["requested"] == sample["requested"]
+    assert fingerprint["resolved"]["identity"] == identity
+    assert (
+        fingerprint["resolved"]["attn_implementation"]
+        == (sample["resolved"]["attn_implementation"])
+    )
+    coverage = {n: e["requested"] for n, e in fingerprint["backbones"].items()}
+    assert coverage == {n: e["requested"] for n, e in sample["backbones"].items()}
+    assert coverage == {"text_config": True, "vision_config": False}
+
+
+def test_a_string_request_no_tower_is_running_is_refused():
+    """The other side of the same rule.
+
+    A request every tower resolved away from bound nothing, and calling the
+    fallback the resolved kernel would put the requested axis value beside an
+    implementation nobody asked for.
+    """
+    model = _Model(_qwen3_vl_config("sdpa"))
+
+    with pytest.raises(kernels.UnidentifiedKernel, match="no backbone is running it"):
+        kernels.read_fingerprint(
+            model, axis="attn.name", value="fa2", requested="flash_attention_2"
+        )
+
+
 def test_a_request_that_bound_two_different_kernels_is_refused():
     model = _Model(_qwen3_vl_config({"text_config": "flash_attention_2", "vision_config": "sdpa"}))
 

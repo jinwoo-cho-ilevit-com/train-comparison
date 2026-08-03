@@ -396,6 +396,51 @@ def _requested_by_backbone(
     return landed
 
 
+def _repository(implementation: str) -> str:
+    """`repo@revision` without the revision, and anything else unchanged.
+
+    The request names a repository; what binds may carry the `@ref` the resolution
+    pinned, and comparing the two as raw strings reads one kernel as two.
+    """
+    return implementation.partition("@")[0]
+
+
+def _names_the_request_can_bind_as(asked: str) -> set[str]:
+    """Every implementation string `asked` may be reported as once the model is built.
+
+    A flash-attention name is not a kernel name. With `flash-attn` absent
+    transformers rewrites it to a Hub repository — `FLASH_ATTN_KERNEL_FALLBACK`
+    (`modeling_flash_attention_utils.py:63-71`), applied inside
+    `_check_and_adjust_attn_implementation` — so the string the config asked for and
+    the string the backbone reports are two names for one request. Without this the
+    rewrite reads as a backbone that did not receive the request.
+    """
+    from transformers.modeling_flash_attention_utils import FLASH_ATTN_KERNEL_FALLBACK
+
+    fallback = FLASH_ATTN_KERNEL_FALLBACK.get(asked)
+    return {asked} if fallback is None else {asked, fallback}
+
+
+def _bound_by_backbone(landed: Mapping[str, str], backbones: Mapping[str, str]) -> dict[str, str]:
+    """The backbones running what the request asked them for, and what they run.
+
+    A backbone the request reached is not a backbone the request bound. transformers
+    resolves each submodule separately — `submodule.get_correct_attn_implementation(
+    sub_implementation)` at `modeling_utils.py:2238-2239`, whose sdpa branch falls
+    back to `eager` at `:2088-2093` — so one string request routinely lands
+    different implementations on different towers. That is the state the
+    per-sub-config map exists to record: `fa2_hub_fallback_qwen3_vl` is exactly it,
+    a string request with the vision tower left on SDPA. Reading every reached
+    backbone as bound made that frozen sample unproducible and refused the whole
+    `attn=fa2/fa3/fa4` x Qwen3-VL column as an unidentified kernel.
+    """
+    return {
+        name: backbones[name]
+        for name, asked in landed.items()
+        if _repository(backbones[name]) in _names_the_request_can_bind_as(asked)
+    }
+
+
 def _one(values: list[str], what: str) -> str:
     unique = sorted(set(values))
     if len(unique) != 1:
@@ -430,9 +475,14 @@ def read_fingerprint(
     backbones, parent_key = _sub_config_implementations(config)
     registry = _mask_registry()
     landed = _requested_by_backbone(requested, backbones, parent_key)
-    resolved_impl = _one(
-        [backbones[name] for name in sorted(landed)], "the implementation that bound"
-    )
+    bound = _bound_by_backbone(landed, backbones)
+    if not bound:
+        raise UnidentifiedKernel(
+            f"the request {requested!r} reached {sorted(landed)} and no backbone is running it: "
+            f"{ {name: backbones[name] for name in sorted(landed)} }. Every tower resolved to "
+            "something else, so this build is measuring an implementation nobody asked for."
+        )
+    resolved_impl = _one([bound[name] for name in sorted(bound)], "the implementation that bound")
     asked = (
         requested if isinstance(requested, str) else _one(list(landed.values()), "what was asked")
     )
