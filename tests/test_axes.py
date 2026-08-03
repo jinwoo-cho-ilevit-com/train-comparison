@@ -75,7 +75,7 @@ from trainbench.embedding import last_token_pool, packed_last_token_pool
 # The fixture and the config builders are shared with tests/test_applied.py rather
 # than re-declared: two definitions of "a valid composed config" would drift, and
 # the drift would be invisible because each file would still pass on its own.
-from .test_applied import bench, config_mapping, gemma  # noqa: F401
+from .test_applied import bench, config_mapping  # noqa: F401
 
 CPU = torch.device("cpu")
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
@@ -138,20 +138,14 @@ def test_every_attention_value_has_a_kwarg_to_ask_for(composed):
     assert set(ATTN_IMPL) == declared
 
 
-# --- peft.mode=qlora, the half that is a dict (load_kwargs) ------------------
+# --- peft.mode=qlora removal --------------------------------------------------
 #
-# QLoRA is LoRA over a 4-bit base. The adapter half is the same `get_peft_model`
-# call as plain LoRA; the base half is a `BitsAndBytesConfig` that has to reach
-# `from_pretrained`, because weights already materialised in bf16 cannot be
-# quantised afterwards. What that call is asked for is a dict, and a dict is
-# assertable on a laptop — `BitsAndBytesConfig` is a transformers dataclass and
-# imports with bitsandbytes absent.
-#
-# What is not asserted anywhere is that 4-bit weights come back. bitsandbytes
-# quantises on CUDA, there is no GPU here, and the package is not installed: that
-# half is 측정 안 함, and the tests below are about the request rather than the
-# result. `_peft` still refuses the axis outright, so nothing in this repository
-# runs a qlora step yet on any device.
+# QLoRA left the campaign 2026-08-03 (user decision, AGENTS.md). `axes.load_kwargs`
+# no longer builds a `BitsAndBytesConfig` for any request, `QLORA_4BIT` and
+# `_base_is_quantised` are gone from axes.py, and `peft.mode` offers only `full`
+# and `lora`. What used to be asserted about the qlora request (a 4-bit
+# `quantization_config`, refused off CUDA) has no successor: there is no axis
+# value left that `load_kwargs` refuses on any device.
 
 
 def on_cuda(config):
@@ -159,110 +153,18 @@ def on_cuda(config):
 
     `device.get_device` takes the override at its word instead of probing for
     hardware — that is what lets a CUDA-only branch be read on a machine without
-    one. Nothing is allocated, loaded or quantised by any test that uses this.
+    one.
     """
     return config.model_copy(update={"device": "cuda"})
 
 
-def test_qlora_asks_from_pretrained_for_a_four_bit_base(composed):
-    config = on_cuda(bench(composed, **{"peft.mode": "qlora", "peft.r": 32}))
-
-    kwargs = axes.load_kwargs(config)
-
-    # The key is transformers' own parameter name, for the reason the attention
-    # test above gives: a misspelled one is accepted and ignored, and the run then
-    # trains a full-precision base under the qlora label.
-    assert set(kwargs) == {"attn_implementation", "quantization_config"}
-    quantisation = kwargs["quantization_config"]
-    # Named rather than imported: this file imports no transformers (see the module
-    # docstring), and what matters is the object `from_pretrained` receives.
-    assert type(quantisation).__name__ == "BitsAndBytesConfig"
-    assert quantisation.load_in_4bit is True
-    assert quantisation.bnb_4bit_quant_type == "nf4"
-    assert quantisation.bnb_4bit_use_double_quant is True
-    # bf16 is the only precision `step_context` lets a run reach; a compute dtype
-    # that disagreed with it would be a precision no axis asked for.
-    assert quantisation.bnb_4bit_compute_dtype is torch.bfloat16
-
-
-def test_full_and_lora_are_loaded_without_a_quantisation_config(composed):
-    """One half of the break: a `quantization_config` returned for every run would
-    satisfy the test above word for word, and would quantise the full finetune that
-    is this study's baseline."""
+def test_load_kwargs_carries_only_attention_for_every_peft_mode(composed):
+    """Attention is the one load-time axis left. A `quantization_config` returned
+    for either mode would be a request nothing here asked for."""
     for mode, rank in (("full", 0), ("lora", 32)):
         config = on_cuda(bench(composed, **{"peft.mode": mode, "peft.r": rank}))
 
         assert set(axes.load_kwargs(config)) == {"attn_implementation"}, mode
-
-
-@pytest.mark.parametrize("device", ["cpu", "mps", "xpu"])
-def test_a_qlora_run_cannot_start_off_cuda(composed, device):
-    """The other half, and the one that matters on this machine.
-
-    bitsandbytes quantises on CUDA. Handing the config back anyway would leave the
-    quantisation to be ignored somewhere downstream, and an ignored quantisation is
-    a full-precision base whose speed gets reported as 4-bit. The device is
-    overridden explicitly rather than left to resolve, so the refusal is asserted on
-    a GPU host too.
-
-    More than one non-CUDA device, because "off cuda" is the claim. Asserting it
-    for `cpu` alone leaves `device.type == "cpu"` — one character from what is
-    written — passing the whole suite while quantising nothing on this laptop's
-    mps and on an Intel host's xpu. `get_device` takes the string at its word, so
-    none of these has to exist here.
-    """
-    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32}).model_copy(
-        update={"device": device}
-    )
-
-    with pytest.raises(axes.UnappliedAxis, match=f"device={device} would load"):
-        axes.load_kwargs(config)
-
-
-def test_qlora_gates_on_the_device_the_run_resolves_to(composed, monkeypatch):
-    """`device: null` is the config default and what every pod composes, so the
-    resolution path is the one a real run takes — and no test walked it: every
-    other qlora test names a device outright.
-
-    The accelerator is stubbed rather than read, because what is under test is the
-    gate rather than this host: a machine with no CUDA would pass a gate that
-    quantised on any accelerator it found, which is how mps would get 4-bit weights
-    it cannot make.
-    """
-    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32}).model_copy(
-        update={"device": None}
-    )
-    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
-
-    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("mps"))
-    with pytest.raises(axes.UnappliedAxis, match="device=mps"):
-        axes.load_kwargs(config)
-
-    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("cuda"))
-    assert "quantization_config" in axes.load_kwargs(config)
-
-
-def test_the_qlora_compute_dtype_stays_a_precision_a_run_can_reach(composed):
-    """`QLORA_4BIT` fixes bf16 compute on the grounds that `precision.name` has no
-    other value to reach. That is one constant resting on another module's
-    schema with nothing between them: the day a second precision value is added,
-    a qlora run under it still computes in bf16 and the study prints that value's
-    name over a bf16 number. Nothing else pins the pair together, so this does —
-    it is the notice, not the fix."""
-    reachable = []
-    for name in get_args(PrecisionConfig.model_fields["name"].annotation):
-        try:
-            axes.step_context(bench(composed, **{"precision.name": name}))
-        except axes.UnappliedAxis:
-            continue
-        reachable.append(name)
-
-    assert reachable == ["bf16"], (
-        f"precision {reachable} can be reached now, and QLORA_4BIT still computes in "
-        f"{axes.QLORA_4BIT['bnb_4bit_compute_dtype']}; decide what the combination "
-        "means before a run measures one under the other's name"
-    )
-    assert axes.QLORA_4BIT["bnb_4bit_compute_dtype"] is torch.bfloat16
 
 
 # --- compile.mode ------------------------------------------------------------
@@ -587,33 +489,12 @@ def test_liger_calls_the_entrypoint_for_this_architecture(composed, monkeypatch)
     assert calls == ["apply_liger_kernel_to_qwen3_5"]
 
 
-def test_liger_reaches_gemma4_on_a_pin_that_has_the_entrypoint(composed, monkeypatch):
-    """`LIGER_UNSUPPORTED` used to refuse this outright, citing Liger-Kernel#1186,
-    and the pinned wheel says otherwise: liger-kernel 0.8.1 defines
-    `apply_liger_kernel_to_gemma4` and maps `gemma4` onto it. A refusal written
-    from an issue tracker would have kept one of the study's three models out of
-    this axis for the whole campaign."""
-    module, calls = liger_stub(entrypoint="apply_liger_kernel_to_gemma4")
-    install_liger(monkeypatch, module)
-    config = gemma(composed, **{"kernel.name": "liger"})
-
-    assert axes.patch(config) == ["kernel.name"]
-    assert calls == ["apply_liger_kernel_to_gemma4"]
-
-
-def test_liger_on_a_pin_without_the_entrypoint_names_what_that_pin_has(composed, monkeypatch):
-    """The other side of the same fact: 0.8.0 has gemma-4's *text* entrypoint and
-    not its multimodal one, so which image is running decides this. The version
-    boundary is answered by the installed package rather than by a table, and the
-    refusal has to carry the correction with it."""
-    module, _ = liger_stub(entrypoint="apply_liger_kernel_to_gemma4_text")
-    install_liger(monkeypatch, module)
-    config = gemma(composed, **{"kernel.name": "liger"})
-
-    with pytest.raises(axes.UnappliedAxis, match=r"apply_liger_kernel_to_gemma4_text") as refusal:
-        axes.patch(config)
-
-    assert "has no apply_liger_kernel_to_gemma4()" in str(refusal.value)
+# test_liger_reaches_gemma4_on_a_pin_that_has_the_entrypoint and
+# test_liger_on_a_pin_without_the_entrypoint_names_what_that_pin_has tested a
+# version boundary specific to gemma-4's liger entrypoint (0.8.0 has only the
+# text one, 0.8.1 adds the multimodal one). Both were removed 2026-08-03 along
+# with `LIGER_ENTRYPOINTS["gemma4"]`: gemma-4 left the campaign, and `model.arch`
+# can no longer construct a config this pin distinction would apply to.
 
 
 def test_the_refusal_reads_the_export_list_a_lazy_module_actually_answers(composed, monkeypatch):
@@ -629,7 +510,7 @@ def test_the_refusal_reads_the_export_list_a_lazy_module_actually_answers(compos
         "AutoLigerKernel",
     ]
     install_liger(monkeypatch, lazy)
-    config = gemma(composed, **{"kernel.name": "liger"})
+    config = bench(composed, **{"kernel.name": "liger"})
 
     with pytest.raises(axes.UnappliedAxis) as refusal:
         axes.patch(config)
@@ -685,17 +566,14 @@ def test_a_wrong_entrypoint_name_reports_what_liger_exports(composed, monkeypatc
 
 
 def test_fla_is_refused_where_transformers_takes_no_fla_path(composed, monkeypatch):
-    """Only Qwen3.5 imports fla in transformers. Asking for it on the other two
-    would name a library the model never enters, which `_capture_kernel` would then
-    read back as `none`."""
+    """Only Qwen3.5 imports fla in transformers. Asking for it on the other
+    arch would name a library the model never enters, which `_capture_kernel`
+    would then read back as `none`."""
     monkeypatch.setattr(axes, "_fla_fast_path", lambda: (True, ""))
 
-    for config in (
-        bench(composed, **{"kernel.name": "fla"}),
-        gemma(composed, **{"kernel.name": "fla"}),
-    ):
-        with pytest.raises(axes.UnappliedAxis, match="no fla kernel path"):
-            axes.patch(config)
+    config = bench(composed, **{"kernel.name": "fla"})
+    with pytest.raises(axes.UnappliedAxis, match="no fla kernel path"):
+        axes.patch(config)
 
 
 def test_fla_without_its_fast_path_is_refused_rather_than_measured(composed, monkeypatch):
@@ -862,7 +740,6 @@ def test_kernel_none_stands_where_no_kernel_binds_itself(composed, monkeypatch):
 
     fla_environment(monkeypatch)
     assert axes.patch(bench(composed)) == []
-    assert axes.patch(gemma(composed)) == []
 
 
 def fla_that_cannot_be_imported(monkeypatch, exc: BaseException) -> None:
@@ -1045,56 +922,12 @@ def test_a_kernel_the_schema_no_longer_offers_is_refused_rather_than_a_key_error
     assert "KERNEL_PATCHERS" in str(refusal.value)
 
 
-# --- freeze.ple --------------------------------------------------------------
-#
-# The capture side is covered in tests/test_applied.py, but every one of those
-# tests feeds an already-frozen fixture straight to `capture` and so never runs
-# `assemble`. That left the apply site bare: replacing the `requires_grad_(False)`
-# loop in `_freeze` with a bare call kept all 325 tests green. These two go
-# through `assemble`, which is where a run reaches it. The axis is 46.8% of
-# gemma-4-E2B's parameters and `_ple_report` has already shipped one silent
-# failure on this exact marker.
-
-
-def ple_model() -> torch.nn.Module:
-    """A model whose parameter names carry gemma-4's per-layer-embedding marker."""
-    model = torch.nn.Module()
-    model.add_module(
-        "embed_tokens_per_layer", torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
-    )
-    model.add_module("language_model", torch.nn.Linear(2, 2))
-    model.config = SimpleNamespace(_attn_implementation="sdpa", sub_configs=())
-    return model
-
-
-def test_freezing_the_ple_tables_goes_through_assemble(composed):
-    config = gemma(composed, **{"freeze.ple": True})
-
-    built, names = axes.assemble(ple_model(), config, CPU, framework="native")
-
-    assert "freeze.ple" in names
-    frozen = axis(capture(built, config), "freeze.ple")
-    assert frozen.applied == "True"
-    assert frozen.detail == {"matched": 4, "frozen": 4}
-
-
-def test_a_ple_freeze_that_did_not_take_is_a_mismatch(composed):
-    """The break, and the one that costs most: these tables are roughly half the
-    model, so a freeze that quietly did nothing moves the optimizer-memory number
-    this model is in the study to demonstrate."""
-    config = gemma(composed, **{"freeze.ple": True})
-    model = ple_model()
-    built, _ = axes.assemble(model, config, CPU, framework="native")
-    model.embed_tokens_per_layer[0].weight.requires_grad_(True)
-
-    state = capture(built, config)
-
-    assert axis(state, "freeze.ple").applied == "partial"
-    with pytest.raises(AppliedMismatch, match="freeze.ple"):
-        assert_matches(state, config)
-
-
 # --- freeze.vision_tower -----------------------------------------------------
+#
+# freeze.ple (gemma-4's per-layer-embedding marker) was tested here until
+# 2026-08-03, when gemma-4-E2B left the campaign and its axis went with it —
+# `FreezeConfig` no longer has a `ple` field, `axes.ple_parameters` and
+# `axes.PLE_PARAM_MARKER` are gone, and `applied._capture_freeze_ple` with them.
 
 
 def test_every_architecture_has_a_recorded_vision_marker():
@@ -1141,16 +974,13 @@ def test_a_marker_that_matches_nothing_is_undetermined_not_frozen(composed):
     assert axis(state, "freeze.vision_tower").detail["matched"] == 0
 
 
-def test_the_markers_are_architecture_specific(composed):
-    """gemma-4 calls it `vision_tower` and both Qwen models call it `visual`. One
-    marker for all three would match nothing on two of them."""
-    gemma_model = towered_model("vision_tower")
-
-    under_gemma = capture(Built(model=gemma_model), gemma(composed))
-    under_qwen = capture(Built(model=gemma_model), bench(composed))
-
-    assert under_gemma.axes and axis(under_gemma, "freeze.vision_tower").applied == "False"
-    assert axis(under_qwen, "freeze.vision_tower").applied is None
+# test_the_markers_are_architecture_specific used to contrast gemma-4's
+# `vision_tower.` marker against both Qwen models' `visual.`, proving one marker
+# for every arch would match nothing on some of them. gemma-4 left the campaign
+# 2026-08-03 (PLAN.md "gemma-4-E2B 제외"), and the two remaining archs share the
+# same marker (`VISION_PARAM_MARKERS`), so there is no second real arch left to
+# contrast against. `test_a_marker_that_matches_nothing_is_undetermined_not_frozen`
+# above still covers a marker matching nothing on the arch it belongs to.
 
 
 def test_an_architecture_with_no_recorded_marker_is_refused():
@@ -1766,108 +1596,6 @@ def test_an_adapter_nothing_here_attached_is_still_seen(composed):
         assert_matches(state, config)
 
 
-def four_bit_lora_model(as_dict: bool = False, **recipe):
-    """A LoRA model over a 4-bit base, quantised by the recipe given.
-
-    Both markers are set where a real load leaves them: `is_loaded_in_4bit` on the
-    model (`quantizers/quantizer_bnb_4bit.py`) and the recipe on `model.config`
-    (`quantizers/auto.py`, which assigns it before the quantizer is even built —
-    so a model carrying the flag carries the recipe too). `as_dict` is the other
-    spelling `model.config` can hold, the one a pre-quantised checkpoint declares
-    in its own config.json.
-    """
-    model = plain_model()
-    model.peft_config = {"default": SimpleNamespace(peft_type="PeftType.LORA")}
-    model.is_loaded_in_4bit = True
-    values = {**axes.QLORA_4BIT, **recipe}
-    model.config.quantization_config = values if as_dict else SimpleNamespace(**values)
-    return model
-
-
-@pytest.mark.parametrize("as_dict", [False, True], ids=["config_object", "config_dict"])
-def test_qlora_is_told_apart_by_the_quantised_base(composed, as_dict):
-    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32})
-
-    state = capture(Built(model=four_bit_lora_model(as_dict)), config)
-
-    assert axis(state, "peft.mode").applied == "qlora"
-    # And the recipe reaches the result file. `build_record` publishes the config
-    # dump and `applied.to_dict()`, and `QLORA_4BIT` is in neither — it is a module
-    # constant, not a schema field (docs/CONTRACTS.md §5). Without this, a result
-    # says "4-bit" and no audit afterwards can say which 4-bit it was.
-    assert axis(state, "peft.mode").detail["base_quantisation"] == {
-        "load_in_4bit": True,
-        "bnb_4bit_quant_type": "nf4",
-        "bnb_4bit_use_double_quant": True,
-        # A string, because the dtype has to survive `json.dumps` into the record.
-        "bnb_4bit_compute_dtype": "bfloat16",
-    }
-
-
-@pytest.mark.parametrize(
-    "wrong",
-    [
-        {"bnb_4bit_quant_type": "fp4"},
-        {"bnb_4bit_use_double_quant": False},
-        {"bnb_4bit_compute_dtype": torch.float16},
-    ],
-    ids=["fp4", "no_double_quant", "fp16_compute"],
-)
-def test_a_four_bit_base_on_another_recipe_is_not_qlora(composed, wrong):
-    """The subtler break, and the one a "is it 4-bit at all" check waves through.
-
-    Each of these loads 4-bit weights, so `is_loaded_in_4bit` is True and the
-    adapter is the same LoRA — every marker the axis used to be read from agrees.
-    They are different techniques: fp4 and nf4 are different quantisers, double
-    quantisation is a second pass over the constants, and an fp16 compute dtype is
-    a precision no axis asked for. Measuring one and printing QLoRA's name over it
-    is this module's whole failure mode, so the applied value is one nothing can
-    match and the run stops.
-    """
-    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32, "run.purpose": "timing"})
-
-    state = capture(Built(model=four_bit_lora_model(**wrong)), config)
-
-    assert axis(state, "peft.mode").applied != "qlora"
-    # Named in the value, so the failure says which knob rather than "mismatch".
-    assert next(iter(wrong)) in axis(state, "peft.mode").applied
-    with pytest.raises(AppliedMismatch, match="peft.mode"):
-        assert_matches(state, config)
-
-
-def test_a_base_that_says_it_is_four_bit_without_saying_how_is_undetermined(composed):
-    """`is_loaded_in_4bit` with no recipe on the config. transformers never
-    produces this, but a framework adapter setting the flag its own way would, and
-    the fail-safe direction is the one this module is built on: not readable is not
-    "the usual recipe"."""
-    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32, "run.purpose": "timing"})
-    model = four_bit_lora_model()
-    del model.config.quantization_config
-
-    state = capture(Built(model=model), config)
-
-    assert axis(state, "peft.mode").applied == "qlora(recipe=unreadable)"
-    with pytest.raises(AppliedMismatch, match="peft.mode"):
-        assert_matches(state, config)
-
-
-def test_a_qlora_request_over_an_unquantised_base_blocks_the_run(composed):
-    """The break for the line above, and the outcome `load_kwargs` exists to make
-    impossible: the adapter is the same object either way, so a run that asked for
-    qlora and got a bf16 base is indistinguishable by adapter type — and its step
-    time is what the study would print for 4-bit. `purpose` is spelled out because
-    what is being asserted is that the reportable run is the one that dies."""
-    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32, "run.purpose": "timing"})
-    model = plain_model()
-    model.peft_config = {"default": SimpleNamespace(peft_type="PeftType.LORA")}
-
-    state = capture(Built(model=model), config)
-
-    assert axis(state, "peft.mode").applied == "lora"
-    with pytest.raises(AppliedMismatch, match="peft.mode"):
-        assert_matches(state, config)
-
-
 def test_lora_attaches_a_real_adapter_and_reads_back_as_lora(composed):
     """The pair for this axis, against real peft rather than a stand-in.
 
@@ -1890,69 +1618,6 @@ def test_lora_attaches_a_real_adapter_and_reads_back_as_lora(composed):
     # the whole suite green until this line existed. `assemble` returns a model for
     # exactly this reason (docs/CONTRACTS.md §2).
     assert type(built.model).__module__.startswith("peft"), type(built.model)
-
-
-def quantised_model() -> torch.nn.Module:
-    """A model as `from_pretrained` returns one under a `BitsAndBytesConfig`.
-
-    The flag rather than real 4-bit weights: bitsandbytes quantises on CUDA and
-    there is none here, so what is under test is the gate rather than the weights.
-    `is_loaded_in_4bit` is one of the two readings `applied._capture_peft` uses to
-    tell `qlora` from `lora`, which is why `_base_is_quantised` uses both.
-    """
-    model = plain_model()
-    model.is_loaded_in_4bit = True
-    return model
-
-
-def test_qlora_attaches_the_adapter_to_a_base_that_arrived_quantised(composed):
-    """The two halves are `load_kwargs`' `BitsAndBytesConfig` and this call, and
-    what this site adds is the check that the first one happened."""
-    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32})
-
-    built, names = axes.assemble(quantised_model(), config, CPU, framework="native")
-
-    assert "peft.mode" in names
-    assert type(built.model).__module__.startswith("peft")
-    trainable = [n for n, p in built.model.named_parameters() if p.requires_grad]
-    assert trainable and all("lora_" in name for name in trainable), trainable
-
-
-def test_qlora_over_an_unquantised_base_is_refused_at_the_adapter(composed):
-    """The realistic failure: the quantisation is requested in `load_kwargs`, a
-    caller that skipped it gets no error from `from_pretrained`, and plain LoRA
-    would then be measured under the QLoRA label. Weights already materialised in
-    bf16 cannot be quantised here, so refusing is the whole of what this site can
-    do about it."""
-    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32})
-
-    with pytest.raises(axes.UnappliedAxis, match="carries no quantisation"):
-        axes.assemble(plain_model(), config, CPU, framework="native")
-
-
-def test_qlora_does_not_run_the_preamble_that_would_turn_on_another_axis(composed, monkeypatch):
-    """`prepare_model_for_kbit_training` is the documented QLoRA preamble and it is
-    deliberately not called: it enables gradient checkpointing by default, which is
-    a separate axis here, and it upcasts the norms to fp32, which
-    `applied._capture_precision` reads as `mixed(bf16,fp32)` against a bf16
-    request. Either one turns a qlora cell into a measurement of something else, so
-    the call is refused rather than left to be noticed."""
-    import peft
-
-    called = []
-    monkeypatch.setattr(
-        peft, "prepare_model_for_kbit_training", lambda *a, **k: called.append(a) or a[0]
-    )
-    config = bench(composed, **{"peft.mode": "qlora", "peft.r": 32})
-
-    built, names = axes.assemble(quantised_model(), config, CPU, framework="native")
-
-    assert called == []
-    assert "train.gradient_checkpointing" not in names
-    assert not any(
-        getattr(module, "gradient_checkpointing", False)
-        for _, module in built.model.named_modules()
-    )
 
 
 def test_an_adapter_freezes_the_base_whatever_the_freeze_axes_did(composed):
@@ -4628,7 +4293,6 @@ def test_every_axis_the_schema_declares_is_wired():
         "dataloader.packing",
         "dataloader.pretokenize",
         "framework.name",
-        "freeze.ple",
         "freeze.vision_tower",
         "kernel.name",
         "loss.name",

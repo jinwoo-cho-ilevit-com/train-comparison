@@ -47,6 +47,12 @@
 
 ## google/gemma-4-E2B
 
+**캠페인 제외 (2026-08-03).** full finetuning이 A100 80GB 한 장에 들어가지 않는다
+(`train.batch_size=16`에서 peak 83.8GB, 배치 4로 낮춘 뒤에도 OOM — `PLAN.md`
+"gemma-4-E2B 제외" 참조). `configs/model/gemma4_e2b.yaml`과 이 문서가 대조하던
+`docs/model-spec.yaml`의 항목은 제거됐다. 아래는 제외 이전에 실측한 결과이므로
+지우지 않고 그대로 남긴다 — 실측은 역사다.
+
 단일 safetensors(10.2GB)이며 `model.safetensors.index.json`이 없다. 파라미터 이름은
 config에서 meta device로 모델 골격을 구성해 열거했다(가중치 다운로드 없음).
 
@@ -72,8 +78,8 @@ language_model.per_layer_model_projection.weight
 language_model.per_layer_projection_norm.weight
 ```
 
-**현재 heuristic의 절반이 죽어 있다.** `native.py:_ple_report`는
-`"per_layer" in name or "altup" in name`으로 찾는데:
+**당시 heuristic의 절반이 죽어 있었다.** gemma-4 제외와 함께 제거된
+`native.py:_ple_report`는 `"per_layer" in name or "altup" in name`으로 찾았는데:
 
 - `per_layer` -> **108개 매칭, 유효**
 - `altup` -> **0개 매칭.** gemma-3n의 이름이며 gemma-4에는 없다
@@ -133,8 +139,9 @@ placeholder 확장 위치와 이미지당 토큰 수는 2026-08-02에 실측으�
 
 16px 격자로 4096px까지 쓸어본 결과 도달 가능한 값은 138종이고 최댓값이 280이다.
 Qwen 계열의 픽셀 비례 방식과 다른 것은 맞지만, **"해상도와 무관하게 고정"은 아니다.**
-그래서 `configs/model/gemma4_e2b.yaml`의 필드 이름이 `max_tokens_per_image`이고,
-probe는 이 값과의 일치가 아니라 초과를 거부한다.
+그래서 (제외 이전) `configs/model/gemma4_e2b.yaml`의 필드 이름은 `max_tokens_per_image`
+였고, probe는 이 값과의 일치가 아니라 초과를 거부했다. gemma-4 제외와 함께 이
+필드는 스키마·config·probe 시그니처에서 전부 제거됐다.
 
 ---
 
@@ -169,10 +176,12 @@ Qwen3-VL-Embedding은 공식 임베딩 모델이라 `true`가 규격이지만, �
 
 ## 확정된 결정 (2026-08-01, 사용자)
 
-결정 1·2와 여기서 확인한 `padding_side`·`max_tokens_per_image`는 `docs/model-spec.yaml`에
-기계 판독 가능한 형태로도 적혀 있고, `scripts/audit_plan.py`의 `model-spec` 체크가
+결정 1·2와 여기서 확인한 `padding_side`는 `docs/model-spec.yaml`에 기계 판독
+가능한 형태로도 적혀 있고, `scripts/audit_plan.py`의 `model-spec` 체크가
 `configs/model/*.yaml`과 **값 대 값으로** 대조한다. 이 문서와 config가 어긋나면
-게이트가 막는다.
+게이트가 막는다. (`max_tokens_per_image`는 gemma-4-E2B 전용 필드였다 — gemma-4
+제외와 함께 스키마·config·이 대조표에서 모두 제거됐다. 아래 "이미지 처리" 절의
+서술은 역사로 남긴다.)
 
 ### 관통 원칙 — 각 모델을 그 모델이 의도한 방식으로 쓴다
 

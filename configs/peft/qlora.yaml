@@ -1,4 +1,0 @@
-mode: qlora
-r: 32
-alpha: 64
-dropout: 0.05

@@ -31,7 +31,7 @@ def test_default_composition_is_valid():
 
 
 def test_every_model_group_composes():
-    for name in ("qwen3_vl_emb_2b", "qwen3_5_0_8b", "gemma4_e2b"):
+    for name in ("qwen3_vl_emb_2b", "qwen3_5_0_8b"):
         assert compose_cfg(f"model={name}").model.name == name
 
 
@@ -64,13 +64,6 @@ def test_gradcache_mini_batch_cannot_exceed_batch():
 def test_gradcache_requires_mini_batch():
     with pytest.raises(ValidationError, match="requires loss.mini_batch"):
         compose_cfg("loss=cached_mnrl", "loss.mini_batch=null")
-
-
-def test_ple_freeze_is_gemma4_only():
-    with pytest.raises(ValidationError, match="only exist in gemma4"):
-        compose_cfg("model=qwen3_5_0_8b", "freeze=ple")
-
-    assert compose_cfg("model=gemma4_e2b", "freeze=ple").freeze.ple is True
 
 
 def test_lora_requires_positive_rank():
@@ -145,34 +138,24 @@ def test_attention_impl_cannot_disagree_with_its_label():
         compose_cfg("attn=fa3", "+attn.impl=sdpa")
 
 
-def test_an_image_token_cap_belongs_only_to_gemma4():
-    """gemma4's processor declares max_soft_tokens=280 and derives each image's count
-    from its aspect ratio; the Qwen models declare a pixel range and no token cap, so
-    a number there is our arithmetic wearing the model's spec."""
-    assert compose_cfg("model=gemma4_e2b").model.max_tokens_per_image == 280
-    for name in ("qwen3_vl_emb_2b", "qwen3_5_0_8b"):
-        assert compose_cfg(f"model={name}").model.max_tokens_per_image is None
-        with pytest.raises(ValidationError, match="the count must be measured"):
-            compose_cfg(f"model={name}", "model.max_tokens_per_image=280")
-
-    with pytest.raises(ValidationError, match="must carry it"):
-        compose_cfg("model=gemma4_e2b", "model.max_tokens_per_image=null")
-
-
 def test_padding_side_is_declared_per_model():
-    """The only model that pads left is the one whose pooling branch was wrong,
-    so the value has to be visible to the code that pools rather than assumed."""
-    assert compose_cfg("model=gemma4_e2b").model.padding_side == "left"
+    """Declared per model rather than branched on `arch` in code, so the value is
+    visible to the code that pools rather than assumed. (gemma-4-E2B, the one
+    model that padded left, left the campaign 2026-08-03 — PLAN.md "gemma-4-E2B
+    제외" — so both surviving models pad right; the field stays per-model because
+    a future model could differ.)"""
     for name in ("qwen3_vl_emb_2b", "qwen3_5_0_8b"):
         assert compose_cfg(f"model={name}").model.padding_side == "right"
 
 
 def test_prompt_format_is_declared_per_model():
-    """Measured 2026-08-02 against the Hub: both Qwen repositories ship
-    chat_template.jinja and `google/gemma-4-E2B` does not — it is the pre-trained
-    checkpoint, and only `google/gemma-4-E2B-it` ships one. Calling
-    `apply_chat_template` regardless is what failed gemma-4 on three frameworks."""
-    assert compose_cfg("model=gemma4_e2b").model.prompt_format == "raw"
+    """Measured 2026-08-02 against the Hub: both surviving repositories ship
+    chat_template.jinja. (`google/gemma-4-E2B` did not — it was the pre-trained
+    checkpoint, and only `google/gemma-4-E2B-it` ships one; calling
+    `apply_chat_template` regardless is what failed it on three frameworks. It
+    left the campaign 2026-08-03 for an unrelated reason — full finetuning does
+    not fit one A100 80GB — and `prompt_format=raw` is exercised directly by
+    `test_a_raw_prompt_format_refuses_a_generation_prompt` below instead.)"""
     for name in ("qwen3_vl_emb_2b", "qwen3_5_0_8b"):
         assert compose_cfg(f"model={name}").model.prompt_format == "chat_template"
 
@@ -180,9 +163,17 @@ def test_prompt_format_is_declared_per_model():
 def test_a_raw_prompt_format_refuses_a_generation_prompt():
     """`add_generation_prompt` is an argument to `apply_chat_template`, and raw has
     no template to pass it to. With last-token pooling the pair would otherwise
-    report a value that decided nothing."""
+    report a value that decided nothing.
+
+    No surviving model declares `prompt_format=raw` (gemma-4-E2B did, and left
+    the campaign 2026-08-03), so the value is asserted directly over a real
+    model rather than skipped: the validator is `model.prompt_format`-scoped, not
+    arch-scoped, and remains reachable by any future raw-format model.
+    """
     with pytest.raises(ValidationError, match="no chat template"):
-        compose_cfg("model=gemma4_e2b", "model.add_generation_prompt=true")
+        compose_cfg(
+            "model=qwen3_5_0_8b", "model.prompt_format=raw", "model.add_generation_prompt=true"
+        )
 
 
 def test_instruction_prompt_only_for_the_official_embedding_model():
@@ -196,10 +187,9 @@ def test_per_model_usage_spec_matches_documented_decisions():
     assert vl.add_generation_prompt is True
     assert vl.instruction_prompt == "Represent the user's input."
 
-    for name in ("qwen3_5_0_8b", "gemma4_e2b"):
-        generative = compose_cfg(f"model={name}").model
-        assert generative.add_generation_prompt is False
-        assert generative.instruction_prompt is None
+    generative = compose_cfg("model=qwen3_5_0_8b").model
+    assert generative.add_generation_prompt is False
+    assert generative.instruction_prompt is None
 
 
 def test_a_corrupt_subset_revision_is_refused_for_every_purpose():
@@ -229,18 +219,17 @@ def test_the_pinned_subsets_are_not_on_the_denylist():
 
 def test_an_adapter_run_cannot_also_request_a_freeze_axis():
     """Measured, not assumed (tests/test_axes.py): `get_peft_model` freezes every
-    base parameter regardless of what a freeze axis did first, so the two freeze
-    settings build the same model under an adapter. Two identical models must not
+    base parameter regardless of what a freeze axis did first, so freezing it
+    again builds the same model under an adapter. Two identical models must not
     occupy two rows of the ablation table under different labels."""
-    for axis in ("freeze.ple=true", "freeze.vision_tower=true"):
-        with pytest.raises(ValidationError, match="freezes every base parameter"):
-            compose_cfg("peft=lora", "model=gemma4_e2b", axis)
+    with pytest.raises(ValidationError, match="freezes every base parameter"):
+        compose_cfg("peft=lora", "freeze.vision_tower=true")
 
 
 def test_the_freeze_axes_stay_available_to_a_full_finetune():
     """The refusal above is about adapters, not about freezing. A check that
     refused both would have removed the axis this study measures."""
-    assert compose_cfg("peft=full", "model=gemma4_e2b", "freeze=ple").freeze.ple is True
+    assert compose_cfg("peft=full", "freeze=vision_tower").freeze.vision_tower is True
 
 
 def test_an_adapter_with_no_rank_is_refused():

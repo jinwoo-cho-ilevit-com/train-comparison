@@ -6,7 +6,6 @@ here is the probe machinery around them.
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import json
 import math
@@ -223,10 +222,8 @@ class _Processor:
         return {"input_ids": self._input_ids}
 
 
-def _count(processor, model, max_tokens_per_image=None, prompt_format="chat_template"):
-    return visual_token_count(
-        processor, model, get_device("cpu"), "right", max_tokens_per_image, prompt_format
-    )
+def _count(processor, model, prompt_format="chat_template"):
+    return visual_token_count(processor, model, get_device("cpu"), "right", prompt_format)
 
 
 def test_visual_token_count_reports_the_placeholder_count():
@@ -257,7 +254,7 @@ def test_the_probe_counts_visual_tokens_without_a_chat_template():
     processor = _BareProcessor(torch.tensor([[5] + [7] * 256 + [6]]))
     model = _Model(_Config(image_token_id=7))
 
-    detail = _count(processor, model, max_tokens_per_image=280, prompt_format="raw")
+    detail = _count(processor, model, prompt_format="raw")
 
     assert detail["visual_tokens_per_image"] == 256
     assert detail["prompt_format"] == "raw"
@@ -266,11 +263,13 @@ def test_the_probe_counts_visual_tokens_without_a_chat_template():
 def test_the_probe_hands_the_processor_one_image_list_per_row():
     """Measured 2026-08-02: `Gemma4Processor` reads a flat list as one row carrying
     every image and refuses the batch, so no gemma-4 probe could build one. Both
-    Qwen processors return byte-identical tensors either way."""
+    Qwen processors return byte-identical tensors either way. (gemma-4 left the
+    campaign 2026-08-03; `_BareProcessor` is kept as a no-chat-template stand-in,
+    which is still a real shape `prompt_format=raw` has to handle.)"""
     processor = _BareProcessor(torch.tensor([[5] + [7] * 256 + [6]]))
     model = _Model(_Config(image_token_id=7))
 
-    _count(processor, model, max_tokens_per_image=280, prompt_format="raw")
+    _count(processor, model, prompt_format="raw")
 
     seen = processor.images_seen
     assert all(isinstance(row, list) for row in seen), f"one list per row, got {seen!r}"
@@ -300,15 +299,12 @@ def test_visual_token_count_refuses_an_all_image_batch():
 def test_visual_token_count_refuses_the_pad_token_id():
     """`0 < n < seq_len` accepts a pad id happily: padded rows are neither empty nor
     full, so the count comes back looking like a measurement of the model when it is
-    a measurement of the batch shape.
-
-    Declared with a cap, because a pad count sits under the cap and the cap check
-    would wave it through. This gate is the one that has to catch it."""
+    a measurement of the batch shape. This gate is the one that has to catch it."""
     processor = _Processor(torch.tensor([[5, 7, 7, 7, 6], [5, 7, 7, 7, 6]]), pad_token_id=7)
     model = _Model(_Config(image_token_id=7))
 
     with pytest.raises(ValueError, match="pad token id"):
-        _count(processor, model, max_tokens_per_image=280)
+        _count(processor, model)
 
 
 def test_visual_token_count_refuses_per_sample_disagreement():
@@ -321,84 +317,13 @@ def test_visual_token_count_refuses_per_sample_disagreement():
         _count(processor, model)
 
 
-def test_visual_token_count_refuses_a_count_above_the_declared_cap():
-    """The cap is what the processor can emit at most. A count above it is a count
-    of something else, and it would divide every tokens/s figure."""
-    processor = _Processor(torch.tensor([[5, 7, 7, 7, 6]]))
-    model = _Model(_Config(image_token_id=7))
-
-    with pytest.raises(ValueError, match="max_tokens_per_image"):
-        _count(processor, model, max_tokens_per_image=2)
-
-
-def test_visual_token_count_accepts_the_gemma4_count_the_processor_actually_emits():
-    """gemma-4's declared 280 is max_soft_tokens, and the processor derives each
-    image's count from its aspect ratio: 448x448 (PROBE_IMAGE_SIZE) gives 256,
-    768x256 gives 252, and 960x672 gives 280 (measured, transformers 5.14.1).
-    This used to be an equality against 280, so every gemma-4 probe died here on a
-    correct measurement — the shape that gets a gate relaxed instead of fixed."""
-    processor = _Processor(torch.tensor([[5] + [7] * 256 + [6]]))
-    model = _Model(_Config(image_token_id=7))
-
-    detail = _count(processor, model, max_tokens_per_image=280)
-
-    assert detail["visual_tokens_per_image"] == 256
-    assert detail["declared_max_tokens_per_image"] == 280
-
-
-def test_every_probe_adapter_hands_visual_token_count_the_declared_cap():
-    """The cap only guards anything if the adapters actually pass it.
-
-    Read off the call site rather than run, because reaching that line needs a real
-    checkpoint. Measured with in-memory mutants: replacing the argument with `None`,
-    or leaving one adapter on a stale field name after a rename, passed the whole
-    suite and would have surfaced as an AttributeError on a pod. An adapter that
-    stops calling `visual_token_count` at all is named here too — dropping the check
-    is the other way to make this pass.
-    """
-    expected = ("config", "model", "max_tokens_per_image")
-    adapters = _adapters_calling_visual_token_count()
-    wrong = {}
-    for path in adapters:
-        source = path.read_text()
-        calls = [
-            node
-            for node in ast.walk(ast.parse(source))
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "visual_token_count"
-        ]
-        for call in calls:
-            names = [
-                tuple(_attribute_chain(arg)) for arg in call.args if isinstance(arg, ast.Attribute)
-            ]
-            if expected not in names:
-                wrong[path.name] = ast.unparse(call)
-        if not calls:
-            wrong[path.name] = "names visual_token_count but never calls it"
-
-    assert not wrong, wrong
-    # An empty sweep would pass on nothing at all.
-    assert [path.name for path in adapters] == ["ms_swift.py", "native.py", "unsloth.py"]
-
-
-def _attribute_chain(node):
-    parts = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    if isinstance(node, ast.Name):
-        parts.append(node.id)
-    return reversed(parts)
-
-
-def _adapters_calling_visual_token_count():
-    probe = pathlib.Path(__file__).parent.parent / "trainbench" / "probe"
-    return [
-        path
-        for path in sorted(probe.glob("*.py"))
-        if path.name != "steps.py" and "visual_token_count" in path.read_text()
-    ]
+# test_visual_token_count_refuses_a_count_above_the_declared_cap,
+# test_visual_token_count_accepts_the_gemma4_count_the_processor_actually_emits and
+# test_every_probe_adapter_hands_visual_token_count_the_declared_cap tested the
+# `max_tokens_per_image` cap. gemma-4-E2B was the only model that declared one
+# (`max_soft_tokens=280`); it left the campaign 2026-08-03, the field left the
+# schema with it, and `visual_token_count` no longer takes that parameter at all
+# — there is no cap left to check any adapter's call site against.
 
 
 class _Tokenizer:
@@ -684,13 +609,29 @@ def test_a_documented_limitation_that_disappears_is_reported(config_mapping, mon
     assert report.unexpected_passes == ["fast_sentence_transformer_accepts_vlm"]
 
 
-def test_ple_report_fails_when_nothing_matches():
-    """A zero match used to be reported as ok. Roughly half of gemma-4-E2B lives in
-    these tables, so it means `freeze.ple` would freeze nothing and say it did."""
-    from trainbench.probe.native import _ple_report
+# A marker `train.seed` value nothing else uses. qlora used to be the axis
+# `axes.load_kwargs` refused off-CUDA; it left the campaign 2026-08-03 along with
+# that refusal (AGENTS.md), so the two tests below inject a synthetic one instead
+# of borrowing a different real axis — the invariant under test (a refused
+# load-time axis is not mistaken for "the model failed to load") must not depend
+# on which real axis happens to be unapplicable this week.
+UNAPPLICABLE_MARKER_SEED = 407_612_988
 
-    with pytest.raises(ValueError, match="per_layer"):
-        _ple_report(torch.nn.Linear(2, 2))
+
+def _refuse_a_marked_config(monkeypatch):
+    from trainbench import axes
+
+    real_load_kwargs = axes.load_kwargs
+
+    def fake(config):
+        if config.train.seed == UNAPPLICABLE_MARKER_SEED:
+            raise axes.UnappliedAxis(
+                f"synthetic refusal injected by test_probe.py for a config marked "
+                f"train.seed={UNAPPLICABLE_MARKER_SEED}"
+            )
+        return real_load_kwargs(config)
+
+    monkeypatch.setattr(axes, "load_kwargs", fake)
 
 
 def _stub_transformers(monkeypatch):
@@ -729,15 +670,17 @@ def _native_report(config_mapping, monkeypatch, **overrides):
 def test_a_refused_load_axis_does_not_read_as_a_model_that_will_not_load(
     config_mapping, monkeypatch
 ):
-    """`peft.mode=qlora` off CUDA is refused by `axes.load_kwargs`. Evaluating that
-    refusal inside the `model_load` lambda charged it to the checkpoint — the cell
-    read "the model does not load", and `if not ok: return` ended the probe three
-    checks in, so the nine checks that have nothing to do with the axis were lost
-    from a support matrix whose job is to decide which cells get measured.
+    """A load-time axis this environment cannot apply is refused by
+    `axes.load_kwargs`. Evaluating that refusal inside the `model_load` lambda
+    charged it to the checkpoint — the cell read "the model does not load", and
+    `if not ok: return` ended the probe three checks in, so the nine checks that
+    have nothing to do with the axis were lost from a support matrix whose job is
+    to decide which cells get measured.
 
     The refusal must still be visible; it is just not the load's fault.
     """
-    report = _native_report(config_mapping, monkeypatch, **{"peft.mode": "qlora", "peft.r": 32})
+    _refuse_a_marked_config(monkeypatch)
+    report = _native_report(config_mapping, monkeypatch, **{"train.seed": UNAPPLICABLE_MARKER_SEED})
     names = [c.name for c in report.checks]
     check = next(c for c in report.checks if c.name == "axes_load_kwargs")
 
@@ -751,29 +694,20 @@ def test_a_refused_load_axis_does_not_read_as_a_model_that_will_not_load(
         "axes_verified",
         "text_tokenize",
         "infonce_backward",
-        "lora_attach",
     } <= set(names), names
-    # And nobody can take the bare load for the requested one. `axes_verified`
-    # cannot say so — `assert_matches` returns immediately for `purpose=probe` —
-    # so what carries the refusal is the state it recorded and `all_ok`.
     assert not report.all_ok
-    peft = next(a for a in report.applied.axes if a.axis == "peft.mode")
-    assert (peft.requested, peft.applied) == ("qlora", "full")
-    assert not report.applied.to_dict()["all_matched"]
 
 
 def test_the_same_refusal_does_not_read_as_a_framework_that_cannot_load(
     config_mapping, monkeypatch
 ):
     """The sentence_transformers adapter had the load-time axes in the same place,
-    and one more way to trip over them: it is the path that imports
+    and one more way to trip over them: `qlora` was the path that imported
     `BitsAndBytesConfig`, so an image without bitsandbytes failed the load with an
     ImportError. Either way the cell read "this framework cannot load this model"
     and `encode` and `mnrl_backward` were skipped for a reason that was never true.
-
-    The package is absent here, so it is stood in for — what is under test is the
-    adapter's order of operations, which is ours, not ST's behaviour.
     """
+    _refuse_a_marked_config(monkeypatch)
     module = types.ModuleType("sentence_transformers")
 
     class _SentenceTransformer(torch.nn.Module):
@@ -793,8 +727,7 @@ def test_the_same_refusal_does_not_read_as_a_framework_that_cannot_load(
     monkeypatch.setitem(sys.modules, "sentence_transformers", module)
     mapping = json.loads(json.dumps(config_mapping))
     mapping["framework"]["name"] = "sentence_transformers"
-    mapping["peft"]["mode"] = "qlora"
-    mapping["peft"]["r"] = 32
+    mapping["train"]["seed"] = UNAPPLICABLE_MARKER_SEED
 
     report = run_probe(to_bench_config(mapping), get_device("cpu"))
     checks = {c.name: c for c in report.checks}
@@ -1017,9 +950,7 @@ def _fake_unsloth(monkeypatch, seen):
     monkeypatch.setitem(sys.modules, "unsloth", module)
 
 
-@pytest.mark.parametrize(
-    ("mode", "full_finetuning"), [("full", True), ("lora", False), ("qlora", False)]
-)
+@pytest.mark.parametrize(("mode", "full_finetuning"), [("full", True), ("lora", False)])
 def test_unsloth_is_told_whether_the_run_finetunes(
     config_mapping, monkeypatch, mode, full_finetuning
 ):
@@ -1045,7 +976,9 @@ def test_unsloth_is_told_whether_the_run_finetunes(
     run_probe(to_bench_config(mapping), get_device("cpu"))
 
     assert seen.get("full_finetuning") is full_finetuning, seen
-    assert seen.get("load_in_4bit") is (mode == "qlora"), seen
+    # qlora left the campaign 2026-08-03; unsloth's load is never asked for a
+    # 4-bit base now, for either mode.
+    assert seen.get("load_in_4bit") is False, seen
 
 
 def test_the_load_axes_reach_from_pretrained_when_they_are_not_refused(config_mapping, monkeypatch):
@@ -1082,43 +1015,36 @@ def test_the_load_axes_reach_from_pretrained_when_they_are_not_refused(config_ma
 def test_the_load_axes_reach_from_pretrained_as_the_whole_mapping(config_mapping, monkeypatch):
     """One key is not the mapping.
 
-    The test above watches `attn_implementation` arrive, and `attn.name` is the
-    only load-time axis that is never refused — so it is the only key any config
-    this suite can compose puts in that mapping, and a helper that forwarded attn
-    while dropping everything else passed the whole suite. `peft.mode=qlora` is
-    the key that would be dropped: the base's 4-bit recipe is produced while the
-    checkpoint is read, so a probe that lost it would load a full-precision base
-    and file the support-matrix cell as qlora.
-
-    Nothing here quantises. The device is the one thing forced, because
-    `axes.load_kwargs` refuses off CUDA and the mapping under test only has a
-    second key when it is not refused; what is compared is the request, which is
-    all this helper is responsible for. Whether 4-bit weights actually arrive is a
-    GPU question and `applied._capture_peft`'s — 측정 안 함 here.
+    `attn.name` is the only load-time axis `axes.load_kwargs` carries today, so a
+    helper that forwarded attn while dropping everything else would pass every
+    test that composes a real config — the same shape `peft.mode=qlora` used to
+    catch before it left the campaign 2026-08-03 (its `BitsAndBytesConfig` was the
+    second key). Injected here instead of borrowed from a real axis, so the check
+    does not depend on `axes.load_kwargs` happening to return more than one key
+    this week.
     """
     from trainbench import axes
     from trainbench.probe import steps
 
-    monkeypatch.setattr(axes, "get_device", lambda name: torch.device("cuda"))
     mapping = json.loads(json.dumps(config_mapping))
     mapping["attn"]["name"] = "flex"
-    mapping["peft"]["mode"] = "qlora"
-    mapping["peft"]["r"] = 32
     config = to_bench_config(mapping)
 
-    def comparable(kwargs):
-        # `BitsAndBytesConfig` has no `__eq__`, so two equal recipes are two
-        # unequal objects; the dict it exports is what "the same mapping" means.
-        return {k: (v.to_dict() if hasattr(v, "to_dict") else v) for k, v in kwargs.items()}
+    real_load_kwargs = axes.load_kwargs
+
+    def with_a_second_key(cfg):
+        return {**real_load_kwargs(cfg), "synthetic_marker": "injected-by-test-probe"}
+
+    monkeypatch.setattr(axes, "load_kwargs", with_a_second_key)
 
     wanted = axes.load_kwargs(config)
     report = ProbeReport(framework="native", model=config.model.name)
     reached = steps.load_kwargs(config, report)
 
-    # Asserted rather than assumed: if the axis started refusing again this would
-    # be one key and the comparison below would pass by having nothing to compare.
-    assert set(wanted) == {"attn_implementation", "quantization_config"}
-    assert comparable(reached) == comparable(wanted)
+    # Asserted rather than assumed: if the injected key were dropped this would be
+    # one key and the comparison below would pass by having nothing to compare.
+    assert set(wanted) == {"attn_implementation", "synthetic_marker"}
+    assert reached == wanted
     check = next(c for c in report.checks if c.name == "axes_load_kwargs")
     assert (check.ok, check.detail) == (True, {"requested": sorted(wanted)})
 

@@ -59,33 +59,25 @@ from trainbench.config_schema import BenchConfig
 from trainbench.device import get_device
 from trainbench.embedding import info_nce
 
-# gemma-4's per-layer embeddings. Every one of the 108 PLE tensors carries this
-# in its name — `language_model.embed_tokens_per_layer.weight`,
-# `layers.N.per_layer_input_gate`, `per_layer_model_projection`, and so on
-# (docs/model-spec.md, read off model.safetensors.index.json). Substring rather
-# than an enumerated list because the layer index is part of the name.
-PLE_PARAM_MARKER = "per_layer"
-
 # Vision-tower parameters, per architecture. Read off each checkpoint rather than
 # guessed: docs/model-spec.md says in as many words that a guessed marker freezes
-# zero tensors and records that as success, which is the failure `_ple_report`
-# had already shipped once with `altup`.
+# zero tensors and records that as success.
 #
 # Measured 2026-08-01 from each repo's safetensors header on `main`:
 #
 #   Qwen/Qwen3-VL-Embedding-2B   model.visual.*         315 of  625 tensors
 #   Qwen/Qwen3.5-0.8B            model.visual.*         153 of  488 tensors
-#   google/gemma-4-E2B           model.vision_tower.*   658 of 2011 tensors
-#                                model.embed_vision.*     1
 #
-# Both Qwen models keep the projector inside the tower (`visual.merger`), while
-# gemma-4 keeps it outside as `embed_vision.embedding_projection`; it is included
-# so the axis means the same thing on all three. gemma-4's `audio_tower` is
-# deliberately not here — it is a third tower, not the vision one.
+# (google/gemma-4-E2B kept its projector outside the tower as
+# `embed_vision.embedding_projection`, marker `vision_tower.`/`embed_vision.` —
+# measured the same day, docs/model-spec.md. Removed 2026-08-03 along with the
+# rest of gemma-4's config group: `model.arch` no longer offers `gemma4`, so a
+# marker this table can never be asked for is not one `test_every_architecture_
+# has_a_recorded_vision_marker` — which pins this table to the schema's declared
+# archs, in both directions — would let stay.)
 VISION_PARAM_MARKERS = {
     "qwen3_vl": ("visual.",),
     "qwen3_5": ("visual.",),
-    "gemma4": ("vision_tower.", "embed_vision."),
 }
 
 # Class definitions from these packages inside a built model are the evidence
@@ -105,28 +97,24 @@ KERNEL_MODULE_ROOTS = {
     "kernels": "kernels_hub",
 }
 
-# How every Liger entrypoint is spelled, and the table of the three this study
-# needs. The suffix is transformers' own `model_type`: `configuration_qwen3_5.py`,
-# `configuration_qwen3_vl.py` and `configuration_gemma4.py` in transformers 5.14.1
-# declare exactly `qwen3_5`, `qwen3_vl` and `gemma4`, so `arch` is the suffix
-# rather than a second table.
+# How every Liger entrypoint is spelled, and the table of the two archs this
+# schema offers. The suffix is transformers' own `model_type`:
+# `configuration_qwen3_5.py` and `configuration_qwen3_vl.py` in transformers
+# 5.14.1 declare exactly `qwen3_5` and `qwen3_vl`, so `arch` is the suffix rather
+# than a second table.
 #
 # Read off the pinned wheel rather than guessed (liger-kernel 0.8.1, the `native`
-# pin; `.plans/research/axis-libraries.md` §1). `monkey_patch.py` defines all three
-# — `:3057`, `:2044`, `:1392` — and its own `model_type` map carries them at
-# `:3569`, `:3573` and `:3541`.
+# pin; `.plans/research/axis-libraries.md` §1).
 #
-# There is a version boundary inside this table and it is not recorded here,
-# because a table cannot hold it: liger-kernel **0.8.0**, the axolotl pin, has
-# `apply_liger_kernel_to_gemma4_text` and no multimodal `apply_liger_kernel_to_gemma4`
-# (§1.3). An image on that pin therefore refuses gemma-4 at the `getattr` below,
-# with the names the installed package really exports — which is the version that
-# is running, and not a claim written down months earlier.
+# gemma4 was here too, mapped to `apply_liger_kernel_to_gemma4`, until it left
+# the campaign 2026-08-03 along with the rest of its config group. `model.arch`
+# no longer offers `gemma4`, and `test_liger_records_an_entrypoint_for_every_
+# architecture_under_test` pins this table to `VISION_PARAM_MARKERS`'s keys —
+# an entry this schema can never request is not one that check would let stand.
 LIGER_ENTRYPOINT_PREFIX = "apply_liger_kernel_to_"
 LIGER_ENTRYPOINTS = {
     "qwen3_5": f"{LIGER_ENTRYPOINT_PREFIX}qwen3_5",
     "qwen3_vl": f"{LIGER_ENTRYPOINT_PREFIX}qwen3_vl",
-    "gemma4": f"{LIGER_ENTRYPOINT_PREFIX}gemma4",
 }
 
 # Architectures whose transformers implementation takes its kernels from
@@ -232,7 +220,6 @@ IMPLEMENTED = frozenset(
         "dataloader.packing",
         "dataloader.pretokenize",
         "framework.name",
-        "freeze.ple",
         "freeze.vision_tower",
         "kernel.name",
         "loss.name",
@@ -576,62 +563,14 @@ KERNEL_PATCHERS = {
 }
 
 
-# QLoRA's base quantisation, in the spelling `from_pretrained` takes. Fixed here
-# rather than offered as config: the axis this study measures is `peft.mode`, and
-# a knob for the quantiser's internals would be a new schema field, which
-# docs/CONTRACTS.md §5 makes a contract change. The values are QLoRA's own recipe —
-# 4-bit NF4 weights with the quantisation constants themselves quantised. The
-# compute dtype is bf16 because that is the only precision this module lets a run
-# reach (`step_context` refuses the rest), so a different one here would compute in
-# a precision no axis asked for.
-QLORA_4BIT = {
-    "load_in_4bit": True,
-    "bnb_4bit_quant_type": "nf4",
-    "bnb_4bit_use_double_quant": True,
-    "bnb_4bit_compute_dtype": torch.bfloat16,
-}
-
-
 def load_kwargs(config: BenchConfig) -> dict[str, Any]:
     """Keyword arguments for `from_pretrained`.
 
     Attention is set here rather than afterwards because transformers validates
     and may downgrade the request during construction; setting it later would mean
     the model was built once with the wrong one.
-
-    `peft.mode=qlora` asks for its base quantisation here for the same reason and a
-    stronger one: 4-bit weights are produced while the checkpoint is being read, and
-    a model already materialised in bf16 cannot be turned into one afterwards.
-
-    Only the request is built here, and only where it can be honoured. bitsandbytes
-    quantises on CUDA, so on any other device this refuses instead of returning a
-    config whose effect is unknown — an ignored quantisation is the outcome that
-    matters, because the run would then train a full-precision base and report its
-    speed under the qlora label. `_peft` is the second gate: it refuses to attach
-    the adapter to a model that did not arrive quantised, which is what catches a
-    caller that never came through here.
     """
-    kwargs: dict[str, Any] = {"attn_implementation": config.attn.impl}
-    if config.peft.mode == "qlora":
-        device = get_device(config.device)
-        if device.type != "cuda":
-            raise UnappliedAxis(
-                f"peft.mode=qlora needs a 4-bit base and bitsandbytes quantises on CUDA; "
-                f"device={device.type} would load the base in full precision and measure "
-                "that under the qlora label."
-            )
-        # Imported here rather than at module scope: this is the only path that
-        # needs transformers, and the probe adapters that call `load_kwargs` are
-        # meant to be importable without it.
-        from transformers import BitsAndBytesConfig
-
-        kwargs["quantization_config"] = BitsAndBytesConfig(**QLORA_4BIT)
-    return kwargs
-
-
-def ple_parameters(model: Any) -> list[tuple[str, Any]]:
-    """The per-layer embedding tensors, by name."""
-    return [(n, p) for n, p in model.named_parameters() if PLE_PARAM_MARKER in n]
+    return {"attn_implementation": config.attn.impl}
 
 
 def vision_parameters(model: Any, arch: str) -> list[tuple[str, Any]]:
@@ -852,15 +791,11 @@ def _freeze(model: Any, config: BenchConfig) -> list[str]:
     """Turn off gradients for the tensors each freeze axis names.
 
     A marker that matches nothing is left to the capture probe rather than raised
-    on here: `applied._capture_freeze_ple` reports zero matches as undetermined,
-    which blocks a reportable run without stopping a probe whose job is to find
-    out what the checkpoint actually contains.
+    on here: `applied._capture_freeze_vision_tower` reports zero matches as
+    undetermined, which blocks a reportable run without stopping a probe whose
+    job is to find out what the checkpoint actually contains.
     """
     applied: list[str] = []
-    if config.freeze.ple:
-        for _, param in ple_parameters(model):
-            param.requires_grad_(False)
-        applied.append("freeze.ple")
     if config.freeze.vision_tower:
         for _, param in vision_parameters(model, config.model.arch):
             param.requires_grad_(False)
@@ -878,38 +813,14 @@ def _peft(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
     freeze axes have no state to be in, and `config_schema.py` refuses the
     combination outright instead of letting two identical models occupy two rows of
     the ablation table.
-
-    `qlora` is this same call over a base that arrived quantised: the two halves are
-    the `BitsAndBytesConfig` `load_kwargs` builds and the adapter here, and the only
-    thing this site adds is the check that the first half actually happened. A model
-    that reached here in bf16 would be plain LoRA under a QLoRA label — and that is
-    the realistic failure, because the quantisation is requested somewhere else and
-    a caller that skipped `load_kwargs` gets no error from `from_pretrained`.
-
-    `prepare_model_for_kbit_training` is deliberately not called, and not for
-    convenience. It upcasts the norm layers to fp32, which
-    `applied._capture_precision` reads as `mixed(bf16,fp32)` against a run that
-    asked for bf16 — every qlora run would apply the axis and then be refused. And
-    it enables gradient checkpointing by default, which is a separate axis in this
-    study (`train.gradient_checkpointing`), so a qlora cell would silently carry a
-    setting its config left at `none`. What it buys is training stability, which is
-    not what this benchmark measures.
     """
     if config.peft.mode == "full":
         return model, []
-    if config.peft.mode == "qlora" and not _base_is_quantised(model):
-        raise UnappliedAxis(
-            "peft.mode=qlora is LoRA over a 4-bit base, and this model carries no "
-            "quantisation: neither is_loaded_in_4bit nor config.quantization_config is set. "
-            "The base is quantised while the checkpoint is read, so a bf16 model cannot be "
-            "turned into one here — pass axes.load_kwargs(config) to from_pretrained. "
-            "Attaching the adapter anyway would measure plain LoRA under the QLoRA label."
-        )
 
     from peft import LoraConfig, get_peft_model
 
     # all-linear rather than a per-architecture list. Naming target modules per
-    # model would make the axis mean something different for each of the three,
+    # model would make the axis mean something different for each of the two,
     # and this benchmark compares the same request across them.
     adapted = get_peft_model(
         model,
@@ -921,20 +832,6 @@ def _peft(model: Any, config: BenchConfig) -> tuple[Any, list[str]]:
         ),
     )
     return adapted, ["peft.mode"]
-
-
-def _base_is_quantised(model: Any) -> bool:
-    """Whether the base weights arrived quantised.
-
-    The same two readings `applied._capture_peft` uses to tell `qlora` from `lora`,
-    so the apply site and the capture site cannot disagree about what a quantised
-    base is. Which of the two a given transformers release sets is not asserted
-    here — either is the checkpoint having been read through a quantiser.
-    """
-    return bool(
-        getattr(model, "is_loaded_in_4bit", False)
-        or getattr(getattr(model, "config", None), "quantization_config", None)
-    )
 
 
 # Which operators `gradient_checkpointing=selective` keeps rather than recomputes.
@@ -1243,13 +1140,11 @@ def _optimizer(params: Any, config: BenchConfig, device: torch.device) -> tuple[
     receives `model.parameters()`, an iterable with no names attached, and every
     way of telling an embedding matrix from a hidden weight matrix needs the names
     or the modules. `docs/methodology.md` states the consequence as a condition on
-    reading any Muon row, because it is not a code detail: under this split
-    gemma-4's PLE tables go *through* Newton-Schulz rather than around it, which is
-    the opposite of the arrangement PLAN.md's gemma-4 hypothesis is about.
+    reading any Muon row, because it is not a code detail.
 
     `adamw_8bit` is `_adamw_8bit` below, gated on CUDA for the same reason
-    `peft.mode=qlora` is: bitsandbytes' 8-bit state is a CUDA kernel and there is
-    none to run here.
+    bitsandbytes' 8-bit state always is: it is a CUDA kernel and there is none to
+    run here.
     """
     if config.optim.name == "adamw_fused":
         built = torch.optim.AdamW(

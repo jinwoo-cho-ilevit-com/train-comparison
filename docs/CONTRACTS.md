@@ -178,8 +178,8 @@ Wave 3에 다른 레인이 만든다. 형태가 없으면 축을 추가하는 �
 | 호출 지점 | 담는 축 |
 |---|---|
 | `patch` | `kernel.name` (liger/fla) |
-| `load_kwargs` | `attn.name`, (qlora 양자화 config, precision의 적재 dtype) |
-| `assemble` -> 모델 | `freeze.vision_tower`, `freeze.ple`, `compile.mode`, `peft.mode`, `train.gradient_checkpointing`, `precision.name`의 모듈 교체(torchao) |
+| `load_kwargs` | `attn.name` |
+| `assemble` -> 모델 | `freeze.vision_tower`, `compile.mode`, `peft.mode`, `train.gradient_checkpointing`, `precision.name`의 모듈 교체(torchao) |
 | `assemble` -> 옵티마이저 | `optim.name`, `train.offload` |
 | `assemble` -> 데이터로더 | `dataloader.backend/packing/pretokenize` |
 | `assemble` -> 손실 | `loss.name`, `parallel.cross_device_negatives` |
@@ -248,18 +248,23 @@ vision tower가 구조적으로 FA를 못 받아 transformers가 개별 강등�
 ### probe 어댑터의 축 중복 (B/D 경계)
 
 `trainbench/probe/native.py`의 `_lora_attach`는 축 적용 지점이 **아니다.** peft는
-`axes.py`에 구현이 없고(LoRA가 모든 base 파라미터를 얼려 `freeze.ple` 판정과 충돌한다 —
-freeze 축이 "얼림"인지 "peft가 얼린 것에 더해 얼림"인지는 축을 구현하는 레인이 정한다),
-`_lora_attach`는 모델을 in-place로 재작성하므로 **마지막에 실행되고 그 뒤에 어떤 체크도
-오지 않는다.**
+`axes.py`에 구현이 없고(LoRA가 모든 base 파라미터를 얼려 `freeze.vision_tower` 판정과
+충돌한다 — freeze 축이 "얼림"인지 "peft가 얼린 것에 더해 얼림"인지는 축을 구현하는
+레인이 정한다), `_lora_attach`는 모델을 in-place로 재작성하므로 **마지막에 실행되고
+그 뒤에 어떤 체크도 오지 않는다.**
 
 **D가 `peft.mode`를 켜는 순간 모든 LoRA timing 런이 차단된다.** 이건 열린 설계 질문이
-아니라 확정된 결과다: peft가 base 파라미터를 전부 얼리므로 `freeze.ple=false` 요청이
-`applied="True"`와 mismatch를 낸다. 그리고 이 프로젝트의 표제 비교가 full finetuning
-대 LoRA다 — 축을 켜자마자 스터디의 절반이 멈춘다. **해법은 probe 완화가 아니라
-`freeze.*` capture가 peft가 얼린 것을 기준선으로 잡고 그 위의 차분을 재는 것이다.**
-D는 축을 구현하기 전에 이걸 정하고 들어간다. PLE 파라미터 판별은 `axes.ple_parameters` 하나뿐이다 — native.py가 갖고
-있던 두 번째 정의는 제거했다(이미 죽은 `altup` 조건으로 드리프트해 있었다).
+아니라 확정된 결과다: peft가 base 파라미터를 전부 얼리므로 `freeze.vision_tower=false`
+요청이 `applied="True"`와 mismatch를 낸다. 그리고 이 프로젝트의 표제 비교가 full
+finetuning 대 LoRA다 — 축을 켜자마자 스터디의 절반이 멈춘다. **해법은 probe 완화가
+아니라 `freeze.*` capture가 peft가 얼린 것을 기준선으로 잡고 그 위의 차분을 재는
+것이다.** D는 축을 구현하기 전에 이걸 정하고 들어간다.
+
+(이 충돌은 아래 "2026-08-01 §2가 열어둔 freeze x peft 충돌을 닫는다" 항목에서
+config 단계 거부로 닫혔다. `freeze.ple`와 그것이 가리키던 gemma-4 전용 per-layer
+embedding 판별(`axes.ple_parameters`)은 2026-08-03 gemma-4 캠페인 제외와 함께
+스키마·axes.py·applied.py에서 전부 제거됐다 — 남은 freeze 축은 `vision_tower`
+하나다.)
 
 ### 경계 규칙의 구현이 둘인 이유 — 지우지 않는다
 
@@ -1031,15 +1036,17 @@ class ProbeReport:
 `docs/model-spec.yaml`이고, `audit_plan.py`의 `model-spec`이 **값 대 값으로** 대조한다
 (문자열 존재 확인은 true를 false로 뒤집어도 통과한다).
 
-| 모델 | `add_generation_prompt` | `instruction_prompt` | `padding_side` | `max_tokens_per_image` |
-|---|---|---|---|---|
-| qwen3_vl_emb_2b | `true` | `"Represent the user's input."` | `right` | `null`(상한 미선언) |
-| qwen3_5_0_8b | `false` | `null` | `right` | `null`(상한 미선언) |
-| gemma4_e2b | `false` | `null` | **`left`** | `280`(상한, 고정값 아님) |
+| 모델 | `add_generation_prompt` | `instruction_prompt` | `padding_side` |
+|---|---|---|---|
+| qwen3_vl_emb_2b | `true` | `"Represent the user's input."` | `right` |
+| qwen3_5_0_8b | `false` | `null` | `right` |
 
-`padding_side`가 config에 있는 이유: gemma-4만 left이고, 그것이 `last_token_pool`
-결함이 드러나는 유일한 모델이다. 코드가 `arch`로 분기하면 그 사실이 pooling 코드를
-읽는 사람 눈에 보이지 않는다.
+(gemma4_e2b는 2026-08-03 캠페인 제외와 함께 이 표에서 빠졌다 — `left` padding과
+`max_tokens_per_image` 상한은 gemma-4에만 있던 값이었다. `docs/model-spec.md`가
+그 실측을 역사로 보존한다.)
+
+`padding_side`가 config에 있는 이유: 모델마다 다를 수 있고, 코드가 `arch`로 분기하면
+그 사실이 pooling 코드를 읽는 사람 눈에 보이지 않는다.
 
 `padding_side_alignment`가 이 값을 대조하는 상대는 **체크포인트의
 `tokenizer_config.json`**이지 프레임워크가 돌려준 객체가 아니다. 위 표의 `source`가

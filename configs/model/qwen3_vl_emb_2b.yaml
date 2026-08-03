@@ -21,6 +21,3 @@ padding_side: right
 pooling: lasttoken
 # chat_template.jinja ships with the repo.
 prompt_format: chat_template
-# Pixel-proportional (min_pixels 4096 .. max_pixels 1310720) with no declared
-# token cap, so nothing bounds the measured count here.
-max_tokens_per_image: null

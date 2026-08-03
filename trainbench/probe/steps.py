@@ -27,9 +27,7 @@ def dtype_for(device: torch.device) -> torch.dtype:
     return torch.bfloat16 if device.type == "cuda" else torch.float32
 
 
-# Both currently-active archs share `Qwen2VLImageProcessor`. gemma4 uses a
-# different image processor entirely and is being dropped from the campaign, so
-# `pixel_budget_kwargs` never applies to it.
+# Both archs this schema offers share `Qwen2VLImageProcessor`.
 PIXEL_BUDGET_ARCHS = ("qwen3_vl", "qwen3_5")
 
 
@@ -44,9 +42,10 @@ def pixel_budget_kwargs(config: BenchConfig) -> dict[str, int]:
     ahead of whatever `size` the checkpoint declared. That override is the point —
     `data.max_pixels`/`data.min_pixels` are the budget, not the checkpoint's own range.
 
-    Empty for any other arch: gemma4 does not use `Qwen2VLImageProcessor`, and these
-    two keys reaching it would be inert at best (silently dropped as unused kwargs)
-    and misleading at worst (looking like a cap that this arch never gets).
+    Empty for any arch outside `PIXEL_BUDGET_ARCHS`: a processor that is not
+    `Qwen2VLImageProcessor` might not accept these two keys at all, and passing
+    them would be inert at best (silently dropped as unused kwargs) and misleading
+    at worst (looking like a cap that arch never gets).
     """
     if config.model.arch not in PIXEL_BUDGET_ARCHS:
         return {}
@@ -68,11 +67,12 @@ def load_kwargs(config: BenchConfig, report: ProbeReport) -> dict[str, Any]:
     """`axes.load_kwargs` as a check of its own, so a refused axis is not a bad load.
 
     The refusal and the load are different answers. `axes.load_kwargs` raises for a
-    value it cannot put into effect — `peft.mode=qlora` off CUDA is the one that
-    does today — and evaluating it inside the `model_load` lambda charged that
-    refusal to the checkpoint: the cell read "the model does not load" and the
-    adapter's `if not ok: return` ended the probe, costing the nine checks that
-    have nothing to do with the axis.
+    load-time axis value it cannot put into effect on this device or environment —
+    no axis currently routes through it does that, but the axis this study measures
+    next well might — and evaluating it inside the `model_load` lambda would charge
+    such a refusal to the checkpoint: the cell would read "the model does not load"
+    and the adapter's `if not ok: return` would end the probe, costing the nine
+    checks that have nothing to do with the axis.
 
     So it is recorded under its own name and the load goes ahead without the
     kwargs, which is the shape `verify_axes` already uses for `assemble`: the axes
@@ -397,16 +397,15 @@ def visual_token_count(
     model: Any,
     device: torch.device,
     padding_side: str,
-    max_tokens_per_image: int | None,
     prompt_format: str,
 ) -> dict[str, Any]:
     """How many tokens one fixed image costs on this model.
 
-    All three models use patch_size 16 but differ in spatial merge and pooling, so
-    the same image is not the same cost. Speed comparisons are meaningless until
-    this is pinned per model.
+    Both models use patch_size 16 but differ in spatial merge and pooling, so the
+    same image is not the same cost. Speed comparisons are meaningless until this
+    is pinned per model.
 
-    Every row of the batch carries the same image, so the four gates below are the
+    Every row of the batch carries the same image, so the three gates below are the
     ways a wrong id can still produce a plausible-looking number:
 
     * an id equal to the pad token counts padding. `0 < n < seq_len` accepts that
@@ -416,19 +415,6 @@ def visual_token_count(
       share; grading `per_sample[0]` alone accepted `[280, 279]`
     * a count of 0, or one filling the sequence, means the id or the prompt format
       is wrong — every format here emits text tokens around the placeholders
-    * a count above `config.model.max_tokens_per_image`, where the model declares a
-      cap, cannot be a count of that model's soft tokens. gemma4's processor stops
-      at max_soft_tokens=280; exceeding it means the id matched more than the
-      placeholders, or the processor we are measuring is not the one the spec
-      describes. The Qwen models declare no cap (None), which is why this is a
-      bound and not a lookup
-
-    The bound is deliberately not an equality. It was one, against a declared 280
-    read off `image_seq_length`, and it refused every real gemma-4 batch: the
-    processor derives each image's count from its aspect ratio (448x448 -> 256,
-    768x256 -> 252) and only reaches 280 when the ratio divides evenly. An equality
-    there is a gate that fires on correct measurements, which is how it gets
-    relaxed. The count that gets published is always the measured one.
 
     A wrong number here silently rescales every tokens/s figure that divides by it.
     """
@@ -459,13 +445,6 @@ def visual_token_count(
             f"{token_id} from {source}; the placeholder id or prompt_format={prompt_format} "
             "is wrong."
         )
-    if max_tokens_per_image is not None and count > max_tokens_per_image:
-        raise ValueError(
-            f"measured {count} visual tokens but config.model.max_tokens_per_image caps "
-            f"them at {max_tokens_per_image}; this processor cannot emit that many, so the "
-            "count is of something else and every tokens/s figure divides by this number."
-        )
-
     return {
         "image_size": list(PROBE_IMAGE_SIZE),
         "image_token_id": token_id,
@@ -473,7 +452,6 @@ def visual_token_count(
         "pad_token_id": pad_id,
         "visual_tokens_per_image": count,
         "visual_tokens_per_sample": per_sample,
-        "declared_max_tokens_per_image": max_tokens_per_image,
         "total_seq_len": total_seq_len,
         # The count is only comparable across models once the prompt around it is
         # known, and the two formats wrap it in different numbers of tokens.

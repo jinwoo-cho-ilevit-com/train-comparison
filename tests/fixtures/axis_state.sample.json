@@ -64,16 +64,6 @@
       "detail": {}
     },
     {
-      "axis": "freeze.ple",
-      "requested": "False",
-      "applied": "False",
-      "owner": null,
-      "state": "applied",
-      "determined": true,
-      "matches": true,
-      "detail": {"matched": 0, "frozen": 0}
-    },
-    {
       "axis": "freeze.vision_tower",
       "requested": "False",
       "applied": "False",
@@ -156,7 +146,7 @@
       "state": "applied",
       "determined": true,
       "matches": true,
-      "detail": {"wrapper_package": "peft", "adapters": ["lora"], "base_quantised": false}
+      "detail": {"wrapper_package": "peft", "adapters": ["lora"]}
     },
     {
       "axis": "precision.name",

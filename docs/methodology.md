@@ -472,15 +472,20 @@ time을 기록한다. 그때까지 이 축에 대해 어떤 수치도 쓰지 않
 "어느 타워가 요청을 받았는가"다. 뒤쪽은 `trainbench/kernels.py`의 지문이 백본별로
 기록한다(§11). 앞쪽은 여전히 **측정 안 함**이고, 두 질문을 하나의 임계값으로 묶지 않는다.
 
-### 오늘의 이미지 세트에서 이 구멍이 열리지 않는 이유 — 우연이 아니라 세 개의 거부
+### 오늘의 이미지 세트에서 이 구멍이 열리지 않는 이유 — 우연이 아니라 두 개의 거부
+
+(gemma4는 2026-08-03 캠페인 제외로 이 표에서 빠졌다. 제외 이전 이 행이 "거부 —
+Liger-Kernel#1186"이라 적었던 것은 이미 낡은 서술이었다 —
+`.plans/review/findings-round2.md`가 `LIGER_UNSUPPORTED`는 axes.py에 정의로
+존재하지 않고 `LIGER_ENTRYPOINTS`가 `gemma4`를 담고 있음을 지적했다. gemma4가
+캠페인에서 빠지면서 그 정정은 더 이상 이 표의 결론과 무관하다.)
 
 | 아키텍처 | `kernel=liger` | 근거 |
 |---|---|---|
-| gemma4 | 거부 | Liger-Kernel#1186 (`LIGER_UNSUPPORTED`) |
 | qwen3_vl | 거부 | 기록된 엔트리포인트 없음 (`LIGER_ENTRYPOINTS`) |
 | qwen3_5 | 거부 | 이미지가 fla를 바인딩한다 — `mixed(fla,liger)`가 될 런을 `patch()`가 막는다 |
 
-셋 다 커버리지와 무관한 이유이므로, **liger의 커버리지 질문은 오늘 아무 런에서도
+둘 다 커버리지와 무관한 이유이므로, **liger의 커버리지 질문은 오늘 아무 런에서도
 발생하지 않는다.** 발생하는 것은 `fla` 쪽이다: canonical baseline이 이제
 `kernel=fla`를 요청하고, Qwen3.5의 모듈 중 fla가 정의하는 것이 몇 개인지는 아무도
 모른다. 그 수가 작다면 지금의 판정은 "fla 패키지의 클래스가 모델 안에 하나라도
@@ -532,8 +537,10 @@ AND된다(`masking_utils.py:182`, 결합은 `:972`). "저장소에 블록 대각
 | 모델 | 텍스트 레이어 타입 | pack 격리 |
 |---|---|---|
 | qwen3_vl | full_attention 하나 | 자동 (`models/qwen3_vl/modeling_qwen3_vl.py:809`) |
-| gemma4 | full + sliding | 둘 다 자동 (`models/gemma4/modeling_gemma4.py:1707`) |
 | qwen3_5 | full + linear_attention | full만 자동. **linear은 아니다** |
+
+(gemma4는 2026-08-03 캠페인 제외로 이 표에서 빠졌다 — 제외 이전에는 full + sliding
+레이어 둘 다 자동으로 격리됐다, `models/gemma4/modeling_gemma4.py:1707`.)
 
 Qwen3.5의 Gated DeltaNet 레이어(`config.layer_types`가 `linear_attention`으로 표시한
 층)는 `position_ids`를 보지 않는다. chunked 커널은 `kwargs["cu_seq_lens_q"]`를

@@ -1,12 +1,14 @@
 # train-comparison
 
-Qwen3-VL-Embedding-2B / Qwen3.5-0.8B / gemma-4-E2B 세 모델의 **임베딩 학습 속도**를
-실측 비교하는 벤치마크. full finetuning과 LoRA를 대상으로, 최적화 기법을 축으로
-ablation하여 throughput x memory x 품질의 Pareto frontier를 산출한다.
+Qwen3-VL-Embedding-2B / Qwen3.5-0.8B 두 모델의 **임베딩 학습 속도**를 실측 비교하는
+벤치마크. full finetuning과 LoRA를 대상으로, 최적화 기법을 축으로 ablation하여
+throughput x memory x 품질의 Pareto frontier를 산출한다. (gemma-4-E2B는 2026-08-03
+캠페인에서 제외됐다 — full finetuning이 A100 80GB 한 장에 들어가지 않는다. `PLAN.md`
+"gemma-4-E2B 제외" 참조.)
 
-세 모델은 병목이 서로 다르다 — Qwen3-VL은 attention, Qwen3.5는 linear attention
-커널(레이어의 75%가 Gated DeltaNet), gemma-4-E2B는 옵티마이저 메모리(전체 5.104B 중
-PLE가 2.390B). "모델 무관 최적 레시피"가 존재하지 않는다는 것이 검증하려는 가설이다.
+두 모델은 병목이 서로 다르다 — Qwen3-VL은 attention, Qwen3.5는 linear attention
+커널(레이어의 75%가 Gated DeltaNet). "모델 무관 최적 레시피"가 존재하지 않는다는
+것이 검증하려는 가설이다.
 
 - 연구 설계와 근거: [PLAN.md](PLAN.md)
 - 측정 규율과 그 근거: [docs/methodology.md](docs/methodology.md)
@@ -35,7 +37,7 @@ InfoNCE가 같은 행을 자기 자신과 대조하게 되므로 스키마가 �
 컨벤션 위반이다.
 
 ```bash
-uv run python scripts/env_report.py device=cpu model=gemma4_e2b attn=fa4 freeze=ple data.limit=4 train.batch_size=4
+uv run python scripts/env_report.py device=cpu model=qwen3_5_0_8b attn=fa4 freeze=vision_tower data.limit=4 train.batch_size=4
 ```
 
 ## 측정 규율

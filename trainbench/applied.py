@@ -243,40 +243,6 @@ def _capture_attn(built: Built, config: BenchConfig) -> tuple[str | None, dict[s
     return "mixed(" + ",".join(sorted(counts)) + ")", {**detail, "dissenting": dissenting[:8]}
 
 
-def _capture_freeze_ple(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
-    """Whether the per-layer embeddings are actually frozen.
-
-    Counting matches is half the check. `_ple_report` used to report ok=True on a
-    zero match, so a renamed parameter upstream would have read as a successful
-    freeze of nothing — 2.39B parameters, 46.8% of gemma-4-E2B, quietly still
-    training. Zero matches on gemma4 is undetermined, not False.
-    """
-    # Imported here rather than at module scope: axes.py imports Built from this
-    # module, and the two would otherwise form a cycle.
-    from trainbench import axes
-
-    if built.model is None:
-        return None, {"reason": "no model was built"}
-    params = axes.ple_parameters(built.model)
-    if not params and config.model.arch == "gemma4":
-        return None, {
-            "reason": f"no parameter name contains {axes.PLE_PARAM_MARKER!r} on a gemma4 model",
-            "matched": 0,
-        }
-    frozen = [n for n, p in params if not p.requires_grad]
-    detail = {"matched": len(params), "frozen": len(frozen)}
-    if not params:
-        # No per-layer embeddings exist, so none are frozen. True by absence, and
-        # the schema already refuses freeze.ple on a non-gemma4 model.
-        return "False", detail
-    if len(frozen) == len(params):
-        return "True", detail
-    if not frozen:
-        return "False", detail
-    unfrozen = sorted({n for n, _ in params} - set(frozen))
-    return "partial", {**detail, "unfrozen_sample": unfrozen[:5]}
-
-
 # The class a run built, in this axis's vocabulary. A table from the constructed
 # object, never a translation of the request: mapping the request would make this
 # a mirror and certify every run. It is also the only way to a value — a class
@@ -758,46 +724,6 @@ def _checkpointing_mode(module: Any) -> tuple[str | None, str | None]:
     )
 
 
-def _quantisation_recipe(model: Any) -> dict[str, Any] | None:
-    """The 4-bit recipe the built model carries, keyed as `axes.QLORA_4BIT` asks.
-
-    `None` means the base reads as quantised but the recipe is not on the object —
-    which is undetermined, not "the usual one". Read off `model.config` because
-    that is where transformers leaves it after `from_pretrained`, as either the
-    `BitsAndBytesConfig` or the dict a quantised checkpoint declared.
-
-    dtypes are stringified here rather than at the comparison: `torch.bfloat16`
-    and the `"bfloat16"` a checkpoint's config.json spells are the same request,
-    and this value is also written into the result JSON.
-    """
-    from trainbench.axes import QLORA_4BIT
-
-    raw = getattr(getattr(model, "config", None), "quantization_config", None)
-    if raw is None:
-        return None
-    read = raw.get if isinstance(raw, dict) else lambda key: getattr(raw, key, None)
-    return {key: _plain(read(key)) for key in QLORA_4BIT}
-
-
-def _plain(value: Any) -> Any:
-    """`torch.bfloat16` and `"bfloat16"` as one spelling, so the recipe compares
-    and serialises the same way whichever the loader left behind."""
-    text = str(value)
-    return text.removeprefix("torch.") if text.startswith("torch.") else value
-
-
-def _off_recipe(recipe: dict[str, Any] | None) -> list[str]:
-    """Where the built model's 4-bit differs from the one `peft.mode=qlora` asks
-    for, as `key=value` of what it actually got."""
-    from trainbench.axes import QLORA_4BIT
-
-    if recipe is None:
-        return ["recipe=unreadable"]
-    return [
-        f"{key}={recipe[key]}" for key, want in QLORA_4BIT.items() if recipe[key] != _plain(want)
-    ]
-
-
 def _capture_peft(built: Built, config: BenchConfig) -> tuple[str | None, dict[str, Any]]:
     """Which adapter, if any, the built model carries.
 
@@ -819,23 +745,7 @@ def _capture_peft(built: Built, config: BenchConfig) -> tuple[str | None, dict[s
     if not kinds and wrapper != "peft":
         return "full", detail
     if kinds == ["lora"]:
-        # qlora is lora over a quantised base, so the adapter type alone cannot
-        # tell the two apart; the base's quantisation is what does.
-        quantised = bool(
-            getattr(built.model, "is_loaded_in_4bit", False)
-            or getattr(getattr(built.model, "config", None), "quantization_config", None)
-        )
-        if not quantised:
-            return "lora", {**detail, "base_quantised": False}
-        recipe = _quantisation_recipe(built.model)
-        detail = {**detail, "base_quantised": True, "base_quantisation": recipe}
-        off = _off_recipe(recipe)
-        # "qlora" names one recipe, not any 4-bit at all. fp4 weights, or double
-        # quantisation left off, are a different technique with a different memory
-        # and speed profile — and the study would print their step time as QLoRA's.
-        # An unnamed value is a mismatch, which stops the run; the recipe travels
-        # in the detail either way, so the result file says which 4-bit it was.
-        return ("qlora" if not off else "qlora(" + ";".join(off) + ")"), detail
+        return "lora", detail
     # Deliberately not equal to any configurable value: an adapter we cannot name
     # must be a mismatch rather than fall into the nearest one.
     return "peft(" + ",".join(kinds or ["unknown"]) + ")", detail
@@ -1294,7 +1204,6 @@ _CAPTURES: dict[str, CaptureFn] = {
     "dataloader.packing": _capture_dataloader_packing,
     "dataloader.pretokenize": _capture_dataloader_pretokenize,
     "framework.name": _capture_framework,
-    "freeze.ple": _capture_freeze_ple,
     "freeze.vision_tower": _capture_freeze_vision_tower,
     "kernel.name": _capture_kernel,
     "loss.name": _capture_loss,

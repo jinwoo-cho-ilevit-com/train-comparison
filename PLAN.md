@@ -42,10 +42,11 @@ Gated DeltaNet이고 그 층의 `conv_dim`이 hidden의 6배에 chunk 상태를 
 비전 타워 12층도 checkpointing 없이 돈다 — 항목별 하한만으로도 A100 80GB에 여유가
 없다.
 
-`configs/model/gemma4_e2b.yaml`과 `configs/experiment/*gemma4*` 매니페스트 8개는
-이 문서 작성 시점에 코드에서 아직 제거되지 않았다 — 제거는 다른 레인의 작업이며,
-저장소 구조 블록은 실제 파일과 일치해야 하므로 그대로 남겨 둔다. 이 절이 말하는
-것은 캠페인의 범위이지 트리의 상태가 아니다.
+`configs/model/gemma4_e2b.yaml`과 `configs/experiment/*gemma4*` 매니페스트 8개,
+qlora를 쓰던 `configs/peft/qlora.yaml`, gemma-4에만 존재하던 PLE 축의
+`configs/freeze/ple.yaml`·`vision_and_ple.yaml`은 Lane G가 제거했다(2026-08-03).
+`docs/support-matrix.md`와 `docs/open-verdicts.json`의 gemma-4·qlora 관련 실측/판정은
+"캠페인 제외"로 표시된 채 남아 있다 — 지운 것은 코드와 config뿐이다.
 
 ### SFT 대비 주장은 철회했다 (2026-08-01)
 
@@ -424,7 +425,7 @@ train-comparison/
 ├── .env.example               # RUNPOD_API_KEY, HF_TOKEN (키 이름만)
 ├── configs/                   # Hydra config groups = 실험 축
 │   ├── config.yaml
-│   ├── model/                 # qwen3_vl_emb_2b, qwen3_5_0_8b, gemma4_e2b
+│   ├── model/                 # qwen3_vl_emb_2b, qwen3_5_0_8b
 │   ├── data/                  # speed(소수 샘플), quality(장기)
 │   ├── run/                   # probe, timing, profile, quality
 │   ├── train/                 # 단일 플래그 knob (batch, seed, checkpointing 등)
@@ -435,8 +436,8 @@ train-comparison/
 │   ├── compile/               # none, default, max_autotune, regional
 │   ├── optim/                 # adamw_fused, adamw_8bit, muon
 │   ├── loss/                  # mnrl, cached_mnrl
-│   ├── peft/                  # full, lora, qlora
-│   ├── freeze/                # none, vision_tower, ple, vision_and_ple
+│   ├── peft/                  # full, lora (qlora 제거 — 사용자 결정)
+│   ├── freeze/                # none, vision_tower
 │   ├── dataloader/            # torch, torch_packed, dali, dali_packed
 │   ├── parallel/              # single, ddp, fsdp2, zero2, zero3
 │   └── framework/             # native, unsloth, ms_swift, st, tevatron, axolotl
@@ -601,7 +602,6 @@ CPU에서 구현·검증이 끝나는 것과 GPU가 있어야 판정되는 것�
 | `parallel=zero2` / `zero3` + `train.offload` | **GPU** | `deepspeed.initialize`가 모델·옵티마이저·로더를 한 번에 만든다(`docs/CONTRACTS.md` §2) |
 | `dataloader=dali` / `dali_packed` | **GPU** | 하드웨어 JPEG 디코드가 이 축의 측정 대상 |
 | `optim=adamw_8bit` | **GPU** | bitsandbytes |
-| `peft=qlora` | **GPU** | 4-bit 양자화가 CUDA 전용 |
 | `compile=regional` | CPU | |
 
 - [ ] 위 표의 미구현 값에 `axes.py` 적용 지점 추가

@@ -1734,7 +1734,7 @@ def test_a_launch_with_no_flag_hands_the_pod_its_own_environment(tmp_path, monke
     code = orchestrate.main(
         [
             "--experiment",
-            "phase2-loss-gemma4_e2b",
+            "phase2-loss-qwen3_vl_emb_2b",
             "--allow-dirty",
             "--infisical-project-id",
             "project",
@@ -1772,7 +1772,7 @@ def test_the_scope_is_read_from_the_environment_the_pod_is_handed(monkeypatch, t
     orchestrate.main(
         [
             "--experiment",
-            "phase2-loss-gemma4_e2b",
+            "phase2-loss-qwen3_vl_emb_2b",
             "--allow-dirty",
             "--infisical-env",
             "pod-only",
@@ -1838,7 +1838,7 @@ def launch(tmp_path, monkeypatch, reachable, outcome=exited, announce=None, afte
     code = orchestrate.main(
         [
             "--experiment",
-            "phase2-loss-gemma4_e2b",
+            "phase2-loss-qwen3_vl_emb_2b",
             "--allow-dirty",
             "--infisical-project-id",
             "project",
@@ -1904,7 +1904,7 @@ def test_a_scoped_token_reaches_the_launch(tmp_path, monkeypatch):
     """The other half: a guard that refuses everything also creates no pod."""
     code, created, _ = launch(tmp_path, monkeypatch, ["HF_TOKEN"])
     assert code == 0
-    assert [spec.name for spec in created] == ["trainbench-phase2-loss-gemma4_e2b"]
+    assert [spec.name for spec in created] == ["trainbench-phase2-loss-qwen3_vl_emb_2b"]
 
 
 def test_a_cycling_pod_is_terminated_and_the_ledger_says_which_kind_it_was(tmp_path, monkeypatch):
@@ -2766,11 +2766,17 @@ RESULT_FILE = f"/{publish_result.RESULT_NAME}"
 
 
 def loss_sweep_experiment():
-    """One pod owning one axis: a baseline run plus every value of `loss`."""
+    """One pod owning one axis: a baseline run plus every value of `loss`.
+
+    Named after `configs/experiment/phase2-loss-qwen3_vl_emb_2b.yaml`, a manifest
+    that actually ships. gemma4_e2b was the original stand-in here; it left the
+    campaign 2026-08-03 (full finetuning does not fit one A100 80GB) and its
+    config group was removed, so a fixture still naming it can no longer compose.
+    """
     return orchestrate.Experiment(
-        name="phase2-loss-gemma4_e2b",
+        name="phase2-loss-qwen3_vl_emb_2b",
         phase="phase2",
-        model="gemma4_e2b",
+        model="qwen3_vl_emb_2b",
         framework="native",
         purpose="timing",
         baseline="canonical",
@@ -3115,7 +3121,13 @@ def test_a_gpu_the_image_does_cover_is_not_in_the_way(tmp_path):
 def probe_config(**over):
     """A resolved probe config, composed the way the orchestrator composes one."""
     config = orchestrate.resolved_config(
-        ["framework=native", "model=gemma4_e2b", "run=probe", "data.limit=8", "train.batch_size=8"]
+        [
+            "framework=native",
+            "model=qwen3_vl_emb_2b",
+            "run=probe",
+            "data.limit=8",
+            "train.batch_size=8",
+        ]
     )
     config.update(over)
     return config
@@ -3153,7 +3165,7 @@ def test_the_preflight_probe_branch_lets_a_current_config_reach_verify_env(tmp_p
     sweep = probe_pod(tmp_path, probe_config())
 
     assert sweep.preflight != []
-    assert [entry["verify_env"]["model"]["name"] for entry in sweep.verify] == ["gemma4_e2b"]
+    assert [entry["verify_env"]["model"]["name"] for entry in sweep.verify] == ["qwen3_vl_emb_2b"]
     assert sweep.proc.returncode == 0, sweep.proc.stderr
     bodies = list(published_results(sweep).values())
     assert bodies and bodies[0]["probe"]["checks"][0]["ok"] is True

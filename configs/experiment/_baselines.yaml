@@ -10,7 +10,8 @@
 # moves when a default moves is not a baseline.
 #
 # Nothing here mentions the pod's own model or framework. The baseline is a fixed
-# reference workload, so the same one runs on the gemma-4 pod and the Qwen3-VL pod.
+# reference workload, so the same one runs on every pod regardless of which model
+# or framework that pod is measuring.
 
 canonical:
   description: >

@@ -44,7 +44,7 @@ def load(config: BenchConfig, device: torch.device, load_kwargs: dict[str, Any])
 
     return FastVisionModel.from_pretrained(
         config.model.hf_id,
-        load_in_4bit=config.peft.mode == "qlora",
+        load_in_4bit=False,
         full_finetuning=config.peft.mode == "full",
         dtype=steps.dtype_for(device),
         revision=config.model.revision,
@@ -84,7 +84,7 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
 
     processor = loaded["processor"]
 
-    if config.peft.mode in ("lora", "qlora"):
+    if config.peft.mode == "lora":
         report.run("get_peft_model", lambda: _peft(loaded, config))
 
     # Before the optimizer, which docs/CONTRACTS.md §2 fixes as the order: an
@@ -117,7 +117,6 @@ def run(config: BenchConfig, device: torch.device, report: ProbeReport) -> None:
             model,
             device,
             side,
-            config.model.max_tokens_per_image,
             config.model.prompt_format,
         ),
     )

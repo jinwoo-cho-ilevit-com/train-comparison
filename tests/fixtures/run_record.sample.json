@@ -264,7 +264,6 @@
       "name": "tevatron"
     },
     "freeze": {
-      "ple": false,
       "vision_tower": false
     },
     "kernel": {
@@ -280,7 +279,6 @@
       "arch": "qwen3_5",
       "hf_id": "Qwen/Qwen3.5-0.8B",
       "instruction_prompt": null,
-      "max_tokens_per_image": null,
       "name": "qwen3_5_0_8b",
       "padding_side": "right",
       "pooling": "lasttoken",

@@ -882,11 +882,9 @@ AXIS_PACKAGES = {
     # could never be satisfied by a correct install.
     "dataloader/dali": ("nvidia-dali-cuda130",),
     "dataloader/dali_packed": ("nvidia-dali-cuda130",),
-    # peft/loss/framework were exempt via NON_AXIS_GROUPS, which hid two real
-    # gaps: bitsandbytes is in 2 of 6 envs while qlora is offered to all six, and
+    # peft/loss/framework were exempt via NON_AXIS_GROUPS, which hid a real gap:
     # no environment has a GradCache implementation at all — while three shipped
     # manifests already assign GPUs to the loss axis.
-    "peft/qlora": ("bitsandbytes",),
     # `loss/cached_mnrl` was here, needing `gradcache` (`grad-cache` is a 404;
     # upstream declares `name="GradCache"`, which PEP 503 normalises to
     # `gradcache`). It needs no package now: `axes._loss` implements the three
@@ -931,8 +929,6 @@ AXIS_NEEDS_NOTHING = frozenset(
         "loss/cached_mnrl",
         "freeze/none",
         "freeze/vision_tower",
-        "freeze/ple",
-        "freeze/vision_and_ple",
         "compile/none",
         "compile/default",
         "compile/max_autotune",
@@ -944,9 +940,8 @@ AXIS_NEEDS_NOTHING = frozenset(
 # backs them.
 # Groups that select something other than an optimisation, so no package backs
 # them. `framework`, `peft`, `loss`, `freeze` and `compile` used to be here and
-# are not: exempting a whole group from the package check is how `peft/qlora`
-# (bitsandbytes in 2 of 6 envs) and `loss/cached_mnrl` (no GradCache anywhere)
-# stayed invisible while `axis-fields` counted both as axes.
+# are not: exempting a whole group from the package check is how `loss/cached_mnrl`
+# (no GradCache anywhere) stayed invisible while `axis-fields` counted it as an axis.
 NON_AXIS_GROUPS = frozenset({"data", "model", "run", "train", "experiment"})
 
 
@@ -1681,10 +1676,6 @@ class _AxisValueRowsWithImages(_AxisValueRows):
 # requires be discarded (MAX_AUTOTUNE_MIN_WARMUP_STEPS).
 AXIS_VALUE_COMPANIONS: dict[str, tuple[str, ...]] = {
     "compile/max_autotune": ("train.warmup_discard_steps=20",),
-    # The PLE tables exist only in gemma-4; the schema refuses the axis on the
-    # other two models rather than letting it freeze nothing.
-    "freeze/ple": ("model=gemma4_e2b",),
-    "freeze/vision_and_ple": ("model=gemma4_e2b",),
     # Gated DeltaNet is a Qwen3.5 layer, so `axes.FLA_ARCHS` is `{qwen3_5}` and
     # the default model refuses `kernel=fla` on architecture before the packages
     # are ever asked about. Without this the value is uncountable in every

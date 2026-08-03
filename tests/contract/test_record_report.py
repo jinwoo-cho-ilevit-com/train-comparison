@@ -326,7 +326,7 @@ def training_verdict(payload: dict[str, Any]) -> tuple[bool, list[str]]:
                 f"peft.mode=full but {trainable} of {total} parameter tensors train; "
                 "a full finetune that froze part of the model is a different workload"
             )
-        if mode in ("lora", "qlora") and trainable >= total:
+        if mode == "lora" and trainable >= total:
             reasons.append(
                 f"peft.mode={mode} but {trainable} of {total} parameter tensors train; "
                 "the adapter did not narrow anything"

@@ -285,15 +285,15 @@ def test_the_instruction_prompt_is_what_the_config_says_and_not_the_template_def
 
 
 def test_a_row_with_no_instruction_prompt_sends_no_system_turn():
-    """Two of the three models declare none (`instruction_prompt: null`), and an
-    empty system turn is not the same row as no system turn.
+    """`qwen3_5_0_8b` declares none (`instruction_prompt: null`), and an empty
+    system turn is not the same row as no system turn.
 
-    It is one more `<|im_start|>system\\n<|im_end|>\\n` on every row of
-    `qwen3_5_0_8b` and `gemma4_e2b`, so the sequence length grows and the tokens/s
-    denominator moves. The roles are asserted as well as the rendering because that
-    is the fact this guard is about; the rendering alone was checked against a stub
-    that dropped every turn but the last, and dropping the `if` in
-    `trainbench/prompt.py:146` then changed nothing any test could see.
+    It is one more `<|im_start|>system\\n<|im_end|>\\n` on every row, so the
+    sequence length grows and the tokens/s denominator moves. The roles are
+    asserted as well as the rendering because that is the fact this guard is
+    about; the rendering alone was checked against a stub that dropped every turn
+    but the last, and dropping the `if` in `trainbench/prompt.py:146` then changed
+    nothing any test could see.
     """
     processor = _Templated()
 

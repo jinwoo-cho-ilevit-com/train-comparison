@@ -138,7 +138,6 @@ AXES = (
     "dataloader.packing",
     "dataloader.pretokenize",
     "framework.name",
-    "freeze.ple",
     "freeze.vision_tower",
     "kernel.name",
     "loss.name",
@@ -295,57 +294,6 @@ def test_the_attention_detail_does_not_grow_with_the_model():
 
     assert detail == {"implementations": {"sdpa": 501}, "modules_checked": 501}
     assert len(json.dumps(detail)) < 200
-
-
-def param(name: str, requires_grad: bool):
-    return name, SimpleNamespace(requires_grad=requires_grad, requires_grad_=lambda flag: None)
-
-
-def gemma(config_mapping, **overrides):
-    return bench(
-        config_mapping,
-        **{
-            "model.arch": "gemma4",
-            "model.padding_side": "left",
-            "model.max_tokens_per_image": 280,
-            "model.instruction_prompt": None,
-        },
-        **overrides,
-    )
-
-
-PLE_FROZEN = param("embed_tokens_per_layer.weight", False)
-PLE_TRAINING = param("layers.0.per_layer_input_gate", True)
-
-
-def test_freezing_nothing_is_not_a_successful_freeze(config_mapping):
-    """`_ple_report` reported ok=True on zero matches, so an upstream rename would
-    have read as a freeze of 2.39B parameters that were in fact still training."""
-    state = capture(built(params=[param("model.layers.0.mlp.weight", True)]), gemma(config_mapping))
-
-    ple = axis(state, "freeze.ple")
-
-    assert ple.applied is None
-    assert ple.detail["matched"] == 0
-
-
-def test_a_half_applied_freeze_is_a_mismatch(config_mapping):
-    config = gemma(config_mapping, **{"freeze.ple": True})
-
-    state = capture(built(params=[PLE_FROZEN, PLE_TRAINING]), config)
-
-    assert axis(state, "freeze.ple").applied == "partial"
-    with pytest.raises(AppliedMismatch, match="freeze.ple"):
-        assert_matches(state, config)
-
-
-def test_a_freeze_that_took_matches(config_mapping):
-    config = gemma(config_mapping, **{"freeze.ple": True})
-    frozen = [PLE_FROZEN, param("layers.0.per_layer_input_gate", False)]
-
-    state = capture(built(params=frozen), config)
-
-    assert axis(state, "freeze.ple").matches
 
 
 def test_expected_failure_does_not_condemn_the_report():
