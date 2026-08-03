@@ -477,6 +477,7 @@ train-comparison/
 │   ├── test_audit.py
 │   ├── test_axes.py
 │   ├── test_bench_framework_step.py  # framework 소유 스텝을 하네스가 구동하는 경로
+│   ├── test_pod_logs.py       # 파드 로그를 종료 전에 받아 보존하는 경로
 │   ├── test_data.py
 │   ├── test_device_seed.py
 │   ├── test_embedding.py
